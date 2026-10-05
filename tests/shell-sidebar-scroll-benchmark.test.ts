@@ -160,7 +160,8 @@ test("characterize settled native fullscreen scroll frames with and without the 
 					assert.equal(visible[0], `ROW-${String(result.positions[frame % result.positions.length]).padStart(5, "0")} settled transcript`, "visible scroll anchor matches requested position");
 					if (fixture.sidebar && fixture.columns === 140) {
 						assert.ok(screen.some((line) => line.includes("Status card")), "desktop rail is painted");
-						assert.equal(screen[0], "HEADER 138");
+						assert.equal(screen[0]!.slice(90), "HEADER 50", "header is pinned at the right rail's origin");
+						assert.equal(result.viewportHeight, 20, "transcript keeps every row except the four-row editor dock");
 					} else {
 						if (fixture.columns === 100) assert.equal(screen[0], "HEADER 100", "narrow fallback retains the full-width header");
 						else assert.ok(!screen.some((line) => line.startsWith("HEADER ")), "desktop sidebar-off control has no header");
@@ -181,7 +182,10 @@ test("characterize settled native fullscreen scroll frames with and without the 
 			for (let frame = 0; frame < results[0]!.screens.length; frame++) {
 				const on = transcriptRows(results[0]!.screens[frame]!);
 				const off = transcriptRows(results[1]!.screens[frame]!);
-				assert.deepEqual(on, off.slice(0, on.length));
+				assert.equal(on.length, off.length + 1, "right-only header and reclaimed footer add one transcript row");
+				assert.deepEqual(on.slice(0, off.length), off, "every shared transcript row is unchanged");
+				const anchor = results[0]!.positions[frame % results[0]!.positions.length]!;
+				assert.equal(on.at(-1), `ROW-${String(anchor + on.length - 1).padStart(5, "0")} settled transcript`, "the additional row follows the same scroll anchor");
 			}
 			console.log("scroll baseline", JSON.stringify(fixtures.map((fixture, index) => ({
 				rows: rowCount, columns: fixture.columns, sidebar: fixture.sidebar,
@@ -238,7 +242,9 @@ test("wrapped ANSI and native Markdown distinguish width composition from settle
 					const height = Math.min(results[0]!.viewportHeight, results[1]!.viewportHeight);
 					const transcript = (screen: string[], start: number) => screen.slice(start, start + height).map((line) => line.slice(0, width).trimEnd());
 					for (let frame = 0; frame < results[0]!.screens.length; frame++) {
-						assert.deepEqual(transcript(results[0]!.screens[frame]!, 1), transcript(results[1]!.screens[frame]!, 0), "width-matched transcript pixels agree");
+						assert.equal(results[0]!.viewportHeight, 20, "wide rail header reserves no transcript rows");
+						assert.equal(results[1]!.viewportHeight, 19, "width-matched native control retains its footer row");
+						assert.deepEqual(transcript(results[0]!.screens[frame]!, 0), transcript(results[1]!.screens[frame]!, 0), "width-matched transcript pixels agree from the first screen row");
 					}
 				}
 				console.log("scroll workload", JSON.stringify(fixtures.map((fixture, index) => ({

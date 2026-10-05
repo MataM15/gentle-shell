@@ -358,6 +358,43 @@ export function shellHeaderUsageHit(chrome: ShellHeaderChrome, x: number, y: num
 	return y === chrome.headerRow && usageSpan !== undefined && x >= usageSpan.start && x < usageSpan.end;
 }
 
+// The rail's cards sit one column in from each rail edge; the pinned header
+// keeps the same inset so its text lines up with the card borders.
+const RAIL_HEADER_INSET = 1;
+
+/**
+ * The header pinned above the wide right rail's scrollable cards. Unlike the
+ * one-row header it stacks its groups at rail width and wraps long values
+ * rather than dropping the model. The usage line is the only interactive
+ * row (`headerRow`); every other row and the rule are decorative.
+ */
+export function renderShellRailHeader(model: ShellHeaderModel, theme: ShellBarTheme, width: number, usageHint?: string, presentation?: Presentation): ShellHeaderChrome {
+	const targetWidth = Math.max(0, Math.floor(width));
+	const inner = targetWidth - RAIL_HEADER_INSET * 2;
+	if (inner < 1) return { rows: [], headerRow: -1 };
+	const pad = " ".repeat(RAIL_HEADER_INSET);
+	const wrap = (text: string) => wrapTextWithAnsi(text, inner).map((line) => pad + line);
+	const rows = [
+		...(presentation?.density === "minimal" ? [] : wrap(theme.fg(ROLE.BRAND, theme.bold(HEADER_BRAND)))),
+		...wrap(locationSegment(model, theme)),
+		...(presentation?.visibility.modelDetails === false ? [] : [
+			...wrap(executionSegment(model.modelId, model.effort, theme)),
+			...(model.profile ? wrap(theme.fg(ROLE.MODEL, sanitizeStatus(model.profile))) : []),
+		]),
+	];
+	if (presentation?.visibility.usageCost === false) return { rows: [...rows, theme.fg(HEADER_RULE_ROLE, HEADER_RULE_CHAR.repeat(targetWidth))], headerRow: -1 };
+	rows.push(...wrap(joinSegments([contextSegment(model.contextPercent, theme), costSegment(model.costTotal, model.subscription, theme)], theme)));
+	// The same standing, clickable usage affordance as the one-row header,
+	// degraded (gauges, then secondary windows) to stay on one row.
+	const windows = model.usage ? (selectUsageLimit(model.usage, model.modelId)?.windows ?? []) : [];
+	const stages: UsageStage[] = ["full", "text", "primary"];
+	const fitted = stages.map((stage) => usageSegmentText(windows, theme, stage, usageHint)).find((text) => visibleWidth(text) <= inner);
+	const usage = fitted ?? truncateToWidth(usageSegmentText(windows, theme, "primary", usageHint), inner, "…");
+	const headerRow = rows.length;
+	rows.push(pad + usage, theme.fg(HEADER_RULE_ROLE, HEADER_RULE_CHAR.repeat(targetWidth)));
+	return { rows, headerRow, usageSpan: { start: RAIL_HEADER_INSET, end: RAIL_HEADER_INSET + visibleWidth(usage) } };
+}
+
 function headerContent(model: ShellHeaderModel, theme: ShellBarTheme, width: number, usageHint?: string, presentation?: Presentation): ShellHeaderResult {
 	const targetWidth = Math.max(0, Math.floor(width));
 	const ctxCost = joinSegments([contextSegment(model.contextPercent, theme), costSegment(model.costTotal, model.subscription, theme)], theme);

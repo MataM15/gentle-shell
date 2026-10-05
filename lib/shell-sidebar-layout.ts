@@ -1,5 +1,5 @@
-import { ScrollView, VStack, visibleWidth, type Component, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
-import { sidebarState, type SidebarRail } from "./shell-sidebar.ts";
+import { ScrollView, VStack, truncateToWidth, visibleWidth, type Component, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import { sidebarState, type SidebarHeaderRail, type SidebarRail } from "./shell-sidebar.ts";
 import type { ShellBarTheme } from "./shell-bar.ts";
 import { CARD_STYLE, cardStyle, type CardStyle } from "./shell-card.ts";
 import { renderSidebarBanner } from "./shell-sidebar-banner.ts";
@@ -8,11 +8,6 @@ import type { Density, HeaderPlacement, StatusPlacement } from "./visual-customi
 export const SIDEBAR_BREAKPOINT = 140;
 const RAIL_WIDTH = 50;
 const RAIL_PADDING = 1;
-// The rail's ScrollView keeps one column for its scrollbar; with the rail
-// padding that puts the card's right border two columns in from the edge.
-// The header row stops at the same column so its right group lines up with
-// the card instead of touching the terminal edge.
-const HEADER_RIGHT_INSET = RAIL_PADDING + 1;
 const GAP = 3;
 /** Right-edge columns the painting rail takes from the editor column; published as `railColumns`. */
 export const SIDEBAR_RAIL_COLUMNS = RAIL_WIDTH + GAP;
@@ -41,9 +36,9 @@ type PreparedRail = {
 	active: boolean;
 	lines: string[];
 	hits: RailHit[];
-	// The header row is a full-width sibling above the hstack, not a rail
-	// section: it never enters `lines`/`hits`, and an empty/blank result
-	// falls back to the old hstack-direct shape with the banner restored.
+	// The pinned right-rail header stays outside the scrollable sections: it
+	// never enters `lines`/`hits`, and an empty/blank result falls back to
+	// the bare rail with the banner restored.
 	headerLines: string[];
 	headerActive: boolean;
 	presentation?: SidebarPresentation;
@@ -133,10 +128,9 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 			for (const part of state.parts.values()) part.invalidate();
 		},
 	};
-	// The header row: a plain leaf component measured from its rendered lines
-	// (one line with just the status bar; two once the rule row joins it),
-	// painted full-width above the hstack when a "header" part is registered
-	// and has something to show.
+	// The narrow top row: a plain leaf component measured from its rendered
+	// lines, painted full-width above the native layout when a "header" part
+	// is registered and has something to show.
 	// The header is not inside the rail's ScrollView, so it never goes through
 	// dispatchPartMouse: it is its own leaf in the layout tree (no [NODE]),
 	// and pi-tui's mouse dispatch (tui-alt-screen.js dispatchMouseToLayout)
@@ -147,6 +141,24 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 		render: () => headerLines,
 		invalidate() {},
 		handleMouse: (event) => state.parts.get("header")?.handleMouse?.(event),
+	};
+	// The wide header: a leaf pinned above the rail's ScrollView, so it stays
+	// put while the cards scroll. Pi dispatches local coordinates straight to
+	// it; a click is honored only against the geometry last painted, never
+	// after a digest change, resize, replacement or disposal.
+	const pinnedHeader: Component = {
+		render: () => headerLines,
+		invalidate() {},
+		handleMouse: (event) => {
+			const current = prepared;
+			const part = state.parts.get("header") as SidebarHeaderRail | undefined;
+			if (!current?.active || !current.headerActive || !part || stopped || failed || host.mode !== "fullscreen" ||
+				host.layoutRoot !== current.root || tui.terminal.columns !== current.width || cache.revision !== current.revision) return undefined;
+			const index = current.parts.findIndex(([key]) => key === "header");
+			if (index < 0 || current.parts[index]![1] !== part || current.digests[index] !== railDigest(part)) return undefined;
+			if (event.x < 0 || event.x >= RAIL_WIDTH || event.y < 0 || event.y >= current.headerLines.length) return undefined;
+			return (part.pinned ?? part).handleMouse?.(event);
+		},
 	};
 	const scroll = new ScrollView(rail, {
 		follow: "none",
@@ -224,11 +236,11 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 			return prepared.active;
 		}
 		try {
-			// The header is a full-width sibling row, not a rail section: it reads
-			// the terminal width (minus the rail's right inset), never the
-			// 50-column rail's content width.
-			const headerPart = state.parts.get("header");
-			const preparedHeaderLines = [...(headerPart?.render(Math.max(0, width - HEADER_RIGHT_INSET)) ?? [])];
+			// The pinned header is not a rail section: it renders at the full
+			// rail width above the ScrollView and never scrolls with the cards.
+			const headerPart = state.parts.get("header") as SidebarHeaderRail | undefined;
+			const preparedHeaderLines = [...((headerPart?.pinned ?? headerPart)?.render(RAIL_WIDTH) ?? [])]
+				.map((line) => visibleWidth(line) <= RAIL_WIDTH ? line : truncateToWidth(line, RAIL_WIDTH, "…"));
 			const headerActive = headerPart !== undefined && preparedHeaderLines.some((line) => line.trim() !== "");
 			const contentWidth = scroll.getContentWidth(RAIL_WIDTH);
 			const sections = ["wellness", "usage", "footer", "agents", "todo"].filter((key) => key !== "todo" || state.visibility?.todo !== false).map((key) => {
@@ -270,8 +282,8 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 				hits.push({ key: section.key, component: section.component, startY, height: section.lines.length, width: contentWidth - RAIL_PADDING * 2 });
 			}
 			// Height is owned by the native ScrollView, never by the transcript.
-			const active = railLines.length > 0 && railLines.every((line) => visibleWidth(line) <= contentWidth);
 			headerLines = headerActive && headerPlacement() === "top" ? preparedHeaderLines : [];
+			const active = (railLines.length > 0 || headerLines.length > 0) && railLines.every((line) => visibleWidth(line) <= contentWidth);
 			prepared = { revision: cache.revision, width, mode: host.mode, headerPlacement: headerPlacement(), cardStyle: style, root, theme, parts, digests, contentWidth, active, lines: railLines, hits, headerLines, headerActive: headerLines.length > 0 };
 			state.active = active;
 			return active;
@@ -322,18 +334,22 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 			const nativeLayout = () => placement() === "hidden" || headerOwnsStatus() ? reclaimFooterRow(original.call(root)) : original.call(root);
 			const nativeHost = { render: () => [], invalidate() {}, [NODE]: nativeLayout };
 			const left = { render: () => [], invalidate() {}, [NODE]: () => reclaimFooterRow(original.call(root)) };
-			// Stable component wrapping the [left, scroll] hstack behind its own
-			// NODE, exactly like `left` wraps the native transcript: the header
-			// vstack's second entry recurses into it the same way pi-tui already
-			// recurses into a nested layout via [NODE].
-			const hstackHost: Component & { [NODE](): LayoutNode } = {
+			// Stable component pinning the header above the rail's ScrollView,
+			// behind its own NODE exactly like `left` wraps the native transcript.
+			// Only the rail reserves rows for the header; the transcript keeps
+			// the full viewport height.
+			const right: Component & { [NODE](): LayoutNode } = {
 				render: () => [],
 				invalidate() {},
-				[NODE]: () => ({ type: "hstack", gap: GAP, align: "stretch", entries: [
-					{ component: left, basis: 0, grow: 1, shrink: 1, minSize: 1 },
-					{ component: scroll, basis: RAIL_WIDTH, grow: 0, shrink: 0, minSize: RAIL_WIDTH },
+				[NODE]: () => ({ type: "vstack", gap: 0, align: "stretch", entries: [
+					{ component: pinnedHeader, basis: "auto", grow: 0, shrink: 0, minSize: 1 },
+					{ component: scroll, basis: 0, grow: 1, shrink: 1, minSize: 1 },
 				] }),
 			};
+			const hstack = (pinned: boolean): LayoutNode => ({ type: "hstack", gap: GAP, align: "stretch", entries: [
+				{ component: left, basis: 0, grow: 1, shrink: 1, minSize: 1 },
+				{ component: pinned ? right : scroll, basis: RAIL_WIDTH, grow: 0, shrink: 0, minSize: RAIL_WIDTH },
+			] });
 			const replacement = () => {
 				if (!prepare(tui.terminal.columns, root)) {
 					if (failed || stopped || host.mode !== "fullscreen") return original.call(root);
@@ -345,12 +361,7 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 				}
 				const current = prepared!;
 				if (current.presentation?.scrollTop === scroll.scrollTop) return current.presentation.output;
-				const output: LayoutNode = current.headerActive && headerPlacement() !== "below-input"
-					? { type: "vstack", gap: 0, align: "stretch", entries: [
-						{ component: header, basis: "auto", grow: 0, shrink: 0, minSize: 1 },
-						{ component: hstackHost, basis: 0, grow: 1, shrink: 1, minSize: 1 },
-					] }
-					: hstackHost[NODE]();
+				const output = hstack(current.headerActive && headerPlacement() !== "below-input");
 				return (current.presentation = { scrollTop: scroll.scrollTop, output }).output;
 			};
 			root[NODE] = replacement;

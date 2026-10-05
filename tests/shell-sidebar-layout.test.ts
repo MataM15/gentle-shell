@@ -4,7 +4,7 @@ import { CURSOR_MARKER, ScrollView, VStack, visibleWidth, type Component, type T
 import { getScrollViewsAt, renderLayoutFrame, type LayoutBox } from "@earendil-works/pi-tui/dist/layout.js";
 import { installSidebar, invalidateSidebar, narrowStatusOwner } from "../lib/shell-sidebar-layout.ts";
 import { sidebarHeader, sidebarPart, sidebarState } from "../lib/shell-sidebar.ts";
-import { renderShellSidebarBar } from "../lib/shell-bar.ts";
+import { renderShellRailHeader, renderShellSidebarBar, shellHeaderUsageHit } from "../lib/shell-bar.ts";
 import { renderTodoCard, type TodoState } from "../lib/shell-todo.ts";
 import { CARD_STYLE, cardStyle, setCardStyle } from "../lib/shell-card.ts";
 
@@ -25,19 +25,141 @@ function rail(f: ReturnType<typeof fixture>): ScrollView {
 	return node.entries[1].component;
 }
 type HstackNode = { type: string; gap: number; align: string; entries: { component: unknown; basis: number | string; grow: number; shrink: number; minSize: number }[] };
-// Finds the [left, scroll] hstack regardless of whether it is returned
-// directly (no active header) or nested one level under the header vstack.
+// The wide layout is always the [transcript, right] hstack; an active header
+// is pinned inside the right entry, above the rail's ScrollView.
 function hstackOf(f: ReturnType<typeof fixture>): HstackNode {
-	const node = f.root[NODE]() as unknown as { type: string; entries: { component: { [NODE]?(): HstackNode } }[] };
-	if (node.type === "hstack") return node as unknown as HstackNode;
-	assert.equal(node.type, "vstack");
-	const nested = node.entries[1]?.component[NODE]?.();
-	assert.ok(nested, "the vstack's second entry must expose the hstack via NODE");
-	return nested!;
+	const node = f.root[NODE]() as unknown as HstackNode;
+	assert.equal(node.type, "hstack");
+	return node;
+}
+function pinnedOf(f: ReturnType<typeof fixture>): HstackNode {
+	const right = hstackOf(f).entries[1].component as { [NODE]?(): HstackNode };
+	const node = right[NODE]?.();
+	assert.ok(node, "the right entry must expose the pinned header vstack via NODE");
+	assert.equal(node!.type, "vstack");
+	return node!;
 }
 function railWithHeader(f: ReturnType<typeof fixture>): ScrollView {
-	return hstackOf(f).entries[1].component as ScrollView;
+	const right = hstackOf(f).entries[1].component as Component & { [NODE]?(): HstackNode };
+	const scroll = right instanceof ScrollView ? right : right[NODE]?.().entries[1].component;
+	assert.ok(scroll instanceof ScrollView);
+	return scroll;
 }
+
+test("rail-header restore pins live rows beside a full-height transcript at 140/141 and preserves 139 fallback", (t) => {
+	for (const width of [139, 140, 141]) {
+		const f = fixture("fullscreen", width);
+		let label = "model-a ctx 42% $1.50";
+		sidebarHeader(f.tui, { digest: () => label, render: (w) => [`${label} width=${w}`, "RULE"], invalidate() {} });
+		sidebarPart(f.tui, "wellness", { render: () => ["Bienestar"], invalidate() {} });
+		sidebarPart(f.tui, "usage", { render: () => ["Limits"], invalidate() {} });
+		t.after(installSidebar(f.tui, theme));
+		const frame = renderLayoutFrame(f.root, width, 20, () => {});
+		if (width < 140) {
+			assert.equal(f.root[NODE]().type, "vstack");
+			assert.match(frame.lines[0] ?? "", /width=139/, "compact top fallback remains");
+			continue;
+		}
+		assert.equal(frame.root.children[0].rect.height, 20, "pinned rail must not shorten transcript");
+		const right = frame.root.children.find((box) => box.rect.x === width - 50)!;
+		assert.ok(right, "right rail occupies its fifty columns");
+		assert.equal(right.children[0].rect.height, 2);
+		assert.match(right.children[0].component.render(50).join("\n"), /width=50/);
+		const scroll = right.children[1].component as ScrollView;
+		const text = scroll.render(50).join("\n");
+		assert.ok(text.indexOf("Bienestar") < text.indexOf("Limits"));
+		assert.ok(text.indexOf("Limits") < text.indexOf("Status"));
+		assert.doesNotMatch(text, /Gentle Shell/, "pinned identity replaces the scrolling banner");
+		sidebarPart(f.tui, "todo", { render: () => Array.from({ length: 60 }, (_, i) => `Task ${i}`), invalidate() {} });
+		renderLayoutFrame(f.root, width, 20, () => {});
+		scroll.scrollBy(5);
+		const scrolled = renderLayoutFrame(f.root, width, 20, () => {});
+		assert.match(scrolled.lines[0] ?? "", /model-a/);
+		label = "model-b ctx 74% $2.00";
+		const changed = renderLayoutFrame(f.root, width, 20, () => {});
+		assert.match(changed.lines[0] ?? "", /model-b/);
+		assert.equal(changed.root.children[0].rect.height, 20);
+	}
+});
+
+test("rail-header restore rejects stale header clicks after digest change, resize, replacement and disposal", (t) => {
+	const f = fixture();
+	let label = "HEADER";
+	let clicks = 0;
+	const register = () => sidebarHeader(f.tui, { digest: () => label, render: () => [label], invalidate() {}, handleMouse() { clicks++; return { handled: true }; } });
+	register();
+	const dispose = installSidebar(f.tui, theme);
+	t.after(dispose);
+	const frame = renderLayoutFrame(f.root, 140, 20, () => {});
+	const findHeader = (box: LayoutBox): Component | undefined => box.component.render(box.rect.width).includes(label) && !box.children.length ? box.component : box.children.map(findHeader).find(Boolean);
+	const header = findHeader(frame.root)!;
+	assert.ok(header);
+	const click = { type: "click", button: "left", x: 1, y: 0, width: 50, height: 1, screenX: 91, screenY: 0, shift: false, alt: false, ctrl: false } as TuiMouseEvent;
+	assert.equal(header.handleMouse?.(click)?.handled, true);
+	label = "UPDATED";
+	assert.equal(header.handleMouse?.(click), undefined, "digest changes invalidate painted hit geometry before repaint");
+	renderLayoutFrame(f.root, 140, 20, () => {});
+	assert.equal(header.handleMouse?.(click)?.handled, true);
+	f.host.terminal.columns = 139;
+	assert.equal(header.handleMouse?.(click), undefined, "resize is inert before repaint");
+	f.host.terminal.columns = 140;
+	register();
+	assert.equal(header.handleMouse?.(click), undefined, "replacement is inert before repaint");
+	dispose();
+	assert.equal(header.handleMouse?.(click), undefined);
+	assert.equal(clicks, 2);
+});
+
+test("pinned header height follows its content in real frames while the transcript keeps full height", (t) => {
+	for (const width of [140, 141]) {
+		const f = fixture("fullscreen", width);
+		let rows = ["HEADER", "RULE"];
+		let clicks = 0;
+		sidebarHeader(f.tui, { digest: () => rows.join(), render: () => rows, invalidate() {}, handleMouse() { clicks++; return { handled: true }; } });
+		sidebarPart(f.tui, "todo", { render: () => Array.from({ length: 40 }, (_, i) => `Task ${i}`), invalidate() {} });
+		const dispose = installSidebar(f.tui, theme);
+		t.after(dispose);
+		const right = (frame: ReturnType<typeof renderLayoutFrame>) => frame.root.children.find((box) => box.rect.x === width - 50)!;
+		const header = right(renderLayoutFrame(f.root, width, 20, () => {})).children[0]!.component;
+		const click = (y: number) => header.handleMouse?.({ type: "click", button: "left", x: 1, y, screenX: width - 49, screenY: y, width: 50, height: rows.length, shift: false, alt: false, ctrl: false } as TuiMouseEvent);
+		for (const next of [["HEADER", "L2", "L3", "RULE"], ["HEADER"], ["HEADER", "RULE"]]) {
+			rows = next;
+			const frame = renderLayoutFrame(f.root, width, 20, () => {});
+			assert.equal(frame.root.children[0]!.rect.height, 20, `${width}: the transcript never shrinks for the header`);
+			assert.equal(right(frame).children[0]!.rect.height, next.length, "the pinned leaf measures its rows");
+			assert.equal(right(frame).children[1]!.rect.height, 20 - next.length, "the rail scrolls in the remaining rows");
+			assert.equal(frame.lines[next.length - 1]!.includes(next.at(-1)!), true);
+			assert.doesNotMatch(frame.lines[next.length] ?? "", /HEADER|RULE|L2|L3/, "rail cards start right below the pinned rows");
+			const before = clicks;
+			assert.equal(click(next.length - 1)?.handled, true, "the last painted header row is in bounds");
+			assert.equal(click(next.length), undefined, "a row past the painted header is out of bounds");
+			assert.equal(click(-1), undefined);
+			assert.equal(clicks, before + 1);
+		}
+		rows = ["HEADER", "L2", "L3", "RULE"];
+		assert.equal(click(3), undefined, "a taller header is inert until it is painted");
+		dispose();
+	}
+});
+
+test("rail header stacks long values at fifty columns with only the usage row interactive", () => {
+	const model = { cwd: "~/proyectos/gentle-shell-worktrees/rail-pinned-header", branch: "feat/rail-pinned-header", dirty: 3,
+		modelId: "claude-opus-5-5-extended-context-preview", effort: "medium", profile: "team", contextPercent: 42,
+		costTotal: 1.5, subscription: true, usage: undefined };
+	const chrome = renderShellRailHeader(model, theme, 50, "alt+u");
+	const text = chrome.rows.map((row) => row.slice(1).trimEnd()).join("");
+	assert.ok(chrome.rows.every((row) => visibleWidth(row) <= 50));
+	for (const value of ["Gentle Shell", "claude-opus-5-5-extended-context-preview", "medium", "team", "42%", "$1.50 sub"]) assert.ok(text.includes(value), value);
+	assert.match(chrome.rows[chrome.headerRow]!, /^ usage · alt\+u$/, "a standing usage affordance even without data");
+	assert.equal(chrome.rows.at(-1), "─".repeat(50));
+	assert.equal(shellHeaderUsageHit(chrome, 1, chrome.headerRow), true);
+	assert.equal(shellHeaderUsageHit(chrome, 0, chrome.headerRow), false, "the inset is inert");
+	assert.equal(shellHeaderUsageHit(chrome, chrome.usageSpan!.end, chrome.headerRow), false, "blank space after usage is inert");
+	for (let y = 0; y < chrome.rows.length; y++) if (y !== chrome.headerRow) assert.equal(shellHeaderUsageHit(chrome, 2, y), false, `row ${y} is decorative`);
+	const hidden = renderShellRailHeader(model, theme, 50, "alt+u", { density: "minimal", visibility: { usageCost: false, modelDetails: false } } as never);
+	assert.equal(hidden.usageSpan, undefined);
+	assert.doesNotMatch(hidden.rows.join("\n"), /usage|ctx|Gentle Shell|claude/, "presentation preferences still hide their groups");
+});
 
 test("grouped Status preserves structured fields and opaque integration text", (t) => {
 	const found = cardStyle();
@@ -270,12 +392,13 @@ test("below-input header removes only the rail's top row", (t) => {
 	let header: "top" | "below-input" = "top";
 	sidebarHeader(f.tui, { render: () => ["header"], invalidate() {} });
 	t.after(installSidebar(f.tui, theme, () => "auto", () => header));
-	assert.equal(f.root[NODE]().type, "vstack");
+	const pinned = () => !(hstackOf(f).entries[1].component instanceof ScrollView);
+	assert.equal(pinned(), true);
 	header = "below-input";
-	assert.equal(f.root[NODE]().type, "hstack");
+	assert.equal(pinned(), false);
 	assert.deepEqual(f.bottom.render(80), []);
 	header = "top";
-	assert.equal(f.root[NODE]().type, "vstack");
+	assert.equal(pinned(), true);
 });
 
 test("TODO visibility hides both rail and bottom without mutating the registered part", (t) => {
@@ -705,7 +828,7 @@ test("native fullscreen header survives narrow and bottom transitions without re
 		const { frame, transcriptRenders } = f.frame(width);
 		assert.equal(transcriptRenders, 1, "native transcript paints only once");
 		assert.equal(frame.primaryScrollView, f.primary);
-		assert.match(frame.lines[0] ?? "", new RegExp(`HEADER ${status === "right" && width >= 140 ? width - 2 : width}`));
+		assert.match(frame.lines[0] ?? "", new RegExp(`HEADER ${status === "right" && width >= 140 ? 50 : width}`));
 		assert.ok(frame.lines.some((line) => line.includes("Editor")), "native editor survives");
 		assert.equal(frame.root.children.some((box) => box.component instanceof ScrollView && box.component !== f.primary), false, "no extra root scroll view");
 	}
@@ -826,12 +949,11 @@ test("a part replaced under the same key never reuses the previous part's cached
 	assert.equal(secondRenders, 1);
 });
 
-// T2: the live header row. A registered "header" part wraps the existing
-// [left, scroll] hstack in a one-row-taller vstack and takes over the brand
-// the banner used to carry inside the rail. Hosts that never register a
-// header (every fixture above) keep the exact old hstack-direct shape.
+// T2: the live header is pinned above only the right rail and takes over the
+// brand the scrollable banner used to carry. The transcript keeps its full
+// height. Hosts that never register a header keep the bare rail.
 
-test("an active header wraps the hstack in a vstack and removes the banner from the rail", (t) => {
+test("an active header is pinned only above the right rail and removes its banner", (t) => {
 	const found = cardStyle();
 	t.after(() => setCardStyle(found));
 	setCardStyle(CARD_STYLE.NEON);
@@ -839,8 +961,7 @@ test("an active header wraps the hstack in a vstack and removes the banner from 
 	sidebarHeader(f.tui, { render: (width: number) => [`HEADER ${width}`], invalidate() {} });
 	t.after(installSidebar(f.tui, theme));
 
-	const node = f.root[NODE]() as unknown as HstackNode;
-	assert.equal(node.type, "vstack");
+	const node = pinnedOf(f);
 	assert.equal(node.gap, 0);
 	assert.equal(node.align, "stretch");
 	// basis "auto": pi-tui measures the header leaf from its rendered lines
@@ -850,10 +971,7 @@ test("an active header wraps the hstack in a vstack and removes the banner from 
 		{ basis: 0, grow: 1, shrink: 1, minSize: 1 },
 	]);
 	const header = node.entries[0].component as { render(width: number): string[] };
-	// The rail card ends two columns before the terminal edge (its padding plus
-	// the scrollbar column); the header stops there too so its right group
-	// lines up with the card border instead of touching the edge.
-	assert.deepEqual(header.render(0), ["HEADER 138"], "the header renders at the terminal width minus the rail's right inset, not the rail width");
+	assert.deepEqual(header.render(0), ["HEADER 50"], "the header renders at the rail width, independent of the transcript");
 
 	const hstack = hstackOf(f);
 	assert.equal(hstack.type, "hstack");
@@ -867,7 +985,7 @@ test("an active header wraps the hstack in a vstack and removes the banner from 
 	assert.notEqual(rail[1]?.trim(), "", "the first card starts on the second row");
 });
 
-test("float rail alignment starts Status background at the conversation body row with either header placement", (t) => {
+test("float rail alignment starts Status background directly under the pinned header, or at the body row without one", (t) => {
 	const found = cardStyle();
 	t.after(() => setCardStyle(found));
 	setCardStyle(CARD_STYLE.FLOAT);
@@ -891,8 +1009,8 @@ test("float rail alignment starts Status background at the conversation body row
 		t.after(installSidebar(f.tui, painted, () => "auto", () => placement));
 		const frame = renderLayoutFrame(f.root, 140, 8, () => {});
 		const bodyY = placement === "top" ? 2 : 0;
-		assert.match(frame.lines[bodyY], /CONVERSATION/);
-		assert.match(frame.lines[bodyY], /\x1b\[48;5;22m/, `${placement}: the first painted padding row aligns with conversation content`);
+		assert.match(frame.lines[0], /CONVERSATION/, "the transcript keeps the top row; only the rail reserves header rows");
+		assert.match(frame.lines[bodyY], /\x1b\[48;5;22m/, `${placement}: the first painted padding row sits directly under the pinned header`);
 		assert.doesNotMatch(frame.lines.slice(0, bodyY).join("\n"), /\x1b\[48;5;22m/);
 		const scroll = railWithHeader(f);
 		const content = scroll.render(50);
@@ -932,7 +1050,7 @@ test("float rail alignment preserves fallback banners and neon bytes across live
 	}
 });
 
-test("the header leaf carries the rule row: a two-line header renders both lines at full width", (t) => {
+test("the pinned header leaf carries both lines at rail width", (t) => {
 	const f = fixture();
 	sidebarHeader(f.tui, {
 		render: (width: number) => [`HEADER ${width}`, `RULE ${width}`],
@@ -940,10 +1058,8 @@ test("the header leaf carries the rule row: a two-line header renders both lines
 	});
 	t.after(installSidebar(f.tui, theme));
 
-	const node = f.root[NODE]() as unknown as { type: string; entries: { component: Component }[] };
-	assert.equal(node.type, "vstack", "a two-line header still wraps the hstack in a vstack");
-	const header = node.entries[0]!.component as { render(width: number): string[] };
-	assert.deepEqual(header.render(0), ["HEADER 138", "RULE 138"], "both the status line and the rule row reach the layout, rendered at the terminal width minus the rail's right inset");
+	const header = pinnedOf(f).entries[0]!.component as { render(width: number): string[] };
+	assert.deepEqual(header.render(0), ["HEADER 50", "RULE 50"], "both the status line and the rule row reach the layout, rendered at the rail width");
 });
 
 test("below the sidebar breakpoint a rule-like header paints above native layout without a rail", (t) => {
@@ -982,7 +1098,7 @@ test("header content changes reach the header row while an unrelated part is unt
 	sidebarHeader(f.tui, { digest: () => label, render: () => [`HEADER ${label}`], invalidate() {} });
 	t.after(installSidebar(f.tui, theme));
 
-	const headerLines = () => (f.root[NODE]() as unknown as HstackNode).entries[0].component as { render(width: number): string[] };
+	const headerLines = () => pinnedOf(f).entries[0].component as { render(width: number): string[] };
 	assert.deepEqual(headerLines().render(0), ["HEADER one"]);
 	label = "two";
 	assert.deepEqual(headerLines().render(0), ["HEADER two"]);
@@ -1011,8 +1127,8 @@ test("rail mouse dispatch still maps clicks correctly with the header row above 
 	assert.ok(headerY >= 0);
 	// The mouse event carries coordinates local to the scroll component itself
 	// (pi-tui's layout tree translates screen coordinates before dispatch), so
-	// nesting the hstack one level deeper under the header row does not shift
-	// what the rail receives.
+	// nesting the rail in the right-hand vstack below the pinned header does
+	// not shift what the rail receives.
 	const hit = scroll.handleMouse({ type: "click", button: "left", x: 2, y: headerY, screenX: 92, screenY: 31 + headerY, width: 50, height: 5, shift: false, alt: false, ctrl: false });
 	assert.equal(hit?.handled, true);
 	assert.equal(clicks, 1);
@@ -1035,11 +1151,10 @@ test("the header component's handleMouse delegates to the registered header part
 	});
 	t.after(installSidebar(f.tui, theme));
 
-	const node = f.root[NODE]() as unknown as { type: string; entries: { component: Component }[] };
-	assert.equal(node.type, "vstack", "an active header wraps the hstack in a vstack");
-	const header = node.entries[0]!.component as { handleMouse(event: TuiMouseEvent): { handled: boolean; render?: boolean } | undefined };
+	renderLayoutFrame(f.root, 140, 20, () => {});
+	const header = pinnedOf(f).entries[0]!.component as { handleMouse(event: TuiMouseEvent): { handled: boolean; render?: boolean } | undefined };
 
-	const event = { type: "click", button: "left", x: 5, y: 0, screenX: 5, screenY: 0, width: 140, height: 1, shift: false, alt: false, ctrl: false } as TuiMouseEvent;
+	const event = { type: "click", button: "left", x: 5, y: 0, screenX: 95, screenY: 0, width: 50, height: 1, shift: false, alt: false, ctrl: false } as TuiMouseEvent;
 	assert.deepEqual(header.handleMouse(event), { handled: true, render: true });
 	assert.equal(received.length, 1);
 	assert.equal(received[0], event, "the event reaches the registered part unmodified");

@@ -12,7 +12,7 @@ import { CODEX_USAGE_URL, NAN_QUOTA_URL, USAGE_SOURCE_EVENT, USAGE_SOURCE_SCHEMA
 import { createVimEditorAdapter } from "../lib/vim-editor-adapter.ts";
 import { buildCommandPaletteGroups } from "../lib/command-palette-catalog.ts";
 import { CHANGE_STATUS } from "../lib/shell-changes.ts";
-import { sidebarPart, sidebarState, type SidebarRail } from "../lib/shell-sidebar.ts";
+import { sidebarPart, sidebarState, type SidebarHeaderRail, type SidebarRail } from "../lib/shell-sidebar.ts";
 import { renderTodoCard } from "../lib/shell-todo.ts";
 import type { ShellBarTheme } from "../lib/shell-bar.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
@@ -533,6 +533,41 @@ test("clicking the header's usage segment opens the usage panel; other header cl
 	} finally {
 		component.dispose();
 		assert.equal(sidebarState(tui as unknown as TUI).parts.has("usage"), false, "disposing the footer removes the Limits rail card");
+	}
+});
+
+test("the pinned rail header keeps a long model, shows usage, and opens the panel only from the usage row", async () => {
+	const { pi, handlers } = fakePi();
+	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" });
+	const { ctx, ui } = fakeContext();
+	await fire(handlers, "session_start", ctx);
+	(ctx.model as { id: string }).id = "claude-opus-5-5-extended-context-preview-build-with-a-very-long-suffix";
+
+	const liveFooterData = { getGitBranch: () => "main", getExtensionStatuses: () => new Map(), getAvailableProviderCount: () => 1, onBranchChange: () => () => {} };
+	const tui = { terminal: { rows: 40, columns: 160 }, requestRender() {} };
+	const factory = ui.footerFactory as (tui: unknown, theme: ShellBarTheme, footerData: unknown) => { render(width: number): string[]; dispose(): void };
+	const component = factory(tui, plainTheme, liveFooterData);
+	try {
+		const header = sidebarState(tui as unknown as TUI).parts.get("header") as SidebarHeaderRail;
+		const pinned = header.pinned!;
+		assert.ok(pinned, "the header declares a rail-width pinned form");
+		const lines = pinned.render(50).map(stripAnsi);
+		assert.ok(lines.every((line) => visibleWidth(line) <= 50), "every pinned row fits the rail");
+		assert.match(lines.map((line) => line.slice(1).trimEnd()).join(""), /claude-opus-5-5-extended-context-preview-build-with-a-very-long-suffix/, "a long model wraps instead of being dropped");
+		assert.match(lines.join("\n"), /ctx/);
+		const usageY = lines.findIndex((line) => /^ usage/.test(line));
+		assert.ok(usageY > 0, "usage stays visible in the pinned header");
+		const click = (x: number, y: number) => pinned.handleMouse?.({ type: "click", button: "left", x, y, screenX: 110 + x, screenY: y, width: 50, height: lines.length, shift: false, alt: false, ctrl: false } as TuiMouseEvent);
+		assert.equal(click(2, 0), undefined, "the brand row is decorative");
+		assert.equal(click(2, lines.length - 1), undefined, "the rule is decorative");
+		assert.equal(click(0, usageY), undefined, "the inset blank before usage is inert");
+		assert.equal(click(lines[usageY]!.trimEnd().length + 1, usageY), undefined, "blank space after usage is inert");
+		assert.equal(click(2, usageY)?.handled, true);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.match(ui.overlayView!.render(90).join("\n"), /Subscriptions/);
+		ui.closeOverlay?.();
+	} finally {
+		component.dispose();
 	}
 });
 
@@ -2946,10 +2981,12 @@ test("T3 live style Cards action refreshes cached TODO, header, footer and promp
 	});
 	let frame = { header: "", rail: "", prompt: "" };
 	function paint() {
+		// Wide fullscreen: [transcript, right], the header pinned above the rail.
 		const layout = root[node]() as unknown as { entries: { component: { render(width: number): string[]; [node](): { entries: { component: { render(width: number): string[] } }[] } } }[] };
+		const right = layout.entries[1].component[node]();
 		frame = {
-			header: layout.entries[0].component.render(160).join("\n"),
-			rail: layout.entries[1].component[node]().entries[1].component.render(50).join("\n"),
+			header: right.entries[0].component.render(50).join("\n"),
+			rail: right.entries[1].component.render(50).join("\n"),
 			prompt: editor.render(100).join("\n"),
 		};
 	}
@@ -2977,7 +3014,8 @@ test("T3 live style Cards action refreshes cached TODO, header, footer and promp
 		assert.ok(overlayRenders > beforeOverlay, "customize redraws too");
 		assert.equal(todoRenders, beforeTodo + 1, "revision invalidation refreshes digest-less TODO");
 		assert.equal(statusRenders, beforeStatus + 1, "live style digest refreshes cached Status");
-		for (const key of ["header", "rail", "prompt"] as const) assert.notEqual(frame[key], before[key], `${key} changes immediately`);
+		for (const key of ["rail", "prompt"] as const) assert.notEqual(frame[key], before[key], `${key} changes immediately`);
+		assert.match(frame.header, /Gentle Shell/, "the pinned rail header stays painted across the switch");
 		assert.match(ui.notices.at(-1)!, /Conversation cards and shell chrome redraw now/);
 		assert.match(ui.overlayView!.render(90).join("\n"), /prompt|shell chrome/i);
 		const rendered = { ...frame };

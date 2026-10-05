@@ -7,7 +7,7 @@ import { profilesFilePath, profileRoleEntries, readProfilesFileResult } from "..
 import { resolveProfilePin } from "../lib/agent-profile-pin.ts";
 import * as os from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { buildShellHeaderModel, renderShellBar, renderShellBelowInputFloat, renderShellBottomOnlyBar, renderShellHeaderChrome, renderShellSidebarBar, shellEnabled, shellHeaderUsageHit, type ShellBarModel, type ShellBarTheme } from "../lib/shell-bar.ts";
+import { buildShellHeaderModel, renderShellBar, renderShellBelowInputFloat, renderShellBottomOnlyBar, renderShellHeaderChrome, renderShellRailHeader, renderShellSidebarBar, shellEnabled, shellHeaderUsageHit, type ShellBarModel, type ShellBarTheme } from "../lib/shell-bar.ts";
 import { CHANGE_STATUS, RootBranchLabels, renderChangesWidget, type ChangedFile, type ChangesModel, type GitRunner, type WorktreeChanges } from "../lib/shell-changes.ts";
 import { WorktreeChangesView } from "../lib/shell-changes-view.ts";
 import { SessionWorktreeRegistry, resolveSessionWorktree, worktreeGitEnvironment, type WorktreeResolver, type WorktreeIdentity } from "../lib/session-worktree-registry.ts";
@@ -1862,10 +1862,13 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 				render: (width) => renderShellSidebarBar(footerModel(), theme, width, visualSettings),
 				invalidate() {},
 			});
-			// The header row carries everything that ticks every frame (model,
+			// The header carries everything that ticks every frame (model,
 			// effort, context, cost, usage) plus session identity; it never sees
-			// extension statuses or the working/thinking state.
+			// extension statuses or the working/thinking state. Wide fullscreen
+			// pins the stacked rail form above the rail's cards; narrow widths
+			// keep the one-row top header.
 			const headerBar = (width: number) => renderShellHeaderChrome(buildShellHeaderModel(footerModel()), theme, width, usageShortcutKey, visualSettings);
+			const railHeader = (width: number) => renderShellRailHeader(buildShellHeaderModel(footerModel()), theme, width, usageShortcutKey, visualSettings);
 			const disposeHeader = sidebarHeader(tui, {
 				digest: () => JSON.stringify([footerModel(), tracker.model, visualSettings, cardStyle()]),
 				render: (width) => headerBar(width).rows,
@@ -1875,6 +1878,16 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 					if (!shellHeaderUsageHit(headerBar(event.width), event.x, event.y)) return undefined;
 					void openUsage(ctx);
 					return { handled: true, render: true };
+				},
+				pinned: {
+					render: (width) => railHeader(width).rows,
+					invalidate() {},
+					handleMouse(event) {
+						if (event.type !== "click" || event.button !== "left") return undefined;
+						if (!shellHeaderUsageHit(railHeader(event.width), event.x, event.y)) return undefined;
+						void openUsage(ctx);
+						return { handled: true, render: true };
+					},
 				},
 			});
 			// Rail-only: the narrow layout keeps the header's usage bar and alt+u.
