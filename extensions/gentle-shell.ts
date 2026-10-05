@@ -109,7 +109,7 @@ import {
 	type DoubleEscCancelPolicy,
 	type DoubleEscCancelResolution,
 } from "../lib/double-esc-cancel-policy.ts";
-import { accountIdFromToken, CODEX_PROVIDER, CODEX_USAGE_URL, NAN_PROVIDER, NAN_QUOTA_URL, parseCodexUsage, parseNanQuota, parseProviderUsage, parseUsageHeaders, parseUsageSource, usageScopeProviders, UsageSourceRegistry, UsageStore, USAGE_SOURCE_EVENT, type ProviderUsage, type UsageSource } from "../lib/shell-usage.ts";
+import { accountIdFromToken, ANTHROPIC_PROVIDER, ANTHROPIC_USAGE_URL, CODEX_PROVIDER, CODEX_USAGE_URL, NAN_PROVIDER, NAN_QUOTA_URL, parseAnthropicOauthUsage, parseCodexUsage, parseNanQuota, parseProviderUsage, parseUsageHeaders, parseUsageSource, renderUsageCard, usageCardDigest, usageScopeProviders, UsageSourceRegistry, UsageStore, USAGE_SOURCE_EVENT, type ProviderUsage, type UsageSource } from "../lib/shell-usage.ts";
 import { UsageView } from "../lib/shell-usage-view.ts";
 import { sidebarHeader, sidebarPart, sidebarState, VISUAL_SETTINGS_CHANGED, type SidebarRail } from "../lib/shell-sidebar.ts";
 import { installSidebar, invalidateSidebar, narrowStatusOwner, STATUS_OWNER } from "../lib/shell-sidebar-layout.ts";
@@ -1396,6 +1396,25 @@ export function devBinaryCard(notice: DevBinaryNotice): Card {
 }
 
 const USAGE_REFRESH_MS = 5 * 60_000;
+const LIMITS_CHECK_MS = 15_000;
+
+// Claude subscription windows from the OAuth token pi already holds. Fixed
+// origin, no redirects, nothing logged or persisted; any failure is silent.
+export async function fetchAnthropicUsage(token: string | undefined, fetchFn: typeof fetch, now: number): Promise<ProviderUsage | undefined> {
+	if (!token) return undefined;
+	try {
+		const response = await fetchFn(ANTHROPIC_USAGE_URL, {
+			redirect: "error",
+			cache: "no-store",
+			signal: AbortSignal.timeout(10_000),
+			headers: { Authorization: `Bearer ${token}`, "anthropic-beta": "oauth-2025-04-20", Accept: "application/json", "User-Agent": "gentle-pi" },
+		});
+		if (!response.ok) return undefined;
+		return parseAnthropicOauthUsage(await response.json(), now);
+	} catch {
+		return undefined;
+	}
+}
 
 // The Codex usage endpoint is what the Codex CLI itself reads. The OAuth
 // token pi already holds carries the account id; nothing else is sent.
@@ -1520,8 +1539,11 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 	// One bounded, self-contained refresh per provider. Providers run
 	// concurrently: a stalled credential lookup or fetch for one can never hold
 	// the others — or the overlay opening on them — past its own window.
-	const refreshProvider = async (ctx: ExtensionContext, provider: string, source: UsageSource | undefined, force: boolean, now: number): Promise<boolean> => {
-		if (!source && provider !== CODEX_PROVIDER && provider !== NAN_PROVIDER) return false;
+	// Claude stays headers-only for the panel; only the rail's Limits card
+	// (`limits`) reads its OAuth usage, and a miss there never marks it failed.
+	const refreshProvider = async (ctx: ExtensionContext, provider: string, source: UsageSource | undefined, force: boolean, now: number, limits = false): Promise<boolean> => {
+		const claudeLimits = limits && provider === ANTHROPIC_PROVIDER;
+		if (!source && provider !== CODEX_PROVIDER && provider !== NAN_PROVIDER && !claudeLimits) return false;
 		if (!force && now - (usageFetchedAt.get(provider) ?? 0) < USAGE_REFRESH_MS) return false;
 		usageFetchedAt.set(provider, now);
 		const generation = (usageGenerations.get(provider) ?? 0) + 1;
@@ -1560,7 +1582,9 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 				? fetchFromSource(source, apiKey, boundedFetch, deps.now())
 				: provider === NAN_PROVIDER
 					? fetchNanUsage(apiKey, boundedFetch, deps.now())
-					: fetchCodexUsage(apiKey, boundedFetch, deps.now());
+					: provider === ANTHROPIC_PROVIDER
+						? fetchAnthropicUsage(apiKey, boundedFetch, deps.now())
+						: fetchCodexUsage(apiKey, boundedFetch, deps.now());
 		})();
 		// The race's loser still runs to completion in the background: guard it so
 		// its rejection (a foreign source escaping its own catch) can never
@@ -1576,7 +1600,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		if (usageGenerations.get(provider) !== generation) return false;
 		if (source && usageSources.get(provider) !== source) return false;
 		if (settled === "timeout" || !settled) {
-			usageFailures.add(provider);
+			if (!claudeLimits) usageFailures.add(provider);
 			notifyUsageSettled();
 			return false;
 		}
@@ -1597,6 +1621,14 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 				.filter((provider) => only === undefined || provider === only)
 				.map((provider) => refreshProvider(ctx, provider, usageSources.get(provider), force, now)),
 		);
+	};
+	// The rail's Limits card shows every connected subscription, not only the
+	// session's scope: each provider with a credential is fetched on its own
+	// 5-minute rule, and one without a credential simply never appears.
+	const refreshAllUsage = async (ctx: ExtensionContext, force: boolean) => {
+		const now = deps.now();
+		const providers = new Set([CODEX_PROVIDER, ANTHROPIC_PROVIDER, ...usageSources.providers()]);
+		await Promise.all([...providers].map((provider) => refreshProvider(ctx, provider, usageSources.get(provider), force, now, true)));
 	};
 	// Subscribed once, for the life of the extension: a registration can
 	// arrive before the first session_start (the owning extension's factory
@@ -1845,6 +1877,22 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 					return { handled: true, render: true };
 				},
 			});
+			// Rail-only: the narrow layout keeps the header's usage bar and alt+u.
+			// No timer of its own: painting the card is what asks for fresh data,
+			// throttled here and still bound by each provider's 5-minute rule.
+			let limitsCheckedAt = 0;
+			const limitsPart = sidebarPart(tui, "usage", { render: () => [], invalidate() {}, dispose() {} }, {
+				digest: () => {
+					const now = deps.now();
+					if (now - limitsCheckedAt >= LIMITS_CHECK_MS && currentContext === ctx) {
+						limitsCheckedAt = now;
+						void refreshAllUsage(ctx, false);
+					}
+					return `${usageCardDigest(usage.all(), now)}|${cardStyle()}`;
+				},
+				render: (width) => renderUsageCard(usage.all(), theme, width, deps.now()),
+				invalidate() {},
+			});
 			const uninstall = installSidebar(tui, theme, () => visualSettings.statusPlacement, () => visualSettings.headerPlacement, () => visualSettings.density);
 			// The public widget slot follows the editor even when the rail is absent.
 			const belowHeader = () => visualSettings.headerPlacement === "below-input" && (tui as TUI & { mode?: string }).mode === "fullscreen" && statusOwner() !== STATUS_OWNER.BOTTOM;
@@ -1870,7 +1918,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 					return rows.length === 0 && (tui as TUI & { mode?: string }).mode === "fullscreen"
 						&& resolvePromptLayout(width, cardStyle(), theme.bg?.bind(theme)).background ? [""] : rows;
 				},
-				dispose() { ctx.ui.setWidget(HEADER_WIDGET_KEY, undefined); disposeHeader(); uninstall(); part.dispose(); if (sidebarTui === tui) { sidebarTui = undefined; groupedChangesOwner = () => false; } } };
+				dispose() { ctx.ui.setWidget(HEADER_WIDGET_KEY, undefined); disposeHeader(); limitsPart.dispose?.(); uninstall(); part.dispose(); if (sidebarTui === tui) { sidebarTui = undefined; groupedChangesOwner = () => false; } } };
 		});
 		void refreshUsage(ctx, true);
 		const ownsPrompt = installPrompt(

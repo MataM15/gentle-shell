@@ -1,4 +1,4 @@
-import { wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { CARD_TONE, panelHeaderRow, panelInnerWidth, renderCard, type CardTheme, type CardTone } from "./shell-card.ts";
 import { sanitizeTerminalText } from "./terminal-theme.ts";
 import { paintHoverable } from "./shell-hover.ts";
@@ -271,11 +271,11 @@ function bodyRows(state: TodoState, theme: TodoTheme, inner: number): string[] {
 	return rows;
 }
 
+// Collapsed means one physical row: a long title or note is truncated, never wrapped.
 function collapsedRow(state: TodoState, theme: TodoTheme, inner: number): string {
-	const active = state.tasks.find((task) => task.status === TODO_STATUS.IN_PROGRESS);
-	if (active) return taskRow(active, theme, inner);
-	const pending = state.tasks.find((task) => task.status === TODO_STATUS.PENDING);
-	if (pending) return taskRow(pending, theme, inner);
+	const next = state.tasks.find((task) => task.status === TODO_STATUS.IN_PROGRESS)
+		?? state.tasks.find((task) => task.status === TODO_STATUS.PENDING);
+	if (next) return truncateToWidth(taskRow(next, theme, inner), inner, "…");
 	const { open } = todoSummary(state);
 	return `${theme.fg(GLYPH_ROLE[TODO_STATUS.PENDING], STATUS_GLYPH[TODO_STATUS.PENDING])} ${theme.fg(NOTE_ROLE, `${open} open`)}`;
 }

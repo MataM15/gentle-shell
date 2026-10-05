@@ -302,6 +302,22 @@ test("rail orders unified Status, agents, TODO without standalone changes", (t) 
 	assert.deepEqual(rail(f).render(50).map((line) => line.trim()), ["✿ Gentle Shell ✿", "", "Status", "", "agents", "", "todo"]);
 });
 
+test("wellness precedes Status and its fallback survives narrow and regular modes", (t) => {
+	const f = fixture();
+	const wellness = sidebarPart(f.tui, "wellness", { render: (_width: number) => ["Bienestar"], invalidate() {} });
+	t.after(installSidebar(f.tui, theme));
+	const lines = rail(f).render(50);
+	const wellnessAt = lines.findIndex((l) => l.includes("Bienestar"));
+	const statusAt = lines.findIndex((l) => l.includes("Status"));
+	assert.ok(wellnessAt >= 0 && wellnessAt < statusAt, "wellness card is first in the rail");
+	assert.deepEqual(wellness.render(80), []);
+	for (const [mode, width] of [["fullscreen", 139], ["regular", 180]] as const) {
+		f.host.mode = mode; f.host.terminal.columns = width;
+		f.root[NODE]();
+		assert.deepEqual(wellness.render(80), ["Bienestar"]);
+	}
+});
+
 test("branding belongs to scroll content before Status, never transcript or narrow bottom", (t) => {
 	const f = fixture();
 	t.after(installSidebar(f.tui, theme));

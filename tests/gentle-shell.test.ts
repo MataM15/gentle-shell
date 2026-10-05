@@ -521,6 +521,7 @@ test("clicking the header's usage segment opens the usage panel; other header cl
 		const line = header.render(160).join("");
 		const usageAt = line.indexOf("usage");
 		assert.ok(usageAt >= 0, "the header shows a standing usage segment");
+		assert.ok(sidebarState(tui as unknown as TUI).parts.has("usage"), "the rail also carries the Limits card");
 
 		const click = (x: number) => header.handleMouse?.({ type: "click", button: "left", x, y: 0, screenX: x, screenY: 0, width: 160, height: 1, shift: false, alt: false, ctrl: false } as TuiMouseEvent);
 		assert.equal(click(0), undefined, "a click on the brand does not open the panel");
@@ -531,6 +532,7 @@ test("clicking the header's usage segment opens the usage panel; other header cl
 		ui.closeOverlay?.();
 	} finally {
 		component.dispose();
+		assert.equal(sidebarState(tui as unknown as TUI).parts.has("usage"), false, "disposing the footer removes the Limits rail card");
 	}
 });
 

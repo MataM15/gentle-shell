@@ -220,6 +220,17 @@ test("renderTodoCard keeps the configured collapse shortcut in the header while 
 	assert.deepEqual(renderTodoCard(emptyTodo(), plainTheme, 70, { collapsed: false, staleTurns: 0 }), []);
 });
 
+test("renderTodoCard keeps a collapsed card to one truncated body row at phone widths", () => {
+	const long = applyTodo(emptyTodo(), { action: "write", tasks: [{ title: "Run authorized bounded local functional preview and clean up owned runtime", status: "in_progress", note: "Fresh ONE session consumed at 8ccb1255: failed browser_run_code_unsafe/login_outcome after normal submit-call completion" }, { title: "Later" }] }, 1).state;
+	for (const width of [40, 52, 70]) {
+		const lines = renderTodoCard(long, plainTheme, width, { collapsed: true, staleTurns: 0 });
+		assert.equal(lines.length, 3);
+		assert.ok(lines.every((line) => visibleWidth(line) === width));
+		assert.match(stripAnsi(lines[1]!), /^│ ◐ Run authorized .*… │$/);
+	}
+	assert.ok(renderTodoCard(long, plainTheme, 40, { collapsed: false, staleTurns: 0 }).length > 3);
+});
+
 test("renderTodoCard keeps English controls visible and falls back to their icons at narrow widths", () => {
 	const expanded = renderTodoCard(seeded(), plainTheme, 70, { collapsed: false, staleTurns: 0, collapseKey: "ctrl+shift+t" }).map(stripAnsi);
 	assert.match(expanded[0], /Todos ▾ Collapse/);

@@ -1,6 +1,7 @@
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import { parseModelRef } from "./agents-config.ts";
 import { paintGauge } from "./shell-gauge.ts";
+import { cardInnerWidth, renderCard } from "./shell-card.ts";
 
 // Gentle Shell subscription usage: the rate-limit windows each connected
 // provider reports. Codex sends them as SSE headers and through its usage
@@ -88,6 +89,9 @@ const ANTHROPIC_WINDOWS: ReadonlyArray<[key: string, seconds: number]> = [
 	["7d", 604_800],
 ];
 export const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
+// The endpoint Claude's own usage settings read with the subscription OAuth
+// token. Not a published API, so the payload is validated field by field.
+export const ANTHROPIC_USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 // The NaN Cloud dashboard backend; not part of NaN's published OpenAPI, so the
 // fetch that uses it is fixed-origin, redirect-refusing, and schema-validated.
 export const NAN_QUOTA_URL = "https://cloud-api.nan.builders/api/usage/quota";
@@ -185,6 +189,10 @@ export class UsageSourceRegistry {
 
 	has(provider: string): boolean {
 		return this.sources.has(provider);
+	}
+
+	providers(): string[] {
+		return [...this.sources.keys()];
 	}
 
 	note(provider: string): string | undefined {
@@ -323,6 +331,25 @@ export function parseAnthropicHeaders(headers: Record<string, string>, now: numb
 	if (windows.length === 0) return undefined;
 	const status = headers[`${ANTHROPIC_PREFIX}status`];
 	return { provider: ANTHROPIC_PROVIDER, plan: undefined, limits: [{ name: ANTHROPIC_MAIN_LIMIT, windows, limitReached: status === "rejected" }], fetchedAt: now };
+}
+
+// The OAuth usage payload reports the same 5-hour and 7-day windows the
+// response headers do, as utilization percentages; it lands in the same shape
+// so the header path and the fetch path overwrite each other cleanly.
+export function parseAnthropicOauthUsage(payload: unknown, now: number): ProviderUsage | undefined {
+	if (!payload || typeof payload !== "object") return undefined;
+	const raw = payload as Record<string, unknown>;
+	const windows: UsageWindow[] = [];
+	let limitReached = false;
+	for (const [key, seconds] of [["five_hour", 18_000], ["seven_day", 604_800]] as const) {
+		const entry = raw[key] as Record<string, unknown> | null | undefined;
+		if (!entry || typeof entry !== "object" || !isFiniteNumber(entry.utilization)) continue;
+		const reset = typeof entry.resets_at === "string" ? Date.parse(entry.resets_at) : Number.NaN;
+		windows.push({ label: windowLabel(seconds), usedPercent: entry.utilization, windowSeconds: seconds, resetAt: Number.isFinite(reset) ? reset : null });
+		if (entry.locked_reason) limitReached = true;
+	}
+	if (windows.length === 0) return undefined;
+	return { provider: ANTHROPIC_PROVIDER, plan: undefined, limits: [{ name: ANTHROPIC_MAIN_LIMIT, windows, limitReached }], fetchedAt: now };
 }
 
 export function parseUsageHeaders(headers: Record<string, string>, now: number): ProviderUsage | undefined {
@@ -613,6 +640,60 @@ export function renderUsagePanel(usages: ProviderUsage[], theme: UsageTheme, wid
 		if (scope?.failed.has(row.provider)) lines.push(`  ${theme.fg(ROLE.RESET, USAGE_FETCH_FAILED_NOTE)}`);
 	}
 	return lines.map((line) => truncateToWidth(line, width, "…"));
+}
+
+// Rail card: every provider with data, whatever model the session uses. Short
+// names and short resets keep each window on one row at rail width.
+const CARD_PROVIDER_NAMES: Record<string, string> = { [CODEX_PROVIDER]: "codex", [ANTHROPIC_PROVIDER]: "claude", cliproxyapi: "antigravity" };
+const CARD_PROVIDER_ORDER = [CODEX_PROVIDER, ANTHROPIC_PROVIDER, "cliproxyapi"];
+const CARD_METER_CELLS = 8;
+
+function shortReset(resetAt: number | null, now: number): string {
+	return formatReset(resetAt, now).replace(/^resets in /, "").replace(/^resets now$/, "now");
+}
+
+export function usageCardDigest(usages: readonly ProviderUsage[], now: number): string {
+	return `${Math.floor(now / 60_000)}|${usages.map((usage) => `${usage.provider}:${usage.fetchedAt}`).join(",")}`;
+}
+
+export function renderUsageCard(usages: readonly ProviderUsage[], theme: UsageTheme, width: number, now: number): string[] {
+	const rank = (provider: string) => {
+		const index = CARD_PROVIDER_ORDER.indexOf(provider);
+		return index === -1 ? CARD_PROVIDER_ORDER.length : index;
+	};
+	const sorted = usages.filter((usage) => usage.limits.length > 0).sort((a, b) => rank(a.provider) - rank(b.provider));
+	if (sorted.length === 0) return [];
+	const innerWidth = cardInnerWidth(width);
+	const sections = sorted.map((usage) => {
+		const name = CARD_PROVIDER_NAMES[usage.provider] ?? usage.provider;
+		const plan = usage.plan && usage.plan !== name ? ` ${theme.fg(ROLE.SEPARATOR, "·")} ${theme.fg(ROLE.PLAN, usage.plan)}` : "";
+		// A single limit is named by its windows; several limits are named by
+		// the limit, plus the window when that limit has more than one.
+		const rows = groupUsageLimits(usage.limits).flatMap((limit) =>
+			limit.windows.map((window) => ({
+				label: usage.limits.length === 1 ? window.label || limit.name : [limit.name, limit.windows.length > 1 ? window.label : ""].filter(Boolean).join(" "),
+				window,
+				reached: limit.limitReached,
+			})),
+		);
+		return { title: `${theme.fg(ROLE.PROVIDER, name)}${plan}`, rows };
+	});
+	const labelWidth = Math.min(10, sections.reduce((widest, section) => Math.max(widest, ...section.rows.map((row) => row.label.length)), 0));
+	const body = sections.flatMap((section, index) => [
+		...(index ? [""] : []),
+		section.title,
+		...section.rows.map((row) => {
+			const label = truncateToWidth(row.label, labelWidth, "…").padEnd(labelWidth);
+			const percent = `${Math.round(row.window.usedPercent)}%`.padStart(4);
+			const reset = shortReset(row.window.resetAt, now);
+			const percentText = row.reached ? theme.fg("error", percent) : theme.fg(ROLE.PERCENT, percent);
+			const line = ` ${theme.fg(ROLE.LABEL, label)} ${paintMeter(row.window.usedPercent, CARD_METER_CELLS, theme)} ${percentText}${reset ? ` ${theme.fg(ROLE.RESET, reset)}` : ""}`;
+			return truncateToWidth(line, innerWidth, "…");
+		}),
+	]);
+	const oldest = Math.min(...sorted.map((usage) => usage.fetchedAt));
+	body.push("", theme.fg(ROLE.RESET, truncateToWidth(`${updatedAgo(oldest, now)} · alt+u`, innerWidth, "…")));
+	return renderCard({ title: "Limits", body, tone: "info" }, theme, width, { expanded: true });
 }
 
 export class UsageStore {
