@@ -14,6 +14,7 @@ import {
 	renderShellHeaderBar,
 	renderShellHeaderChrome,
 	renderShellHeaderRule,
+	renderShellRailHeader,
 	renderShellSidebarBar,
 	shellEnabled,
 	shellHeaderUsageHit,
@@ -105,6 +106,68 @@ test("visual visibility hides only selected optional status segments", () => {
 	assert.doesNotMatch(renderShellBar(data, plainTheme, 160, settings).join(""), /gpt-5\.5|ctx|\$9\.49/);
 	assert.doesNotMatch(renderShellSidebarBar(data, plainTheme, 50, settings).join(""), /Changes|2 files/);
 	assert.doesNotMatch(renderShellHeaderBar(buildShellHeaderModel(data), plainTheme, 160, undefined, settings).text, /gpt-5\.5|ctx|\$9\.49|usage/);
+});
+
+test("Status groups running job descriptions beside RDD without a compact count", () => {
+	const data = model({ jobs: [
+		{ id: "job-2", label: "CI for PR 1860", startedAt: 2 },
+		{ id: "job-1", label: "Build runtime", startedAt: 1 },
+	], review: { state: "reviewing", scope: "first.ts" } });
+	for (const width of [30, 60]) {
+		const lines = renderShellSidebarBar(data, plainTheme, width);
+		const text = lines.join("\n");
+		assert.match(text, /Jobs[\s\S]*CI for PR 1860[\s\S]*Build runtime/);
+		assert.match(text, /🌹 RDD/);
+		assert.doesNotMatch(text, /2 jobs/);
+		assert.ok(lines.every((line) => visibleWidth(line) <= width));
+	}
+	assert.doesNotMatch(renderShellSidebarBar(model({ jobs: [] }), plainTheme, 60).join("\n"), /Jobs/);
+});
+
+test("header shows only the running job count when requested and preserves it at mobile widths", () => {
+	const data = model({ jobs: [{ id: "job-1", label: "CI for PR 1860", startedAt: 1 }] });
+	for (const width of [40, 80, 160]) {
+		const text = renderShellHeaderBar(buildShellHeaderModel(data, true), plainTheme, width).text;
+		assert.match(text, /⧗ 1 job/);
+		assert.doesNotMatch(text, /CI for PR/);
+		assert.ok(visibleWidth(text) <= width);
+	}
+	assert.doesNotMatch(renderShellHeaderBar(buildShellHeaderModel(data), plainTheme, 160).text, /1 job/);
+	assert.doesNotMatch(renderShellHeaderBar(buildShellHeaderModel(model({ jobs: [] }), true), plainTheme, 160).text, /jobs?/);
+});
+
+test("pinned rail header groups the running job count with context/cost and keeps it when usage/cost is hidden", () => {
+	const jobs = buildShellHeaderModel(model({ jobs: [{ id: "job-1", label: "CI for PR 1860", startedAt: 1 }] }), true);
+	const none = buildShellHeaderModel(model({ jobs: [] }), true);
+	const shown = renderShellRailHeader(jobs, plainTheme, 50, "alt+u");
+	const absent = renderShellRailHeader(none, plainTheme, 50, "alt+u");
+	const withJobs = shown.rows.map(stripAnsi);
+	assert.equal(withJobs.filter((row) => /⧗ 1 job/.test(row)).length, 1);
+	assert.doesNotMatch(withJobs.join("\n"), /CI for PR/);
+	assert.doesNotMatch(absent.rows.join("\n"), /jobs?\b/);
+	assert.equal(shown.rows.length, absent.rows.length);
+	assert.equal(shown.headerRow, absent.headerRow);
+	assert.deepEqual(shown.usageSpan, absent.usageSpan);
+	assert.ok(shown.rows.every((row) => visibleWidth(row) <= 50));
+	const hidden = { density: "comfortable", visibility: { usageCost: false, modelDetails: true } } as never;
+	const hiddenJobs = renderShellRailHeader(jobs, plainTheme, 50, "alt+u", hidden);
+	assert.match(hiddenJobs.rows.join("\n"), /⧗ 1 job/);
+	assert.doesNotMatch(hiddenJobs.rows.join("\n"), /ctx|usage|alt\+u/);
+	assert.equal(hiddenJobs.headerRow, -1);
+	assert.equal(hiddenJobs.usageSpan, undefined);
+	assert.doesNotMatch(renderShellRailHeader(none, plainTheme, 50, "alt+u", hidden).rows.join("\n"), /jobs?\b/);
+});
+
+test("bottom-only and hidden below-input chrome retain a compact jobs count", (t) => {
+	const data = model({ jobs: [{ id: "job-1", label: "CI for PR 1860", startedAt: 1 }] });
+	assert.match(renderShellBottomOnlyBar(data, plainTheme, 80).join("\n"), /⧗ 1 job/);
+	useCardStyle(t, CARD_STYLE.FLOAT);
+	const settings = { ...DEFAULT_VISUAL_SETTINGS, headerPlacement: "below-input" as const, statusPlacement: "hidden" as const };
+	const rows = renderShellBelowInputFloat(data, withBackground(plainTheme), 80, undefined, settings)?.rows;
+	assert.ok(rows);
+	assert.match(rows.join("\n"), /⧗ 1 job/);
+	assert.doesNotMatch(rows.join("\n"), /CI for PR/);
+	assert.ok(rows.every((line) => visibleWidth(line) <= 80));
 });
 
 test("Status title stays plain without an active review", () => {

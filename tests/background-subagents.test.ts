@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import {
+import fs, {
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
@@ -7,9 +7,10 @@ import {
 	rmSync,
 	writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import test, { after, type TestContext } from "node:test";
+import { syncBuiltinESMExports } from "node:module";
+import os, { tmpdir } from "node:os";
+import { basename, dirname, join, sep } from "node:path";
+import test, { after, beforeEach, type TestContext } from "node:test";
 import type {
 	ExtensionAPI,
 	ExtensionContext,
@@ -51,6 +52,34 @@ function makeScratch(prefix: string): string {
 	scratchRoots.push(dir);
 	return dir;
 }
+
+beforeEach((context) => {
+	const t = context as TestContext;
+	const home = makeScratch("gp-bg-isolated-home-");
+	scopedEnv(t, {
+		GENTLE_PI_CONFIG_HOME: join(home, "gentle-ai"),
+		GENTLE_PI_AGENT_HOME: join(home, "agent"),
+		PI_CODING_AGENT_DIR: join(home, "agent"),
+		GENTLE_PI_BACKGROUND_SUBAGENTS: undefined,
+	});
+	t.mock.method(os, "homedir", () => home);
+	const originalExistsSync = fs.existsSync;
+	// The fallback also probes package siblings and the user's global install.
+	// Only scratch manifests may count; keep real filesystem checks for fixtures.
+	t.mock.method(fs, "existsSync", (path: Parameters<typeof fs.existsSync>[0]) => {
+		if (typeof path === "string" && basename(path) === "package.json"
+			&& ["pi-subagents-j0k3r", "pi-subagents"].includes(basename(dirname(path)))
+			&& !scratchRoots.some((root) => path.startsWith(`${root}${sep}`))) {
+			return false;
+		}
+		return originalExistsSync(path);
+	});
+	syncBuiltinESMExports();
+	t.after(() => {
+		t.mock.restoreAll();
+		syncBuiltinESMExports();
+	});
+});
 
 after(() => {
 	for (const dir of scratchRoots) rmSync(dir, { recursive: true, force: true });
@@ -552,20 +581,28 @@ function selectingContext(
 	} as unknown as ExtensionContext;
 }
 
+const savedEnvironments = new WeakMap<TestContext, Map<string, string | undefined>>();
+
 /** Point the command's global config home at a scratch dir, never at ~/.pi. */
 function scopedEnv(t: TestContext, values: Record<string, string | undefined>): void {
-	const previous = new Map<string, string | undefined>();
+	let previous = savedEnvironments.get(t);
+	if (!previous) {
+		previous = new Map<string, string | undefined>();
+		savedEnvironments.set(t, previous);
+		const saved = previous;
+		t.after(() => {
+			for (const [key, value] of saved) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		});
+	}
 	for (const [key, value] of Object.entries(values)) {
-		previous.set(key, process.env[key]);
+		// beforeEach and command fixtures share one restore point per test.
+		if (!previous.has(key)) previous.set(key, process.env[key]);
 		if (value === undefined) delete process.env[key];
 		else process.env[key] = value;
 	}
-	t.after(() => {
-		for (const [key, value] of previous) {
-			if (value === undefined) delete process.env[key];
-			else process.env[key] = value;
-		}
-	});
 }
 
 async function runBackgroundSubagents(
@@ -624,8 +661,7 @@ test("no argument opens a selectable menu and applies the chosen sub-action", as
 	assert.ok(command, "gentle:background-subagents must be registered");
 
 	// A dismissed menu (undefined selection) reports nothing and writes nothing.
-	// It runs first so the untouched config home can prove the no-write: a second
-	// scopedEnv save point in one test would restore out of order at teardown.
+	// It runs first so the untouched config home can prove the no-write.
 	const dismissed: Array<{ message: string; type?: string }> = [];
 	await command!.handler("", selectingContext(cwd, dismissed, async () => undefined));
 	assert.equal(dismissed.length, 0, "a dismissed menu reports nothing");
