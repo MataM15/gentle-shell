@@ -6,7 +6,11 @@ import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-age
 import { Box, visibleWidth } from "@earendil-works/pi-tui";
 import { renderGentleAiLifecycleCall, renderGentleAiResult, GentleAiCallCard } from "../lib/gentle-ai-renderer.ts";
 import { CARD_STYLE, cardStyle, setCardStyle } from "../lib/shell-card.ts";
-import { stripAnsi } from "../lib/terminal-theme.ts";
+import { stripAnsi as stripTerminalAnsi } from "../lib/terminal-theme.ts";
+
+// Outlined cards are inset two columns; most assertions are about the frame
+// itself, so this strips the colors and the gutters. The inset has its own tests.
+const stripAnsi = (text: string): string => stripTerminalAnsi(text).replace(/^ {2}(?=[╭│╰])/, "").replace(/(?<=[╮│╯]) {2}$/, "");
 
 initTheme("dark");
 
@@ -29,7 +33,7 @@ test("a running call card closes its own frame and a completed one leaves that t
 	const completed = card.render(80).map(stripAnsi);
 	assert.equal(completed.length, 1);
 	assert.match(completed[0], /ctrl\+o to expand ╮$/);
-	assert.equal(visibleWidth(completed[0]), 80);
+	assert.equal(visibleWidth(card.render(80)[0]), 80);
 });
 
 test("completed review cards fit Pi's default Box at terminal width 57", () => {
@@ -38,10 +42,10 @@ test("completed review cards fit Pi's default Box at terminal width 57", () => {
 		card.update("completed", operationPath, plainTheme, undefined, "ctrl+o to expand");
 		const box = new Box(1, 1);
 		box.addChild(card);
-		const lines = box.render(57).map(stripAnsi);
+		const lines = box.render(57).map(stripTerminalAnsi);
 		for (const line of lines) assert.equal(visibleWidth(line), 57, `${operationPath}: ${JSON.stringify(line)}`);
 		if (operationPath === "review inspect") {
-			assert.equal(lines[1], " ╭─ 🌹 rdd inspect ────────────────── ctrl+o to expand ╮ ");
+			assert.equal(lines[1], "   ╭─ 🌹 rdd inspect ────────────── ctrl+o to expand ╮   ");
 		}
 	}
 });
@@ -282,7 +286,7 @@ test("native context failures keep red useful previews and promote replay state"
 		const rows = collapsed.render(width);
 		assert.ok(rows.length <= 4);
 		assert.ok(rows.every((row) => visibleWidth(row) <= width));
-		assert.equal(rows.filter((row) => row.startsWith("╰")).length, width === 0 ? 0 : 1);
+		assert.equal(rows.filter((row) => row.trimStart().startsWith("╰")).length, width === 0 ? 0 : 1);
 	}
 	assert.match(renderGentleAiResult(result, { expanded: true }, theme, ctx).render(80).join("\n"), /fourth detail/);
 	roles.length = 0;
@@ -579,4 +583,36 @@ test("float rose error results paint the error background on every row", () => {
 	const plain = rows.map(stripAnsi);
 	assert.deepEqual(plain.map((line) => BLANK.test(line)), [true, false, false, true]);
 	for (const line of rows) assert.ok(line.startsWith(" \x1b[48;5;52m"), JSON.stringify(line));
+});
+
+// Outlined rose cards: a full rounded box inset two columns on both sides, like the compact tool cards.
+
+test("outlined rose cards are one rounded box inset two columns with two free right columns", () => {
+	const call = new GentleAiCallCard();
+	call.update("completed", "review inspect", plainTheme, undefined, "ctrl+o to expand");
+	const result = renderGentleAiResult({ content: [{ type: "text", text: "one\ntwo" }] }, { expanded: false }, plainTheme, { state: { gentleAiRender: { startedAt: 0, endedAt: 4_000 } } } as never);
+	const rows = [...call.render(100), ...result.render(100)].map(stripTerminalAnsi);
+	assert.equal(rows.length, 4);
+	assert.match(rows[0], /^ {2}╭─ 🌹 rdd inspect ─+ ctrl\+o to expand ╮ {2}$/);
+	assert.match(rows[1], /^ {2}│ one +│ {2}$/);
+	assert.match(rows[2], /^ {2}│ two +│ {2}$/);
+	assert.match(rows[3], /^ {2}╰─+ 4s ╯ {2}$/);
+	for (const row of rows) assert.equal(visibleWidth(row), 100);
+	const running = new GentleAiCallCard();
+	running.update("running", "review start", plainTheme, "$ gentle-ai review start", undefined, "3s");
+	const open = running.render(100).map(stripTerminalAnsi);
+	assert.match(open[1], /^ {2}│ \$ gentle-ai review start +│ {2}$/);
+	assert.match(open[2], /^ {2}╰─+ 3s ╯ {2}$/);
+});
+
+test("outlined rose cards drop the margin first and then render plain at narrow widths", () => {
+	const call = new GentleAiCallCard();
+	call.update("completed", "review inspect", plainTheme, undefined, "ctrl+o to expand");
+	assert.match(stripTerminalAnsi(call.render(12)[0]), /^ {2}╭.*╮ {2}$/);
+	assert.match(stripTerminalAnsi(call.render(11)[0]), /^╭.*╮$/, "below the box minimum the margin is gone");
+	for (let width = 0; width <= 40; width++) {
+		for (const line of [...call.render(width), ...renderGentleAiResult({ content: [{ type: "text", text: "one" }] }, { expanded: true }, plainTheme).render(width)]) {
+			assert.ok(visibleWidth(line) <= width, `width ${width}: ${JSON.stringify(line)}`);
+		}
+	}
 });

@@ -1,7 +1,7 @@
 import { keyHint, type AgentToolResult } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import { type GentleAiTimingLookup } from "./gentle-ai-elapsed-store.ts";
-import { CARD_TONE, cardBodyRows, cardBottom, cardInnerWidth, cardLine, cardTop, floatRows, type Card, type CardTheme, type CardTone } from "./shell-card.ts";
+import { CARD_STYLE, CARD_TONE, cardBodyRows, cardBottom, cardInnerWidth, cardLine, cardStyle, cardTop, floatRows, type Card, type CardParts, type CardTheme, type CardTone } from "./shell-card.ts";
 import { formatElapsed } from "./agents-widget.ts";
 import { sanitizeTerminalText, stripAnsi } from "./terminal-theme.ts";
 
@@ -75,6 +75,23 @@ const CARD_GLYPH = "\u{1F339}";
 const DETAIL_ROLE = "dim";
 const passthroughTheme: CardTheme = { fg: (_color, text) => text };
 
+// The outlined frame is inset like the compact tool cards: two free columns on
+// each side. Narrower than the minimum box the margin goes first, leaving the
+// plain full-width frame. pi does not add its own shell (renderShell "self"),
+// and the float style keeps its own one-column margin.
+const OUTLINE_MARGIN = 2;
+const OUTLINE_MIN_BOX = 8;
+const FLOAT_MIN_WIDTH = 10; // mirrors shell-card's float threshold
+
+function insetRows(tone: CardTone, theme: GentleAiRenderTheme, width: number, render: (inner: number) => CardParts): string[] {
+	const floated = cardStyle() === CARD_STYLE.FLOAT && typeof theme.bg === "function" && width >= FLOAT_MIN_WIDTH;
+	const margin = !floated && width - OUTLINE_MARGIN * 2 >= OUTLINE_MIN_BOX ? OUTLINE_MARGIN : 0;
+	const rows = floatRows(tone, theme, width - margin * 2, render);
+	if (margin === 0) return rows;
+	const gutter = " ".repeat(margin);
+	return rows.map((row) => `${gutter}${row}${gutter}`);
+}
+
 // The running/failed state stays visible until the call completes.
 function callTitle(status: LifecycleStatus, operationPath: string): string {
 	const review = operationPath === REVIEW_PREFIX || operationPath.startsWith(`${REVIEW_PREFIX} `);
@@ -117,7 +134,7 @@ export class GentleAiCallCard {
 	render(width: number): string[] {
 		if (width <= 0) return [];
 		// The command detail belongs to the heading; the result below owns the body.
-		return floatRows(this.card.tone, this.theme, width, (inner) => ({
+		return insetRows(this.card.tone, this.theme, width, (inner) => ({
 			head: [cardTop(this.card, this.theme, inner, this.hint), ...(this.detail ? [cardLine(this.theme.fg(DETAIL_ROLE, this.detail), this.card.tone, this.theme, inner)] : [])],
 			bottom: this.open ? cardBottom(this.card.tone, this.theme, inner, this.elapsed || undefined) : undefined,
 		}));
@@ -215,7 +232,7 @@ export class GentleAiResultCard {
 		const role = this.tone === CARD_TONE.ERROR ? "error" : "toolOutput";
 		// A partial result sits under a running call card, which still closes the
 		// frame; there, the call's closing row already separates the body.
-		return floatRows(this.tone, this.theme, width, (inner) => ({
+		return insetRows(this.tone, this.theme, width, (inner) => ({
 			body: this.body(inner, role),
 			bottom: this.partial ? undefined : cardBottom(this.tone, this.theme, inner, this.elapsed || undefined),
 			afterHeading: !this.partial,
