@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { TUI } from "@earendil-works/pi-tui";
-import { sidebarHeader, sidebarPart, sidebarState } from "../lib/shell-sidebar.ts";
+import { isPhoneWidth, PHONE_COLUMNS, sidebarHeader, sidebarPart, sidebarState } from "../lib/shell-sidebar.ts";
 
 const host = (terminal?: object) => ({ terminal }) as TUI;
 const component = () => ({ render: (_width = 80) => ["bottom"], invalidate() {} });
@@ -71,4 +71,16 @@ test("sidebarHeader dispose does not remove a replacement rail registered after 
 	sidebarHeader(tui, second);
 	dispose();
 	assert.equal(sidebarState(tui).parts.get("header"), second);
+});
+
+test("phone width is terminal columns only: 60 is phone-sized, 61 is not, and unknown hosts never are", () => {
+	assert.equal(PHONE_COLUMNS, 60);
+	for (const [columns, phone] of [[1, true], [40, true], [60, true], [61, false], [140, false]] as const) assert.equal(isPhoneWidth(host({ columns })), phone, `${columns} columns`);
+	for (const tui of [host(), host({}), host({ columns: 0 }), host({ columns: Number.NaN }), host({ columns: "40" })]) assert.equal(isPhoneWidth(tui), false);
+	const resized = host({ columns: 61 });
+	assert.equal(isPhoneWidth(resized), false);
+	(resized.terminal as { columns: number }).columns = 60;
+	assert.equal(isPhoneWidth(resized), true, "resizing down is picked up on the next call");
+	(resized.terminal as { columns: number }).columns = 61;
+	assert.equal(isPhoneWidth(resized), false, "and back up");
 });

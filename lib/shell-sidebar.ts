@@ -5,6 +5,12 @@ import type { Component, TUI } from "@earendil-works/pi-tui";
 const STATE = Symbol.for("gentle-pi.experimental-sidebar.state");
 /** In-process notification after a visual preference is persisted. */
 export const VISUAL_SETTINGS_CHANGED = "gentle-pi.visual-settings-changed";
+/** Terminals this narrow or narrower are phone-sized: Wellness stays hidden and the Todos panel compacts. */
+export const PHONE_COLUMNS = 60;
+export function isPhoneWidth(tui: TUI): boolean {
+	const columns = tui.terminal?.columns;
+	return typeof columns === "number" && columns > 0 && columns <= PHONE_COLUMNS;
+}
 export interface SidebarState {
 	active: boolean;
 	visibility?: { todo?: boolean };

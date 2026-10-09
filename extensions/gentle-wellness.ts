@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { shellEnabled } from "../lib/shell-bar.ts";
-import { sidebarPart } from "../lib/shell-sidebar.ts";
+import { isPhoneWidth, sidebarPart } from "../lib/shell-sidebar.ts";
 import { invalidateSidebar } from "../lib/shell-sidebar-layout.ts";
 import { parseWellnessConfig, WellnessSession, WELLNESS_LABELS, WELLNESS_LABELS_ES, WELLNESS_NOTICES_ES, type Reminder, type WellnessConfig } from "../lib/shell-wellness.ts";
 import { WellnessStateStore, type WellnessState } from "../lib/wellness-state.ts";
@@ -94,10 +94,12 @@ export default function gentleWellness(
 			timer.unref();
 			const currentTheme = theme ?? ctx.ui.theme;
 			const part = sidebarPart(tui, "wellness", {
-				render: (width: number) => model.render(Date.now(), width, currentTheme),
+				// Hidden only in paint: polling, notices, resets and persistence keep running.
+				render: (width: number) => isPhoneWidth(tui) ? [] : model.render(Date.now(), width, currentTheme),
 				invalidate: () => invalidateSidebar(tui),
 				handleMouse(event) {
-					if (event.type !== "click" || event.button !== "left") return undefined;
+					// Hit targets from a wider paint are stale while hidden.
+					if (event.type !== "click" || event.button !== "left" || isPhoneWidth(tui)) return undefined;
 					const target = model.resetTargetAt(event.x, event.y);
 					if (!target) return undefined;
 					void store.reset(target, Date.now()).then((state) => {

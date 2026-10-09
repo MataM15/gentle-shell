@@ -493,3 +493,23 @@ test("a call card awaits its result until pi finishes the row or a result render
 	assert.equal(cardRunningLine(CARD_TONE.WARNING, plainTheme, 20), `│ running…${" ".repeat(8)} │`);
 	for (const width of [0, 1, 2, 3, 4, 5, 6, 7, 8]) assert.ok(visibleWidth(cardRunningLine(CARD_TONE.WARNING, plainTheme, width)) <= width);
 });
+
+test("compact is opt-in to panels: a card without panel keeps its box and unrelated cards never compact", () => {
+	const card: Card = { title: "Notice", body: ["one", "two"], tone: CARD_TONE.INFO };
+	const base = renderCard(card, plainTheme, 40, { expanded: true });
+	assert.deepEqual(renderCard(card, plainTheme, 40, { expanded: true, compact: true }), base, "compact without panel is ignored");
+	assert.equal(base.length, 4);
+	const previous = cardStyle();
+	try {
+		for (const style of [CARD_STYLE.NEON, CARD_STYLE.FLOAT]) {
+			setCardStyle(style);
+			const themed = { ...plainTheme, bg: (_c: string, text: string) => `\x1b[48;5;22m${text}\x1b[49m` };
+			assert.deepEqual(renderCard(card, themed, 40, { expanded: true, compact: true }), renderCard(card, themed, 40, { expanded: true }), `${style}: no panel, no compact`);
+		}
+		setCardStyle(CARD_STYLE.NEON);
+		const compact = renderCard(card, plainTheme, 40, { expanded: true, panel: true, compact: true }).map(stripAnsi);
+		assert.deepEqual(compact, ["✿ Notice", " one", " two"], "a panel in neon compacts to title and body");
+	} finally {
+		setCardStyle(previous);
+	}
+});

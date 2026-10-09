@@ -19,7 +19,7 @@ Spanish and fixed UTC−3 example:
 
 English and the host's local timezone are the defaults when language and offset are omitted. Fixed offsets do not follow daylight saving. Intervals must be integers from 1 to 1440 minutes; offsets range from −840 to 840 minutes. Dinner uses a valid 24-hour `HH:MM` time and rolls forward to the next day after that time.
 
-At fullscreen widths of at least 140 columns, the dock is the first scrollable right-rail card, below the pinned model/context header. Narrow and regular mode show it below the editor. It includes the clock, date, and water, break, stretch, and dinner countdowns. Shell-disabled, child-agent, and noninteractive sessions do not mount it.
+At fullscreen widths of at least 140 columns, the dock is the first scrollable right-rail card, below the pinned model/context header. Narrow and regular mode show it below the editor. At 60 terminal columns or fewer (phone-sized) the dock is not painted at all; reminders, notices, `/gentle-wellness reset` and shared state keep running, and it reappears above 60 columns. It includes the clock, date, and water, break, stretch, and dinner countdowns. Shell-disabled, child-agent, and noninteractive sessions do not mount it.
 
 Click a reminder's `↻` to reset water, break, or stretch. Use `/gentle-wellness reset water|break|stretch|dinner|all` for command resets (select one target). Dinner has no reset glyph: it stays due for one hour after its time, then rolls forward to the next day on its own. Other due reminders remain due until reset; rendering alone never consumes a notice.
 

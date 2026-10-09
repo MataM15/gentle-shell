@@ -3,7 +3,7 @@ import { Text, type Component, type TUI } from "@earendil-works/pi-tui";
 import { appendSystemPromptOnce } from "../lib/append-system-prompt.ts";
 import { NativePointerRegion } from "../lib/native-pointer-region.ts";
 import { panelHeaderRow } from "../lib/shell-card.ts";
-import { sidebarPart } from "../lib/shell-sidebar.ts";
+import { isPhoneWidth, sidebarPart } from "../lib/shell-sidebar.ts";
 import { invalidateSidebar } from "../lib/shell-sidebar-layout.ts";
 import {
 	applyTodo,
@@ -122,15 +122,18 @@ export default function gentleTodo(pi: ExtensionAPI, env: NodeJS.ProcessEnv = pr
 		const card: Component = {
 			render(width: number) {
 				const stale = staleTurns(current.state, current.turn);
-				headerRow = panelHeaderRow(theme, width, todoCardTone(stale));
+				// The regular-mode widget compacts on phone-sized terminals; the rail never does.
+				const compact = !scrollable && !!current.tui && isPhoneWidth(current.tui);
+				headerRow = panelHeaderRow(theme, width, todoCardTone(stale), compact);
 				const lines = renderTodoCard(current.state, theme, width, {
 					collapsed: current.collapsed,
 					staleTurns: stale,
 					collapseKey,
 					hovered,
+					...(compact ? { compact: true } : {}),
 					...(scrollable ? { scrollable: true } : {}),
 				});
-				return spacer && lines.length > 0 ? [...lines, ""] : lines;
+				return spacer && !compact && lines.length > 0 ? [...lines, ""] : lines;
 			},
 			invalidate() {
 				hovered = false;

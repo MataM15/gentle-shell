@@ -62,6 +62,12 @@ export interface CardRenderOptions {
 	 * Neon keeps the outlined frame. Conversation cards never set it.
 	 */
 	panel?: boolean;
+	/**
+	 * Phone-sized terminals. A float panel drops its transparent margins, top
+	 * padding row, header separator and bottom padding row, keeping the accent
+	 * bar. The outlined frame drops the box: a title/control row, then the body.
+	 */
+	compact?: boolean;
 }
 
 export const CARD_GLYPH = "✿";
@@ -86,6 +92,8 @@ const SUBTITLE_ROLE = "muted";
 const BODY_ROLE = "text";
 const SEPARATOR = "·";
 const FRAME_COLUMNS = 4;
+// A borderless compact panel indents its body one column and keeps one spare on the right.
+const BORDERLESS_COLUMNS = 2;
 
 // The characters that draw a card around its content. The float style keeps
 // every row the same width: the left edge becomes an accent bar and the rules
@@ -320,8 +328,8 @@ function floatOpener(theme: CardTheme, tone: CardTone, width: number): string {
 // Paints every row behind its tone background, re-armed after any reset the
 // content carries, inside a transparent one-column margin on both sides.
 // Padding rows keep their tone-coloured accent just like content rows.
-function paintFloat(rows: readonly string[], open: string): string[] {
-	const margin = " ".repeat(FLOAT_MARGIN);
+function paintFloat(rows: readonly string[], open: string, marginColumns = FLOAT_MARGIN): string[] {
+	const margin = " ".repeat(marginColumns);
 	return rows.map((row) => `${margin}${open}${row.replace(BG_CLEARING, (reset) => reset + open)}${BG_RESET}${margin}`);
 }
 
@@ -330,8 +338,9 @@ function paintFloat(rows: readonly string[], open: string): string[] {
  * style. Callers that pre-wrap or pre-fit rows use it so a float panel, two
  * columns narrower than the outlined frame, never re-wraps or clips them.
  */
-export function panelInnerWidth(theme: CardTheme, width: number, tone: CardTone = CARD_TONE.INFO): number {
-	return floatOpener(theme, tone, width) ? cardInnerWidth(Math.floor(width) - FLOAT_MARGIN * 2) : cardInnerWidth(width);
+export function panelInnerWidth(theme: CardTheme, width: number, tone: CardTone = CARD_TONE.INFO, compact = false): number {
+	if (floatOpener(theme, tone, width)) return cardInnerWidth(Math.floor(width) - (compact ? 0 : FLOAT_MARGIN * 2));
+	return compact ? Math.max(1, Math.floor(width) - BORDERLESS_COLUMNS) : cardInnerWidth(width);
 }
 
 /**
@@ -339,8 +348,8 @@ export function panelInnerWidth(theme: CardTheme, width: number, tone: CardTone 
  * outlined frame, 1 below the float panel's top padding row. Callers
  * hit-test their header control with it.
  */
-export function panelHeaderRow(theme: CardTheme, width: number, tone: CardTone = CARD_TONE.INFO): number {
-	return floatOpener(theme, tone, width) ? 1 : 0;
+export function panelHeaderRow(theme: CardTheme, width: number, tone: CardTone = CARD_TONE.INFO, compact = false): number {
+	return !compact && floatOpener(theme, tone, width) ? 1 : 0;
 }
 
 /**
@@ -348,8 +357,8 @@ export function panelHeaderRow(theme: CardTheme, width: number, tone: CardTone =
  * padding row and the separator below the header, or 0 for the outlined
  * frame. Callers with a row budget spend them from the body.
  */
-export function panelExtraRows(theme: CardTheme, width: number, tone: CardTone = CARD_TONE.INFO): number {
-	return floatOpener(theme, tone, width) ? 2 : 0;
+export function panelExtraRows(theme: CardTheme, width: number, tone: CardTone = CARD_TONE.INFO, compact = false): number {
+	return !compact && floatOpener(theme, tone, width) ? 2 : 0;
 }
 
 export function renderCard(card: Card, theme: CardTheme, width: number, options: CardRenderOptions): string[] {
@@ -363,7 +372,9 @@ export function renderCard(card: Card, theme: CardTheme, width: number, options:
 	// Without the panel opt-in, legacy cards always keep the outlined frame.
 	if (chrome !== OUTLINE_CHROME) return withChrome(OUTLINE_CHROME, () => renderCard(card, theme, width, options));
 	const open = options.panel ? floatOpener(theme, card.tone, width) : "";
+	if (open && options.compact) return paintFloat(withChrome(FLOAT_CHROME, () => compactPanel(card, theme, Math.floor(width), options)), open, 0);
 	if (open) return paintFloat(withChrome(FLOAT_CHROME, () => floatPanel(card, theme, Math.floor(width) - FLOAT_MARGIN * 2, options)), open);
+	if (options.panel && options.compact) return borderlessPanel(card, theme, Math.floor(width), options);
 	const top = cardTop(card, theme, width, options.hint);
 	const bottom = cardBottom(card.tone, theme, width);
 	return [top, ...cardText(card, theme, cardInnerWidth(width), options.expanded).map((line) => cardLine(line, card.tone, theme, width)), bottom];
@@ -389,6 +400,24 @@ function floatPanel(card: Card, theme: CardTheme, width: number, options: CardRe
 	const blank = cardBottom(card.tone, theme, width);
 	const body = cardText(card, theme, cardInnerWidth(width), options.expanded).map((line) => cardLine(line, card.tone, theme, width));
 	return [blank, panelHeader(card, theme, width, options.hint), ...(body.length > 0 ? [blank, ...body] : []), blank];
+}
+
+// Compact float panel: header and body only, edge to edge.
+function compactPanel(card: Card, theme: CardTheme, width: number, options: CardRenderOptions): string[] {
+	const body = cardText(card, theme, cardInnerWidth(width), options.expanded).map((line) => cardLine(line, card.tone, theme, width));
+	return [panelHeader(card, theme, width, options.hint), ...body];
+}
+
+// Compact outlined panel: no box. The title/control row, then the body one column in.
+function borderlessPanel(card: Card, theme: CardTheme, width: number, options: CardRenderOptions): string[] {
+	if (width <= 0) return [];
+	const title = titleText(card, theme);
+	const hintWidth = options.hint ? visibleWidth(options.hint) + 2 : 0;
+	const header = options.hint && title.width + hintWidth <= width
+		? `${title.styled}${" ".repeat(width - title.width - hintWidth + 1)}${theme.fg(HINT_ROLE, options.hint)} `
+		: truncateToWidth(title.styled, width, "…");
+	const inner = Math.max(1, width - BORDERLESS_COLUMNS);
+	return [header, ...cardText(card, theme, inner, options.expanded).map((line) => ` ${truncateToWidth(line, inner, "…")}`)];
 }
 
 function fitRow(text: string, width: number): string {

@@ -12,7 +12,7 @@ import {
 	todoSummary,
 	type TodoState,
 } from "../lib/shell-todo.ts";
-import { CARD_STYLE, cardStyle, setCardStyle, type CardStyle } from "../lib/shell-card.ts";
+import { CARD_STYLE, cardStyle, panelExtraRows, panelHeaderRow, panelInnerWidth, setCardStyle, type CardStyle } from "../lib/shell-card.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 
 // Gentle Todo: a task list the model rewrites as it works. The reducer is
@@ -479,4 +479,99 @@ test("renderTodoCard folds dropped tasks next to done ones in a long list", () =
 	assert.match(plain[2], /^│ ✕ 3 dropped +│$/);
 	assert.match(plain[3], /^│ ○ Task 9 +│$/);
 	assert.match(plain[12], /^│ … 3 more +│$/);
+});
+
+test("compact float Todos panel drops margins and padding rows but keeps the header control on row 0", (t) => {
+	useCardStyle(t, CARD_STYLE.FLOAT);
+	const theme = withBackground(plainTheme);
+	for (const width of [40, 60]) {
+		for (const collapsed of [false, true]) {
+			const options = { collapsed, staleTurns: 0, collapseKey: "ctrl+shift+t" };
+			const regular = renderTodoCard(seeded(), theme, width, options);
+			const compact = renderTodoCard(seeded(), theme, width, { ...options, compact: true });
+			assert.equal(compact.length, regular.length - 3, "top padding, separator and bottom padding rows are gone");
+			assert.match(stripAnsi(compact[0]!), /^▎ ❀ Todos ▾? ?▸? ?/u, "the header is the first row");
+			assert.match(stripAnsi(compact[0]!), /1 of 3/);
+			for (const line of compact) {
+				assert.equal(visibleWidth(line), width, `"${stripAnsi(line)}" is not ${width} wide`);
+				assert.ok(line.startsWith(BG_OPEN) && line.endsWith(BG_CLOSE), "painted edge to edge without transparent margins");
+			}
+			// Two more content columns may re-wrap a row, so compare the text, not the row split.
+			if (collapsed) assert.ok(compact.length === 2, "collapsed stays one body row");
+			else assert.equal(compact.slice(1).map(bodyText).join(" "), regular.slice(3, -1).map(bodyText).join(" ").replace(/ +/g, " "), "the body text is the same");
+			assert.equal(panelHeaderRow(theme, width, "info", true), 0);
+			assert.equal(panelExtraRows(theme, width, "info", true), 0);
+			assert.equal(panelInnerWidth(theme, width, "info", true), width - 4);
+			assert.ok(compact.slice(1).every((row) => !/^\s*▎\s+$/.test(stripAnsi(row))), "no blank padding rows");
+		}
+	}
+});
+
+test("compact neon Todos is two borderless rows collapsed: title/control, then the current task", () => {
+	const theme = plainTheme;
+	const options = { collapsed: true, staleTurns: 0, collapseKey: "ctrl+shift+t", compact: true };
+	for (const width of [30, 40, 60]) {
+		const rows = renderTodoCard(seeded(), theme, width, options).map(stripAnsi);
+		assert.equal(rows.length, 2, `collapsed is two rows at ${width}`);
+		assert.match(rows[0]!, /^❀ Todos ▸ (Expand )?·? ?1 of 3/u, "row 0 is the clickable title/control row");
+		assert.match(rows[1]!, /^ ◐ Fix quiet tools/u, "row 1 is the current task");
+		assert.doesNotMatch(rows.join("\n"), /[╭╮╰╯│─]/u, "no box");
+		for (const row of rows) assert.ok(visibleWidth(row) <= width, `"${row}" overflows ${width}`);
+	}
+	assert.match(stripAnsi(renderTodoCard(seeded(), theme, 40, options)[1]!), /…$/u, "a long task is truncated, never wrapped");
+	const long = applyTodo(emptyTodo(), { action: "write", tasks: [{ title: "Implementar la vista angosta compacta", status: "in_progress" }] }, 1).state;
+	const [header, task, ...rest] = renderTodoCard(long, theme, 40, options).map(stripAnsi);
+	assert.equal(header, "❀ Todos ▸ Expand · 0 of 1");
+	assert.equal(task, " ◐ Implementar la vista angosta compac…");
+	assert.deepEqual(rest, []);
+});
+
+test("compact neon Todos expanded keeps header then every task, borderless", () => {
+	const rows = renderTodoCard(seeded(), plainTheme, 40, { collapsed: false, staleTurns: 0, collapseKey: "ctrl+shift+t", compact: true }).map(stripAnsi);
+	assert.equal(rows[0], "❀ Todos ▾ Collapse · 1 of 3");
+	assert.deepEqual(rows.slice(1).map((row) => row.trimEnd()), [" ✓ ~Add quiet tool rendering~", " ◐ Fix quiet tools conflict · fixing", " conflict", " ○ Show git bash tails"]);
+	assert.doesNotMatch(rows.join("\n"), /[╭╮╰╯│─]/u);
+	assert.equal(panelHeaderRow(plainTheme, 40, "info", true), 0);
+	assert.equal(panelExtraRows(plainTheme, 40, "info", true), 0);
+	assert.equal(panelInnerWidth(plainTheme, 40, "info", true), 38);
+});
+
+// Golden rows captured from the unmodified renderer (before any compact work) at 61 columns.
+const ORIGINAL_61: Record<"neon" | "float", string[]> = {
+ "neon": [
+  "<border>╭</border><border>─ </border><accent>❀ Todos <accent>▾ Collapse</accent></accent> <muted>·</muted> <muted>1 of 3</muted><border> </border> <dim>k collapse</dim> <border>╮</border>",
+  "<border>│</border> <text><success>✓</success> <dim>~Add~</dim></text>        <border>│</border>",
+  "<border>│</border> <text><accent>◐</accent> <accent>Fix</accent> <muted>·</\u001b[0m…\u001b[0m <border>│</border>",
+  "<border>│</border> <text><muted>n</muted></text>                             <border>│</border>",
+  "<border>│</border> <text><muted>○</muted> <text>Show</text></text>           <border>│</border>",
+  "<border>╰</border><border>───────────────────────────────────────────────────────────╯</border>"
+ ],
+ "float": [
+  " [toolSuccessBg]<border>▎</border><border>                                                          </border>\u001b[49m ",
+  " [toolSuccessBg]<border>▎</border> <accent>❀ Todos <accent>▾ Collapse</acc\u001b[0m[toolSuccessBg]…\u001b[0m[toolSuccessBg]\u001b[49m ",
+  " [toolSuccessBg]<border>▎</border><border>                                                          </border>\u001b[49m ",
+  " [toolSuccessBg]<border>▎</border> <text><success>✓</success> <dim>~Add~</dim></text>      <border> </border>\u001b[49m ",
+  " [toolSuccessBg]<border>▎</border> <text><accent>◐</accent> <accent>Fix</accent> <muted>·\u001b[0m[toolSuccessBg]…\u001b[0m[toolSuccessBg] <border> </border>\u001b[49m ",
+  " [toolSuccessBg]<border>▎</border> <text></muted> <muted>n</muted></text>                  <border> </border>\u001b[49m ",
+  " [toolSuccessBg]<border>▎</border> <text><muted>○</muted> <text>Show</text></text>         <border> </border>\u001b[49m ",
+  " [toolSuccessBg]<border>▎</border><border>                                                          </border>\u001b[49m "
+ ]
+};
+
+test("non-compact Todos (above 60 columns) keeps the original render byte for byte in both styles", (t) => {
+	const tagged = { fg: (role: string, text: string) => `<${role}>${text}</${role}>`, strikethrough: (text: string) => `~${text}~`, bg: (role: string, text: string) => `[${role}]${text}\x1b[49m` };
+	const state = applyTodo(emptyTodo(), { action: "write", tasks: [{ title: "Add", status: "done" }, { title: "Fix", status: "in_progress", note: "n" }, { title: "Show" }] }, 1).state;
+	const options = { collapsed: false, staleTurns: 0, collapseKey: "k" };
+	assert.deepEqual(renderTodoCard(state, tagged, 61, options), ORIGINAL_61.neon);
+	assert.deepEqual(renderTodoCard(state, tagged, 61, { ...options, compact: false }), ORIGINAL_61.neon);
+	useCardStyle(t, CARD_STYLE.FLOAT);
+	assert.deepEqual(renderTodoCard(state, tagged, 61, options), ORIGINAL_61.float);
+});
+
+test("compact float is a no-op off the float style and non-compact float keeps its layout", (t) => {
+	const theme = withBackground(plainTheme);
+	useCardStyle(t, CARD_STYLE.FLOAT);
+	assert.equal(panelHeaderRow(theme, 40, "info"), 1);
+	assert.equal(panelExtraRows(theme, 40, "info"), 2);
+	assertFloatRows(renderTodoCard(seeded(), theme, 80, { collapsed: false, staleTurns: 0 }), 80);
 });

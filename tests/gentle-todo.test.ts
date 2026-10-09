@@ -477,3 +477,102 @@ test("a list left with only dropped tasks open finishes and clears; a blocked-on
 	}
 	assert.match(widget()![2], /⊘ Deploy · waiting for an admin/);
 });
+
+// Phone-sized terminals (<= 60 columns) compact only the regular-mode Todos widget.
+async function compactFixture(columns: number) {
+	const { pi, tools, fire } = fakePi();
+	gentleTodo(pi, {});
+	const { ctx, widgets } = fakeContext();
+	await fire("session_start", ctx);
+	await tools.get("todo")!.execute("c1", { action: "write", tasks: [{ title: "Implementar la vista angosta compacta", status: "in_progress" }, { title: "B" }, { title: "C" }] }, undefined, undefined, ctx);
+	await fire("tool_execution_end", ctx, { toolName: "todo" });
+	const terminal = { columns };
+	const tui = { terminal, requestRender() {} };
+	const theme = { ...plainTheme, bg: (_color: string, text: string) => `\x1b[48;5;22m${text}\x1b[49m` };
+	const component = widgets.get("gentle-todo")!(tui, theme);
+	const pointer = (type: "move" | "click", y: number, width = terminal.columns) => ({
+		type, button: type === "move" ? "none" as const : "left" as const, x: 1, y, screenX: 1, screenY: y, width, height: 6, shift: false, alt: false, ctrl: false,
+	});
+	const rows = () => component.render(terminal.columns).map(stripAnsi);
+	return { terminal, component, pointer, rows };
+}
+
+test("neon: the Todos widget is two borderless rows when collapsed at <= 60 columns and the original box at 61", async () => {
+	const f = await compactFixture(60);
+	for (const width of [60, 40]) {
+		f.terminal.columns = width;
+		// A long first task may wrap at narrower widths, so only the extra rows are pinned.
+		assert.equal(f.rows().length, width === 60 ? 4 : 5, "expanded: header + tasks, no spacer");
+		assert.notEqual(f.rows().at(-1), "", "no spacer row");
+		assert.match(f.rows()[0]!, /^❀ Todos ▾ Collapse · 0 of 3/u);
+		assert.doesNotMatch(f.rows().join("\n"), /[╭╮╰╯│]/u);
+		assert.deepEqual(f.component.handleMouse?.(f.pointer("click", 1)), undefined, "a body row is not the control");
+		assert.equal(f.component.handleMouse?.(f.pointer("click", 0))?.handled, true, "the header row toggles");
+		const collapsed = f.rows();
+		assert.equal(collapsed.length, 2, `collapsed is two rows at ${width}`);
+		assert.match(collapsed[0]!, /^❀ Todos ▸ Expand · 0 of 3/u);
+		assert.match(collapsed[1]!, /^ ◐ Implementar la vista/u);
+		assert.doesNotMatch(collapsed.join("\n"), /[╭╮╰╯│]/u);
+		assert.equal(f.component.handleMouse?.(f.pointer("click", 1)), undefined, "the task row is not the control");
+		assert.equal(f.component.handleMouse?.(f.pointer("click", 0))?.handled, true);
+		assert.match(f.rows()[0]!, /Collapse/);
+	}
+	// 61 columns: the original outlined card (box, spacer row), clickable on row 0.
+	f.terminal.columns = 61;
+	const wide = f.rows();
+	assert.match(wide[0]!, /^╭─ ❀ Todos ▾ Collapse · 0 of 3 ─+ ctrl\+shift\+t collapse ╮$/u);
+	assert.match(wide[1]!, /^│ ◐ Implementar la vista angosta compacta +│$/u);
+	assert.equal(wide.at(-1), "", "the spacer row is back");
+	assert.equal(wide.length, 6);
+	assert.equal(f.component.handleMouse?.(f.pointer("click", 1)), undefined);
+	assert.equal(f.component.handleMouse?.(f.pointer("click", 0))?.handled, true);
+	assert.equal(f.rows().length, 4, "collapsed box is 3 rows plus the spacer");
+	// Back down: compact again, same state.
+	f.terminal.columns = 60;
+	assert.equal(f.rows().length, 2);
+	assert.match(f.rows()[0]!, /Todos ▸ Expand/);
+});
+
+test("float: the Todos widget drops margins, padding and spacer at <= 60 columns, with the header control on row 0", async (t) => {
+	const found = cardStyle();
+	t.after(() => setCardStyle(found));
+	const f = await compactFixture(60);
+	setCardStyle(CARD_STYLE.FLOAT);
+	f.terminal.columns = 61;
+	const wide = f.rows();
+	assert.match(wide[0]!, /^ ▎ +$/, "above 60: padding row first");
+	assert.match(wide[1]!, /^ ▎ ❀ Todos ▾ Collapse/);
+	assert.equal(wide.at(-1), "");
+	assert.equal(f.component.handleMouse?.(f.pointer("click", 0)), undefined, "above 60: the padding row is not the control");
+	for (const width of [60, 40, 30]) {
+		f.terminal.columns = width;
+		const rows = f.rows();
+		assert.match(rows[0]!, /^▎ ❀ Todos ▾ Collapse/, `compact header is row 0 at ${width}`);
+		assert.equal(rows.length, width === 60 ? 4 : 5, "header + tasks, no padding or spacer");
+		assert.doesNotMatch(rows[1]!, /^▎ +$/, "no blank row under the header");
+		assert.doesNotMatch(rows.at(-1)!, /^▎? *$/, "no padding or spacer row at the bottom");
+		assert.ok(rows.every((row) => row.length === width), "edge to edge, no transparent margins");
+		assert.equal(f.component.handleMouse?.(f.pointer("click", 1)), undefined);
+		assert.equal(f.component.handleMouse?.(f.pointer("click", 0))?.handled, true);
+		const collapsed = f.rows();
+		assert.equal(collapsed.length, 2);
+		assert.match(collapsed[0]!, /^▎ ❀ Todos ▸ Expand/);
+		assert.match(collapsed[1]!, /^▎ ◐ Implementar/);
+		assert.equal(f.component.handleMouse?.(f.pointer("click", 0))?.handled, true);
+	}
+	// Back above the breakpoint: header returns to row 1.
+	f.terminal.columns = 61;
+	assert.match(f.rows()[1]!, /^ ▎ ❀ Todos ▾ Collapse/);
+	assert.equal(f.component.handleMouse?.(f.pointer("click", 0)), undefined);
+	assert.equal(f.component.handleMouse?.(f.pointer("click", 1))?.handled, true);
+});
+
+test("compact is scoped to the Todos regular-mode widget: hosts without terminal columns keep the original card", async () => {
+	const { pi, tools, fire } = fakePi();
+	gentleTodo(pi, {});
+	const { ctx, widgetComponent } = fakeContext();
+	await fire("session_start", ctx);
+	await tools.get("todo")!.execute("c1", { action: "write", tasks: [{ title: "A", status: "in_progress" }] }, undefined, undefined, ctx);
+	await fire("tool_execution_end", ctx, { toolName: "todo" });
+	assert.match(stripAnsi(widgetComponent()!.render(40)[0]!), /^╭─ ❀ Todos/u);
+});

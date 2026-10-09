@@ -201,3 +201,46 @@ test("command gentle-wellness reset validates arguments and notifies user", asyn
 test("resolveAgentDir honors PI_CODING_AGENT_DIR override", () => {
 	assert.equal(resolveAgentDir({ PI_CODING_AGENT_DIR: "/custom/agent/dir" }), "/custom/agent/dir");
 });
+
+test("phone-sized terminals (60 columns or fewer) hide the Wellness paint but keep reminders and resets running", async t => {
+	const f = await extensionFixture(t);
+	const columns = f.tui.terminal as { columns: number };
+	for (const width of [40, 60]) {
+		columns.columns = width;
+		assert.deepEqual(f.widget.render(width), [], `hidden at ${width} columns`);
+	}
+	columns.columns = 61;
+	assert.ok(f.widget.render(61).length > 0, "painted again one column past the phone breakpoint");
+	columns.columns = 40;
+	t.mock.timers.tick(1000);
+	for (let i = 0; i < 12; i++) await Promise.resolve();
+	assert.equal(f.claims(), 4, "due reminders are still claimed");
+	assert.ok(f.notices.includes("Hora de tomar agua."), "notices are still delivered");
+	await f.commands.get("gentle-wellness")!.handler("reset water", f.ctx);
+	assert.equal(f.resets.at(-1), "water", "the reset command still works while hidden");
+});
+
+test("a stale reset hit never fires while Wellness is hidden on a phone-sized terminal, and works again above 60", async t => {
+	const f = await extensionFixture(t);
+	const columns = f.tui.terminal as { columns: number };
+	const rows = f.widget.render(140);
+	const y = rows.findIndex(row => row.includes("↻"));
+	assert.ok(y >= 0, "a reset glyph is painted when wide");
+	const x = visibleWidth(rows[y]!.slice(0, rows[y]!.indexOf("↻")));
+	const click = { type: "click", button: "left", x, y, screenX: x, screenY: y, width: 140, height: rows.length, shift: false, alt: false, ctrl: false } as const;
+	const flush = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); };
+	for (const width of [60, 40]) {
+		columns.columns = width;
+		assert.deepEqual(f.widget.render(width), []);
+		assert.equal(f.widget.handleMouse?.(click), undefined, `hidden click is not handled at ${width}`);
+		await flush();
+		assert.deepEqual(f.resets, [], `no reset at ${width}`);
+	}
+	columns.columns = 141;
+	const again = f.widget.render(141);
+	const row = again.findIndex(line => line.includes("↻"));
+	const col = visibleWidth(again[row]!.slice(0, again[row]!.indexOf("↻")));
+	assert.equal(f.widget.handleMouse?.({ ...click, x: col, y: row, screenX: col, screenY: row, width: 141 })?.handled, true, "visible again: the reset glyph works");
+	await flush();
+	assert.equal(f.resets.length, 1);
+});

@@ -84,6 +84,8 @@ export interface TodoRenderOptions {
 	collapseKey?: string;
 	/** The pointer is over the clickable collapse/expand control. */
 	hovered?: boolean;
+	/** Phone-sized terminal: the float panel drops its margins and padding rows. */
+	compact?: boolean;
 }
 
 /** Tool results carry the snapshot under this key; the old rpiv-todo shape is read too. */
@@ -328,10 +330,10 @@ export function renderTodoCard(state: TodoState, theme: TodoTheme, width: number
 	const control = `${icon} ${width >= 28 ? actionLabel : ""}`.trimEnd();
 	const tone = todoCardTone(options.staleTurns);
 	const hint = options.collapseKey
-		? panelHeaderRow(theme, width, tone) ? options.collapseKey : `${options.collapseKey} ${action}`
+		? panelHeaderRow(theme, width, tone, options.compact) ? options.collapseKey : `${options.collapseKey} ${action}`
 		: undefined;
 	// Content columns of the card body in the active style (float is narrower).
-	const inner = panelInnerWidth(theme, width, tone);
+	const inner = panelInnerWidth(theme, width, tone, options.compact);
 	const rows = options.collapsed ? [collapsedRow(state, theme, inner)] : options.scrollable ? state.tasks.map((task) => taskRow(task, theme, inner)) : bodyRows(state, theme, inner);
 	const body = stale ? [theme.fg(NOTE_ROLE, `stale · ${options.staleTurns} turns`), ...rows] : rows;
 	// The clickable control paints the shared hover role while hovered --
@@ -341,6 +343,6 @@ export function renderTodoCard(state: TodoState, theme: TodoTheme, width: number
 		{ title: `Todos ${paintHoverable(theme, control, options.hovered, "accent")}`, subtitle: `${done} of ${planned}`, body, tone, glyph: TODO_GLYPH },
 		theme,
 		width,
-		{ expanded: true, hint, panel: true },
+		{ expanded: true, hint, panel: true, compact: options.compact },
 	);
 }
