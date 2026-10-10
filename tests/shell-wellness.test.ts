@@ -112,7 +112,7 @@ test("store keeps only the current revision's claim, pruning superseded ones on 
 });
 
 // In-memory store and UI only: these tests never touch preferences or shared files.
-async function extensionFixture(t: TestContext, notifications = true, enabled = true, reset?: (target: string) => WellnessState) {
+async function extensionFixture(t: TestContext, notifications = true, enabled = true, reset?: (target: string) => WellnessState, frozenNow?: number) {
 	const handlers = new Map<string, Function>();
 	const commands = new Map<string, { description: string; handler: (args: string, ctx: unknown) => Promise<void> }>();
 	let factory: Function | undefined;
@@ -129,7 +129,8 @@ async function extensionFixture(t: TestContext, notifications = true, enabled = 
 			async loadOrInitialize() { loads++; return shared; }, async load() { return shared; },
 			async reset(target: string) { resets.push(target); return reset?.(target) ?? shared; }, async claimDue() { claims++; return true; },
 		}));
-	t.mock.timers.enable({ apis: ["setInterval"] });
+	if (frozenNow === undefined) t.mock.timers.enable({ apis: ["setInterval"] });
+	else t.mock.timers.enable({ apis: ["setInterval", "Date"], now: frozenNow });
 	const ctx = { mode: "tui", hasUI: true, ui: { theme, setWidget(_key: string, value: Function | undefined) { factory = value; }, notify(text: string) { notices.push(text); } } };
 	await handlers.get("session_start")!({}, ctx);
 	const tui = { terminal: { columns: 140 }, requestRender() {} } as unknown as TUI;
@@ -200,6 +201,36 @@ test("command gentle-wellness reset validates arguments and notifies user", asyn
 
 test("resolveAgentDir honors PI_CODING_AGENT_DIR override", () => {
 	assert.equal(resolveAgentDir({ PI_CODING_AGENT_DIR: "/custom/agent/dir" }), "/custom/agent/dir");
+});
+
+async function pollFor(t: TestContext, seconds: number) {
+	for (let second = 0; second < seconds; second++) {
+		t.mock.timers.tick(1000);
+		for (let i = 0; i < 12; i++) await Promise.resolve();
+	}
+}
+
+// Every Pi render re-lays out the whole transcript, so a 1 s repaint made idle long sessions burn a core.
+test("the 1 s poll requests a render only when the painted card changes", async t => {
+	const f = await extensionFixture(t, true, true, undefined, Date.parse("2026-09-27T23:30:05Z"));
+	let renders = 0;
+	f.tui.requestRender = () => { renders++; };
+	assert.ok(f.widget.render(140).length > 0, "the rail painted the card");
+	await pollFor(t, 5);
+	assert.equal(f.claims(), 4, "due reminders are still claimed every poll");
+	assert.equal(renders, 0, "no render while the clock and reminders show the same text");
+	await pollFor(t, 60);
+	assert.equal(renders, 1, "the minute change repaints once");
+});
+
+test("a hidden phone-width card never requests a render from the poll", async t => {
+	const f = await extensionFixture(t, true, true, undefined, Date.parse("2026-09-27T23:30:05Z"));
+	let renders = 0;
+	f.tui.requestRender = () => { renders++; };
+	(f.tui.terminal as { columns: number }).columns = 40;
+	assert.deepEqual(f.widget.render(40), []);
+	await pollFor(t, 120);
+	assert.equal(renders, 0);
 });
 
 test("phone-sized terminals (60 columns or fewer) hide the Wellness paint but keep reminders and resets running", async t => {

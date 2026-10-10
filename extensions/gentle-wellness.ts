@@ -65,6 +65,11 @@ export default function gentleWellness(
 			activeStore = store;
 			const repaint = () => { invalidateSidebar(tui); tui.requestRender(); };
 			refresh = repaint;
+			const currentTheme = theme ?? ctx.ui.theme;
+			const paint = (width: number) => isPhoneWidth(tui) ? [] : model.render(Date.now(), width, currentTheme);
+			// Every Pi render re-lays out the whole transcript, so the poll repaints only when
+			// the last painted card would change (clock minute, countdowns, visibility).
+			let painted: { width: number; text: string } | undefined;
 			let polling = false;
 			let disposed = false;
 			const poll = async () => {
@@ -86,16 +91,24 @@ export default function gentleWellness(
 						if (!isCurrent()) return;
 						if (claimed && config.notifications) ctx.ui.notify(spanish ? WELLNESS_NOTICES_ES[key] : `${WELLNESS_LABELS[key]} is due.`, "info");
 					}
-					if (isCurrent()) repaint();
+					const next = isCurrent() && painted ? paint(painted.width).join("\n") : undefined;
+					// Recorded before the rail repaints, so a skipped paint never re-requests every second.
+					if (painted && next !== undefined && next !== painted.text) {
+						painted = { width: painted.width, text: next };
+						repaint();
+					}
 				} catch { /* Persistence failures must not reject the polling timer. */ }
 				finally { polling = false; }
 			};
 			const timer = setInterval(poll, 1000);
 			timer.unref();
-			const currentTheme = theme ?? ctx.ui.theme;
 			const part = sidebarPart(tui, "wellness", {
 				// Hidden only in paint: polling, notices, resets and persistence keep running.
-				render: (width: number) => isPhoneWidth(tui) ? [] : model.render(Date.now(), width, currentTheme),
+				render: (width: number) => {
+					const lines = paint(width);
+					painted = { width, text: lines.join("\n") };
+					return lines;
+				},
 				invalidate: () => invalidateSidebar(tui),
 				handleMouse(event) {
 					// Hit targets from a wider paint are stale while hidden.
