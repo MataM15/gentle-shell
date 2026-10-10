@@ -8,7 +8,7 @@ import { readSessionProfileBinding } from "../lib/session-profile-binding.ts";
 import { resolveProfilePin } from "../lib/agent-profile-pin.ts";
 import * as os from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { buildShellHeaderModel, renderShellBar, renderShellBelowInputFloat, renderShellBottomOnlyBar, renderShellHeaderChrome, renderShellRailHeader, renderShellSidebarBar, keepNativeWorkingRow, shellEnabled, shellHeaderUsageHit, shellJobsCount, type ShellBarModel, type ShellBarTheme } from "../lib/shell-bar.ts";
+import { buildShellHeaderModel, renderShellBar, renderShellBelowInputFloat, renderShellBottomOnlyBar, renderShellHeaderChrome, renderShellRailHeader, renderShellSidebarBar, keepNativeWorkingRow, shellEnabled, shellHeaderCommandsHit, shellHeaderUsageHit, shellJobsCount, type ShellBarModel, type ShellBarTheme } from "../lib/shell-bar.ts";
 import { CHANGE_STATUS, RootBranchLabels, renderChangesWidget, type ChangedFile, type ChangesModel, type GitRunner, type WorktreeChanges } from "../lib/shell-changes.ts";
 import { WorktreeChangesView } from "../lib/shell-changes-view.ts";
 import { SessionWorktreeRegistry, resolveSessionWorktree, worktreeGitEnvironment, type WorktreeResolver, type WorktreeIdentity } from "../lib/session-worktree-registry.ts";
@@ -1939,7 +1939,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			// Status is absent, never opaque statuses or working/thinking state.
 			const headerModel = () => buildShellHeaderModel(footerModel(), !statusCardVisible() && (statusOwner() === STATUS_OWNER.HEADER || visualSettings.statusPlacement === "hidden"));
 			const headerBar = (width: number) => renderShellHeaderChrome(headerModel(), theme, width, usageShortcutKey, visualSettings);
-			const railHeader = (width: number) => renderShellRailHeader(headerModel(), theme, width, usageShortcutKey, visualSettings);
+			const railHeader = (width: number) => renderShellRailHeader(headerModel(), theme, width, usageShortcutKey, visualSettings, commandsKey(env));
 			const disposeHeader = sidebarHeader(tui, {
 				digest: () => JSON.stringify([footerModel(), tracker.model, visualSettings, cardStyle()]),
 				render: (width) => headerBar(width).rows,
@@ -1955,7 +1955,12 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 					invalidate() {},
 					handleMouse(event) {
 						if (event.type !== "click" || event.button !== "left") return undefined;
-						if (!shellHeaderUsageHit(railHeader(event.width), event.x, event.y)) return undefined;
+						const chrome = railHeader(event.width);
+						if (shellHeaderCommandsHit(chrome, event.x, event.y)) {
+							void showCommandPalette(pi, ctx, env);
+							return { handled: true, render: true };
+						}
+						if (!shellHeaderUsageHit(chrome, event.x, event.y)) return undefined;
 						void openUsage(ctx);
 						return { handled: true, render: true };
 					},

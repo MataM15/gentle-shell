@@ -4,7 +4,7 @@ import { CURSOR_MARKER, ScrollView, VStack, visibleWidth, type Component, type T
 import { getScrollViewsAt, renderLayoutFrame, type LayoutBox } from "@earendil-works/pi-tui/dist/layout.js";
 import { installSidebar, invalidateSidebar, narrowStatusOwner } from "../lib/shell-sidebar-layout.ts";
 import { sidebarHeader, sidebarPart, sidebarState } from "../lib/shell-sidebar.ts";
-import { renderShellRailHeader, renderShellSidebarBar, shellHeaderUsageHit } from "../lib/shell-bar.ts";
+import { renderShellRailHeader, renderShellSidebarBar, shellHeaderCommandsHit, shellHeaderUsageHit } from "../lib/shell-bar.ts";
 import { renderTodoCard, type TodoState } from "../lib/shell-todo.ts";
 import { CARD_STYLE, cardStyle, setCardStyle } from "../lib/shell-card.ts";
 
@@ -146,19 +146,31 @@ test("rail header stacks long values at fifty columns with only the usage row in
 	const model = { cwd: "~/proyectos/gentle-shell-worktrees/rail-pinned-header", branch: "feat/rail-pinned-header", dirty: 3,
 		modelId: "claude-opus-5-5-extended-context-preview", effort: "medium", profile: "team", contextPercent: 42,
 		costTotal: 1.5, subscription: true, usage: undefined };
-	const chrome = renderShellRailHeader(model, theme, 50, "alt+u");
+	const chrome = renderShellRailHeader(model, theme, 50, "alt+u", undefined, "alt+k");
 	const text = chrome.rows.map((row) => row.slice(1).trimEnd()).join("");
 	assert.ok(chrome.rows.every((row) => visibleWidth(row) <= 50));
 	for (const value of ["Gentle Shell", "claude-opus-5-5-extended-context-preview", "medium", "team", "42%", "$1.50 sub"]) assert.ok(text.includes(value), value);
-	assert.match(chrome.rows[chrome.headerRow]!, /^ usage · alt\+u$/, "a standing usage affordance even without data");
+	assert.match(chrome.rows[chrome.headerRow]!, /^ ◔  usage {6}\[alt\+u\]$/, "a standing usage affordance even without data");
+	assert.match(chrome.rows[chrome.commandsRow!]!, /^ ☰ commands {3}\[alt\+k\]$/);
+	assert.equal(chrome.commandsRow, chrome.headerRow - 1, "the two action rows are adjacent");
+	assert.equal(chrome.rows[chrome.commandsRow! - 1], " " + "┄".repeat(48), "a dotted rule opens the action rows");
 	assert.equal(chrome.rows.at(-1), "─".repeat(50));
 	assert.equal(shellHeaderUsageHit(chrome, 1, chrome.headerRow), true);
 	assert.equal(shellHeaderUsageHit(chrome, 0, chrome.headerRow), false, "the inset is inert");
 	assert.equal(shellHeaderUsageHit(chrome, chrome.usageSpan!.end, chrome.headerRow), false, "blank space after usage is inert");
-	for (let y = 0; y < chrome.rows.length; y++) if (y !== chrome.headerRow) assert.equal(shellHeaderUsageHit(chrome, 2, y), false, `row ${y} is decorative`);
+	for (let y = 0; y < chrome.rows.length; y++) if (y !== chrome.headerRow) assert.equal(shellHeaderUsageHit(chrome, 2, y), false, `row ${y} is not the usage row`);
+	assert.equal(shellHeaderCommandsHit(chrome, 1, chrome.commandsRow!), true);
+	assert.equal(shellHeaderCommandsHit(chrome, 0, chrome.commandsRow!), false, "the inset is inert");
+	assert.equal(shellHeaderCommandsHit(chrome, chrome.commandsSpan!.end, chrome.commandsRow!), false, "blank space after the key hint is inert");
+	assert.equal(shellHeaderCommandsHit(chrome, 2, chrome.headerRow), false, "the usage row never opens the palette");
+	assert.equal(shellHeaderUsageHit(chrome, 2, chrome.commandsRow!), false, "the commands row never opens usage");
+	for (let y = 0; y < chrome.rows.length; y++) if (y !== chrome.commandsRow) assert.equal(shellHeaderCommandsHit(chrome, 2, y), false, `row ${y} is not the commands row`);
 	const hidden = renderShellRailHeader(model, theme, 50, "alt+u", { density: "minimal", visibility: { usageCost: false, modelDetails: false } } as never);
 	assert.equal(hidden.usageSpan, undefined);
+	assert.equal(hidden.headerRow, -1);
 	assert.doesNotMatch(hidden.rows.join("\n"), /usage|ctx|Gentle Shell|claude/, "presentation preferences still hide their groups");
+	assert.match(hidden.rows.join("\n"), /☰ commands/, "usageCost=false keeps the commands row");
+	assert.equal(shellHeaderCommandsHit(hidden, 2, hidden.commandsRow!), true);
 });
 
 test("grouped Status preserves structured fields and opaque integration text", (t) => {

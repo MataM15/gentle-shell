@@ -624,7 +624,7 @@ test("the pinned rail header keeps a long model, shows usage, and opens the pane
 		assert.ok(lines.every((line) => visibleWidth(line) <= 50), "every pinned row fits the rail");
 		assert.match(lines.map((line) => line.slice(1).trimEnd()).join(""), /claude-opus-5-5-extended-context-preview-build-with-a-very-long-suffix/, "a long model wraps instead of being dropped");
 		assert.match(lines.join("\n"), /ctx/);
-		const usageY = lines.findIndex((line) => /^ usage/.test(line));
+		const usageY = lines.findIndex((line) => /^ ◔  usage/.test(line));
 		assert.ok(usageY > 0, "usage stays visible in the pinned header");
 		const click = (x: number, y: number) => pinned.handleMouse?.({ type: "click", button: "left", x, y, screenX: 110 + x, screenY: y, width: 50, height: lines.length, shift: false, alt: false, ctrl: false } as TuiMouseEvent);
 		assert.equal(click(2, 0), undefined, "the brand row is decorative");
@@ -637,6 +637,65 @@ test("the pinned rail header keeps a long model, shows usage, and opens the pane
 		ui.closeOverlay?.();
 	} finally {
 		component.dispose();
+	}
+});
+
+async function railActions(env: NodeJS.ProcessEnv) {
+	const { pi, handlers, sentMessages } = fakePi();
+	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off", ...env });
+	const { ctx, ui } = fakeContext();
+	await fire(handlers, "session_start", ctx);
+	const liveFooterData = { getGitBranch: () => "main", getExtensionStatuses: () => new Map(), getAvailableProviderCount: () => 1, onBranchChange: () => () => {} };
+	const tui = { terminal: { rows: 40, columns: 160 }, requestRender() {} };
+	const factory = ui.footerFactory as (tui: unknown, theme: ShellBarTheme, footerData: unknown) => { render(width: number): string[]; dispose(): void };
+	const component = factory(tui, plainTheme, liveFooterData);
+	const pinned = (sidebarState(tui as unknown as TUI).parts.get("header") as SidebarHeaderRail).pinned!;
+	const lines = pinned.render(50).map(stripAnsi);
+	const click = (x: number, y: number) => pinned.handleMouse?.({ type: "click", button: "left", x, y, screenX: 110 + x, screenY: y, width: 50, height: lines.length, shift: false, alt: false, ctrl: false } as TuiMouseEvent);
+	return { lines, click, ui, component, sentMessages };
+}
+
+test("the rail commands row opens the command palette like alt+k and the usage row still opens usage", async () => {
+	const { lines, click, ui, component } = await railActions({});
+	try {
+		const commandsY = lines.findIndex((line) => /^ ☰ commands {3}\[alt\+k\]$/.test(line));
+		const usageY = lines.findIndex((line) => /^ ◔  usage {6}\[alt\+u\]$/.test(line));
+		assert.ok(commandsY > 0 && usageY === commandsY + 1, lines.join("\n"));
+		assert.equal(click(2, commandsY - 1), undefined, "the dotted rule is decorative");
+		assert.equal(click(0, commandsY), undefined, "the inset is inert");
+		assert.equal(click(40, commandsY), undefined, "blank space after the key hint is inert");
+		assert.equal(click(2, commandsY)?.handled, true);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.match(ui.overlayView!.render(100).join("\n"), /Configuration/, "the palette opened");
+		assert.doesNotMatch(ui.overlayView!.render(100).join("\n"), /Subscriptions/);
+		ui.overlayView!.handleInput("\x1b");
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.equal(click(2, usageY)?.handled, true);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.match(ui.overlayView!.render(90).join("\n"), /Subscriptions/);
+		ui.closeOverlay?.();
+	} finally {
+		component.dispose();
+	}
+});
+
+test("the rail action rows show remapped keys and no hint when a shortcut is disabled", async () => {
+	const remapped = await railActions({ GENTLE_PI_COMMANDS_KEY: "ctrl+p", GENTLE_PI_SHELL_USAGE_KEY: "ctrl+o" });
+	try {
+		assert.ok(remapped.lines.includes(" ☰ commands   [ctrl+p]"), remapped.lines.join("\n"));
+		assert.ok(remapped.lines.includes(" ◔  usage      [ctrl+o]"));
+	} finally {
+		remapped.component.dispose();
+	}
+	const off = await railActions({ GENTLE_PI_COMMANDS_KEY: "off", GENTLE_PI_SHELL_USAGE_KEY: "off" });
+	try {
+		assert.ok(off.lines.includes(" ☰ commands"), off.lines.join("\n"));
+		assert.ok(off.lines.includes(" ◔  usage"));
+		const y = off.lines.indexOf(" ☰ commands");
+		assert.equal(off.click(2, y)?.handled, true, "a disabled shortcut still has a clickable row");
+		assert.equal(off.click(12, y), undefined, "no key hint means no hit area past the label");
+	} finally {
+		off.component.dispose();
 	}
 });
 

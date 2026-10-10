@@ -82,6 +82,9 @@ export interface ShellHeaderChrome {
 	rows: string[];
 	headerRow: number;
 	usageSpan?: HeaderUsageSpan;
+	/** Rail only: the `☰ commands` action row and its hit span (the palette opener). */
+	commandsRow?: number;
+	commandsSpan?: HeaderUsageSpan;
 }
 
 export interface ShellBarTheme {
@@ -377,17 +380,33 @@ export function shellHeaderUsageHit(chrome: ShellHeaderChrome, x: number, y: num
 	return y === chrome.headerRow && usageSpan !== undefined && x >= usageSpan.start && x < usageSpan.end;
 }
 
+/** The rail's commands action is interactive only on its own row, within its label and key hint. */
+export function shellHeaderCommandsHit(chrome: ShellHeaderChrome, x: number, y: number): boolean {
+	const { commandsSpan } = chrome;
+	return chrome.commandsRow !== undefined && y === chrome.commandsRow && commandsSpan !== undefined && x >= commandsSpan.start && x < commandsSpan.end;
+}
+
 // The rail's cards sit one column in from each rail edge; the pinned header
 // keeps the same inset so its text lines up with the card borders.
 const RAIL_HEADER_INSET = 1;
+// Action rows: `☰ commands  [alt+k]`; the key hints share one column. ☰
+// (U+2630) is East Asian Wide, two cells, so the icon column is two cells
+// wide and ◔ is padded to match, keeping labels and keys aligned.
+const RAIL_COMMANDS_ICON = "☰";
+const RAIL_USAGE_ICON = "◔";
+const RAIL_ACTION_ICON_CELLS = 2;
+const RAIL_ACTION_KEY_COLUMN = 14;
+const RAIL_ACTION_RULE_CHAR = "┄";
+const RAIL_ACTION_HINT_ROLE = "dim";
 
 /**
  * The header pinned above the wide right rail's scrollable cards. Unlike the
  * one-row header it stacks its groups at rail width and wraps long values
- * rather than dropping the model. The usage line is the only interactive
- * row (`headerRow`); every other row and the rule are decorative.
+ * rather than dropping the model. A dotted rule opens two aligned action
+ * rows, `☰ commands` (`commandsRow`) and `◔ usage` (`headerRow`); every other
+ * row and the rules are decorative. A missing hint means that shortcut is off.
  */
-export function renderShellRailHeader(model: ShellHeaderModel, theme: ShellBarTheme, width: number, usageHint?: string, presentation?: Presentation): ShellHeaderChrome {
+export function renderShellRailHeader(model: ShellHeaderModel, theme: ShellBarTheme, width: number, usageHint?: string, presentation?: Presentation, commandsHint?: string): ShellHeaderChrome {
 	const targetWidth = Math.max(0, Math.floor(width));
 	const inner = targetWidth - RAIL_HEADER_INSET * 2;
 	if (inner < 1) return { rows: [], headerRow: -1 };
@@ -402,20 +421,33 @@ export function renderShellRailHeader(model: ShellHeaderModel, theme: ShellBarTh
 		]),
 	];
 	const jobs = model.jobs ? [theme.fg(ROLE.STATUS, shellJobsCount(model.jobs))] : [];
-	if (presentation?.visibility.usageCost === false) {
-		const jobsRows = jobs.length > 0 ? wrap(joinSegments(jobs, theme)) : [];
-		return { rows: [...rows, ...jobsRows, theme.fg(HEADER_RULE_ROLE, HEADER_RULE_CHAR.repeat(targetWidth))], headerRow: -1 };
+	const showUsage = presentation?.visibility.usageCost !== false;
+	if (showUsage) rows.push(...wrap(joinSegments([...jobs, contextSegment(model.contextPercent, theme), costSegment(model.costTotal, model.subscription, theme)], theme)));
+	else if (jobs.length > 0) rows.push(...wrap(joinSegments(jobs, theme)));
+	// Two aligned action rows under a dotted rule: icon, label, then a key
+	// column. The commands row opens the palette; the usage row the usage panel.
+	const action = (icon: string, label: string, hint: string | undefined) => {
+		const labelText = truncateToWidth(`${icon}${" ".repeat(Math.max(0, RAIL_ACTION_ICON_CELLS - visibleWidth(icon)))} ${label}`, inner, "");
+		const keyText = hint ? truncateToWidth(`[${hint}]`, Math.max(0, inner - RAIL_ACTION_KEY_COLUMN), "…") : "";
+		const gap = " ".repeat(Math.max(1, RAIL_ACTION_KEY_COLUMN - visibleWidth(labelText)));
+		const showKey = keyText !== "" && visibleWidth(labelText) + gap.length + visibleWidth(keyText) <= inner;
+		const text = theme.fg(ROLE.BRAND, labelText) + (showKey ? gap + theme.fg(RAIL_ACTION_HINT_ROLE, keyText) : "");
+		return { text: pad + text, end: RAIL_HEADER_INSET + visibleWidth(labelText) + (showKey ? gap.length + visibleWidth(keyText) : 0) };
+	};
+	rows.push(pad + theme.fg(RAIL_ACTION_HINT_ROLE, RAIL_ACTION_RULE_CHAR.repeat(inner)));
+	const commands = action(RAIL_COMMANDS_ICON, "commands", commandsHint);
+	const commandsRow = rows.length;
+	rows.push(commands.text);
+	let headerRow = -1;
+	let usageSpan: HeaderUsageSpan | undefined;
+	if (showUsage) {
+		const usage = action(RAIL_USAGE_ICON, "usage", usageHint);
+		headerRow = rows.length;
+		rows.push(usage.text);
+		usageSpan = { start: RAIL_HEADER_INSET, end: usage.end };
 	}
-	rows.push(...wrap(joinSegments([...jobs, contextSegment(model.contextPercent, theme), costSegment(model.costTotal, model.subscription, theme)], theme)));
-	// The same standing, clickable usage affordance as the one-row header,
-	// degraded (gauges, then secondary windows) to stay on one row.
-	const windows = model.usage ? (selectUsageLimit(model.usage, model.modelId)?.windows ?? []) : [];
-	const stages: UsageStage[] = ["full", "text", "primary"];
-	const fitted = stages.map((stage) => usageSegmentText(windows, theme, stage, usageHint)).find((text) => visibleWidth(text) <= inner);
-	const usage = fitted ?? truncateToWidth(usageSegmentText(windows, theme, "primary", usageHint), inner, "…");
-	const headerRow = rows.length;
-	rows.push(pad + usage, theme.fg(HEADER_RULE_ROLE, HEADER_RULE_CHAR.repeat(targetWidth)));
-	return { rows, headerRow, usageSpan: { start: RAIL_HEADER_INSET, end: RAIL_HEADER_INSET + visibleWidth(usage) } };
+	rows.push(theme.fg(HEADER_RULE_ROLE, HEADER_RULE_CHAR.repeat(targetWidth)));
+	return { rows, headerRow, ...(usageSpan ? { usageSpan } : {}), commandsRow, commandsSpan: { start: RAIL_HEADER_INSET, end: commands.end } };
 }
 
 function headerContent(model: ShellHeaderModel, theme: ShellBarTheme, width: number, usageHint?: string, presentation?: Presentation): ShellHeaderResult {
