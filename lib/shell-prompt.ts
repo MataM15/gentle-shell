@@ -64,8 +64,8 @@ export interface PromptFrameOptions {
 	 */
 	workingLabel?: string;
 	/**
-	 * Present only while the right rail (and its `☰ commands` card row) is not
-	 * visible: paints `☰ commands · key` after the petal. `hint` is the resolved
+	 * Present only while the right rail (and its `≡ commands` card row) is not
+	 * visible: paints `≡ commands · key` after the petal. `hint` is the resolved
 	 * shortcut; absent means the shortcut is disabled and no key is shown.
 	 */
 	commandsLabel?: { hint?: string };
@@ -92,7 +92,7 @@ export const DOUBLE_ESC_CANCEL_HINT = "esc again to cancel";
 export const IDLE_ESC_CLEAR_HINT = "esc again to clear";
 const LABEL_ROLE = "muted";
 const HINT_ROLE = "dim";
-const COMMANDS_ICON = "☰";
+const COMMANDS_ICON = "≡";
 const COMMANDS_NAME = "commands";
 const COMMANDS_LABEL_ROLE = "accent";
 const COMMANDS_SEPARATOR = " · ";
@@ -128,7 +128,7 @@ function stateLabel(options: PromptFrameOptions): string | undefined {
 	return STATE_LABEL[options.state];
 }
 
-// ☰ is East Asian Wide (two cells): widths always come from visibleWidth.
+// Widths always come from visibleWidth; ≡ is one cell, like every glyph here.
 // Only the icon and name are clickable (nameWidth); the key hint is not.
 function commandsLabel(options: PromptFrameOptions): { text: string; width: number; nameWidth: number } | undefined {
 	const spec = options.commandsLabel;

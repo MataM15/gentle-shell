@@ -624,7 +624,7 @@ test("the pinned rail header keeps a long model, shows usage, and opens the pane
 		assert.ok(lines.every((line) => visibleWidth(line) <= 50), "every pinned row fits the rail");
 		assert.match(lines.map((line) => line.slice(1).trimEnd()).join(""), /claude-opus-5-5-extended-context-preview-build-with-a-very-long-suffix/, "a long model wraps instead of being dropped");
 		assert.match(lines.join("\n"), /ctx/);
-		const usageY = lines.findIndex((line) => /^ ◔  usage/.test(line));
+		const usageY = lines.findIndex((line) => /^ ◔ usage/.test(line));
 		assert.ok(usageY > 0, "usage stays visible in the pinned header");
 		const click = (x: number, y: number) => pinned.handleMouse?.({ type: "click", button: "left", x, y, screenX: 110 + x, screenY: y, width: 50, height: lines.length, shift: false, alt: false, ctrl: false } as TuiMouseEvent);
 		assert.equal(click(2, 0), undefined, "the brand row is decorative");
@@ -658,8 +658,8 @@ async function railActions(env: NodeJS.ProcessEnv) {
 test("the rail commands row opens the command palette like alt+k and the usage row still opens usage", async () => {
 	const { lines, click, ui, component } = await railActions({});
 	try {
-		const commandsY = lines.findIndex((line) => /^ ☰ commands {3}\[alt\+k\]$/.test(line));
-		const usageY = lines.findIndex((line) => /^ ◔  usage {6}\[alt\+u\]$/.test(line));
+		const commandsY = lines.findIndex((line) => /^ ≡ commands {3}\[alt\+k\]$/.test(line));
+		const usageY = lines.findIndex((line) => /^ ◔ usage {6}\[alt\+u\]$/.test(line));
 		assert.ok(commandsY > 0 && usageY === commandsY + 1, lines.join("\n"));
 		assert.equal(click(2, commandsY - 1), undefined, "the dotted rule is decorative");
 		assert.equal(click(0, commandsY), undefined, "the inset is inert");
@@ -682,16 +682,16 @@ test("the rail commands row opens the command palette like alt+k and the usage r
 test("the rail action rows show remapped keys and no hint when a shortcut is disabled", async () => {
 	const remapped = await railActions({ GENTLE_PI_COMMANDS_KEY: "ctrl+p", GENTLE_PI_SHELL_USAGE_KEY: "ctrl+o" });
 	try {
-		assert.ok(remapped.lines.includes(" ☰ commands   [ctrl+p]"), remapped.lines.join("\n"));
-		assert.ok(remapped.lines.includes(" ◔  usage      [ctrl+o]"));
+		assert.ok(remapped.lines.includes(" ≡ commands   [ctrl+p]"), remapped.lines.join("\n"));
+		assert.ok(remapped.lines.includes(" ◔ usage      [ctrl+o]"));
 	} finally {
 		remapped.component.dispose();
 	}
 	const off = await railActions({ GENTLE_PI_COMMANDS_KEY: "off", GENTLE_PI_SHELL_USAGE_KEY: "off" });
 	try {
-		assert.ok(off.lines.includes(" ☰ commands"), off.lines.join("\n"));
-		assert.ok(off.lines.includes(" ◔  usage"));
-		const y = off.lines.indexOf(" ☰ commands");
+		assert.ok(off.lines.includes(" ≡ commands"), off.lines.join("\n"));
+		assert.ok(off.lines.includes(" ◔ usage"));
+		const y = off.lines.indexOf(" ≡ commands");
 		assert.equal(off.click(2, y)?.handled, true, "a disabled shortcut still has a clickable row");
 		assert.equal(off.click(12, y), undefined, "no key hint means no hit area past the label");
 	} finally {
@@ -6239,7 +6239,7 @@ test("an explicit session binding routes the Usage scope ahead of the pin and th
 	}
 });
 
-// C3: the editor border's `☰ commands` label exists only while the rail is not
+// C3: the editor border's `≡ commands` label exists only while the rail is not
 // visible, and only a clean click on it opens the palette.
 
 async function paletteEditor(env: NodeJS.ProcessEnv = {}, options: { columns?: number; mode?: string; rail?: boolean } = {}) {
@@ -6266,15 +6266,15 @@ const topBorder = (editor: GentlePromptEditor, width: number) => stripAnsi(edito
 test("editor border shows the commands label only while the rail is hidden, across the 140 column breakpoint", async () => {
 	const { editor, tui } = await paletteEditor({}, { columns: 100 });
 	try {
-		assert.match(topBorder(editor, 100), /^╭─ ✿ ☰ commands · alt\+k ─+╮$/);
+		assert.match(topBorder(editor, 100), /^╭─ ✿ ≡ commands · alt\+k ─+╮$/);
 		assert.equal(visibleWidth(editor.render(100)[0]!), 100);
 		tui.terminal.columns = 139;
-		assert.match(topBorder(editor, 139), /☰ commands · alt\+k/, "139 columns: no rail yet");
+		assert.match(topBorder(editor, 139), /≡ commands · alt\+k/, "139 columns: no rail yet");
 		tui.terminal.columns = 140;
 		assert.doesNotMatch(topBorder(editor, 112), /commands/, "140 columns: the rail card carries it");
 		assert.match(topBorder(editor, 112), /^╭─ ✿ ─+╮$/);
 		tui.terminal.columns = 120;
-		assert.match(topBorder(editor, 120), /☰ commands/, "shrinking back restores the label");
+		assert.match(topBorder(editor, 120), /≡ commands/, "shrinking back restores the label");
 	} finally { editor.dispose(); }
 });
 
@@ -6282,8 +6282,8 @@ test("editor border label honors a remapped key and drops the hint when the shor
 	const remapped = await paletteEditor({ GENTLE_PI_COMMANDS_KEY: "ctrl+p" });
 	const off = await paletteEditor({ GENTLE_PI_COMMANDS_KEY: "off" });
 	try {
-		assert.match(topBorder(remapped.editor, 100), /^╭─ ✿ ☰ commands · ctrl\+p ─+╮$/);
-		assert.match(topBorder(off.editor, 100), /^╭─ ✿ ☰ commands ─+╮$/);
+		assert.match(topBorder(remapped.editor, 100), /^╭─ ✿ ≡ commands · ctrl\+p ─+╮$/);
+		assert.match(topBorder(off.editor, 100), /^╭─ ✿ ≡ commands ─+╮$/);
 		assert.equal(off.mouse("click", 7, 0)?.handled, true, "a disabled shortcut still has the clickable label");
 		assert.equal(await off.opened(), true);
 	} finally { remapped.editor.dispose(); off.editor.dispose(); }
@@ -6294,7 +6294,7 @@ test("editor border omits the label outside fullscreen, where mouse never reache
 	const bare = await paletteEditor({}, { rail: false });
 	try {
 		assert.doesNotMatch(topBorder(regular.editor, 100), /commands/);
-		assert.match(topBorder(bare.editor, 100), /☰ commands/, "fullscreen with no rail owner still shows it");
+		assert.match(topBorder(bare.editor, 100), /≡ commands/, "fullscreen with no rail owner still shows it");
 	} finally { regular.editor.dispose(); bare.editor.dispose(); }
 });
 
@@ -6304,13 +6304,13 @@ test("only a click on the label cells opens the palette; every other event falls
 	try {
 		editor.render(100);
 		reference.editor.render(100);
-		// `☰ commands` spans columns 5..15 on row 0; the ` · alt+k` hint (16..23) is not clickable.
-		for (const x of [0, 2, 3, 4, 16, 18, 20, 23, 24, 25, 60, 99]) assert.deepEqual(mouse("click", x, 0), reference.mouse("click", x, 0), `border cell ${x} stays native`);
+		// `≡ commands` spans columns 5..14 on row 0; the ` · alt+k` hint (15..22) is not clickable.
+		for (const x of [0, 2, 3, 4, 15, 17, 19, 22, 23, 24, 60, 99]) assert.deepEqual(mouse("click", x, 0), reference.mouse("click", x, 0), `border cell ${x} stays native`);
 		for (const type of ["press", "drag", "release", "move", "scroll"]) assert.deepEqual(mouse(type, 8, 0), reference.mouse(type, 8, 0), `${type} on the label is native`);
 		for (const y of [1, 2]) for (const x of [5, 8, 20]) assert.deepEqual(mouse("click", x, y), reference.mouse("click", x, y), `input row ${y} stays native`);
 		assert.equal(await opened(), false, "none of those opened the palette");
 		assert.equal(editor.getText(), "");
-		for (const x of [5, 6, 8, 15]) {
+		for (const x of [5, 6, 8, 14]) {
 			assert.equal(mouse("click", x, 0)?.handled, true, `label cell ${x}`);
 			assert.equal(await opened(), true);
 			ui.overlayView!.handleInput("\x1b");
@@ -6340,7 +6340,7 @@ test("float hint row carries the label and the same click rules", async () => {
 		setCardStyle(CARD_STYLE.FLOAT);
 		editor.render(100);
 		const row = stripAnsi(editor.render(100)[0]!);
-		assert.match(row, /^ ▎ ✿ ☰ commands · alt\+k/, row);
+		assert.match(row, /^ ▎ ✿ ≡ commands · alt\+k/, row);
 		mouse("click", 4, 0);
 		mouse("click", 24, 0);
 		mouse("click", 8, 1);

@@ -379,7 +379,7 @@ interface PromptEditorDeps {
 	 */
 	workingLabel?: () => string | undefined;
 	/**
-	 * Read fresh on every render and click: the `☰ commands` border label while
+	 * Read fresh on every render and click: the `≡ commands` border label while
 	 * the rail card does not carry that action (rail hidden, mouse reachable),
 	 * with the resolved shortcut hint; undefined hides the label and its hit area.
 	 */

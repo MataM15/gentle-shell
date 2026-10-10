@@ -82,7 +82,7 @@ export interface ShellHeaderChrome {
 	rows: string[];
 	headerRow: number;
 	usageSpan?: HeaderUsageSpan;
-	/** Rail only: the `☰ commands` action row and its hit span (the palette opener). */
+	/** Rail only: the `≡ commands` action row and its hit span (the palette opener). */
 	commandsRow?: number;
 	commandsSpan?: HeaderUsageSpan;
 }
@@ -389,22 +389,23 @@ export function shellHeaderCommandsHit(chrome: ShellHeaderChrome, x: number, y: 
 // The rail's cards sit one column in from each rail edge; the pinned header
 // keeps the same inset so its text lines up with the card borders.
 const RAIL_HEADER_INSET = 1;
-// Action rows: `☰ commands  [alt+k]`; the key hints share one column. ☰
-// (U+2630) is East Asian Wide, two cells, so the icon column is two cells
-// wide and ◔ is padded to match, keeping labels and keys aligned.
-const RAIL_COMMANDS_ICON = "☰";
+// Action rows: `≡ commands   [alt+k]`; the key hints share one column. Every
+// glyph is one cell wide (≡ rather than ☰, which Pi measures as two cells but
+// many terminals draw in one), so Pi and the terminal agree on the columns.
+const RAIL_COMMANDS_ICON = "≡";
 const RAIL_USAGE_ICON = "◔";
-const RAIL_ACTION_ICON_CELLS = 2;
-const RAIL_ACTION_KEY_COLUMN = 14;
+const RAIL_ACTION_KEY_COLUMN = 13;
 const RAIL_ACTION_RULE_CHAR = "┄";
+const RAIL_ACTION_LABEL_ROLE = "borderAccent";
 const RAIL_ACTION_HINT_ROLE = "dim";
 
 /**
  * The header pinned above the wide right rail's scrollable cards. Unlike the
  * one-row header it stacks its groups at rail width and wraps long values
  * rather than dropping the model. A dotted rule opens two aligned action
- * rows, `☰ commands` (`commandsRow`) and `◔ usage` (`headerRow`); every other
+ * rows, `≡ commands` (`commandsRow`) and `◔ usage` (`headerRow`); every other
  * row and the rules are decorative. A missing hint means that shortcut is off.
+ * Location and profile are left to the rail's Status card, which shows them.
  */
 export function renderShellRailHeader(model: ShellHeaderModel, theme: ShellBarTheme, width: number, usageHint?: string, presentation?: Presentation, commandsHint?: string): ShellHeaderChrome {
 	const targetWidth = Math.max(0, Math.floor(width));
@@ -414,11 +415,7 @@ export function renderShellRailHeader(model: ShellHeaderModel, theme: ShellBarTh
 	const wrap = (text: string) => wrapTextWithAnsi(text, inner).map((line) => pad + line);
 	const rows = [
 		...(presentation?.density === "minimal" ? [] : wrap(theme.fg(ROLE.BRAND, theme.bold(HEADER_BRAND)))),
-		...wrap(locationSegment(model, theme)),
-		...(presentation?.visibility.modelDetails === false ? [] : [
-			...wrap(executionSegment(model.modelId, model.effort, theme)),
-			...(model.profile ? wrap(theme.fg(ROLE.MODEL, sanitizeStatus(model.profile))) : []),
-		]),
+		...(presentation?.visibility.modelDetails === false ? [] : wrap(executionSegment(model.modelId, model.effort, theme))),
 	];
 	const jobs = model.jobs ? [theme.fg(ROLE.STATUS, shellJobsCount(model.jobs))] : [];
 	const showUsage = presentation?.visibility.usageCost !== false;
@@ -427,11 +424,11 @@ export function renderShellRailHeader(model: ShellHeaderModel, theme: ShellBarTh
 	// Two aligned action rows under a dotted rule: icon, label, then a key
 	// column. The commands row opens the palette; the usage row the usage panel.
 	const action = (icon: string, label: string, hint: string | undefined) => {
-		const labelText = truncateToWidth(`${icon}${" ".repeat(Math.max(0, RAIL_ACTION_ICON_CELLS - visibleWidth(icon)))} ${label}`, inner, "");
+		const labelText = truncateToWidth(`${icon} ${label}`, inner, "");
 		const keyText = hint ? truncateToWidth(`[${hint}]`, Math.max(0, inner - RAIL_ACTION_KEY_COLUMN), "…") : "";
 		const gap = " ".repeat(Math.max(1, RAIL_ACTION_KEY_COLUMN - visibleWidth(labelText)));
 		const showKey = keyText !== "" && visibleWidth(labelText) + gap.length + visibleWidth(keyText) <= inner;
-		const text = theme.fg(ROLE.BRAND, labelText) + (showKey ? gap + theme.fg(RAIL_ACTION_HINT_ROLE, keyText) : "");
+		const text = theme.fg(RAIL_ACTION_LABEL_ROLE, labelText) + (showKey ? gap + theme.fg(RAIL_ACTION_HINT_ROLE, keyText) : "");
 		return { text: pad + text, end: RAIL_HEADER_INSET + visibleWidth(labelText) + (showKey ? gap.length + visibleWidth(keyText) : 0) };
 	};
 	rows.push(pad + theme.fg(RAIL_ACTION_HINT_ROLE, RAIL_ACTION_RULE_CHAR.repeat(inner)));

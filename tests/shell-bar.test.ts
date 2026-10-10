@@ -137,40 +137,50 @@ test("header shows only the running job count when requested and preserves it at
 	assert.doesNotMatch(renderShellHeaderBar(buildShellHeaderModel(model({ jobs: [] }), true), plainTheme, 160).text, /jobs?/);
 });
 
+test("rail header drops location and profile (the Status card carries them) and keeps model, ctx/cost and actions", () => {
+	const chrome = renderShellRailHeader(buildShellHeaderModel(model({ profile: "openai" }), true), plainTheme, 50, "alt+u", undefined, "alt+k");
+	const text = chrome.rows.map(stripAnsi).join("\n");
+	assert.doesNotMatch(text, /gentle-pi|\bmain\b|openai/, text);
+	assert.match(text, /gentle shell/i);
+	assert.match(text, /gpt-5\.5 · medium/);
+	assert.match(text, /ctx/);
+	assert.match(text, /≡ commands/);
+});
+
 test("rail header action rows: dotted rule, aligned icon/label/key columns, resolved keys", () => {
 	const data = buildShellHeaderModel(model({}), true);
 	const rows = (usageHint?: string, commandsHint?: string, presentation?: never) => renderShellRailHeader(data, plainTheme, 50, usageHint, presentation, commandsHint);
 	const chrome = rows("alt+u", "alt+k");
 	const plain = chrome.rows.map(stripAnsi);
 	assert.equal(plain[chrome.commandsRow! - 1], " " + "┄".repeat(48));
-	assert.equal(plain[chrome.commandsRow!], " ☰ commands   [alt+k]");
-	assert.equal(plain[chrome.headerRow], " ◔  usage      [alt+u]");
+	assert.equal(plain[chrome.commandsRow!], " ≡ commands   [alt+k]");
+	assert.equal(plain[chrome.headerRow], " ◔ usage      [alt+u]");
 	const keyCell = (row: string) => visibleWidth(row.slice(0, row.indexOf("[")));
 	assert.equal(keyCell(plain[chrome.commandsRow!]!), keyCell(plain[chrome.headerRow]!), "the key column aligns in terminal cells");
 	const labelCell = (row: string, label: string) => visibleWidth(row.slice(0, row.indexOf(label)));
 	assert.equal(labelCell(plain[chrome.commandsRow!]!, "commands"), labelCell(plain[chrome.headerRow]!, "usage"), "the label column aligns in terminal cells");
-	assert.deepEqual(["☰", "◔", "┄"].map((glyph) => visibleWidth(glyph)), [2, 1, 1], "☰ is East Asian Wide; the icon column pads ◔ to match");
+	assert.deepEqual(["≡", "◔", "┄"].map((glyph) => visibleWidth(glyph)), [1, 1, 1], "every action glyph is one cell, so terminals and Pi agree on columns");
 	const remapped = rows("ctrl+shift+u", "ctrl+p").rows.map(stripAnsi);
-	assert.match(remapped.join("\n"), /☰ commands {3}\[ctrl\+p\]/);
-	assert.match(remapped.join("\n"), /◔  usage {6}\[ctrl\+shift\+u\]/);
+	assert.match(remapped.join("\n"), /≡ commands {3}\[ctrl\+p\]/);
+	assert.match(remapped.join("\n"), /◔ usage {6}\[ctrl\+shift\+u\]/);
 	const noKeys = rows(undefined, undefined);
-	assert.equal(stripAnsi(noKeys.rows[noKeys.commandsRow!]!), " ☰ commands");
-	assert.equal(stripAnsi(noKeys.rows[noKeys.headerRow]!), " ◔  usage");
-	assert.deepEqual(noKeys.commandsSpan, { start: 1, end: 1 + visibleWidth("☰ commands") });
+	assert.equal(stripAnsi(noKeys.rows[noKeys.commandsRow!]!), " ≡ commands");
+	assert.equal(stripAnsi(noKeys.rows[noKeys.headerRow]!), " ◔ usage");
+	assert.deepEqual(noKeys.commandsSpan, { start: 1, end: 1 + visibleWidth("≡ commands") });
 	const noUsage = rows("alt+u", "alt+k", { density: "comfortable", visibility: { usageCost: false, modelDetails: true } } as never);
 	assert.equal(noUsage.headerRow, -1);
 	assert.equal(noUsage.usageSpan, undefined);
-	assert.match(stripAnsi(noUsage.rows[noUsage.commandsRow!]!), /^ ☰ commands {3}\[alt\+k\]$/);
+	assert.match(stripAnsi(noUsage.rows[noUsage.commandsRow!]!), /^ ≡ commands {3}\[alt\+k\]$/);
 	assert.doesNotMatch(noUsage.rows.map(stripAnsi).join("\n"), /usage|ctx/);
 	assert.ok(noUsage.rows.every((row) => visibleWidth(row) <= 50));
 });
 
-test("rail header action rows use accent labels and dim hints/rule", () => {
+test("rail header action rows use rose (borderAccent) labels and dim hints/rule", () => {
 	const roles: string[] = [];
 	const spy: ShellBarTheme = { fg: (color, text) => { roles.push(`${color}:${text}`); return text; }, bold: (text) => text };
 	renderShellRailHeader(buildShellHeaderModel(model({}), true), spy, 50, "alt+u", undefined, "alt+k");
-	assert.ok(roles.includes("accent:☰ commands"));
-	assert.ok(roles.includes("accent:◔  usage"));
+	assert.ok(roles.includes("borderAccent:≡ commands"));
+	assert.ok(roles.includes("borderAccent:◔ usage"));
 	assert.ok(roles.includes("dim:[alt+k]"));
 	assert.ok(roles.includes("dim:[alt+u]"));
 	assert.ok(roles.includes(`dim:${"┄".repeat(48)}`));

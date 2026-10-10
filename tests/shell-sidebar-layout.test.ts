@@ -149,9 +149,10 @@ test("rail header stacks long values at fifty columns with only the usage row in
 	const chrome = renderShellRailHeader(model, theme, 50, "alt+u", undefined, "alt+k");
 	const text = chrome.rows.map((row) => row.slice(1).trimEnd()).join("");
 	assert.ok(chrome.rows.every((row) => visibleWidth(row) <= 50));
-	for (const value of ["Gentle Shell", "claude-opus-5-5-extended-context-preview", "medium", "team", "42%", "$1.50 sub"]) assert.ok(text.includes(value), value);
-	assert.match(chrome.rows[chrome.headerRow]!, /^ ◔  usage {6}\[alt\+u\]$/, "a standing usage affordance even without data");
-	assert.match(chrome.rows[chrome.commandsRow!]!, /^ ☰ commands {3}\[alt\+k\]$/);
+	for (const value of ["Gentle Shell", "claude-opus-5-5-extended-context-preview", "medium", "42%", "$1.50 sub"]) assert.ok(text.includes(value), value);
+	for (const value of ["team", "rail-pinned-header", "feat/"]) assert.ok(!text.includes(value), `${value} is left to the Status card`);
+	assert.match(chrome.rows[chrome.headerRow]!, /^ ◔ usage {6}\[alt\+u\]$/, "a standing usage affordance even without data");
+	assert.match(chrome.rows[chrome.commandsRow!]!, /^ ≡ commands {3}\[alt\+k\]$/);
 	assert.equal(chrome.commandsRow, chrome.headerRow - 1, "the two action rows are adjacent");
 	assert.equal(chrome.rows[chrome.commandsRow! - 1], " " + "┄".repeat(48), "a dotted rule opens the action rows");
 	assert.equal(chrome.rows.at(-1), "─".repeat(50));
@@ -169,7 +170,7 @@ test("rail header stacks long values at fifty columns with only the usage row in
 	assert.equal(hidden.usageSpan, undefined);
 	assert.equal(hidden.headerRow, -1);
 	assert.doesNotMatch(hidden.rows.join("\n"), /usage|ctx|Gentle Shell|claude/, "presentation preferences still hide their groups");
-	assert.match(hidden.rows.join("\n"), /☰ commands/, "usageCost=false keeps the commands row");
+	assert.match(hidden.rows.join("\n"), /≡ commands/, "usageCost=false keeps the commands row");
 	assert.equal(shellHeaderCommandsHit(hidden, 2, hidden.commandsRow!), true);
 });
 
