@@ -10,7 +10,7 @@ import { CURSOR_MARKER, matchesKey, visibleWidth, type TUI, type TuiMouseEvent }
 import installGentleShell, { buildShellBarModel, createActiveProfileReader, changesShortcut, devBinaryCard, extractQueuedText, fetchCodexUsage, fetchNanUsage, loadFileDiff, shellGitRunner, openInExternalEditor, usageShortcut, GentlePromptEditor } from "../extensions/gentle-shell.ts";
 import { CODEX_USAGE_URL, NAN_QUOTA_URL, USAGE_SOURCE_EVENT, USAGE_SOURCE_SCHEMA } from "../lib/shell-usage.ts";
 import { bindSessionProfile, clearSessionProfileBinding, resetSessionProfileBindingsForTesting } from "../lib/session-profile-binding.ts";
-import { createVimEditorAdapter } from "../lib/vim-editor-adapter.ts";
+import { createVimEditorAdapter, isAuditedPiEditorVersion } from "../lib/vim-editor-adapter.ts";
 import { buildCommandPaletteGroups } from "../lib/command-palette-catalog.ts";
 import { CHANGE_STATUS } from "../lib/shell-changes.ts";
 import { sidebarPart, sidebarState, type SidebarHeaderRail, type SidebarRail } from "../lib/shell-sidebar.ts";
@@ -167,7 +167,7 @@ async function fire(handlers: Map<string, Array<(event: unknown, ctx: ExtensionC
 	for (const handler of handlers.get(event) ?? []) await handler({}, ctx);
 }
 
-function fakeContext(options: { hasUI?: boolean; entries?: unknown[]; oauth?: boolean; pending?: boolean; idle?: boolean; editorFactory?: unknown; token?: string; select?: (title: string, options: string[]) => Promise<string | undefined> } = {}): { ctx: ExtensionContext; ui: FakeUi; overlayReady: Promise<void> } {
+function fakeContext(options: { theme?: typeof plainTheme & { getBgAnsi?(): string }; hasUI?: boolean; entries?: unknown[]; oauth?: boolean; pending?: boolean; idle?: boolean; editorFactory?: unknown; token?: string; select?: (title: string, options: string[]) => Promise<string | undefined> } = {}): { ctx: ExtensionContext; ui: FakeUi; overlayReady: Promise<void> } {
 	const ui: FakeUi = { footerFactory: undefined, editorFactory: options.editorFactory, widgets: new Map(), widgetSets: 0, workingVisible: undefined, notices: [], overlay: undefined, overlayView: undefined, closeOverlay: undefined };
 	let resolveOverlay: () => void;
 	const overlayReady = new Promise<void>((resolve) => { resolveOverlay = resolve; });
@@ -188,7 +188,7 @@ function fakeContext(options: { hasUI?: boolean; entries?: unknown[]; oauth?: bo
 		modelRegistry: { isUsingOAuth: () => options.oauth ?? true, getApiKeyForProvider: async () => options.token },
 		getContextUsage: () => ({ tokens: 122_400, contextWindow: 272_000, percent: 45 }),
 		ui: {
-			theme: plainTheme,
+			theme: options.theme ?? plainTheme,
 			getAllThemes: () => [{ name: "dark", path: undefined }, { name: "light", path: undefined }],
 			getTheme: (name: string) => name === "dark" || name === "light" ? { name } : undefined,
 			setTheme: (name: string) => ({ success: name === "dark" || name === "light" }),
@@ -282,6 +282,63 @@ test("buildShellBarModel shortens the home directory and hides effort for non-re
 	assert.equal(built.cwd, "~/work/gentle-pi");
 	assert.equal(built.effort, undefined);
 	assert.equal(built.branch, null);
+});
+
+test("buildShellBarModel reports auto effort for NaN models that manage their own depth", () => {
+	const { pi } = fakePi();
+	const { ctx } = fakeContext();
+	const model = ctx.model as unknown as { id: string; provider: string };
+	model.provider = "nan";
+	model.id = "deepseek-v4-flash";
+	const footerData = {
+		getGitBranch: () => null,
+		getExtensionStatuses: () => new Map(),
+		getAvailableProviderCount: () => 1,
+		onBranchChange: () => () => {},
+	};
+	assert.equal(buildShellBarModel(pi, ctx, footerData, { home: "/home/alan" }).effort, "auto");
+	// A NaN model that honors the level keeps reporting the selected one.
+	model.id = "glm5.3";
+	assert.equal(buildShellBarModel(pi, ctx, footerData, { home: "/home/alan" }).effort, "medium");
+});
+
+test("a self-managing NaN model announces its automatic depth once per session", async () => {
+	const { pi, handlers } = fakePi();
+	gentleShell(pi, {});
+	const { ctx, ui } = fakeContext();
+	const adaptive = { id: "qwen3.8-flash", provider: "nan", name: "Qwen 3.8 Flash", reasoning: true };
+	const budget = { id: "glm5.3", provider: "nan", name: "GLM 5.3", reasoning: true };
+	(ctx as unknown as { model: unknown }).model = adaptive;
+	const emit = async (event: string, payload: unknown) => {
+		for (const handler of handlers.get(event) ?? []) await handler(payload, ctx);
+	};
+	await emit("thinking_level_select", { type: "thinking_level_select", level: "high", previousLevel: "medium" });
+	assert.deepEqual(ui.notices.filter((notice) => notice.includes("automatically")), [
+		"Qwen 3.8 Flash chooses its reasoning depth automatically; the selected thinking level is accepted but does not change it.",
+	]);
+	// Re-selecting the same model or level never repeats the notice.
+	await emit("model_select", { type: "model_select", model: adaptive, previousModel: budget, source: "set" });
+	assert.equal(ui.notices.filter((notice) => notice.includes("automatically")).length, 1);
+	// A model that applies the level never announces.
+	(ctx as unknown as { model: unknown }).model = budget;
+	await emit("model_select", { type: "model_select", model: budget, previousModel: adaptive, source: "set" });
+	assert.equal(ui.notices.filter((notice) => notice.includes("automatically")).length, 1);
+});
+
+test("a session that starts on a self-managing NaN model announces it once", async () => {
+	const { pi, handlers } = fakePi();
+	gentleShell(pi, {});
+	const { ctx, ui } = fakeContext();
+	const adaptive = { id: "mimo-v2.6-flash", provider: "nan", name: "MiMo V2.6 Flash", reasoning: true };
+	(ctx as unknown as { model: unknown }).model = adaptive;
+	for (const handler of handlers.get("session_start") ?? []) await handler({}, ctx);
+	assert.deepEqual(ui.notices.filter((notice) => notice.includes("automatically")), [
+		"MiMo V2.6 Flash chooses its reasoning depth automatically; the selected thinking level is accepted but does not change it.",
+	]);
+	// A session that starts on a model which honors the level stays silent.
+	(ctx as unknown as { model: unknown }).model = { id: "gemma4", provider: "nan", name: "Gemma 4", reasoning: true };
+	for (const handler of handlers.get("session_start") ?? []) await handler({}, ctx);
+	assert.equal(ui.notices.filter((notice) => notice.includes("automatically")).length, 1);
 });
 
 test("gentleShell installs the footer on session_start when a UI exists", () => {
@@ -1992,8 +2049,7 @@ test("GentlePromptEditor autocomplete respects narrow frame widths", () => {
 test("registered prompt stays transparent while idle, working, and queued", () => {
 	const { pi, handlers, tools } = fakePi();
 	gentleShell(pi, {});
-	const { ctx, ui } = fakeContext();
-	ctx.ui.theme = { ...plainTheme, getBgAnsi: () => "\x1b[44m" } as typeof ctx.ui.theme;
+	const { ctx, ui } = fakeContext({ theme: { ...plainTheme, getBgAnsi: () => "\x1b[44m" } });
 	const editor = installedPrompt(ctx, ui, handlers);
 	try {
 		for (const state of ["idle", "working", "queued"]) {
@@ -2054,8 +2110,8 @@ test("visual customization and Vim register once and remain independently discov
 	assert.equal(JSON.parse(readFileSync(join(home, "vim.json"), "utf8")).policy, "on");
 });
 
-test("actual Pi 1.0.0 enables a live prompt and enters NORMAL without a compatibility fallback", async () => {
- assert.equal(INSTALLED_PI, "1.0.0", "the shell audit must run against actual installed Pi 1.0.0");
+test(`actual Pi ${INSTALLED_PI} enables a live prompt and enters NORMAL without a compatibility fallback`, async () => {
+ assert.ok(isAuditedPiEditorVersion(INSTALLED_PI), `actual installed Pi ${INSTALLED_PI} must be audited`);
  const configHome = mkdtempSync(join(tmpdir(), "gentle-vim-shell-"));
  const { pi, handlers, commands } = fakePi();
  gentleShell(pi, { GENTLE_PI_CONFIG_HOME: configHome });
@@ -4703,6 +4759,7 @@ test("same-session explicit registration after bootstrap does not claim Changes"
 	await register.execute("after", { path: "/repo" }, undefined, undefined, ctx);
 	await register.execute("dedup", { path: "/repo" }, undefined, undefined, ctx);
 	await assert.rejects(register.execute("foreign", { path: "/foreign" }, undefined, undefined, ctx), /same Git clone/);
+	await assert.rejects(register.execute("foreign", { path: "/foreign" }, undefined, undefined, ctx), /subagent_run with repository_root/);
 	assert.equal(ctx.sessionManager, manager);
 	assert.equal(ctx.sessionManager.getEntries().length, 1);
 	await commands.get("gentle:changes")!.handler("", ctx);
@@ -4842,7 +4899,7 @@ test("loadFileDiff asks git for a HEAD diff, or a no-index diff for untracked fi
 
 test("shell Git runner hides initial and repeated background polling children", async () => {
 	const calls: Array<{ command: string; args: readonly string[]; options: Record<string, unknown> }> = [];
-	const run = ((command: string, args: readonly string[], options: Record<string, unknown>, callback: (error: Error | null, stdout: string) => void) => {
+	const run = ((command: string, args: readonly string[], options: Record<string, unknown>, callback: (error: Error | null, stdout: string, stderr: string) => void) => {
 		calls.push({ command, args, options });
 		callback(null, "", "");
 	}) as typeof import("node:child_process").execFile;

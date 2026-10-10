@@ -364,6 +364,25 @@ test("planModel discloses the PATH change and runtime persistence before consent
 		[[false, true], [false, true]]);
 });
 
+// S6 notice: shown on the review screen before consent; it changes nothing else.
+test("the review screen shows the notice about reused tools in folders another account can change", async () => {
+	const weak = { check: "parent-acl-mask", at: "C:\\Users\\m\\AppData\\Roaming", sid: "S-1-5-21-1-2-3-1002", account: "PC\\other", rights: "0x001301BF" };
+	const windows = { platform: "win32", node: { ...cleanInventory.node, persistent: true, npm: true }, pnpm: { ...cleanInventory.pnpm, persistent: true },
+		go: { available: true, version: "1.26.0", usable: true } };
+	const view = await serverPlanView({ ...windows, folders: { node: weak, npm: weak } });
+	const model = wizard.planModel(view);
+	assert.equal(model.kind, "install");
+	assert.equal(model.notice, view.sharedFolders.description);
+	assert.deepEqual(model.disclosures.map((item: { id: string }) => item.id), ["profile", "persistence"]);
+	const node = wizard.renderPlan(new FakeDocument(), model, { install() {}, reload() {}, close() {} });
+	assert.match(node.textContent, /Tools in folders other accounts can change/);
+	assert.ok(node.textContent.includes("S-1-5-21-1-2-3-1002 (PC\\other) can change C:\\Users\\m\\AppData\\Roaming"));
+	assert.ok(button(node, "Install Gentle Shell"), "still installable");
+	const plain = wizard.planModel(await serverPlanView(windows));
+	assert.equal(plain.notice, null);
+	assert.doesNotMatch(wizard.renderPlan(new FakeDocument(), plain, { install() {}, reload() {}, close() {} }).textContent, /other accounts can change/);
+});
+
 test("a recoverable stack is reviewed as completing setup, not as a reinstall", async () => {
 	const view = await serverPlanView({ pi: { available: true, version: "1.0.0", usable: true },
 		shell: { available: true, version: requirements.shell, usable: true, global: true },
@@ -406,6 +425,10 @@ test("expectedSteps mirrors the runner sequence and every step has a label", () 
 	assert.deepEqual(wizard.expectedSteps(["setup-global-bin", "persist-node", "persist-package-managers", "configure-npm-prefix", "install-pi",
 		"install-shell", "setup-shell", "verify-readiness"]), ["check-global-bin", "check-existing-stack", "persist-node", "persist-package-managers",
 		"verify-persistent-runtime", "check-npm", "configure-npm-prefix", ...base, "persist-path"]);
+	// Next to a persistent pnpm (never downgraded), a bootstrap-only Node persists only npm with it.
+	assert.deepEqual(wizard.expectedSteps(["persist-node", "persist-npm", "configure-npm-prefix", "install-pi", "install-shell", "setup-shell",
+		"verify-readiness"]), ["check-global-bin", "check-existing-stack", "persist-node", "persist-npm", "verify-persistent-runtime", "check-npm",
+		"configure-npm-prefix", ...base]);
 	assert.deepEqual(wizard.expectedSteps(["persist-npm", "install-pi", "install-shell"]),
 		["check-global-bin", "check-existing-stack", "persist-npm", "check-npm", ...base]);
 	assert.deepEqual(wizard.expectedSteps(["persist-pnpm", "install-pi", "install-shell"]),
@@ -443,6 +466,24 @@ test("expectedSteps places the main steps after the release verification and bef
 	for (const id of mainIds) assert.notEqual(wizard.stepLabel(id), id, `label for ${id}`);
 });
 
+test("expectedSteps runs the pinned Go acquisition after the pre-install checks and before anything is installed", () => {
+	const go = ["acquire-go", "verify-go"];
+	assert.deepEqual(wizard.expectedSteps([...go, "install-pi", "install-shell", "setup-shell", "verify-readiness", ...mainIds]),
+		["check-npm", "check-global-bin", "check-existing-stack", ...go, "install-global", "verify-global-list", "verify-shell-bin",
+			"verify-gentle-ai", ...mainIds, "shell-setup"]);
+	// Like the runner, the pinned Go comes before the runtime is persisted.
+	assert.deepEqual(wizard.expectedSteps(["setup-global-bin", ...go, "persist-node", "persist-package-managers", "configure-npm-prefix",
+		"install-pi", "install-shell", "setup-shell", "verify-readiness", ...mainIds]),
+		["check-global-bin", "check-existing-stack", ...go, "persist-node", "persist-package-managers", "verify-persistent-runtime", "check-npm",
+			"configure-npm-prefix", "install-global", "verify-global-list", "verify-shell-bin", "verify-gentle-ai", ...mainIds, "shell-setup", "persist-path"]);
+	assert.deepEqual(wizard.expectedSteps([...go, "persist-pnpm", "install-pi", "install-shell", "setup-shell", "verify-readiness"]),
+		["check-npm", "check-global-bin", "check-existing-stack", ...go, "persist-pnpm", "verify-persistent-pnpm", "install-global",
+			"verify-global-list", "verify-shell-bin", "verify-gentle-ai", "shell-setup"]);
+	assert.deepEqual(wizard.expectedSteps([...go, "update-shell-main", "setup-shell", "verify-readiness"]),
+		["check-npm", "check-global-bin", "check-installed-shell", ...go, "update-shell", "verify-updated-shell", "shell-setup"]);
+	for (const id of go) assert.notEqual(wizard.stepLabel(id), id, `label for ${id}`);
+});
+
 test("the review screen offers the release and main channels and reloads the plan for the chosen one", async () => {
 	const release = await serverPlanView(goReady);
 	const main = await serverPlanView(goReady, "main");
@@ -478,8 +519,72 @@ test("an already set-up computer points to gentle-shell upgrade, and to its main
 	assert.ok(guidance.blocked["unsupported-plan"].includes("Use `gentle-shell upgrade` or follow the README."));
 });
 
-test("a main plan blocked by a missing Go still lets the user switch back to release", async () => {
-	const blocked = await serverPlanView({}, "main");
+test("expectedSteps mirrors the shell-only installation and the update of an existing Gentle Shell", () => {
+	assert.deepEqual(wizard.expectedSteps(["install-shell", "setup-shell", "verify-readiness"]),
+		["check-npm", "check-global-bin", "check-existing-shell", "install-global", "verify-global-list", "verify-shell-bin", "verify-gentle-ai", "shell-setup"]);
+	assert.deepEqual(wizard.expectedSteps(["install-pi", "update-shell-release", "setup-shell", "verify-readiness"]),
+		["check-npm", "check-global-bin", "check-installed-shell", "install-pi", "update-shell", "verify-updated-shell", "verify-gentle-ai", "shell-setup"]);
+	assert.deepEqual(wizard.expectedSteps(["update-shell-main", "setup-shell", "verify-readiness"]),
+		["check-npm", "check-global-bin", "check-installed-shell", "update-shell", "verify-updated-shell", "shell-setup"]);
+});
+
+test("expectedSteps checks, updates and verifies an older Pi before any Gentle Shell step", () => {
+	assert.deepEqual(wizard.expectedSteps(["update-pi", "install-shell", "setup-shell", "verify-readiness"]),
+		["check-npm", "check-global-bin", "check-existing-shell", "check-installed-pi", "update-pi", "verify-updated-pi", "install-global",
+			"verify-global-list", "verify-shell-bin", "verify-gentle-ai", "shell-setup"]);
+	assert.deepEqual(wizard.expectedSteps(["update-pi", "update-shell-release", "setup-shell", "verify-readiness"]),
+		["check-npm", "check-global-bin", "check-installed-shell", "check-installed-pi", "update-pi", "verify-updated-pi", "update-shell",
+			"verify-updated-shell", "verify-gentle-ai", "shell-setup"]);
+	assert.deepEqual(wizard.expectedSteps(["update-pi", "verify-readiness"]),
+		["check-npm", "check-global-bin", "check-installed-pi", "update-pi", "verify-updated-pi"]);
+	// The installer's Pi added on its own, next to an older one that neither pnpm nor npm owns.
+	assert.deepEqual(wizard.expectedSteps(["install-pi", "verify-readiness"]),
+		["check-npm", "check-global-bin", "check-existing-pi", "install-pi", "verify-installed-pi"]);
+	for (const id of ["check-installed-pi", "update-pi", "verify-updated-pi", "check-existing-pi", "verify-installed-pi"]) {
+		assert.notEqual(wizard.stepLabel(id), id);
+	}
+});
+
+test("a plan that only updates an older Pi is reviewed as a Pi update, with an Update Pi button", () => {
+	const document = new FakeDocument();
+	const model = wizard.planModel({ planId: "p", ready: false, channel: "release", blockers: [],
+		actions: [{ id: "update-pi", description: "Update Pi 0.87.1 to 1.0.0 with npm." }, { id: "verify-readiness", description: "Verify." }] });
+	assert.equal(model.kind, "update-pi");
+	const view = wizard.renderPlan(document, model, { install: () => {}, reload: () => {}, close: () => {} });
+	assert.ok(headings(view)[0].textContent.includes("Update Pi"));
+	assert.ok(button(view, "Update Pi"));
+	assert.equal(button(view, "Install Gentle Shell"), undefined);
+	const alongside = wizard.planModel({ planId: "p", blockers: [], actions: [{ id: "install-pi", description: "Install Pi." },
+		{ id: "verify-readiness", description: "Verify." }] });
+	assert.equal(alongside.kind, "install-pi");
+	const installView = wizard.renderPlan(document, alongside, { install: () => {}, reload: () => {}, close: () => {} });
+	assert.ok(headings(installView)[0].textContent.includes("Install Pi"));
+	assert.ok(button(installView, "Install Pi"));
+	// The same plan serves a missing Pi and an older one neither pnpm nor npm owns.
+	assert.ok(installView.textContent.includes("Pi is missing or older than it needs"));
+	assert.equal(installView.textContent.includes("needs a newer Pi"), false);
+	// Combined with a Gentle Shell installation or update, the plan keeps its usual kind.
+	const install = wizard.planModel({ planId: "p", blockers: [], actions: [{ id: "update-pi" }, { id: "install-shell" }, { id: "setup-shell" },
+		{ id: "verify-readiness" }] });
+	assert.equal(install.kind, "install");
+	const update = wizard.planModel({ planId: "p", blockers: [], actions: [{ id: "update-pi" }, { id: "update-shell-release" },
+		{ id: "setup-shell" }, { id: "verify-readiness" }] });
+	assert.equal(update.kind, "update");
+});
+
+test("an update plan is reviewed as an update, with an Update button", () => {
+	const document = new FakeDocument();
+	const model = wizard.planModel({ planId: "p", ready: false, channel: "release", blockers: [],
+		actions: [{ id: "update-shell-release", description: "Update." }, { id: "setup-shell", description: "Setup." }, { id: "verify-readiness", description: "Verify." }] });
+	assert.equal(model.kind, "update");
+	const view = wizard.renderPlan(document, model, { install: () => {}, reload: () => {}, close: () => {} });
+	assert.ok(headings(view)[0].textContent.includes("Update Gentle Shell"));
+	assert.ok(button(view, "Update Gentle Shell"));
+	assert.equal(button(view, "Install Gentle Shell"), undefined);
+});
+
+test("a main plan blocked by a Go it cannot check still lets the user switch back to release", async () => {
+	const blocked = await serverPlanView({ go: { available: null } }, "main");
 	assert.ok(blocked.blockers.some((blocker: { code: string }) => blocker.code === "main-requires-go"));
 	const ui = mount({ "GET /api/progress": () => idleProgress(), "GET /api/plan": () => [200, blocked] });
 	await ui.app.start();
@@ -563,16 +668,31 @@ test("a failed setup shows its last error as labelled plain text", () => {
 	const persist = wizard.outcomeModel({ outcome: "failed", failedStep: "persist-path", completed: [], guidance: guidance.persistPathShell, detail: pnpmDetail });
 	assert.equal(persist.detail, pnpmDetail);
 	assert.equal(persist.detailCommand, "pnpm setup");
+	// The Go download's folder conflict is labelled with that step.
+	const goDetail = "Conflicting Go destination: ~/.pi/gentle-ai/tools/go/1.25.14";
+	const go = wizard.outcomeModel({ outcome: "failed", failedStep: "acquire-go", completed: [], guidance: guidance.goDestinationConflict, detail: goDetail });
+	assert.equal(go.detail, goDetail);
+	assert.equal(go.detailCommand, "the Go download");
 	const persistNode = wizard.renderOutcome(document, persist, { close() {} });
 	const persistSection = all(persistNode, "section").find((element) => element.textContent.startsWith("Last error from pnpm setup"));
 	assert.ok(persistSection, "pnpm setup detail section");
 	assert.equal(all(persistSection, "code")[0].textContent, pnpmDetail);
 	assert.doesNotMatch(persistNode.textContent, /Last error from gentle-shell setup/);
+	// The install, main-channel and update steps label their detail with what failed.
+	for (const [step, label] of [["install-global", "pnpm add -g"], ["install-shell-main", "the Gentle Shell main install"],
+		["build-gentle-ai-main", "the Gentle AI main build"], ["update-shell", "the Gentle Shell update"]]) {
+		const failed = wizard.outcomeModel({ outcome: "failed", failedStep: step, completed: [], guidance: "g", detail: hostile });
+		assert.deepEqual([failed.detail, failed.detailCommand], [hostile, label], step);
+		const rendered = wizard.renderOutcome(document, failed, { close() {} });
+		const labelled = all(rendered, "section").find((element) => element.textContent.startsWith(`Last error from ${label}`));
+		assert.ok(labelled, `${step} detail section`);
+		assert.equal(all(labelled, "code")[0].textContent, hostile);
+	}
 	// The detail is shown only for a failed setup step with a string value, bounded to 300 characters.
 	const long = wizard.outcomeModel({ outcome: "failed", failedStep: "shell-setup", completed: [], guidance: "g", detail: "y".repeat(400) });
 	assert.equal(long.detail.length, 300);
 	for (const outcome of [
-		{ outcome: "failed", failedStep: "install-global", completed: [], guidance: "g", detail: hostile },
+		{ outcome: "failed", failedStep: "record-channel", completed: [], guidance: "g", detail: hostile },
 		{ outcome: "failed", failedStep: "shell-setup", completed: [], guidance: "g", detail: 42 },
 		{ outcome: "failed", failedStep: "shell-setup", completed: [], guidance: "g", detail: "" },
 		{ outcome: "ready", completed: [], guidance: "g", detail: hostile },
@@ -990,4 +1110,11 @@ test("Copy writes the command through the injected clipboard and reports success
 	await flush();
 	assert.equal(button(none.view, "Copy"), undefined, "no clipboard, no Copy button");
 	assert.ok(none.view.textContent.includes("gentle-shell"), "the command is still shown");
+});
+
+test("the PNPM_HOME blocker and the private PNPM_HOME step have labels", () => {
+	const model = wizard.planModel({ planId: "p", ready: false, actions: [], blockers: [{ code: "untrusted-pnpm-home", tool: "pnpmHome", guidance: "g" }],
+		profileChange: { changesProfile: false, binDir: null, description: "x" }, persistence: { tools: [], pnpmHome: null, description: "y" } });
+	assert.equal(model.blockers[0].toolLabel, "pnpm home folder");
+	assert.equal(wizard.stepLabel("prepare-pnpm-home"), "Create the private pnpm folder");
 });
