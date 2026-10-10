@@ -295,7 +295,9 @@ function headerLeftStages(model: ShellHeaderModel, theme: ShellBarTheme, showMod
 	];
 }
 
-const USAGE_LABEL_ROLE = ROLE.LABEL;
+// The bar's usage segment reads like the rail's usage action row: the same
+// one-cell icon and rose label, then its windows, then the dim key hint.
+const USAGE_LABEL_ROLE = "borderAccent";
 const USAGE_HINT_ROLE = "dim";
 
 function usageWindowText(window: UsageWindow, theme: ShellBarTheme, withGauge: boolean): string {
@@ -314,11 +316,11 @@ function usageWindowText(window: UsageWindow, theme: ShellBarTheme, withGauge: b
 // so all three collapse to the bare "usage" label plus the shortcut hint.
 type UsageStage = "full" | "text" | "primary";
 function usageSegmentText(windows: UsageWindow[], theme: ShellBarTheme, stage: UsageStage, hint: string | undefined): string {
-	const label = theme.fg(USAGE_LABEL_ROLE, "usage");
+	const label = theme.fg(USAGE_LABEL_ROLE, "◔ usage");
 	const shown = stage === "primary" ? windows.slice(0, 1) : windows;
 	const body = shown.map((window) => usageWindowText(window, theme, stage === "full")).join(` ${theme.fg(ROLE.LABEL, "·")} `);
 	const head = body.length > 0 ? `${label} ${body}` : label;
-	return hint ? `${head} ${theme.fg(ROLE.LABEL, "·")} ${theme.fg(USAGE_HINT_ROLE, hint)}` : head;
+	return hint ? `${head} ${theme.fg(USAGE_HINT_ROLE, hint)}` : head;
 }
 
 // The float header is a full-width INFO background bar with a two-column

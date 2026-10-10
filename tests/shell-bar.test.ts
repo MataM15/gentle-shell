@@ -509,7 +509,7 @@ test("renderShellHeaderBar draws the brand, identity, and right-aligned counters
 	const header = buildShellHeaderModel(model({ profile: "team" }));
 	const { text: line } = renderShellHeaderBar(header, plainTheme, 120);
 	const left = "✿ Gentle Shell ⟡ ~/work/gentle-pi main ⟡ gpt-5.5 · medium · team";
-	const right = "ctx ▰▰▰▰▱▱▱▱ 45% ⟡ $9.49 sub ⟡ usage";
+	const right = "ctx ▰▰▰▰▱▱▱▱ 45% ⟡ $9.49 sub ⟡ ◔ usage";
 	assert.equal(line, left + " ".repeat(120 - visibleWidth(left) - visibleWidth(right)) + right);
 	assert.equal(visibleWidth(line), 120);
 });
@@ -533,7 +533,7 @@ test("renderShellHeaderBar drops the profile, then the effort, then the whole lo
 	const { text: wide } = renderShellHeaderBar(withProfile, plainTheme, 120);
 	assert.match(wide, /gpt-5\.5 · medium · team/);
 	assert.match(wide, /~\/work\/gentle-pi main/);
-	assert.match(wide, /ctx ▰▰▰▰▱▱▱▱ 45% ⟡ \$9\.49 sub ⟡ usage$/);
+	assert.match(wide, /ctx ▰▰▰▰▱▱▱▱ 45% ⟡ \$9\.49 sub ⟡ ◔ usage$/);
 
 	// 100 cols: the profile no longer fits, but effort and location still do.
 	const { text: noProfile } = renderShellHeaderBar(withProfile, plainTheme, 100);
@@ -555,7 +555,7 @@ test("renderShellHeaderBar drops the profile, then the effort, then the whole lo
 	assert.doesNotMatch(noLocation, /~\/work\/gentle-pi/);
 	assert.match(noLocation, /gpt-5\.5/);
 	assert.match(noLocation, /✿ Gentle Shell/);
-	assert.match(noLocation, /ctx ▰▰▰▰▱▱▱▱ 45% ⟡ \$9\.49 sub ⟡ usage$/);
+	assert.match(noLocation, /ctx ▰▰▰▰▱▱▱▱ 45% ⟡ \$9\.49 sub ⟡ ◔ usage$/);
 	assert.equal(visibleWidth(noLocation), 82);
 
 	// 60 cols: even the standing usage segment is gone now; brand+model and ctx/cost survive.
@@ -590,17 +590,26 @@ const USAGE_TWO_WINDOWS = {
 test("renderShellHeaderBar shows every usage window with its gauge and the shortcut hint, after cost", () => {
 	const header = buildShellHeaderModel(model({ usage: USAGE_TWO_WINDOWS }));
 	const { text, usageSpan } = renderShellHeaderBar(header, plainTheme, 140, "alt+u");
-	assert.match(text, /\$9\.49 sub ⟡ usage 5h ▰▰▱▱▱▱▱▱ 26% · week ▰▱▱▱▱▱▱▱ 12% · alt\+u$/);
+	assert.match(text, /\$9\.49 sub ⟡ ◔ usage 5h ▰▰▱▱▱▱▱▱ 26% · week ▰▱▱▱▱▱▱▱ 12% alt\+u$/);
 	assert.ok(usageSpan);
-	assert.equal(text.slice(usageSpan.start, usageSpan.end), "usage 5h ▰▰▱▱▱▱▱▱ 26% · week ▰▱▱▱▱▱▱▱ 12% · alt+u");
+	assert.equal(text.slice(usageSpan.start, usageSpan.end), "◔ usage 5h ▰▰▱▱▱▱▱▱ 26% · week ▰▱▱▱▱▱▱▱ 12% alt+u");
 });
 
-test("renderShellHeaderBar shows 'usage · <shortcut>' with no data, and drops the hint when the shortcut is disabled", () => {
+test("renderShellHeaderBar shows '◔ usage <shortcut>' with no data, and drops the hint when the shortcut is disabled", () => {
 	const withHint = renderShellHeaderBar(buildShellHeaderModel(model({ usage: undefined })), plainTheme, 140, "alt+u");
-	assert.match(withHint.text, /usage · alt\+u$/);
+	assert.match(withHint.text, /◔ usage alt\+u$/);
+	assert.doesNotMatch(withHint.text, /usage ·/, "no dot before the key hint, like the rail action rows");
 	const noHint = renderShellHeaderBar(buildShellHeaderModel(model({ usage: undefined })), plainTheme, 140, undefined);
-	assert.match(noHint.text, /usage$/);
+	assert.match(noHint.text, /◔ usage$/);
 	assert.doesNotMatch(noHint.text, /alt\+u/);
+});
+
+test("renderShellHeaderBar paints the usage label rose (borderAccent) and its key dim, like the rail action rows", () => {
+	const roles: string[] = [];
+	const spy: ShellBarTheme = { fg: (color, text) => { roles.push(`${color}:${text}`); return text; }, bold: (text) => text };
+	renderShellHeaderBar(buildShellHeaderModel(model({ usage: undefined })), spy, 140, "alt+u");
+	assert.ok(roles.includes("borderAccent:◔ usage"), roles.join("\n"));
+	assert.ok(roles.includes("dim:alt+u"));
 });
 
 test("renderShellHeaderBar degrades the usage segment (gauges, then secondary windows, then the whole segment) before touching ctx/cost", () => {
@@ -612,13 +621,13 @@ test("renderShellHeaderBar degrades the usage segment (gauges, then secondary wi
 	// (a positive match on the bare "5h 26% · week 12%" run rules out any
 	// gauge glyph sneaking in between them; ctx's own gauge is unrelated).
 	const noGauges = renderShellHeaderBar(header, plainTheme, 100, "alt+u").text;
-	assert.match(noGauges, /usage 5h 26% · week 12% · alt\+u$/);
+	assert.match(noGauges, /◔ usage 5h 26% · week 12% alt\+u$/);
 	assert.match(noGauges, /ctx ▰▰▰▰▱▱▱▱ 45% ⟡ \$9\.49 sub/, "ctx/cost are untouched while usage still degrades");
 	assert.equal(visibleWidth(noGauges), 100);
 
 	// 80 cols: only the first window remains.
 	const primaryOnly = renderShellHeaderBar(header, plainTheme, 80, "alt+u").text;
-	assert.match(primaryOnly, /usage 5h 26% · alt\+u$/);
+	assert.match(primaryOnly, /◔ usage 5h 26% alt\+u$/);
 	assert.doesNotMatch(primaryOnly, /week/);
 	assert.match(primaryOnly, /ctx ▰▰▰▰▱▱▱▱ 45% ⟡ \$9\.49 sub/);
 	assert.equal(visibleWidth(primaryOnly), 80);
@@ -635,7 +644,7 @@ test("renderShellHeaderBar's usage span always points at the usage text, not ctx
 	for (const width of [140, 100, 90]) {
 		const { text, usageSpan } = renderShellHeaderBar(header, plainTheme, width, "alt+u");
 		if (!usageSpan) continue;
-		assert.match(text.slice(usageSpan.start, usageSpan.end), /^usage/);
+		assert.match(text.slice(usageSpan.start, usageSpan.end), /^◔ usage/);
 		assert.equal(usageSpan.end, visibleWidth(text), "the usage segment always ends at the right edge");
 	}
 });
@@ -698,7 +707,7 @@ test("renderShellHeaderBar shifts the float usage span past its two-column inset
 		assert.deepEqual(usageSpan, neonInner.usageSpan && { start: neonInner.usageSpan.start + FLOAT_HEADER_OFFSET, end: neonInner.usageSpan.end + FLOAT_HEADER_OFFSET });
 		if (!usageSpan) continue;
 		const plain = stripAnsi(text);
-		assert.match(plain.slice(usageSpan.start, usageSpan.end), /^usage/);
+		assert.match(plain.slice(usageSpan.start, usageSpan.end), /^◔ usage/);
 		assert.equal(usageSpan.end, visibleWidth(plain) - FLOAT_HEADER_OFFSET, "the usage segment ends before the right inset");
 	}
 });
@@ -753,7 +762,7 @@ test("float header chrome shares padded geometry with usage hit-testing", (t) =>
 			assert.equal(shellHeaderUsageHit(chrome, 0, 1), false, "hidden usage never clicks");
 			continue;
 		}
-		assert.match(stripAnsi(chrome.rows[chrome.headerRow]!).slice(span.start, span.end), /^usage/);
+		assert.match(stripAnsi(chrome.rows[chrome.headerRow]!).slice(span.start, span.end), /^◔ usage/);
 		for (const y of [-1, 0, 2, 3, 4]) assert.equal(shellHeaderUsageHit(chrome, span.start, y), false, `decorative row ${y}`);
 		assert.equal(shellHeaderUsageHit(chrome, span.start - 1, 1), false);
 		assert.equal(shellHeaderUsageHit(chrome, span.start, 1), true);
