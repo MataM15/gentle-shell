@@ -1,4 +1,4 @@
-import { isKeyRelease, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { isKeyRelease, matchesKey, truncateToWidth, visibleWidth, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { stripAnsi } from "./terminal-theme.ts";
 
 // Command palette: a pure, curated, grouped overlay component for
@@ -135,6 +135,16 @@ const DEFAULT_ROWS = 40;
 
 type PaletteRow = { kind: "title"; text: string } | { kind: "blank" } | { kind: "item"; item: CommandPaletteItem; itemIndex: number };
 
+// What a body line does under a clean left click: close (on its `esc` span
+// only) or run its command (anywhere on the row). Lines without one are inert.
+type PaletteHit = { kind: "close"; start: number; end: number } | { kind: "run"; command: string };
+type BodyLine = { text: string; hit?: PaletteHit };
+// Body lines sit one row below the card's top border and two cells in ("│ ").
+const CARD_TOP_ROWS = 1;
+const CARD_LEFT_CELLS = 2;
+const FOOTER_HINT = "type to search • ↑/↓ move • enter/click run • esc close";
+const FOOTER_CLOSE = "esc close";
+
 function buildRows(groups: readonly CommandPaletteGroup[]): PaletteRow[] {
 	const rows: PaletteRow[] = [];
 	let itemIndex = 0;
@@ -170,6 +180,8 @@ export class CommandPalette {
 	private readonly done: (result: CommandPaletteResult) => void;
 	private readonly theme: CommandPaletteTheme | undefined;
 	private readonly rowsFn: () => number;
+	// The geometry of the last render; a click against any other size is stale.
+	private layout: { width: number; height: number; hits: Array<PaletteHit | undefined> } | undefined;
 
 	constructor(groups: readonly CommandPaletteGroup[], done: (result: CommandPaletteResult) => void, theme?: CommandPaletteTheme, rows: () => number = () => DEFAULT_ROWS) {
 		this.groups = groups;
@@ -178,7 +190,37 @@ export class CommandPalette {
 		this.rowsFn = rows;
 	}
 
-	invalidate(): void {}
+	invalidate(): void {
+		this.layout = undefined;
+	}
+
+	/**
+	 * Fullscreen mouse: a clean left click on `esc` (header) or `esc close`
+	 * (footer) closes, on a command row runs it; the wheel moves the
+	 * selection. Presses, drags and clicks against a stale render do nothing.
+	 */
+	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		if (this.completed) return undefined;
+		if (event.type === "wheel") {
+			const delta = Math.sign(event.wheelDelta ?? 0);
+			if (delta === 0) return undefined;
+			this.moveSelection(delta);
+			return { handled: true, render: true };
+		}
+		if (event.type !== "click" || event.button !== "left") return undefined;
+		const layout = this.layout;
+		if (!layout || event.width !== layout.width || event.height !== layout.height) return undefined;
+		const hit = layout.hits[event.y - CARD_TOP_ROWS];
+		const x = event.x - CARD_LEFT_CELLS;
+		if (!hit || x < 0) return undefined;
+		if (hit.kind === "close") {
+			if (x < hit.start || x >= hit.end) return undefined;
+			this.finish({ type: "close" });
+		} else {
+			this.finish({ type: "run", name: hit.command });
+		}
+		return { handled: true, render: true };
+	}
 
 	handleInput(data: string): void {
 		if (this.completed || isKeyRelease(data)) return;
@@ -217,7 +259,10 @@ export class CommandPalette {
 	render(width: number): string[] {
 		const innerWidth = Math.max(1, width - CARD_PADDING);
 		const maxTotalLines = Math.max(MIN_TOTAL_ROWS, Math.floor(this.rowsFn() * HEIGHT_RATIO));
-		return renderPaletteCard(this.renderBody(innerWidth, maxTotalLines), width, this.theme);
+		const body = this.renderBody(innerWidth, maxTotalLines);
+		const lines = renderPaletteCard(body.map((line) => line.text), width, this.theme);
+		this.layout = { width, height: lines.length, hits: body.map((line) => line.hit) };
+		return lines;
 	}
 
 	/**
@@ -254,20 +299,24 @@ export class CommandPalette {
 		this.done(result);
 	}
 
-	private renderBody(width: number, maxTotalLines: number): string[] {
-		const lines: string[] = [];
-		lines.push(this.renderHeaderRow(width));
-		lines.push(this.query.length > 0 ? this.renderLine(`› ${this.query}`, width) : this.renderLine("› Search", width, "muted"));
-		lines.push("");
+	private renderBody(width: number, maxTotalLines: number): BodyLine[] {
+		const lines: BodyLine[] = [];
+		// `esc` is right-aligned on the header row, so it ends at the last column.
+		lines.push({ text: this.renderHeaderRow(width), hit: width > 4 ? { kind: "close", start: width - 3, end: width } : undefined });
+		lines.push({ text: this.query.length > 0 ? this.renderLine(`› ${this.query}`, width) : this.renderLine("› Search", width, "muted") });
+		lines.push({ text: "" });
 		const groups = this.matches();
 		if (groups.length === 0) {
-			lines.push(this.renderLine(`No commands match "${this.query}"`, width, "muted"));
+			lines.push({ text: this.renderLine(`No commands match "${this.query}"`, width, "muted") });
 		} else {
 			const budget = Math.max(1, maxTotalLines - CARD_BORDER_ROWS - CHROME_ROWS);
 			lines.push(...this.renderGroups(groups, width, budget));
 		}
-		lines.push("");
-		lines.push(this.renderLine("type to search • ↑/↓ move • enter run • esc close", width, "muted"));
+		lines.push({ text: "" });
+		// `esc close` is clickable only while the footer is shown untruncated.
+		const closeAt = FOOTER_HINT.indexOf(FOOTER_CLOSE);
+		const footerFits = visibleWidth(FOOTER_HINT) <= width;
+		lines.push({ text: this.renderLine(FOOTER_HINT, width, "muted"), hit: footerFits ? { kind: "close", start: visibleWidth(FOOTER_HINT.slice(0, closeAt)), end: visibleWidth(FOOTER_HINT) } : undefined });
 		return lines;
 	}
 
@@ -277,21 +326,22 @@ export class CommandPalette {
 		return this.justifyToWidth(left, right, width);
 	}
 
-	private renderGroups(groups: CommandPaletteGroup[], width: number, budget: number): string[] {
+	private renderGroups(groups: CommandPaletteGroup[], width: number, budget: number): BodyLine[] {
 		const rows = buildRows(groups);
 		const selected = Math.max(0, Math.min(countItems(groups) - 1, this.selected));
-		if (rows.length <= budget) return rows.map((row) => this.renderRow(row, width, selected));
+		const line = (row: PaletteRow): BodyLine => ({ text: this.renderRow(row, width, selected), hit: row.kind === "item" ? { kind: "run", command: row.item.command } : undefined });
+		if (rows.length <= budget) return rows.map(line);
 		const windowSize = Math.max(1, budget - SCROLL_INDICATOR_ROWS);
 		const selectedRowIndex = Math.max(0, rows.findIndex((row) => row.kind === "item" && row.itemIndex === selected));
 		const start = Math.max(0, Math.min(selectedRowIndex - Math.floor(windowSize / 2), Math.max(0, rows.length - windowSize)));
 		const end = Math.min(rows.length, start + windowSize);
-		const result: string[] = [];
-		if (start > 0) result.push(this.renderLine(`  ↑ ${start} more`, width, "muted"));
+		const result: BodyLine[] = [];
+		if (start > 0) result.push({ text: this.renderLine(`  ↑ ${start} more`, width, "muted") });
 		for (let i = start; i < end; i++) {
 			const row = rows[i];
-			if (row) result.push(this.renderRow(row, width, selected));
+			if (row) result.push(line(row));
 		}
-		if (end < rows.length) result.push(this.renderLine(`  ↓ ${rows.length - end} more`, width, "muted"));
+		if (end < rows.length) result.push({ text: this.renderLine(`  ↓ ${rows.length - end} more`, width, "muted") });
 		return result;
 	}
 

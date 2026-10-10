@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { existsSync, readFileSync } from "node:fs";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { visibleWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { CommandPalette, commandsKey, rankPaletteGroups, type CommandPaletteGroup, type CommandPaletteItem, type CommandPaletteResult, type CommandPaletteTheme } from "../lib/command-palette.ts";
 import { buildCommandPaletteGroups, COMMAND_PALETTE_CATALOG } from "../lib/command-palette-catalog.ts";
 
@@ -294,7 +294,7 @@ test("render escapes control characters in labels and shortcuts", () => {
 
 test("render footer lists the key bindings", () => {
 	const lines = render(GROUPS, "").join("\n");
-	assert.match(lines, /type to search • ↑\/↓ move • enter run • esc close/);
+	assert.match(lines, /type to search • ↑\/↓ move • enter\/click run • esc close/);
 });
 
 test("render keeps the right border aligned when a label has wide characters", () => {
@@ -421,4 +421,66 @@ test("buildCommandPaletteGroups keeps only registered commands, attaches descrip
 test("buildCommandPaletteGroups drops every group when nothing in the catalog is registered", () => {
 	const groups = buildCommandPaletteGroups([{ name: "not-in-catalog", description: "n/a" }], {});
 	assert.deepEqual(groups, []);
+});
+
+// S11 (odd/tasks/palette-button.md): the palette answers the mouse in
+// fullscreen. Card rows are the body lines shifted down one row by the top
+// border; content columns start two cells in ("│ ").
+function mouse(type: TuiMouseEvent["type"], x: number, y: number, width: number, height: number, button: TuiMouseEvent["button"] = "left"): TuiMouseEvent {
+	return { type, button, x, y, screenX: x, screenY: y, width, height, shift: false, alt: false, ctrl: false } as TuiMouseEvent;
+}
+
+test("a click on the header esc or the footer esc close closes the palette, like Esc", () => {
+	for (const target of ["header", "footer"] as const) {
+		const { palette, results } = createPalette(GROUPS);
+		const lines = palette.render(60);
+		const y = target === "header" ? 1 : lines.length - 2;
+		const plain = lines[y]!;
+		const x = target === "header" ? plain.lastIndexOf("esc") : plain.indexOf("esc close") + 4;
+		assert.deepEqual(palette.handleMouse(mouse("click", x, y, 60, lines.length)), { handled: true, render: true }, target);
+		assert.deepEqual(results, [{ type: "close" }], target);
+	}
+});
+
+test("a click on a command row runs that command; titles, blanks, search and border are inert", () => {
+	const { palette, results } = createPalette(GROUPS);
+	const lines = palette.render(60);
+	const rowOf = (label: string) => lines.findIndex((line) => line.includes(label));
+	for (const y of [0, 2, 3, rowOf("Configuration"), rowOf("Session") - 1, rowOf("Session"), lines.length - 1]) {
+		palette.handleMouse(mouse("click", 10, y, 60, lines.length));
+	}
+	palette.handleMouse(mouse("click", 0, rowOf("Agent-model profiles"), 60, lines.length));
+	assert.deepEqual(results, [], "none of those ran or closed anything");
+	assert.deepEqual(palette.handleMouse(mouse("click", 10, rowOf("Agent-model profiles"), 60, lines.length)), { handled: true, render: true });
+	assert.deepEqual(results, [{ type: "run", name: "gentle:profiles" }]);
+});
+
+test("a click runs the row under the pointer even when a query filters the list", () => {
+	const { palette, results } = createPalette(GROUPS);
+	type(palette, "captured");
+	const lines = palette.render(60);
+	palette.handleMouse(mouse("click", 10, lines.findIndex((line) => line.includes("Browse captured changes")), 60, lines.length));
+	assert.deepEqual(results, [{ type: "run", name: "gentle:changes" }]);
+});
+
+test("presses, drags, releases, other buttons and stale geometry never act", () => {
+	const { palette, results } = createPalette(GROUPS);
+	const lines = palette.render(60);
+	const y = lines.findIndex((line) => line.includes("Agent-model profiles"));
+	for (const type of ["press", "drag", "release", "move"] as const) palette.handleMouse(mouse(type, 10, y, 60, lines.length));
+	palette.handleMouse(mouse("click", 10, y, 60, lines.length, "right"));
+	palette.handleMouse(mouse("click", 10, y, 70, lines.length));
+	palette.handleMouse(mouse("click", 10, y, 60, lines.length + 1));
+	assert.deepEqual(results, []);
+});
+
+test("the wheel moves the selection like up and down", () => {
+	const { palette, results } = createPalette(GROUPS);
+	const lines = palette.render(60);
+	const wheel = (delta: number) => palette.handleMouse({ ...mouse("wheel", 10, 5, 60, lines.length, "none"), wheelDelta: delta });
+	assert.deepEqual(wheel(1), { handled: true, render: true });
+	wheel(1);
+	wheel(-1);
+	palette.handleInput(KEY.ENTER);
+	assert.deepEqual(results, [{ type: "run", name: "gentle:profiles" }], "down, down, up lands on the second item");
 });
