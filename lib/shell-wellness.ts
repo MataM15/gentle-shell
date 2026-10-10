@@ -114,12 +114,12 @@ export class WellnessSession {
 				if (last >= 0 && rows[last]!.length + 3 + item.length <= innerWidth) rows[last] += ` · ${item}`;
 				else rows.push(item);
 			}
-			return renderCard({ title, subtitle: time, tone: "info", body: rows }, theme, width, { expanded: true });
+			return renderCard({ title, subtitle: time, tone: "info", body: rows, rail: true }, theme, width, { expanded: true });
 		}
 		const clock = [0, 1, 2].map((row) => [...time].map((digit) => DIGITS[digit][row]).join(" "));
 		const right = [...clock, day];
 		const body = reminders.map((line, row) => line.slice(0, innerWidth - 17).padEnd(innerWidth - 17) + right[row].padStart(17));
-		const output = renderCard({ title, tone: "info", body }, theme, width, { expanded: true });
+		const output = renderCard({ title, tone: "info", body, rail: true }, theme, width, { expanded: true });
 		this.resetHits = [];
 		for (const key of REMINDERS) {
 			if (key === "dinner") continue;

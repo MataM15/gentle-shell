@@ -513,3 +513,22 @@ test("compact is opt-in to panels: a card without panel keeps its box and unrela
 		setCardStyle(previous);
 	}
 });
+
+test("rail cards drop the glyph and paint an info title rose and bold; other cards keep the glyph and accent", () => {
+	const roles: string[] = [];
+	const theme = { fg: (color: string, text: string) => { roles.push(`${color}:${text}`); return text; }, bold: (text: string) => `\x1b[1m${text}\x1b[22m` };
+	const rail = renderCard({ title: "Status", body: ["x"], tone: CARD_TONE.INFO, rail: true }, theme, 30, { expanded: true });
+	assert.match(stripAnsi(rail[0]!), /^╭─ Status ─+╮$/);
+	assert.equal(visibleWidth(rail[0]!), 30);
+	assert.ok(roles.includes("borderAccent:\x1b[1mStatus\x1b[22m"), roles.join("\n"));
+	roles.length = 0;
+	const overlay = renderCard({ title: "Usage", body: ["x"], tone: CARD_TONE.INFO }, theme, 30, { expanded: true });
+	assert.match(overlay[0]!, /^╭─ ✿ Usage ─+╮$/);
+	assert.ok(roles.includes("accent:✿ Usage"));
+	const warning = renderCard({ title: "Todos", body: ["x"], tone: CARD_TONE.WARNING, rail: true }, theme, 30, { expanded: true });
+	assert.match(stripAnsi(warning[0]!), /^╭─ Todos ─+╮$/, "a stale rail card keeps its warning role");
+	assert.ok(roles.includes("warning:\x1b[1mTodos\x1b[22m"));
+	const suffix = renderCard({ title: "Todos", titleSuffix: "▾ Collapse", subtitle: "1 of 3", body: ["x"], tone: CARD_TONE.INFO, rail: true }, theme, 40, { expanded: true });
+	assert.match(stripAnsi(suffix[0]!), /^╭─ Todos ▾ Collapse · 1 of 3 ─+╮$/);
+	assert.equal(visibleWidth(suffix[0]!), 40);
+});

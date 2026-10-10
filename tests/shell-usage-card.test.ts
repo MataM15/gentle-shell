@@ -37,6 +37,7 @@ test("renders every provider in a fixed order within the rail width", () => {
 	const lines = renderUsageCard(usages, plain, 44, NOW);
 	const text = lines.join("\n");
 	assert.ok(text.includes("Limits"));
+	assert.match(lines[0]!, /^╭─ Limits ─+╮$/, "a rail card title: no glyph");
 	assert.ok(text.indexOf("codex") < text.indexOf("antigravity"));
 	assert.ok(text.includes("5h"));
 	assert.ok(text.includes("23%"));

@@ -284,12 +284,14 @@ until curl -sf localhost:3000/health; do sleep 1; done     # server is up
 The `todo` tool and its card replace the third-party todo extension (remove `npm:@juicesharp/rpiv-todo` from your pi packages; sessions written by it replay into the new card).
 
 ```text
-╭─ ❀ Todos · 1 of 3 ──────────────────────────────────────╮
+╭─ Todos ▾ Collapse · 1 of 3 ─────────────────────────────╮
 │ ✓ Add quiet tool rendering                              │
 │ ◐ Fix quiet tools conflict · fixing conflict            │
 │ ○ Show git bash tails                                   │
 ╰─────────────────────────────────────────────────────────╯
 ```
+
+Like the other rail cards (Status, Limits, Wellness), its title carries no glyph: the name is rose and bold, and the `▾ Collapse` control and the count stay dim beside it, so the teal `✿ Gentle Shell` heading is the only flower in the rail.
 
 The runtime helps keep the list current beyond a static tool description:
 

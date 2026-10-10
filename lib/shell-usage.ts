@@ -694,7 +694,7 @@ export function renderUsageCard(usages: readonly ProviderUsage[], theme: UsageTh
 	]);
 	const oldest = Math.min(...sorted.map((usage) => usage.fetchedAt));
 	body.push("", theme.fg(ROLE.RESET, truncateToWidth(`${updatedAgo(oldest, now)} · alt+u`, innerWidth, "…")));
-	return renderCard({ title: "Limits", body, tone: "info" }, theme, width, { expanded: true });
+	return renderCard({ title: "Limits", body, tone: "info", rail: true }, theme, width, { expanded: true });
 }
 
 export class UsageStore {

@@ -337,10 +337,10 @@ export function renderTodoCard(state: TodoState, theme: TodoTheme, width: number
 	const rows = options.collapsed ? [collapsedRow(state, theme, inner)] : options.scrollable ? state.tasks.map((task) => taskRow(task, theme, inner)) : bodyRows(state, theme, inner);
 	const body = stale ? [theme.fg(NOTE_ROLE, `stale · ${options.staleTurns} turns`), ...rows] : rows;
 	// The clickable control paints the shared hover role while hovered --
-	// same treatment every other clickable surface uses -- instead of its
-	// ordinary accent role.
+	// same treatment every other clickable surface uses -- and stays dim
+	// otherwise, secondary to the rose rail title.
 	return renderCard(
-		{ title: `Todos ${paintHoverable(theme, control, options.hovered, "accent")}`, subtitle: `${done} of ${planned}`, body, tone, glyph: TODO_GLYPH },
+		{ title: "Todos", titleSuffix: paintHoverable(theme, control, options.hovered, "dim"), subtitle: `${done} of ${planned}`, body, tone, glyph: TODO_GLYPH, rail: true },
 		theme,
 		width,
 		{ expanded: true, hint, panel: true, compact: options.compact },

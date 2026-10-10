@@ -229,13 +229,13 @@ test("bottom-only and hidden below-input chrome retain a compact jobs count", (t
 
 test("Status title stays plain without an active review", () => {
 	const lines = renderShellSidebarBar(model(), plainTheme, 60);
-	assert.match(lines[0], /^╭─ ✿ Status ─+╮$/);
+	assert.match(lines[0], /^╭─ Status ─+╮$/);
 	assert.doesNotMatch(lines.slice(1).join("\n"), /🌹 RDD/);
 });
 
 test("Status title stays plain above the review lifecycle block", () => {
 	const lines = renderShellSidebarBar(model({ review: { state: "reviewing", scope: "first.ts +2 files" } }), plainTheme, 60);
-	assert.match(lines[0], /^╭─ ✿ Status ─+╮$/);
+	assert.match(lines[0], /^╭─ Status ─+╮$/);
 	assert.match(lines.slice(1).join("\n"), /🌹 RDD[\s\S]*Reviewers running…[\s\S]*first\.ts \+2 files/);
 });
 
@@ -261,7 +261,7 @@ test("Status and review lifecycle block respect terminal width", () => {
 		for (const review of [undefined, { state: "reviewing" as const, scope: "first.ts +2 files" }, { state: "approved" as const, scope: REVIEW_SCOPE_UNAVAILABLE }]) {
 			const lines = renderShellSidebarBar(model({ review }), plainTheme, width);
 			for (const line of lines) assert.ok(visibleWidth(line) <= width, `${width}: ${line}`);
-			if (width >= 20) assert.match(lines[0], /^╭─ ✿ Status ─+╮$/);
+			if (width >= 20) assert.match(lines[0], /^╭─ Status ─+╮$/);
 		}
 	}
 });
@@ -423,7 +423,7 @@ test("shellEnabled honors GENTLE_PI_SHELL=0", () => {
 test("renderShellSidebarBar paints the Status card frame with border and the title with accent", () => {
 	const lines = renderShellSidebarBar(model(), taggedTheme, 46);
 	assert.match(lines[0], /^<border>╭<\/border>/);
-	assert.match(lines[0], /<accent>✿ Status<\/accent>/);
+	assert.match(lines[0], /<borderAccent>Status<\/borderAccent>/);
 	assert.match(lines[lines.length - 1], /^<border>╰<\/border>/);
 });
 
@@ -662,7 +662,7 @@ test("the sidebar Status card in the float style is a float panel two rows talle
 	useCardStyle(t, CARD_STYLE.FLOAT);
 	const float = renderShellSidebarBar(model({ review: { state: "reviewing", scope: "first.ts +2 files" } }), theme, 60);
 	assert.equal(float.length, neon.length + 2);
-	assert.equal(stripAnsi(float[1]!), ` ▎ ✿ Status${" ".repeat(49)}`);
+	assert.equal(stripAnsi(float[1]!), ` ▎ Status${" ".repeat(51)}`);
 	assert.equal(stripAnsi(float[2]!), ` ▎${" ".repeat(57)} `, "a blank separator row follows the header");
 	assertFloatRows(float, 60);
 	assert.deepEqual(float.slice(3, -1).map(bodyText), neon.slice(1, -1).map(bodyText));

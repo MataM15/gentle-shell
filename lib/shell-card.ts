@@ -19,12 +19,22 @@ export interface Card {
 	body: string[];
 	tone: CardTone;
 	glyph?: string;
+	/**
+	 * Rail cards (Status, Limits, Wellness, Todos): no glyph, and an info title
+	 * paints rose (`borderAccent`) and bold, so it reads apart from the teal
+	 * `✿ Gentle Shell` heading above it. Other tones keep their own role.
+	 */
+	rail?: boolean;
+	/** Pre-styled text right after the title, outside its role (the Todos control). */
+	titleSuffix?: string;
 }
 
 export interface CardTheme {
 	fg(color: string, text: string): string;
 	/** Pi themes have it; the float style needs it to paint its panel. */
 	bg?(color: string, text: string): string;
+	/** Pi themes have it; rail card titles are bold when it exists. */
+	bold?(text: string): string;
 }
 
 // Conversation cards come in two styles, chosen in /gentle:customize. Pi loads
@@ -130,12 +140,24 @@ function rule(length: number): string {
 	return chrome.rule.repeat(Math.max(0, length));
 }
 
+const RAIL_TITLE_ROLE = "borderAccent";
+
+// The glyph and title in the title role, then any pre-styled suffix. The
+// width counts the unstyled title, so a theme's own escapes never shift it.
+function titleHead(card: Card, theme: CardTheme): { styled: string; width: number } {
+	const plain = card.rail ? card.title : `${card.glyph ?? CARD_GLYPH} ${card.title}`;
+	const role = card.rail && card.tone === CARD_TONE.INFO ? RAIL_TITLE_ROLE : TITLE_ROLE[card.tone];
+	const title = theme.fg(role, card.rail && theme.bold ? theme.bold(plain) : plain);
+	const suffix = card.titleSuffix ? ` ${card.titleSuffix}` : "";
+	return { styled: title + suffix, width: visibleWidth(plain) + visibleWidth(suffix) };
+}
+
 function titleText(card: Card, theme: CardTheme): { styled: string; width: number } {
-	const head = `${card.glyph ?? CARD_GLYPH} ${card.title}`;
+	const head = titleHead(card, theme);
 	const styled = card.subtitle
-		? `${theme.fg(TITLE_ROLE[card.tone], head)} ${theme.fg(SUBTITLE_ROLE, SEPARATOR)} ${theme.fg(SUBTITLE_ROLE, card.subtitle)}`
-		: theme.fg(TITLE_ROLE[card.tone], head);
-	return { styled, width: visibleWidth(head) + (card.subtitle ? visibleWidth(card.subtitle) + 3 : 0) };
+		? `${head.styled} ${theme.fg(SUBTITLE_ROLE, SEPARATOR)} ${theme.fg(SUBTITLE_ROLE, card.subtitle)}`
+		: head.styled;
+	return { styled, width: head.width + (card.subtitle ? visibleWidth(card.subtitle) + 3 : 0) };
 }
 
 function bodyLines(card: Card, innerWidth: number): string[] {
@@ -430,7 +452,7 @@ function fitRow(text: string, width: number): string {
 function panelHeader(card: Card, theme: CardTheme, width: number, hint?: string): string {
 	const lead = theme.fg(FRAME_ROLE[card.tone], chrome.topLeft) + chrome.topLead;
 	const subtitle = card.subtitle ? `  ${theme.fg(SUBTITLE_ROLE, card.subtitle)}` : "";
-	const left = `${lead}${theme.fg(TITLE_ROLE[card.tone], `${card.glyph ?? CARD_GLYPH} ${card.title}`)}${subtitle}`;
+	const left = `${lead}${titleHead(card, theme).styled}${subtitle}`;
 	const right = hint ? `${theme.fg(SUBTITLE_ROLE, hint)}${chrome.topRight}` : "";
 	const gap = width - visibleWidth(left) - visibleWidth(right);
 	return right && gap >= 1 ? `${left}${" ".repeat(gap)}${right}` : fitRow(left, width);
