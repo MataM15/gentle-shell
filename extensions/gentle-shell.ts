@@ -25,7 +25,7 @@ import { DEFAULT_VISUAL_SETTINGS, DENSITY, HEADER_PLACEMENT, STATUS_PLACEMENT, V
 import { BANNER_COLORS, DEFAULT_BANNER_CONFIG, readBannerConfig, readBannerConfigForEdit, writeBannerConfig } from "./startup-banner.ts";
 import { agentsViewKey } from "../lib/agents-keys.ts";
 import { GentleAiDevBinaryOverrideError, resolveGentleAiDevBinaryOverride } from "../lib/gentle-ai-binary.ts";
-import { DOUBLE_ESC_CANCEL_HINT, floatPromptRow, framePromptLines, resolvePromptLayout, IDLE_ESC_CLEAR_HINT, PROMPT_HINT, PROMPT_STATE, SHELL_PULSE_MS, withPromptHint, type PromptState } from "../lib/shell-prompt.ts";
+import { DOUBLE_ESC_CANCEL_HINT, floatPromptRow, framePromptChrome, resolvePromptLayout, IDLE_ESC_CLEAR_HINT, PROMPT_HINT, PROMPT_STATE, SHELL_PULSE_MS, withPromptHint, type PromptLabelSpan, type PromptState } from "../lib/shell-prompt.ts";
 import { oddPhaseRegistry } from "../lib/odd-phase.ts";
 import { inferOddPhase } from "../lib/odd-phase-inference.ts";
 import { isInteractiveMode } from "../lib/rpc-host.ts";
@@ -378,6 +378,14 @@ interface PromptEditorDeps {
 	 * generic "working…" label. Never applied to IDLE or QUEUED.
 	 */
 	workingLabel?: () => string | undefined;
+	/**
+	 * Read fresh on every render and click: the `☰ commands` border label while
+	 * the rail card does not carry that action (rail hidden, mouse reachable),
+	 * with the resolved shortcut hint; undefined hides the label and its hit area.
+	 */
+	commandsLabel?: () => { hint?: string } | undefined;
+	/** Opens the command palette, exactly like Alt+K. */
+	openCommands?: () => void;
 }
 
 const PROMPT_FRAME_ROLE = "border";
@@ -435,6 +443,8 @@ export class GentlePromptEditor extends CustomEditor {
 	private pulse: NodeJS.Timeout | undefined;
 	private readonly deps: PromptEditorDeps;
 	private floatMouseLayout?: ReturnType<typeof resolvePromptLayout>;
+	// Where the last render painted the commands label (row 0) and at what width.
+	private commandsHit?: { span: PromptLabelSpan; width: number };
 	// Native selection engine (shift+home/end, alt+a, replace-on-key): ported
 	// from pi-select-del so the petal prompt owns the feature without factory
 	// composition. Constructed with `this`; the internals probe degrades to
@@ -1042,6 +1052,14 @@ export class GentlePromptEditor extends CustomEditor {
 	}
 
 	handleMouse(event: Parameters<CustomEditor["handleMouse"]>[0]): ReturnType<CustomEditor["handleMouse"]> {
+		// Only a clean click (pi-tui synthesizes it for press+release on one cell)
+		// on a cell of the label, on the border row, while the label is still shown.
+		const hit = this.commandsHit;
+		if (hit && event.type === "click" && event.button === "left" && event.y === 0 && event.width === hit.width &&
+			event.x >= hit.span.start && event.x < hit.span.end && this.deps.commandsLabel?.() && this.deps.openCommands) {
+			this.deps.openCommands();
+			return { handled: true, render: true };
+		}
 		const layout = this.floatMouseLayout;
 		if (!layout) return super.handleMouse(event);
 		// Row coordinates stay native: padding=0, content=1…N, hint=N+1.
@@ -1075,13 +1093,14 @@ export class GentlePromptEditor extends CustomEditor {
 		const visibleCount = (this as unknown as { renderedVisibleLineCount?: number }).renderedVisibleLineCount;
 		const borderEnd = Number.isInteger(visibleCount) && visibleCount! >= 1 && visibleCount! + 2 <= editorLines.length
 			? visibleCount! + 2 : editorLines.length;
-		const framed = framePromptLines(editorLines.slice(0, borderEnd), width, {
+		const chrome = framePromptChrome(editorLines.slice(0, borderEnd), width, {
 			state,
 			tick: this.tick,
 			borderColor: (text) => layout.background ? this.borderColor(text) : this.deps.fg(PROMPT_FRAME_ROLE, text),
 			fg: this.deps.fg,
 			bold: this.deps.bold,
 			workingLabel: this.promptState === PROMPT_STATE.WORKING ? this.deps.workingLabel?.() : undefined,
+			commandsLabel: this.deps.commandsLabel?.(),
 			escHint: [
 				this.vimPolicy === "on" ? (this.vimVisual.active ? (this.vimVisual.kind === "line" ? "VISUAL LINE" : "VISUAL") : this.vimNormal ? "NORMAL" : "INSERT") : undefined,
 				this.promptState === PROMPT_STATE.WORKING && this.isPendingEscapeCancel()
@@ -1091,6 +1110,8 @@ export class GentlePromptEditor extends CustomEditor {
 						: undefined,
 			].filter(Boolean).join(" · ") || undefined,
 		}, layout);
+		const framed = chrome.lines;
+		this.commandsHit = chrome.commandsSpan ? { span: chrome.commandsSpan, width } : undefined;
 		if (this.vimPolicy !== "on") {
 			framed[framed.length - 1] = layout.background
 				? floatPromptRow(this.selectionEngine.decorateBottomRule("", layout.nativeWidth, ""), layout, (text) => this.borderColor(text))
@@ -1143,7 +1164,7 @@ type PromptFactory = NonNullable<ReturnType<ExtensionContext["ui"]["getEditorCom
 function installPrompt(
 	ctx: ExtensionContext,
 	onCreated: (prompt: GentlePromptEditor) => void,
-	promptDeps: { now: () => number; doubleEscCancelEnabled: () => boolean; dispatchQueuedText: (text: string) => void; vimRuntimeVersion?: () => string | undefined },
+	promptDeps: { now: () => number; doubleEscCancelEnabled: () => boolean; dispatchQueuedText: (text: string) => void; vimRuntimeVersion?: () => string | undefined; commandsHint: () => string | undefined; openCommands: () => void },
 ): boolean {
 	const previous = ctx.ui.getEditorComponent() as PromptFactory | undefined;
 	if (previous && !previous[PROMPT_OWNER]) return false;
@@ -1160,6 +1181,14 @@ function installPrompt(
 			notifyCompatibility: (message) => ctx.ui.notify(message, "warning"),
 			tuiVersion: promptDeps.vimRuntimeVersion,
 			workingLabel: () => oddPhaseRegistry.label(ctx.sessionManager.getSessionId()),
+			// The rail's header card carries this action while the rail is visible;
+			// regular mode never delivers mouse events, so a label there would be dead.
+			commandsLabel: () => {
+				if ((tui as TUI & { mode?: string }).mode !== "fullscreen" || !tui.terminal) return undefined;
+				const sidebar = sidebarState(tui);
+				return sidebar.active && sidebar.ownsHost?.() ? undefined : { hint: promptDeps.commandsHint() };
+			},
+			openCommands: promptDeps.openCommands,
 		});
 		// Pi's own docs require an explicit requestRender() after a state change
 		// (docs/tui.md: "Call tui.requestRender() after state changes"); no host
@@ -2021,7 +2050,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 				prompt.setAnimationPolicy(animationPolicy);
 				prompt.setVimPolicy(vimPolicy);
 			},
-			{ now: () => deps.now(), doubleEscCancelEnabled: () => doubleEscCancelPolicy === "on", dispatchQueuedText: (text) => { pendingQueuedText = pendingQueuedText === undefined ? text : `${pendingQueuedText}\n\n${text}`; }, vimRuntimeVersion: deps.vimRuntimeVersion },
+			{ now: () => deps.now(), doubleEscCancelEnabled: () => doubleEscCancelPolicy === "on", dispatchQueuedText: (text) => { pendingQueuedText = pendingQueuedText === undefined ? text : `${pendingQueuedText}\n\n${text}`; }, vimRuntimeVersion: deps.vimRuntimeVersion, commandsHint: () => commandsKey(env), openCommands: () => { void showCommandPalette(pi, ctx, env); } },
 		);
 		// Hide native feedback only when our petal replaces it. Native transcript
 		// thinking blocks remain Pi-owned; this changes only the supported loader UI.

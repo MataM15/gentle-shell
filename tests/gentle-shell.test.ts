@@ -6238,3 +6238,114 @@ test("an explicit session binding routes the Usage scope ahead of the pin and th
 		resetSessionProfileBindingsForTesting();
 	}
 });
+
+// C3: the editor border's `☰ commands` label exists only while the rail is not
+// visible, and only a clean click on it opens the palette.
+
+async function paletteEditor(env: NodeJS.ProcessEnv = {}, options: { columns?: number; mode?: string; rail?: boolean } = {}) {
+	const { pi, handlers } = fakePi();
+	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off", ...env });
+	const { ctx, ui } = fakeContext();
+	await fire(handlers, "session_start", ctx);
+	const tui = { mode: options.mode ?? "fullscreen", terminal: { rows: 40, columns: options.columns ?? 100 }, requestRender() {} };
+	// The real layout publishes this on the terminal; the label reads it per render.
+	const state = sidebarState(tui as unknown as TUI);
+	state.active = options.rail ?? true;
+	state.ownsHost = () => tui.terminal.columns >= 140;
+	const factory = ui.editorFactory as (tui: unknown, theme: unknown, keybindings: unknown) => GentlePromptEditor;
+	const editor = factory(tui, editorTheme, fakeKeybindings);
+	editor.focused = true;
+	const mouse = (type: string, x: number, y: number, width = tui.terminal.columns) =>
+		editor.handleMouse({ type, button: "left", x, y, screenX: x, screenY: y, width, height: 3, shift: false, alt: false, ctrl: false } as TuiMouseEvent);
+	const opened = async () => { await new Promise((resolve) => setTimeout(resolve, 0)); return ui.overlayView?.render(100).join("\n").includes("Configuration") ?? false; };
+	return { editor, tui, mouse, opened, ui, ctx };
+}
+
+const topBorder = (editor: GentlePromptEditor, width: number) => stripAnsi(editor.render(width)[0]!);
+
+test("editor border shows the commands label only while the rail is hidden, across the 140 column breakpoint", async () => {
+	const { editor, tui } = await paletteEditor({}, { columns: 100 });
+	try {
+		assert.match(topBorder(editor, 100), /^╭─ ✿ ☰ commands · alt\+k ─+╮$/);
+		assert.equal(visibleWidth(editor.render(100)[0]!), 100);
+		tui.terminal.columns = 139;
+		assert.match(topBorder(editor, 139), /☰ commands · alt\+k/, "139 columns: no rail yet");
+		tui.terminal.columns = 140;
+		assert.doesNotMatch(topBorder(editor, 112), /commands/, "140 columns: the rail card carries it");
+		assert.match(topBorder(editor, 112), /^╭─ ✿ ─+╮$/);
+		tui.terminal.columns = 120;
+		assert.match(topBorder(editor, 120), /☰ commands/, "shrinking back restores the label");
+	} finally { editor.dispose(); }
+});
+
+test("editor border label honors a remapped key and drops the hint when the shortcut is disabled", async () => {
+	const remapped = await paletteEditor({ GENTLE_PI_COMMANDS_KEY: "ctrl+p" });
+	const off = await paletteEditor({ GENTLE_PI_COMMANDS_KEY: "off" });
+	try {
+		assert.match(topBorder(remapped.editor, 100), /^╭─ ✿ ☰ commands · ctrl\+p ─+╮$/);
+		assert.match(topBorder(off.editor, 100), /^╭─ ✿ ☰ commands ─+╮$/);
+		assert.equal(off.mouse("click", 7, 0)?.handled, true, "a disabled shortcut still has the clickable label");
+		assert.equal(await off.opened(), true);
+	} finally { remapped.editor.dispose(); off.editor.dispose(); }
+});
+
+test("editor border omits the label outside fullscreen, where mouse never reaches Pi, and without a sidebar host", async () => {
+	const regular = await paletteEditor({}, { mode: "regular" });
+	const bare = await paletteEditor({}, { rail: false });
+	try {
+		assert.doesNotMatch(topBorder(regular.editor, 100), /commands/);
+		assert.match(topBorder(bare.editor, 100), /☰ commands/, "fullscreen with no rail owner still shows it");
+	} finally { regular.editor.dispose(); bare.editor.dispose(); }
+});
+
+test("only a click on the label cells opens the palette; every other event falls through", async () => {
+	const { editor, mouse, opened, ui } = await paletteEditor();
+	const reference = (await paletteEditor({}, { rail: true, columns: 140 }));
+	try {
+		editor.render(100);
+		reference.editor.render(100);
+		// `☰ commands` spans columns 5..15 on row 0; the ` · alt+k` hint (16..23) is not clickable.
+		for (const x of [0, 2, 3, 4, 16, 18, 20, 23, 24, 25, 60, 99]) assert.deepEqual(mouse("click", x, 0), reference.mouse("click", x, 0), `border cell ${x} stays native`);
+		for (const type of ["press", "drag", "release", "move", "scroll"]) assert.deepEqual(mouse(type, 8, 0), reference.mouse(type, 8, 0), `${type} on the label is native`);
+		for (const y of [1, 2]) for (const x of [5, 8, 20]) assert.deepEqual(mouse("click", x, y), reference.mouse("click", x, y), `input row ${y} stays native`);
+		assert.equal(await opened(), false, "none of those opened the palette");
+		assert.equal(editor.getText(), "");
+		for (const x of [5, 6, 8, 15]) {
+			assert.equal(mouse("click", x, 0)?.handled, true, `label cell ${x}`);
+			assert.equal(await opened(), true);
+			ui.overlayView!.handleInput("\x1b");
+			await new Promise((resolve) => setTimeout(resolve, 0));
+		}
+	} finally { editor.dispose(); reference.editor.dispose(); }
+});
+
+test("a stale label span is not clickable once the rail takes over", async () => {
+	const { editor, tui, mouse, opened } = await paletteEditor();
+	try {
+		editor.render(100);
+		tui.terminal.columns = 140;
+		editor.render(112);
+		mouse("click", 8, 0, 112);
+		assert.equal(await opened(), false);
+	} finally { editor.dispose(); }
+});
+
+test("float hint row carries the label and the same click rules", async () => {
+	const previous = cardStyle();
+	const { editor, mouse, opened, ctx } = await paletteEditor({}, { columns: 100 });
+	const themeHost = ctx.ui as unknown as MutablePromptThemeHost;
+	const originalTheme = themeHost.theme;
+	try {
+		themeHost.theme = { ...plainTheme, bg: (_role: string, text: string) => `\x1b[44m${text}\x1b[49m` } as unknown as typeof ctx.ui.theme;
+		setCardStyle(CARD_STYLE.FLOAT);
+		editor.render(100);
+		const row = stripAnsi(editor.render(100)[0]!);
+		assert.match(row, /^ ▎ ✿ ☰ commands · alt\+k/, row);
+		mouse("click", 4, 0);
+		mouse("click", 24, 0);
+		mouse("click", 8, 1);
+		assert.equal(await opened(), false);
+		assert.equal(mouse("click", 8, 0)?.handled, true);
+		assert.equal(await opened(), true);
+	} finally { themeHost.theme = originalTheme; setCardStyle(previous); editor.dispose(); }
+});

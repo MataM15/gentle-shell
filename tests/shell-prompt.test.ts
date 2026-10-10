@@ -3,6 +3,7 @@ import test from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 import {
+	framePromptChrome,
 	framePromptLines,
 	scanWorkingText,
 	PROMPT_STATE,
@@ -283,4 +284,61 @@ test("T2 float prompt rearms real SGR resets without altering inversion or marke
 		const rows = framePromptLines(["──", native, "──"], 30, options({ style: "float", bg: (_r, t) => `${open}${t}\x1b[49m`, fg: (_c, t) => t }));
 		assert.ok(rows[1].includes(`${marker}\x1b[7mx\x1b[0m${open}Y\x1b[0;7m${open}Z\x1b[27m`));
 	}
+});
+
+// C3: with the rail hidden, the top border carries a clickable
+// `☰ commands · key` label one cell after the petal. ☰ is two cells wide.
+
+test("neon top border shows the commands label with one cell around petal and icon", () => {
+	const chrome = framePromptChrome(editorLines(60), 60, options({ fg: (_role, text) => text, commandsLabel: { hint: "alt+k" } }));
+	const top = stripAnsi(chrome.lines[0]!);
+	assert.equal(top, "╭─ ✿ ☰ commands · alt+k " + "─".repeat(60 - 24 - 1 - 1) + "╮");
+	assert.equal(visibleWidth(top), 60);
+	assert.deepEqual(chrome.commandsSpan, { start: 5, end: 16 }, "only the icon and name are clickable, not the key hint");
+	assert.equal(top.slice(0, 5), "╭─ ✿ ");
+});
+
+test("neon commands label honors a remapped key, no hint when disabled, and stays absent by default", () => {
+	const plain = { fg: (_role: string, text: string) => text };
+	assert.match(stripAnsi(framePromptLines(editorLines(60), 60, options({ ...plain, commandsLabel: { hint: "ctrl+p" } }))[0]!), /^╭─ ✿ ☰ commands · ctrl\+p ─+╮$/);
+	const off = framePromptChrome(editorLines(60), 60, options({ ...plain, commandsLabel: {} }));
+	assert.match(stripAnsi(off.lines[0]!), /^╭─ ✿ ☰ commands ─+╮$/);
+	assert.deepEqual(off.commandsSpan, { start: 5, end: 16 });
+	const absent = framePromptChrome(editorLines(60), 60, options(plain));
+	assert.equal(absent.commandsSpan, undefined);
+	assert.doesNotMatch(stripAnsi(absent.lines[0]!), /commands/);
+});
+
+test("neon commands label keeps working/queued labels and scroll indicators after it", () => {
+	const plain = { fg: (_role: string, text: string) => text, commandsLabel: { hint: "alt+k" } };
+	const working = framePromptChrome(editorLines(70), 70, options({ ...plain, state: PROMPT_STATE.WORKING }));
+	assert.match(stripAnsi(working.lines[0]!), /^╭─ [✿❀❁✾] ☰ commands · alt\+k · working… ─+╮$/);
+	assert.deepEqual(working.commandsSpan, { start: 5, end: 16 });
+	const lines = editorLines(70);
+	lines[0] = "─── ↑ 3 more ───";
+	assert.match(stripAnsi(framePromptLines(lines, 70, options(plain))[0]!), /^╭─ ✿ ☰ commands · alt\+k · ↑ 3 more ─+╮$/);
+});
+
+test("neon commands label is dropped when it cannot fit, never truncated", () => {
+	for (const width of [2, 10, 20, 26]) {
+		const chrome = framePromptChrome(editorLines(Math.max(4, width)), width, options({ fg: (_role, text) => text, commandsLabel: { hint: "alt+k" } }));
+		assert.equal(chrome.commandsSpan, undefined, `width ${width}`);
+		assert.ok(chrome.lines.every((line) => visibleWidth(line) <= width));
+	}
+	const fits = framePromptChrome(editorLines(27), 27, options({ fg: (_role, text) => text, commandsLabel: { hint: "alt+k" } }));
+	assert.deepEqual(fits.commandsSpan, { start: 5, end: 16 });
+	assert.equal(visibleWidth(fits.lines[0]!), 27);
+});
+
+test("float hint row carries the same label at the same columns", () => {
+	const bg = (_role: string, text: string) => `\x1b[44m${text}\x1b[49m`;
+	const chrome = framePromptChrome(editorLines(55), 60, options({ style: "float", bg, fg: (_role, text) => text, commandsLabel: { hint: "alt+k" } }));
+	const hint = stripAnsi(chrome.lines[0]!);
+	assert.match(hint, /^ ▎ ✿ ☰ commands · alt\+k · waiting for input\s*$/);
+	assert.equal(visibleWidth(chrome.lines[0]!), 60);
+	assert.deepEqual(chrome.commandsSpan, { start: 5, end: 16 });
+	assert.equal(hint.indexOf("☰"), 5);
+	const absent = framePromptChrome(editorLines(55), 60, options({ style: "float", bg, fg: (_role, text) => text }));
+	assert.equal(absent.commandsSpan, undefined);
+	assert.doesNotMatch(stripAnsi(absent.lines[0]!), /commands/);
 });
