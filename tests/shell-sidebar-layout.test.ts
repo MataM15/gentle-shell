@@ -1210,3 +1210,81 @@ test("rail scrollbar stays hidden when the rail does not overflow", (t) => {
 	scroll.scrollBy(1);
 	assert.equal(scroll.isScrollbarVisible, false);
 });
+
+// S14 (odd/tasks/palette-button.md): `» hide panel · alt+h` pinned at the
+// rail's bottom folds the rail; folded, the native layout returns and
+// `railAvailable` tells the editor it can offer `« panel`.
+function railControl(collapsed = false, hint: string | null = "alt+h") {
+	const control = { state: collapsed, toggles: 0, collapsed: () => control.state, toggle: () => { control.toggles++; control.state = !control.state; }, hint: () => hint ?? undefined };
+	return control;
+}
+function click(component: Component, x: number, y: number, width: number, height: number, type = "click", button = "left") {
+	return component.handleMouse?.({ type, button, x, y, screenX: x, screenY: y, width, height, shift: false, alt: false, ctrl: false } as TuiMouseEvent);
+}
+
+test("an expanded rail pins `» hide panel · key` at its bottom, and a click on it folds the rail", () => {
+	const f = fixture("fullscreen", 160);
+	const control = railControl();
+	const uninstall = installSidebar(f.tui, theme, () => "auto", () => "top", () => "comfortable", control);
+	try {
+		const right = hstackOf(f).entries[1].component as { [NODE](): HstackNode };
+		const entries = right[NODE]().entries;
+		const footer = entries.at(-1)!.component as Component;
+		assert.ok(entries.some((entry) => entry.component instanceof ScrollView), "the cards still scroll above it");
+		const [row] = footer.render(50);
+		assert.equal(row, " » hide panel · alt+h");
+		for (const x of [0, 22, 49]) click(footer, x, 0, 50, 1);
+		for (const type of ["press", "drag", "release", "move"]) click(footer, 3, 0, 50, 1, type);
+		click(footer, 3, 0, 50, 1, "click", "right");
+		assert.equal(control.toggles, 0, "only a left click on the label folds the rail");
+		assert.equal(click(footer, 3, 0, 50, 1)?.handled, true);
+		assert.equal(control.toggles, 1);
+		assert.equal(f.tui.terminal.columns, 160);
+	} finally {
+		uninstall();
+	}
+});
+
+test("without a key the footer reads `» hide panel`, still clickable", () => {
+	const f = fixture("fullscreen", 160);
+	const control = railControl(false, null);
+	const uninstall = installSidebar(f.tui, theme, () => "auto", () => "top", () => "comfortable", control);
+	try {
+		const footer = (hstackOf(f).entries[1].component as { [NODE](): HstackNode })[NODE]().entries.at(-1)!.component as Component;
+		assert.equal(footer.render(50)[0], " » hide panel");
+		click(footer, 2, 0, 50, 1);
+		assert.equal(control.toggles, 1);
+	} finally {
+		uninstall();
+	}
+});
+
+test("a folded rail gives the full width back and reports that it could be shown", () => {
+	const f = fixture("fullscreen", 160);
+	const control = railControl(true);
+	const uninstall = installSidebar(f.tui, theme, () => "auto", () => "top", () => "comfortable", control);
+	try {
+		const state = sidebarState(f.tui);
+		assert.notEqual((f.root[NODE]() as { type: string }).type, "hstack", "folded: no rail column");
+		assert.equal(state.ownsHost?.(), false);
+		assert.equal(state.railAvailable?.(), true, "unfolding would show the rail here");
+		control.state = false;
+		assert.equal(hstackOf(f).type, "hstack", "unfolding restores the rail on the next layout");
+		f.host.terminal.columns = 139;
+		assert.equal(state.railAvailable?.(), false, "below the breakpoint there is no rail to unfold");
+	} finally {
+		uninstall();
+	}
+});
+
+test("hidden or bottom Status placement never offers the rail", () => {
+	for (const placement of ["hidden", "bottom"] as const) {
+		const f = fixture("fullscreen", 160);
+		const uninstall = installSidebar(f.tui, theme, () => placement, () => "top", () => "comfortable", railControl(true));
+		try {
+			assert.equal(sidebarState(f.tui).railAvailable?.(), false, placement);
+		} finally {
+			uninstall();
+		}
+	}
+});

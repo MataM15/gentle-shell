@@ -51,6 +51,7 @@ export const COMMAND_PALETTE_CATALOG: readonly CommandPaletteCatalogGroup[] = [
 			{ command: "gentle:agents", label: "Subagents", icon: "⬡" },
 			{ command: "gentle:jobs", label: "Background jobs", icon: "⧗" },
 			{ command: "gentle:usage", label: "Subscription usage", icon: "◔" },
+			{ command: "gentle:panel", label: "Toggle side panel", icon: "◨" },
 			{ command: "gentle:review-session-permission", label: "Review session permission", icon: "✓" },
 		],
 	},

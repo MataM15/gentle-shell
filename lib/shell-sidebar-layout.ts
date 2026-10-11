@@ -90,7 +90,21 @@ export function narrowStatusOwner(input: StatusOwnerInput): StatusOwner | undefi
 }
 
 /** Installs the fullscreen rail: wraps the host layout root with the [rail, transcript] hstack and returns a disposer restoring the original layout. */
-export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => StatusPlacement = () => "auto", headerPlacement: () => HeaderPlacement = () => "top", density: () => Density = () => "comfortable"): () => void {
+/**
+ * Folding the rail (`» hide panel`, alt+h): whether it is folded now, how to
+ * flip it, and the resolved shortcut hint (undefined when disabled). Without
+ * one the rail has no footer row and is never folded.
+ */
+export interface RailControl {
+	collapsed(): boolean;
+	toggle(): void;
+	hint(): string | undefined;
+}
+
+const RAIL_FOOTER_ARROW = "»";
+const RAIL_FOOTER_LABEL = "hide panel";
+
+export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => StatusPlacement = () => "auto", headerPlacement: () => HeaderPlacement = () => "top", density: () => Density = () => "comfortable", control?: RailControl): () => void {
 	if (!tui.terminal) return () => {};
 	const host = tui as Host;
 	const state = sidebarState(tui);
@@ -120,7 +134,10 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 		narrowStatusOwner({ mode: host.mode, columns: tui.terminal.columns, statusPlacement: placement(), headerPlacement: headerPlacement() }) === STATUS_OWNER.HEADER;
 	state.headerOwnsStatus = headerOwnsStatus;
 	state.railColumns = SIDEBAR_RAIL_COLUMNS;
-	state.ownsHost = () => !stopped && host.mode === "fullscreen" && tui.terminal.columns >= SIDEBAR_BREAKPOINT && (placement() === "auto" || placement() === "right") && !!host.layoutRoot && roots.has(host.layoutRoot);
+	const folded = () => control?.collapsed() === true;
+	const railPossible = () => !stopped && host.mode === "fullscreen" && tui.terminal.columns >= SIDEBAR_BREAKPOINT && (placement() === "auto" || placement() === "right") && !!host.layoutRoot && roots.has(host.layoutRoot);
+	state.ownsHost = () => railPossible() && !folded();
+	state.railAvailable = () => railPossible() && folded();
 	const rail: Component = {
 		render: () => railLines,
 		invalidate() {
@@ -158,6 +175,27 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 			if (index < 0 || current.parts[index]![1] !== part || current.digests[index] !== railDigest(part)) return undefined;
 			if (event.x < 0 || event.x >= RAIL_WIDTH || event.y < 0 || event.y >= current.headerLines.length) return undefined;
 			return (part.pinned ?? part).handleMouse?.(event);
+		},
+	};
+	// `» hide panel · alt+h`, pinned below the cards while the rail shows: the
+	// arrow in the rail's rose, the words dim. A clean left click on the label
+	// folds the rail; anywhere else on the row is inert.
+	const footerText = () => {
+		const hint = control?.hint();
+		return `${RAIL_FOOTER_ARROW} ${RAIL_FOOTER_LABEL}${hint ? ` · ${hint}` : ""}`;
+	};
+	const pinnedFooter: Component = {
+		render: (width) => {
+			const text = footerText();
+			const painted = ` ${theme.fg("borderAccent", RAIL_FOOTER_ARROW)}${theme.fg("dim", text.slice(RAIL_FOOTER_ARROW.length))}`;
+			return [visibleWidth(text) + 1 <= width ? painted : truncateToWidth(painted, Math.max(0, width), "")];
+		},
+		invalidate() {},
+		handleMouse: (event) => {
+			if (!control || event.type !== "click" || event.button !== "left" || event.y !== 0) return undefined;
+			if (event.x < 1 || event.x >= 1 + visibleWidth(footerText())) return undefined;
+			control.toggle();
+			return { handled: true, render: true };
 		},
 	};
 	const scroll = new ScrollView(rail, {
@@ -209,7 +247,7 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 			headerLines = [];
 			return false;
 		}
-		const railEligible = width >= SIDEBAR_BREAKPOINT && placement() !== "bottom" && placement() !== "hidden";
+		const railEligible = width >= SIDEBAR_BREAKPOINT && placement() !== "bottom" && placement() !== "hidden" && !folded();
 		if (!railEligible) {
 			prepared = undefined;
 			try {
@@ -338,18 +376,24 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 			// behind its own NODE exactly like `left` wraps the native transcript.
 			// Only the rail reserves rows for the header; the transcript keeps
 			// the full viewport height.
+			// With a rail control the fold row is pinned below the cards too.
+			let rightPinned = true;
 			const right: Component & { [NODE](): LayoutNode } = {
 				render: () => [],
 				invalidate() {},
 				[NODE]: () => ({ type: "vstack", gap: 0, align: "stretch", entries: [
-					{ component: pinnedHeader, basis: "auto", grow: 0, shrink: 0, minSize: 1 },
+					...(rightPinned ? [{ component: pinnedHeader, basis: "auto", grow: 0, shrink: 0, minSize: 1 }] : []),
 					{ component: scroll, basis: 0, grow: 1, shrink: 1, minSize: 1 },
+					...(control ? [{ component: pinnedFooter, basis: "auto", grow: 0, shrink: 0, minSize: 1 }] : []),
 				] }),
 			};
-			const hstack = (pinned: boolean): LayoutNode => ({ type: "hstack", gap: GAP, align: "stretch", entries: [
-				{ component: left, basis: 0, grow: 1, shrink: 1, minSize: 1 },
-				{ component: pinned ? right : scroll, basis: RAIL_WIDTH, grow: 0, shrink: 0, minSize: RAIL_WIDTH },
-			] });
+			const hstack = (pinned: boolean): LayoutNode => {
+				rightPinned = pinned;
+				return { type: "hstack", gap: GAP, align: "stretch", entries: [
+					{ component: left, basis: 0, grow: 1, shrink: 1, minSize: 1 },
+					{ component: pinned || control ? right : scroll, basis: RAIL_WIDTH, grow: 0, shrink: 0, minSize: RAIL_WIDTH },
+				] };
+			};
 			const replacement = () => {
 				if (!prepare(tui.terminal.columns, root)) {
 					if (failed || stopped || host.mode !== "fullscreen") return original.call(root);

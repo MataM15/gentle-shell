@@ -123,6 +123,7 @@ import { SelectionEngine } from "../lib/selection-engine.ts";
 import { withOverlayRepaint } from "../lib/overlay-repaint.ts";
 import { buildNotificationRows } from "../lib/notification-customize.ts";
 import { releaseFullscreenProbe, selectWithMouse, setFullscreenProbe } from "../lib/mouse-select.ts";
+import { railPanelKey, readRailCollapsed, writeRailCollapsed } from "../lib/rail-collapse.ts";
 
 // Gentle Shell: the visual layer gentle-pi puts on top of pi. It installs the
 // status bar, the petal prompt, the working-tree changes widget and overlay,
@@ -387,6 +388,13 @@ interface PromptEditorDeps {
 	commandsLabel?: () => { hint?: string } | undefined;
 	/** Opens the command palette, exactly like Alt+K. */
 	openCommands?: () => void;
+	/**
+	 * Read fresh on every render and click: `« panel · key` at the right end of
+	 * the border while the user folded the rail away and it could show again.
+	 */
+	panelLabel?: () => { hint?: string } | undefined;
+	/** Folds or unfolds the rail, exactly like alt+h. */
+	togglePanel?: () => void;
 }
 
 const PROMPT_FRAME_ROLE = "border";
@@ -446,6 +454,7 @@ export class GentlePromptEditor extends CustomEditor {
 	private floatMouseLayout?: ReturnType<typeof resolvePromptLayout>;
 	// Where the last render painted the commands label (row 0) and at what width.
 	private commandsHit?: { span: PromptLabelSpan; width: number };
+	private panelHit?: { span: PromptLabelSpan; width: number };
 	// Native selection engine (shift+home/end, alt+a, replace-on-key): ported
 	// from pi-select-del so the petal prompt owns the feature without factory
 	// composition. Constructed with `this`; the internals probe degrades to
@@ -1061,6 +1070,12 @@ export class GentlePromptEditor extends CustomEditor {
 			this.deps.openCommands();
 			return { handled: true, render: true };
 		}
+		const panel = this.panelHit;
+		if (panel && event.type === "click" && event.button === "left" && event.y === 0 && event.width === panel.width &&
+			event.x >= panel.span.start && event.x < panel.span.end && this.deps.panelLabel?.() && this.deps.togglePanel) {
+			this.deps.togglePanel();
+			return { handled: true, render: true };
+		}
 		const layout = this.floatMouseLayout;
 		if (!layout) return super.handleMouse(event);
 		// Row coordinates stay native: padding=0, content=1…N, hint=N+1.
@@ -1102,6 +1117,7 @@ export class GentlePromptEditor extends CustomEditor {
 			bold: this.deps.bold,
 			workingLabel: this.promptState === PROMPT_STATE.WORKING ? this.deps.workingLabel?.() : undefined,
 			commandsLabel: this.deps.commandsLabel?.(),
+			panelLabel: this.deps.panelLabel?.(),
 			escHint: [
 				this.vimPolicy === "on" ? (this.vimVisual.active ? (this.vimVisual.kind === "line" ? "VISUAL LINE" : "VISUAL") : this.vimNormal ? "NORMAL" : "INSERT") : undefined,
 				this.promptState === PROMPT_STATE.WORKING && this.isPendingEscapeCancel()
@@ -1113,6 +1129,7 @@ export class GentlePromptEditor extends CustomEditor {
 		}, layout);
 		const framed = chrome.lines;
 		this.commandsHit = chrome.commandsSpan ? { span: chrome.commandsSpan, width } : undefined;
+		this.panelHit = chrome.panelSpan ? { span: chrome.panelSpan, width } : undefined;
 		if (this.vimPolicy !== "on") {
 			framed[framed.length - 1] = layout.background
 				? floatPromptRow(this.selectionEngine.decorateBottomRule("", layout.nativeWidth, ""), layout, (text) => this.borderColor(text))
@@ -1165,7 +1182,7 @@ type PromptFactory = NonNullable<ReturnType<ExtensionContext["ui"]["getEditorCom
 function installPrompt(
 	ctx: ExtensionContext,
 	onCreated: (prompt: GentlePromptEditor) => void,
-	promptDeps: { now: () => number; doubleEscCancelEnabled: () => boolean; dispatchQueuedText: (text: string) => void; vimRuntimeVersion?: () => string | undefined; commandsHint: () => string | undefined; openCommands: () => void },
+	promptDeps: { now: () => number; doubleEscCancelEnabled: () => boolean; dispatchQueuedText: (text: string) => void; vimRuntimeVersion?: () => string | undefined; commandsHint: () => string | undefined; openCommands: () => void; panelHint: () => string | undefined; togglePanel: () => void },
 ): boolean {
 	const previous = ctx.ui.getEditorComponent() as PromptFactory | undefined;
 	if (previous && !previous[PROMPT_OWNER]) return false;
@@ -1190,6 +1207,12 @@ function installPrompt(
 				return sidebar.active && sidebar.ownsHost?.() ? undefined : { hint: promptDeps.commandsHint() };
 			},
 			openCommands: promptDeps.openCommands,
+			// Only while the user folded the rail away and the layout could show it.
+			panelLabel: () => {
+				if ((tui as TUI & { mode?: string }).mode !== "fullscreen" || !tui.terminal) return undefined;
+				return sidebarState(tui).railAvailable?.() ? { hint: promptDeps.panelHint() } : undefined;
+			},
+			togglePanel: promptDeps.togglePanel,
 		});
 		// Pi's own docs require an explicit requestRender() after a state change
 		// (docs/tui.md: "Call tui.requestRender() after state changes"); no host
@@ -1397,6 +1420,7 @@ async function showCommandPalette(pi: ExtensionAPI, ctx: ExtensionContext, env: 
 	const groups = buildCommandPaletteGroups(pi.getCommands(), {
 		"gentle:changes": changesShortcut(env),
 		"gentle:agents": agentsViewKey(env),
+		"gentle:panel": railPanelKey(env),
 	});
 	if (groups.length === 0) {
 		ctx.ui.notify("No Gentle commands are registered.", "info");
@@ -1817,6 +1841,21 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 	};
 	let visualSettings = resolveVisualSettings(animationOptions).settings;
 	let sidebarTui: TUI | undefined;
+	// `» hide panel` / `« panel` / alt+h: the folded rail, remembered across sessions.
+	const railConfigHome = env.GENTLE_PI_CONFIG_HOME ?? join(os.homedir(), ".pi", "gentle-ai");
+	let railCollapsed = readRailCollapsed({ gentlePiConfigHome: railConfigHome });
+	const toggleRail = (ctx?: ExtensionContext) => {
+		railCollapsed = !railCollapsed;
+		try {
+			writeRailCollapsed(railCollapsed, { gentlePiConfigHome: railConfigHome });
+		} catch {
+			ctx?.ui.notify("Could not save the side panel state; it applies to this session only.", "warning");
+		}
+		if (sidebarTui) {
+			invalidateSidebar(sidebarTui);
+			sidebarTui.requestRender();
+		}
+	};
 	let groupedChangesOwner: (width: number) => boolean = () => false;
 	const refreshVisual = () => {
 		visualSettings = resolveVisualSettings(animationOptions).settings;
@@ -2016,7 +2055,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 				render: (width) => renderUsageCard(usage.all(), theme, width, deps.now()),
 				invalidate() {},
 			});
-			const uninstall = installSidebar(tui, theme, () => visualSettings.statusPlacement, () => visualSettings.headerPlacement, () => visualSettings.density);
+			const uninstall = installSidebar(tui, theme, () => visualSettings.statusPlacement, () => visualSettings.headerPlacement, () => visualSettings.density, { collapsed: () => railCollapsed, toggle: () => toggleRail(), hint: () => railPanelKey(env) });
 			// The public widget slot follows the editor even when the rail is absent.
 			const belowHeader = () => visualSettings.headerPlacement === "below-input" && (tui as TUI & { mode?: string }).mode === "fullscreen" && statusOwner() !== STATUS_OWNER.BOTTOM;
 			const widgetChrome = (width: number) => belowFloat(width, false) ?? headerBar(width);
@@ -2055,7 +2094,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 				prompt.setAnimationPolicy(animationPolicy);
 				prompt.setVimPolicy(vimPolicy);
 			},
-			{ now: () => deps.now(), doubleEscCancelEnabled: () => doubleEscCancelPolicy === "on", dispatchQueuedText: (text) => { pendingQueuedText = pendingQueuedText === undefined ? text : `${pendingQueuedText}\n\n${text}`; }, vimRuntimeVersion: deps.vimRuntimeVersion, commandsHint: () => commandsKey(env), openCommands: () => { void showCommandPalette(pi, ctx, env); } },
+			{ now: () => deps.now(), doubleEscCancelEnabled: () => doubleEscCancelPolicy === "on", dispatchQueuedText: (text) => { pendingQueuedText = pendingQueuedText === undefined ? text : `${pendingQueuedText}\n\n${text}`; }, vimRuntimeVersion: deps.vimRuntimeVersion, commandsHint: () => commandsKey(env), openCommands: () => { void showCommandPalette(pi, ctx, env); }, panelHint: () => railPanelKey(env), togglePanel: () => toggleRail(ctx) },
 		);
 		// Hide native feedback only when our petal replaces it. Native transcript
 		// thinking blocks remain Pi-owned; this changes only the supported loader UI.
@@ -2129,6 +2168,17 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		pi.registerShortcut(commandsShortcut as Parameters<ExtensionAPI["registerShortcut"]>[0], {
 			description: "Open the command palette",
 			handler: async (ctx) => showCommandPalette(pi, ctx, env),
+		});
+	}
+	pi.registerCommand("gentle:panel", {
+		description: "Fold or unfold the right side panel (Status, Limits, Wellness, Todos); remembered across sessions.",
+		handler: async (_args, ctx) => toggleRail(ctx),
+	});
+	const panelShortcut = railPanelKey(env);
+	if (panelShortcut) {
+		pi.registerShortcut(panelShortcut as Parameters<ExtensionAPI["registerShortcut"]>[0], {
+			description: "Fold or unfold the right side panel",
+			handler: async (ctx) => toggleRail(ctx),
 		});
 	}
 	pi.registerCommand("gentle:customize", {

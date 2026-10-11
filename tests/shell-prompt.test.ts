@@ -342,3 +342,38 @@ test("float hint row carries the same label at the same columns", () => {
 	assert.equal(absent.commandsSpan, undefined);
 	assert.doesNotMatch(stripAnsi(absent.lines[0]!), /commands/);
 });
+
+// R2 (S14): with the rail folded away, the top border ends with a clickable
+// `« panel · key` that unfolds it; the commands label keeps its place.
+test("neon top border ends with `« panel · key` when the folded rail could be shown", () => {
+	const chrome = framePromptChrome(editorLines(80), 80, options({ fg: (_role, text) => text, commandsLabel: { hint: "alt+k" }, panelLabel: { hint: "alt+h" } }));
+	const top = stripAnsi(chrome.lines[0]!);
+	assert.match(top, /^╭─ ✿ ≡ commands · alt\+k ─+ « panel · alt\+h ─╮$/);
+	assert.equal(visibleWidth(top), 80);
+	assert.deepEqual(chrome.commandsSpan, { start: 5, end: 15 }, "the commands label does not move");
+	const start = top.indexOf("«");
+	assert.deepEqual(chrome.panelSpan, { start, end: start + "« panel".length }, "only `« panel` is clickable, not the key");
+	assert.equal(start, 80 - 3 - "« panel · alt+h".length);
+});
+
+test("the panel label works without the commands label or a key, and is dropped when it does not fit", () => {
+	const alone = framePromptChrome(editorLines(60), 60, options({ fg: (_role, text) => text, panelLabel: {} }));
+	assert.match(stripAnsi(alone.lines[0]!), /^╭─ ✿ ─+ « panel ─╮$/);
+	assert.equal(alone.panelSpan?.end, 60 - 3);
+	const tight = framePromptChrome(editorLines(30), 30, options({ fg: (_role, text) => text, commandsLabel: { hint: "alt+k" }, panelLabel: { hint: "alt+h" } }));
+	assert.equal(tight.panelSpan, undefined, "no room: dropped whole, never truncated");
+	assert.doesNotMatch(stripAnsi(tight.lines[0]!), /panel/);
+	assert.ok(tight.lines.every((line) => visibleWidth(line) <= 30));
+	const absent = framePromptChrome(editorLines(80), 80, options({ fg: (_role, text) => text }));
+	assert.equal(absent.panelSpan, undefined);
+});
+
+test("float hint row right-aligns the same `« panel · key` label", () => {
+	const bg = (_role: string, text: string) => `\x1b[44m${text}\x1b[49m`;
+	const chrome = framePromptChrome(editorLines(75), 80, options({ style: "float", bg, fg: (_role, text) => text, commandsLabel: { hint: "alt+k" }, panelLabel: { hint: "alt+h" } }));
+	const hint = stripAnsi(chrome.lines[0]!);
+	assert.match(hint, /^ ▎ ✿ ≡ commands · alt\+k · waiting for input +« panel · alt\+h +$/);
+	assert.equal(visibleWidth(chrome.lines[0]!), 80);
+	const start = hint.indexOf("«");
+	assert.deepEqual(chrome.panelSpan, { start, end: start + "« panel".length });
+});

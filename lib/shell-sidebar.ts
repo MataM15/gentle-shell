@@ -24,6 +24,12 @@ export interface SidebarState {
 	railColumns?: number;
 	/** True while Status placement is "hidden": the bottom Status bar paints nothing at any width or mode. */
 	statusHidden?: () => boolean;
+	/**
+	 * True when the user folded the rail away (`» hide panel` / alt+h) but the
+	 * layout would show it otherwise: fullscreen, wide enough, and a Status
+	 * placement that allows it. The editor offers `« panel` only then.
+	 */
+	railAvailable?: () => boolean;
 	/** True while a painting top header is the only status row of a narrow fullscreen terminal: the bottom Status bar steps aside. */
 	headerOwnsStatus?: () => boolean;
 	parts: Map<string, SidebarRail>;

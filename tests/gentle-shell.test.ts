@@ -6384,3 +6384,68 @@ test("palette sub-menus use the mouse-capable select only while the footer's TUI
 	await command.handler("", ctx);
 	assert.equal(selects.length, 2, "after dispose the probe is released and the native select returns");
 });
+
+// S14 (odd/tasks/palette-button.md): alt+h, /gentle:panel and the editor's
+// `« panel · key` fold and unfold the rail; the choice survives sessions.
+async function panelShell(t: test.TestContext, env: NodeJS.ProcessEnv = {}) {
+	const home = mkdtempSync(join(tmpdir(), "gentle-panel-"));
+	t.after(() => rmSync(home, { recursive: true, force: true }));
+	const { pi, handlers, commands, shortcuts } = fakePi(undefined, [...DEFAULT_COMMANDS, { name: "gentle:panel", description: "Fold or unfold the right side panel", source: "extension", sourceInfo: FAKE_SOURCE_INFO }]);
+	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off", GENTLE_PI_CONFIG_HOME: home, ...env });
+	const { ctx, ui } = fakeContext();
+	await fire(handlers, "session_start", ctx);
+	const tui = { mode: "fullscreen", terminal: { rows: 40, columns: 160 }, requestRender() {} };
+	const state = sidebarState(tui as unknown as TUI);
+	const factory = ui.editorFactory as (tui: unknown, theme: unknown, keybindings: unknown) => GentlePromptEditor;
+	const editor = factory(tui, editorTheme, fakeKeybindings);
+	editor.focused = true;
+	t.after(() => editor.dispose());
+	const railFile = () => { try { return JSON.parse(readFileSync(join(home, "rail.json"), "utf8")); } catch { return undefined; } };
+	return { pi, commands, shortcuts, ctx, ui, tui, state, editor, home, railFile };
+}
+
+test("/gentle:panel and alt+h fold and unfold the rail and remember it", async (t) => {
+	const { commands, shortcuts, ctx, railFile } = await panelShell(t);
+	assert.ok(commands.has("gentle:panel"));
+	assert.ok(shortcuts.has("alt+h"), "alt+h is registered by default");
+	await commands.get("gentle:panel")!.handler("", ctx);
+	assert.deepEqual(railFile(), { schema: "gentle-pi.rail/v1", collapsed: true });
+	await shortcuts.get("alt+h")!.handler(ctx);
+	assert.deepEqual(railFile(), { schema: "gentle-pi.rail/v1", collapsed: false });
+});
+
+test("the panel shortcut follows GENTLE_PI_PANEL_KEY and off removes it", async (t) => {
+	const remapped = await panelShell(t, { GENTLE_PI_PANEL_KEY: "ctrl+alt+p" });
+	assert.ok(remapped.shortcuts.has("ctrl+alt+p"));
+	assert.ok(!remapped.shortcuts.has("alt+h"));
+	const off = await panelShell(t, { GENTLE_PI_PANEL_KEY: "off" });
+	assert.ok(!off.shortcuts.has("alt+h"));
+	assert.ok(off.commands.has("gentle:panel"), "the command stays even without a shortcut");
+});
+
+test("a folded rail shows `« panel · alt+h` on the editor border, and a click on it unfolds", async (t) => {
+	const { editor, state, railFile, commands, ctx } = await panelShell(t);
+	await commands.get("gentle:panel")!.handler("", ctx);
+	state.active = false;
+	state.railAvailable = () => true;
+	const top = stripAnsi(editor.render(160)[0]!);
+	assert.match(top, /^╭─ ✿ ≡ commands · alt\+k ─+ « panel · alt\+h ─╮$/);
+	const x = top.indexOf("«");
+	const event = (type: string, at: number) => ({ type, button: "left", x: at, y: 0, screenX: at, screenY: 0, width: 160, height: 3, shift: false, alt: false, ctrl: false } as TuiMouseEvent);
+	editor.handleMouse(event("press", x));
+	editor.handleMouse(event("click", x + "« panel".length + 2));
+	assert.deepEqual(railFile(), { schema: "gentle-pi.rail/v1", collapsed: true }, "the key hint and presses do nothing");
+	assert.equal(editor.handleMouse(event("click", x))?.handled, true);
+	assert.deepEqual(railFile(), { schema: "gentle-pi.rail/v1", collapsed: false });
+	state.railAvailable = () => false;
+	assert.doesNotMatch(stripAnsi(editor.render(160)[0]!), /panel/, "no label when there is no rail to unfold");
+});
+
+test("the palette lists Toggle side panel with its shortcut", async (t) => {
+	const { commands, ctx, ui } = await panelShell(t);
+	void commands.get("gentle:commands")!.handler("", ctx);
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	const row = ui.overlayView!.render(100).map(stripAnsi).find((line) => line.includes("Toggle side panel"));
+	assert.ok(row, "the palette has the entry");
+	assert.match(row!, /◨ Toggle side panel +alt\+h/);
+});

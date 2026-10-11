@@ -69,6 +69,12 @@ export interface PromptFrameOptions {
 	 * shortcut; absent means the shortcut is disabled and no key is shown.
 	 */
 	commandsLabel?: { hint?: string };
+	/**
+	 * Present only while the user folded the rail away and it could show:
+	 * paints `« panel · key` at the right end of the top border (float: of the
+	 * hint row). `hint` is the resolved shortcut; absent when it is disabled.
+	 */
+	panelLabel?: { hint?: string };
 }
 
 /** Columns of the clickable commands label on row 0 of the framed prompt. */
@@ -81,6 +87,8 @@ export interface PromptChrome {
 	lines: string[];
 	/** Where the commands label sits on row 0; undefined when it is absent or did not fit. */
 	commandsSpan?: PromptLabelSpan;
+	/** Where `« panel` sits on row 0; undefined when it is absent or did not fit. */
+	panelSpan?: PromptLabelSpan;
 }
 
 // A terminal cell cannot grow, so the petal earns presence with weight and
@@ -138,7 +146,29 @@ function commandsLabel(options: PromptFrameOptions): { text: string; width: numb
 	return { text: options.fg(COMMANDS_LABEL_ROLE, name) + (hint ? options.fg(HINT_ROLE, hint) : ""), width: visibleWidth(name + hint), nameWidth: visibleWidth(name) };
 }
 
-function topRule(width: number, options: PromptFrameOptions, indicator: string | undefined): { line: string; span?: PromptLabelSpan } {
+const PANEL_NAME = "« panel";
+
+// `« panel · key`: the arrow and word in the commands-label role, the key dim.
+function panelLabel(options: PromptFrameOptions): { text: string; width: number; nameWidth: number } | undefined {
+	const spec = options.panelLabel;
+	if (!spec) return undefined;
+	const hint = spec.hint ? COMMANDS_SEPARATOR + spec.hint : "";
+	return { text: options.fg(COMMANDS_LABEL_ROLE, PANEL_NAME) + (hint ? options.fg(HINT_ROLE, hint) : ""), width: visibleWidth(PANEL_NAME + hint), nameWidth: visibleWidth(PANEL_NAME) };
+}
+
+// The top rule's tail after `fill` rule cells: plain `─…─╮`, or with room,
+// `─…─ « panel · key ─╮` and where `« panel` landed. Dropped whole when the
+// rule would lose its last cell before the label.
+function closeTopRule(width: number, fill: number, options: PromptFrameOptions): { tail: string; span?: PromptLabelSpan } {
+	const panel = panelLabel(options);
+	if (panel && fill - panel.width - 3 >= 1) {
+		const start = width - 3 - panel.width;
+		return { tail: options.borderColor(` ${rule(fill - panel.width - 3)} `) + panel.text + options.borderColor(" ─╮"), span: { start, end: start + panel.nameWidth } };
+	}
+	return { tail: options.borderColor(` ${rule(fill)}╮`) };
+}
+
+function topRule(width: number, options: PromptFrameOptions, indicator: string | undefined): { line: string; span?: PromptLabelSpan; panelSpan?: PromptLabelSpan } {
 	const label = indicator ?? stateLabel(options);
 	const scanning = options.state === PROMPT_STATE.WORKING;
 	const glyph = petalGlyph(options.state, options.tick);
@@ -155,14 +185,16 @@ function topRule(width: number, options: PromptFrameOptions, indicator: string |
 		if (fill >= 1) {
 			const title = petal + " " + commands.text + (paintedLabel ? options.fg(HINT_ROLE, COMMANDS_SEPARATOR) + paintedLabel : "");
 			const start = 3 + glyphWidth + 1;
-			return { line: options.borderColor("╭─ ") + title + options.borderColor(` ${rule(fill)}╮`), span: { start, end: start + commands.nameWidth } };
+			const close = closeTopRule(width, fill, options);
+			return { line: options.borderColor("╭─ ") + title + close.tail, span: { start, end: start + commands.nameWidth }, panelSpan: close.span };
 		}
 	}
 	const title = [petal, paintedLabel].filter(Boolean).join(" ");
 	const titleWidth = glyphWidth + (label ? visibleWidth(label) + (glyph ? 1 : 0) : 0);
 	const fill = width - titleWidth - 5;
 	if (fill < 0) return { line: options.borderColor(`╭${rule(width - 2)}╮`) };
-	return { line: options.borderColor("╭─ ") + title + options.borderColor(` ${rule(fill)}╮`) };
+	const close = closeTopRule(width, fill, options);
+	return { line: options.borderColor("╭─ ") + title + close.tail, panelSpan: close.span };
 }
 
 function bottomRule(width: number, options: PromptFrameOptions, indicator: string | undefined): string {
@@ -238,7 +270,7 @@ export function floatPromptRow(line: string, layout: PromptLayout, borderColor: 
 	return " " + layout.background + rearmPromptBackground(content, layout.background) + "\x1b[49m ";
 }
 
-function floatPromptHint(top: string, bottom: string, options: PromptFrameOptions, width: number): { text: string; span?: PromptLabelSpan } {
+function floatPromptHint(top: string, bottom: string, options: PromptFrameOptions, width: number): { text: string; span?: PromptLabelSpan; panelSpan?: PromptLabelSpan } {
 	const glyph = petalGlyph(options.state, options.tick);
 	const petal = options.fg(petalTone(options.state, options.tick), options.bold ? options.bold(glyph) : glyph);
 	const label = stateLabel(options) ?? "waiting for input";
@@ -265,6 +297,14 @@ function floatPromptHint(top: string, bottom: string, options: PromptFrameOption
 		span = { start, end: start + commands.nameWidth };
 	}
 	const hint = truncateToWidth(text, width, "");
+	// `« panel · key` right-aligned with one cell to spare, only past a gap.
+	const panel = panelLabel(options);
+	if (panel && visibleWidth(hint) + 2 + panel.width + 1 <= width) {
+		const gap = width - visibleWidth(hint) - panel.width - 1;
+		// Painted columns run one ahead of this content (" ▎ " vs "  ").
+		const start = width - 1 - panel.width + 1;
+		return { text: hint + " ".repeat(gap) + panel.text + " ", span, panelSpan: { start, end: start + panel.nameWidth } };
+	}
 	return { text: hint + " ".repeat(Math.max(0, width - visibleWidth(hint))), span };
 }
 
@@ -284,6 +324,7 @@ export function framePromptChrome(lines: string[], width: number, options: Promp
 				floatPromptRow("", layout, options.borderColor),
 			],
 			commandsSpan: hint.span,
+			panelSpan: hint.panelSpan,
 		};
 	}
 	if (lines.length < 2) return { lines: lines.map((line) => truncateToWidth(line, width, "")) };
@@ -293,7 +334,7 @@ export function framePromptChrome(lines: string[], width: number, options: Promp
 	const bottom = lines[lines.length - 1];
 	const content = lines.slice(1, -1).map((line) => sideRules(line, innerWidth, options));
 	const head = topRule(width, options, scrollIndicator(top));
-	return { lines: [head.line, ...content, bottomRule(width, options, options.escHint ?? scrollIndicator(bottom))], commandsSpan: head.span };
+	return { lines: [head.line, ...content, bottomRule(width, options, options.escHint ?? scrollIndicator(bottom))], commandsSpan: head.span, panelSpan: head.panelSpan };
 }
 
 export function withPromptHint(line: string, hint: string, fg: PromptFrameOptions["fg"]): string {
