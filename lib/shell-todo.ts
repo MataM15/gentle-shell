@@ -335,7 +335,16 @@ export function renderTodoCard(state: TodoState, theme: TodoTheme, width: number
 	// Content columns of the card body in the active style (float is narrower).
 	const inner = panelInnerWidth(theme, width, tone, options.compact);
 	const rows = options.collapsed ? [collapsedRow(state, theme, inner)] : options.scrollable ? state.tasks.map((task) => taskRow(task, theme, inner)) : bodyRows(state, theme, inner);
-	const body = stale ? [theme.fg(NOTE_ROLE, `stale · ${options.staleTurns} turns`), ...rows] : rows;
+	const staleLabel = theme.fg(NOTE_ROLE, `stale · ${options.staleTurns} turns`);
+	let body = options.collapsed
+		? [truncateToWidth(`${stale ? `${staleLabel} · ` : ""}${rows[0]}`, inner, "…")]
+		: stale ? [staleLabel, ...rows] : rows;
+	if (!options.collapsed && !options.scrollable) {
+		// Budget physical lines after wrapping: one long task can exceed the
+		// old task-count cap by itself. Scrollable hosts retain every line.
+		body = body.flatMap((row) => wrapTextWithAnsi(row, Math.max(1, inner)));
+		if (body.length > ROW_CAP) body = [...body.slice(0, ROW_CAP - 1), theme.fg(NOTE_ROLE, "… more")];
+	}
 	// The clickable control paints the shared hover role while hovered --
 	// same treatment every other clickable surface uses -- and stays dim
 	// otherwise, secondary to the rose rail title.

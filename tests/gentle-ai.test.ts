@@ -309,7 +309,7 @@ test("registered Gentle Review tools preserve result envelopes and preview usefu
 		{ manifest: encoded, sha256, cursor: 0 },
 		undefined,
 		undefined,
-		{ cwd: process.cwd() } as ExtensionContext,
+		{ cwd: process.cwd() } as unknown as ExtensionContext,
 	);
 	const visibleEnvelope = JSON.parse(result.content[0].text);
 	assert.deepEqual(visibleEnvelope, {
@@ -742,7 +742,7 @@ test("session startup reports invalid project routing without mutating the profi
 		registerCommand() {},
 		registerTool() {},
 	} as unknown as ExtensionAPI;
-	createGentleAiExtension({ nativeReviewCli: null })(pi);
+	createGentleAiExtension({ nativeReviewCli: null, processEnv: { GENTLE_PI_AGENTS_CHILD: "0" } })(pi);
 	const sessionStart = handlers.get("session_start");
 	assert.equal(typeof sessionStart, "function");
 	const notifications: Array<{ message: string; severity: string }> = [];
@@ -1351,7 +1351,7 @@ test("delivery commands bypass RDD under every mode outcome while command safety
 			cwd: process.cwd(),
 			hasUI: true,
 			ui: { confirm: async () => true },
-		} as ExtensionContext;
+		} as unknown as ExtensionContext;
 
 		for (const command of commands) {
 			const result = await toolCall!({ toolName: "bash", input: { command } }, ctx);
@@ -1393,7 +1393,7 @@ test("guarded command confirmation emits a generic correlated permission lifecyc
 				sequence.push(
 					channel === "herdr:blocked"
 						? `herdr:${"active" in data && data.active ? "active" : "inactive"}`
-						: `event:${data.state}`,
+						: `event:${"state" in data ? data.state : "unknown"}`,
 				);
 				emitted.push({ channel, data } as EmittedEvent);
 			},
@@ -1415,7 +1415,7 @@ test("guarded command confirmation emits a generic correlated permission lifecyc
 					return confirm();
 				},
 			},
-		} as ExtensionContext;
+		} as unknown as ExtensionContext;
 		let resolveConfirmation!: (approved: boolean) => void;
 		confirm = () => new Promise<boolean>((resolve) => { resolveConfirmation = resolve; });
 		const denied = toolCall!({
@@ -1549,7 +1549,7 @@ test("concurrent guarded confirmations coalesce the Herdr lifecycle per extensio
 			ui: {
 				confirm: async () => new Promise<boolean>((resolve) => { confirmations.push(resolve); }),
 			},
-		} as ExtensionContext);
+		} as unknown as ExtensionContext);
 		const firstRequest = first.handlers.get("tool_call")!({ toolName: "bash", input: { command: "git rebase main" } }, context(first.confirmations));
 		const secondRequest = first.handlers.get("tool_call")!({ toolName: "bash", input: { command: "git rebase main --another-command" } }, context(first.confirmations));
 		await Promise.resolve();
@@ -1708,7 +1708,7 @@ test("Herdr preserves the initial label and balanced edges across overlapping so
 			ui: {
 				confirm: async () => new Promise<boolean>((resolve) => { confirmations.push(resolve); }),
 			},
-		} as ExtensionContext;
+		} as unknown as ExtensionContext;
 		return { confirmations, context, herdrEvents, pi, toolCall: handlers.get("tool_call")! };
 	};
 
@@ -1817,7 +1817,7 @@ test("closed choice blockers retain the visible choice label through guarded-con
 			ui: {
 				confirm: async () => new Promise<boolean>((resolve) => { confirmations.push(resolve); }),
 			},
-		} as ExtensionContext,
+		} as unknown as ExtensionContext,
 	);
 	await Promise.resolve();
 	assert.equal(confirmations.length, 1);
@@ -1867,12 +1867,12 @@ test("permission lifecycle is inactive for unguarded and headless commands", asy
 			cwd,
 			hasUI: false,
 			ui: { confirm },
-		} as ExtensionContext), undefined);
+		} as unknown as ExtensionContext), undefined);
 		assert.deepEqual(await toolCall!({ toolName: "bash", input: { command: "git rebase main" } }, {
 			cwd,
 			hasUI: false,
 			ui: { confirm },
-		} as ExtensionContext), {
+		} as unknown as ExtensionContext), {
 			block: true,
 			reason: "Gentle AI safety policy requires interactive confirmation before this command.",
 		});
@@ -1927,7 +1927,7 @@ test("bash tool_call confirms a late guarded npm publish and denies on non-appro
 				return false;
 			},
 		},
-	} as ExtensionContext;
+	} as unknown as ExtensionContext;
 
 	const prefix = "noise ".repeat(80);
 	const command = `${prefix}npm publish --tag beta`;
@@ -1979,7 +1979,7 @@ test("bash tool_call confirms every compound action and centers a long git -C pu
 			cwd: process.cwd(),
 			hasUI: true,
 			ui: { confirm: async (title: string, message: string) => (confirmArgs.push([title, message]), false) },
-		} as ExtensionContext);
+		} as unknown as ExtensionContext);
 		assert.deepEqual(result, {
 			block: true,
 			reason: "Gentle AI safety policy blocked the command because it was not confirmed.",
@@ -2501,6 +2501,47 @@ test("applying a populated profile with matching routes but a different orchestr
 	assert.equal(fixture.confirmCalls.length, 1, "an orchestrator change is a real change and must confirm");
 	assert.match(fixture.confirmCalls[0]?.[0] ?? "", /Apply profile/);
 	assert.notEqual(JSON.parse(readFileSync(storePath, "utf8")).active, "team", "declining leaves the store untouched");
+});
+
+test("profile replacement with 23 routes changes files only after confirmation", async (t) => {
+	for (const approved of [false, true]) {
+		await t.test(approved ? "confirmed replacement" : "declined replacement", async (t) => {
+			const { fixture, storePath, writeStore, writeSettings, settingsPath } = profilesStoreFixture(t);
+			writeSettings();
+			writeStore({ team: { worker: { model: "openai/alpha" } } });
+			const names = ["worker", "review-refuter", ...Array.from({ length: 21 }, (_, i) => `helper-${i + 1}`)];
+			const profiles = Object.fromEntries(names.map((name) => [name, { model: "openai/beta", effort: "high" }]));
+			const subagentsPath = join(fixture.root, ".pi", "subagents.json");
+			writeFileSync(subagentsPath, `${JSON.stringify({ max_concurrency: 3, user_setting: { keep: true }, model_profiles: profiles })}\n`);
+			writeFileSync(fixture.globalPath, `${JSON.stringify({ worker: { model: "openai/beta", thinking: "high" } })}\n`);
+			const markdown = names.map((name) => join(fixture.root, ".pi", "agents", `${name}.md`));
+			for (const [i, path] of markdown.entries()) writeMarkdown(path, `---\nname: ${names[i]}\ndescription: User agent\nmodel: openai/beta\nthinking: high\n---\nUser instruction for ${names[i]}.\n`);
+			const files = [fixture.globalPath, subagentsPath, storePath, settingsPath, ...markdown];
+			const before = files.map((path) => readFileSync(path, "utf8"));
+			fixture.onConfirm(async () => approved);
+			applyOnce(fixture);
+			await fixture.run("gentle:profiles");
+			assert.equal(fixture.confirmCalls.length, 1);
+			assert.equal(fixture.confirmCalls[0][0], 'Apply profile "team"?');
+			for (const name of names.slice(2)) assert.ok(fixture.confirmCalls[0][1].includes(`${name}: openai/beta · high → inherit`), `confirmation names ${name}`);
+			assert.deepEqual(fixture.liveSwitches, [], "no orchestrator changes were requested");
+			assert.equal(readFileSync(settingsPath, "utf8"), before[3]);
+			if (!approved) {
+				assert.deepEqual(files.map((path) => readFileSync(path, "utf8")), before, "declining preserves all 23 routes and Markdown, stores and settings byte-identically");
+				return;
+			}
+			assert.deepEqual(JSON.parse(readFileSync(subagentsPath, "utf8")), { max_concurrency: 3, user_setting: { keep: true }, model_profiles: { worker: { model: "openai/alpha" }, "review-refuter": profiles["review-refuter"] } });
+			assert.deepEqual(JSON.parse(readFileSync(fixture.globalPath, "utf8")), { worker: { model: "openai/alpha" } });
+			assert.equal(JSON.parse(readFileSync(storePath, "utf8")).active, "team");
+			for (const [i, path] of markdown.entries()) {
+				const stored = readFileSync(path, "utf8");
+				assert.ok(stored.endsWith(`User instruction for ${names[i]}.\n`));
+				if (i === 0) { assert.match(stored, /^model: openai\/alpha$/m); assert.doesNotMatch(stored, /^thinking:/m); }
+				else if (i === 1) assert.equal(stored, before[4 + i], "provider review role is not cleared");
+				else { assert.doesNotMatch(stored, /^model:/m); assert.doesNotMatch(stored, /^thinking:/m); }
+			}
+		});
+	}
 });
 
 test("applying a populated profile names materialized-only routes it would clear before asking", async (t) => {

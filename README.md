@@ -240,6 +240,28 @@ The [v3.5.1 release](https://github.com/Gentleman-Programming/gentle-shell/relea
 
 > **Naming transition:** The product is called `gentle-shell`; the current npm package and repository remain `gentle-pi` until migration.
 
+### Easiest: download and double-click (no terminal needed)
+
+Download the installer for your computer, double-click it, and follow the steps in your browser. It installs everything Gentle Shell needs (Node.js, pnpm, Pi and Gentle Shell), or updates what you already have, and installs nothing until you confirm the plan it shows you. (To show that plan it may first download Node.js and pnpm into a temporary folder, which it removes afterwards.)
+
+| Your computer | Download | Then |
+| --- | --- | --- |
+| **macOS** | [gentle-shell-installer-macos.zip](https://github.com/Gentleman-Programming/gentle-shell/releases/latest/download/gentle-shell-installer-macos.zip) | Open the zip, then double-click **Install Gentle Shell.command** inside the *Gentle Shell Installer* folder. |
+| **Windows** | [gentle-shell-installer-windows.zip](https://github.com/Gentleman-Programming/gentle-shell/releases/latest/download/gentle-shell-installer-windows.zip) | Right-click the zip → **Extract All**. Open the extracted folder, then the *Gentle Shell Installer* folder inside it, and double-click **Install Gentle Shell.cmd**. It does not run from inside the zip. |
+| **Linux** | [gentle-shell-installer-linux.tar.gz](https://github.com/Gentleman-Programming/gentle-shell/releases/latest/download/gentle-shell-installer-linux.tar.gz) | Extract it, then double-click **install-gentle-shell.sh**. If your file manager does not run scripts, run `sh install-gentle-shell.sh` in that folder. |
+
+A small window opens, then the installer appears in your browser. Use the tab it opens, and keep the small window open until the installer says it is done. If a download link does not open, the newest release does not include the installers yet: use [Path C](#path-c-browser-installer-from-a-checkout) meanwhile.
+
+> **Your computer will warn you the first time.** These installers are not signed with an Apple or Microsoft developer certificate yet, so the system cannot verify who made them. That warning is expected; here is how to continue:
+>
+> - **macOS:** you see *"Install Gentle Shell.command" Not Opened* (or *cannot be opened because Apple cannot check it*). Click **Done**, open **System Settings → Privacy & Security**, scroll down to the message about *Install Gentle Shell.command*, click **Open Anyway**, and confirm with your password. On older macOS versions you can instead right-click the file, choose **Open**, then **Open** again. You only do this once.
+> - **Windows:** you see *Windows protected your PC*: click **More info**, then **Run anyway**. If you see *Open File – Security Warning* instead, click **Run**.
+> - **Linux:** if double-click opens the file in an editor, run `sh install-gentle-shell.sh` in that folder instead.
+>
+> Only download from this repository's [Releases](https://github.com/Gentleman-Programming/gentle-shell/releases) page. To check a download, compare its SHA-256 with [gentle-shell-installers-SHA256SUMS.txt](https://github.com/Gentleman-Programming/gentle-shell/releases/latest/download/gentle-shell-installers-SHA256SUMS.txt).
+
+The installer is a preview: it is tested on Linux and in CI, while clean-machine runs on macOS and Windows are still being verified. How it works and what it changes: **[installation wizard](docs/install-wizard.md)**.
+
 ### Path A: standalone `gentle-shell` (recommended, no pi changes)
 
 `gentle-shell` opens Pi with the Gentle Shell package loaded, without installing it into your pi agent or editing its `settings.json`.
@@ -289,6 +311,51 @@ See the [v3.5.1 release notes](https://github.com/Gentleman-Programming/gentle-s
 
 **Builtin codemode warning.** gentle-pi replaces Pi's builtin `codemode` with its compact renderer, so Pi warns at startup that the builtin was not loaded. In your own Pi home (`pi` with this package, or `gentle-shell --link`), gentle-pi asks once in the interactive TUI whether to add `"-builtin:codemode"` to `extensions` in the agent `settings.json` (usually `~/.pi/agent/settings.json`); it writes only if you accept, and the warning disappears from the next launch. A declined prompt is not repeated. To silence it by hand, add the entry yourself, for example `"extensions": ["-builtin:codemode"]`. Isolated `gentle-shell` homes already carry it.
 
+### Path C: browser installer from a checkout
+
+The same installer as the [download above](#easiest-download-and-double-click-no-terminal-needed), started from a clone instead of a download:
+
+```bash
+git clone https://github.com/Gentleman-Programming/gentle-shell.git
+cd gentle-shell
+
+# macOS and Linux
+sh scripts/bootstrap.sh
+
+# Windows (cmd)
+scripts\bootstrap.cmd
+```
+
+It installs what is missing (Node.js, pnpm, Pi, Gentle Shell) and updates an existing Gentle Shell or an older Pi; nothing changes until you confirm. The bootstrap gets Node.js and pnpm into a temporary folder if they are missing, then opens the wizard in your browser at a private `127.0.0.1` address. Use the tab it opens: the link works once and expires after 2 minutes. On the review screen, choose what to install:
+
+- **Latest release** (recommended): the published Gentle Shell with its pinned Gentle AI binary.
+- **Latest main**: development builds of Gentle Shell and Gentle AI from the latest commit of `main`, built on your computer with Go. If your Go is missing or older, the installer downloads its own pinned, verified Go only for that build.
+
+An older Node.js or an incompatible pnpm (from mise, nvm, nvm-windows, fnm, Volta or Homebrew, for example) is left untouched: the installer uses its own pinned, verified copy and installs it under `$PNPM_HOME`, and the plan says so before you confirm; a version manager may still put your own version first in new terminals. This applies only to a new installation: with Gentle Shell already installed, an older Node.js or incompatible pnpm still blocks. On Windows, `bootstrap.cmd` also uses its own Node.js when it cannot verify where yours lives (an nvm-windows symlink or an fnm junction, for example), without running yours. A pnpm in the pnpm global bin directory (`$PNPM_HOME/bin`) is never replaced or downgraded: an older one blocks with the `pnpm self-update` command that updates it, and one whose version could not be checked is left as it is while the installer uses its own verified pnpm, which the plan says before you confirm. A working `npm` on your PATH (from Node.js, Homebrew, nvm, nvm-windows, fnm, mise, asdf or Volta, for example) is used as it is; the installer adds its own npm only when none works. On Windows it never runs `npm.cmd` or `pnpm.cmd` through a shell: it runs what a recognized shim runs, or the `.exe` itself, and treats any other shim as not usable. It also checks that no other account can change the pnpm home folder (`PNPM_HOME`), and never runs a pnpm from a folder another account can change (or one it cannot prove is pnpm, such as Corepack's `pnpm.cmd`): it uses its own verified pnpm instead and leaves yours as it is. When pnpm's default `%LOCALAPPDATA%\pnpm` fails that check and holds nothing yet, it uses `%USERPROFILE%\.pnpm` instead and `pnpm setup` saves it for new terminals; pnpm commands you run later still keep pnpm's configuration, cache and state under `%LOCALAPPDATA%`, an accepted risk the plan states. When that folder already holds files, or your own `PNPM_HOME` fails the check, it stops and names the folder, the account and its rights. The plan says so before you confirm. Your Node.js, npm, Go, Pi or npm-installed Gentle Shell are used as you already use them; when one lives in a folder another account can change, the plan names that folder, the account and its rights as a notice, without blocking. When a build needs Go (the main channel, or Windows) and yours is missing or older, the installer downloads a pinned Go from go.dev, verifies its checksum and uses it only to build, from its own folder; your Go and PATH are left untouched, and the plan says so before you confirm. A release install on macOS or Linux never downloads Go. An existing Pi that meets the minimum is reused as it is. With pnpm 11, Gentle Shell may run a newer Pi than the installer's that pnpm puts next to it (always at least the minimum); the installer says which one when it finishes. An older Pi is updated to the version the installer installs, with the package manager that installed it (pnpm or npm); the plan shows the found and target versions before you confirm. An older Pi that neither manages (mise, Homebrew or a standalone binary, for example) is left untouched, and the installer adds its own Pi with pnpm, as when Pi is missing; Gentle Shell uses that one. Pi is never downgraded. An existing Gentle Shell is updated with the package manager that installed it (pnpm or npm); one it cannot attribute, such as an `npm link` of a source checkout, is left untouched and explained. No checkout dependencies are needed (`pnpm install` is not required). This is a preview: it is tested on Linux and in CI, while clean-machine runs on macOS and Windows are still being verified. Details: **[installation wizard](docs/install-wizard.md)**.
+
+### Keep it up to date
+
+```bash
+# Update along your channel: the latest release, or the latest main
+gentle-shell upgrade
+
+# Switch channel
+gentle-shell upgrade --channel main
+gentle-shell upgrade --channel release
+```
+
+`gentle-shell upgrade` uses the package manager that owns your installation. On the main channel it rebuilds Gentle AI and Gentle Shell from the latest `main` commits (only what changed) and needs pnpm and Go (a Go older than the minimum is replaced, for the build only, by the pinned Go the installer left in its own folder); switching back to release restores the pinned Gentle AI binary. With pnpm 11, the updated Gentle Shell may run a newer Pi that pnpm puts next to it (always at least the minimum); your own Pi is never changed. `gentle-shell update` is a different command: it is Pi's own package update. More: **[upgrade reference](docs/readme-reference.md#upgrade-subcommand-and-channels)**.
+
+### Remove it
+
+```bash
+# Show what would be removed, then remove it after confirming
+gentle-shell self-uninstall --dry-run
+gentle-shell self-uninstall
+```
+
+`gentle-shell self-uninstall` removes Gentle Shell's own data, its isolated home and the `gentle-pi` package. It keeps the shared Gentle AI configuration in `~/.pi/gentle-ai` unless you accept or pass `--include-shared`, and never touches your Pi home or custom `--home` homes. `gentle-shell uninstall` is Pi's own alias for `remove`. More: **[Removing Gentle Shell](docs/gentle-shell-uninstall.md)**.
+
 ### Background jobs
 
 Use `/gentle:jobs` to inspect this session's background commands and monitors. Running jobs appear first; each group is ordered newest first. Arrow keys select a job, `Tab` opens details on narrow terminals, `s` stops a running job, and `q` closes the modal.
@@ -303,14 +370,16 @@ Thinking levels follow NaN's [reasoning contract](https://nan.builders/docs/mode
 
 | Models | Pi thinking levels |
 | --- | --- |
-| GLM 5.3 / GLM 5.3 Flash | `low`, `medium`, `high`, `max`; `minimal` aliases `low`, and `xhigh` aliases `max`. No `off`. |
-| Gemma 4 / Qwen 3.6 | `off` sends `none`; `minimal` also disables reasoning. `low`, `medium`, `high`, and `max` set reasoning budgets; `xhigh` aliases `max`. |
-| DeepSeek V4 Flash / Qwen 3.8 Flash / MiMo | Only `medium` is exposed as a Pi placeholder. NaN manages reasoning depth; the effort parameter does not provide an off switch or adjustable depth. |
+| GLM 5.3 / GLM 5.3 Flash | `low`, `medium`, `high`, and `max` are fully controllable. No `off`; Pi's `minimal` and `xhigh` clamp to `low` and `max`. |
+| Qwen 3.6 / Gemma 4 | `off` sends `none` and `minimal` also skips reasoning; `low`, `medium`, `high`, and `max` set reasoning budgets. Pi's `xhigh` clamps to `max`. |
+| DeepSeek V4 Flash / Qwen 3.8 Flash / MiMo | The same `off` (`none`), `minimal`, `low`, `medium`, `high`, and `max` levels are accepted, but NaN manages their reasoning depth, so no value changes it. Pi's `xhigh` clamps to `max`. The header reports `effort: auto` for these three and a one-time notice says the level does not change the depth. |
 
 ```text
 /gentle:status
 /gentle:doctor
 ```
+
+> **STATUS diagnostics are opt-in:** `/gentle:status-timing enable` arms timing for the next separately authorized STATUS-bearing tool call; `show` consults the memory-only summary and `disable` clears it. It never invokes or retries STATUS. See the [diagnostic boundaries](docs/readme-reference.md#diagnose-status-timing-without-retrying-it).
 
 > **RDD is opt-in:** enable native receipt-driven development only through an explicit `/gentle:review-mode enable` decision. The `.git/gentle-ai/candidate-views` parent must sit on a filesystem that honors private POSIX modes (or equivalent Windows ACLs); WSL DrvFS mounts without metadata can reject START before lineage creation.
 
@@ -339,7 +408,8 @@ Start with the product-facing destination, then move into the operational refere
 | [Telemetry](docs/telemetry.md) | Approved fields and source limitations. |
 | [Delegated verification](docs/delegated-verification.md) | Practical verification guidance. |
 | [Skill style guide](docs/skill-style-guide.md) | The package skill contract. |
-| [Installation wizard (in development)](docs/install-wizard.md) | The browser installation wizard's design, security model and preview. Not a supported installation path yet. |
+| [Removing Gentle Shell](docs/gentle-shell-uninstall.md) | What `gentle-shell self-uninstall` removes, keeps and never touches. |
+| [Installation wizard (preview)](docs/install-wizard.md) | How the browser installer checks your computer, what it installs on the release and main channels, its security model, and what is still being verified. |
 
 <p align="right"><a href="#top">Back to top ↑</a></p>
 

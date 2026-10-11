@@ -31,6 +31,8 @@ import {
 	type ReviewLastEventClosureV1,
 } from "./review-integration-v2.ts";
 
+import { observeNativeStatus, measureStatusSync, measureStatusAsync } from "./status-timing-diagnostics.ts";
+
 const execFileAsync = promisify(execFile);
 
 // Negotiated review/status responses can carry a complete authority inventory.
@@ -1218,8 +1220,10 @@ function nativeProcessDiagnostics(operation: NativeReviewOperation, code: Native
 }
 
 function parseJson(stdout: string, operation: NativeReviewOperation, mutating: boolean, diagnostics: NativeReviewProcessDiagnostics): Record<string, unknown> {
-	if (stdout.length === 0) throw new NativeReviewCliError(NATIVE_REVIEW_ERROR_CODE.EMPTY_OUTPUT, operation, true, mutating, "native command returned empty output", { ...diagnostics, error_code: NATIVE_REVIEW_ERROR_CODE.EMPTY_OUTPUT });
-	try { return object(JSON.parse(stdout)); } catch { throw new NativeReviewCliError(NATIVE_REVIEW_ERROR_CODE.MALFORMED_JSON, operation, true, mutating, "native command returned malformed JSON", { ...diagnostics, error_code: NATIVE_REVIEW_ERROR_CODE.MALFORMED_JSON }); }
+	return measureStatusSync("decode", () => {
+		if (stdout.length === 0) throw new NativeReviewCliError(NATIVE_REVIEW_ERROR_CODE.EMPTY_OUTPUT, operation, true, mutating, "native command returned empty output", { ...diagnostics, error_code: NATIVE_REVIEW_ERROR_CODE.EMPTY_OUTPUT });
+		try { return object(JSON.parse(stdout)); } catch { throw new NativeReviewCliError(NATIVE_REVIEW_ERROR_CODE.MALFORMED_JSON, operation, true, mutating, "native command returned malformed JSON", { ...diagnostics, error_code: NATIVE_REVIEW_ERROR_CODE.MALFORMED_JSON }); }
+	});
 }
 function decodeNativeMaintenanceResult(value: unknown, expectedOperation: NativeReviewOperation): NativeReviewRecoveryResult {
 	const body = exactObject(value, ["operation", "record"]);
@@ -1250,7 +1254,7 @@ function assertSupportedNextTransitionOperation(body: Record<string, unknown>): 
 	}
 }
 function decode<T>(operation: NativeReviewOperation, mutating: boolean, callback: () => T, diagnostics = nativeProcessDiagnostics(operation, NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE)): T {
-	try { return callback(); } catch (error) { if (error instanceof NativeReviewCliError) throw error; throw new NativeReviewCliError(NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE, operation, true, mutating, "native response is schema incompatible", { ...diagnostics, error_code: NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE }); }
+	try { return measureStatusSync("decode", callback); } catch (error) { if (error instanceof NativeReviewCliError) throw error; throw new NativeReviewCliError(NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE, operation, true, mutating, "native response is schema incompatible", { ...diagnostics, error_code: NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE }); }
 }
 function decodeReviewStartResponse(value: unknown): ReviewStartV3 | ReviewStartV4 {
 	const body = object(value);
@@ -1262,50 +1266,6 @@ function decodeReleaseEvidence(value: unknown): void {
 	const release = exactObject(value, ["release_tree", "configuration_hash", "generated_artifact_hash", "provenance_hash", "publication_boundary_hash", "publication_state", "evidence_freshness_hash", "evidence_freshness_state"]);
 	for (const field of ["release_tree", "configuration_hash", "generated_artifact_hash", "provenance_hash", "publication_boundary_hash", "evidence_freshness_hash"]) requiredString(release[field]);
 	if (release.publication_state !== "sealed" || release.evidence_freshness_state !== "current") throw new Error("invalid release evidence");
-}
-function decodeNonDecidingGateContext(value: unknown, expectedGate: string): NativeGateContext {
-	const context = exactObject(value, ["gate"]);
-	const gate = enumString(context.gate, NATIVE_GATE);
-	if (gate !== expectedGate) throw new Error("native non-deciding gate context does not match the requested gate");
-	return { lineageId: "", storeRevision: "", raw: context };
-}
-function decodeGateContext(value: unknown): NativeGateContext {
-	const context = exactObject(
-		value,
-		["gate", "lineage_id", "generation", "base_tree", "candidate_tree", "paths_digest", "fix_delta_hash", "policy_hash", "ledger_hash", "evidence_hash", "base_relationship_valid"],
-		["store_revision", "genesis_revision", "chain_identity", "bundle_digest", "external_evidence", "base_advanced_compatible", "release", "pre_pr_boundary", "denial"],
-	);
-	const gate = stringValue(context.gate);
-	if (gate !== "" && !(NATIVE_GATE as readonly string[]).includes(gate)) throw new Error("invalid gate context gate");
-	for (const field of ["lineage_id", "base_tree", "candidate_tree", "paths_digest", "fix_delta_hash", "policy_hash", "ledger_hash", "evidence_hash"]) stringValue(context[field]);
-	for (const field of ["store_revision", "genesis_revision", "chain_identity", "bundle_digest"]) if (context[field] !== undefined) stringValue(context[field]);
-	nonNegativeInteger(context.generation);
-	booleanValue(context.base_relationship_valid);
-	if (context.external_evidence !== undefined) enumString(context.external_evidence, ["invalidating", "escalating"]);
-	let sanitizedContext = context;
-	if (context.denial !== undefined) {
-		const denial = exactObject(context.denial, ["stage", "code"]);
-		const stage = sanitizeNativeDiagnosticText(requiredString(denial.stage), NATIVE_REVIEW_DENIAL_TEXT_LIMIT);
-		const code = sanitizeNativeDiagnosticText(requiredString(denial.code), NATIVE_REVIEW_DENIAL_TEXT_LIMIT);
-		if (!isCanonicalProcessString(stage) || !isCanonicalProcessString(code)) throw new Error("non-canonical denial evidence");
-		sanitizedContext = { ...context, denial: { stage, code } };
-	}
-	if (context.pre_pr_boundary !== undefined) {
-		const boundary = exactObject(context.pre_pr_boundary, ["source", "selector", "commit"], ["remote", "remote_ref", "remote_identity"]);
-		enumString(boundary.source, ["explicit", "publication-default"]); requiredString(boundary.selector); stringValue(boundary.commit);
-		for (const field of ["remote", "remote_ref", "remote_identity"]) if (boundary[field] !== undefined) requiredString(boundary[field]);
-	}
-	if (context.base_advanced_compatible !== undefined) {
-		const proof = exactObject(context.base_advanced_compatible, ["status", "compatible", "old_base_tree", "new_base_tree", "original_patch_identity", "delivered_patch_identity", "delivered_paths_digest", "base_advance_paths_digest", "paths_disjoint", "merged_result_tree", "ci_attestation_artifact_hash", "ci_attestation_issuer", "ci_status"]);
-		for (const field of ["status", "old_base_tree", "new_base_tree", "original_patch_identity", "delivered_patch_identity", "delivered_paths_digest", "base_advance_paths_digest", "merged_result_tree", "ci_attestation_artifact_hash", "ci_attestation_issuer", "ci_status"]) requiredString(proof[field]);
-		booleanValue(proof.compatible); booleanValue(proof.paths_disjoint);
-	}
-	if (context.release !== undefined) decodeReleaseEvidence(context.release);
-	return {
-		lineageId: stringValue(context.lineage_id),
-		storeRevision: context.store_revision === undefined ? "" : stringValue(context.store_revision),
-		raw: sanitizedContext,
-	};
 }
 function decodeNativeReviewRecovery(value: unknown): NativeReviewRecovery {
 	const recovery = exactObject(value, ["predecessor_lineage_id", "predecessor_revision", "disposition", "reason", "actor", "recovered_at"], ["maintainer_authorization"]);
@@ -1397,7 +1357,7 @@ function decodeNativeReviewStatus(value: unknown): NativeReviewStatusResult {
 	const complete = booleanValue(body.complete);
 	const authoritative = booleanValue(body.authoritative);
 	if (authoritative && !complete) throw new Error("incomplete inventory cannot be authoritative");
-	if (!Array.isArray(body.entries) || !Array.isArray(body.locks)) throw new Error("invalid native status inventory");
+	if (!Array.isArray(body.entries) || !Array.isArray(body.locks) || !Array.isArray(body.diagnostics)) throw new Error("invalid native status inventory");
 	return {
 		repository: requiredString(body.repository),
 		complete,
@@ -1569,7 +1529,10 @@ class NativeReviewPlainCli {
 	// membership in the frozen set.
 	private async execute(operation: NativeReviewOperation, cwd: string, arguments_: readonly string[], mutating: boolean, signal?: AbortSignal, toleratedStderr: readonly string[] = []): Promise<NativeJsonExecution> {
 		let result: ExecFileResult;
-		try { result = await this.adapter({ file: this.executablePath(operation, mutating), arguments: arguments_, cwd, timeoutMs: mutating ? undefined : this.timeoutMs, maxBufferBytes: this.maxBufferBytes, signal }); }
+		try {
+			const file = measureStatusSync("resolution", () => this.executablePath(operation, mutating));
+			result = await measureStatusAsync("adapter", () => this.adapter({ file, arguments: arguments_, cwd, timeoutMs: mutating ? undefined : this.timeoutMs, maxBufferBytes: this.maxBufferBytes, signal }));
+		}
 		catch (error) {
 			if (error instanceof NativeReviewCliError) throw nativeError(error.code, operation, mutating, error.message, undefined, error.launchAttempted);
 			if (error instanceof Error && error.name === "AbortError") throw nativeError(NATIVE_REVIEW_ERROR_CODE.CANCELLED, operation, mutating, "native process was cancelled");
@@ -1579,7 +1542,7 @@ class NativeReviewPlainCli {
 		if (result.outputLimitExceeded) throw nativeError(NATIVE_REVIEW_ERROR_CODE.OUTPUT_LIMIT, operation, mutating, "native process output exceeded limit", result, true, undefined, this.maxBufferBytes);
 		if (result.timedOut) throw nativeError(NATIVE_REVIEW_ERROR_CODE.TIMEOUT, operation, mutating, "native process timed out", result);
 		if (result.signal) throw nativeError(NATIVE_REVIEW_ERROR_CODE.SIGNAL, operation, mutating, "native process was signalled", result);
-		const maintenancePartialFailure = [NATIVE_REVIEW_OPERATION.ABANDON, NATIVE_REVIEW_OPERATION.QUARANTINE_LEGACY, NATIVE_REVIEW_OPERATION.RECONCILE_AUTHORITY, NATIVE_REVIEW_OPERATION.REPAIR_LEGACY_ALIAS].includes(operation) && result.exitCode !== 0;
+		const maintenancePartialFailure = new Set<NativeReviewOperation>([NATIVE_REVIEW_OPERATION.ABANDON, NATIVE_REVIEW_OPERATION.QUARANTINE_LEGACY, NATIVE_REVIEW_OPERATION.RECONCILE_AUTHORITY, NATIVE_REVIEW_OPERATION.REPAIR_LEGACY_ALIAS]).has(operation) && result.exitCode !== 0;
 		const toleratedNotice = stderrIsTolerated(result.stderr, toleratedStderr);
 		if (result.exitCode !== 0 && !maintenancePartialFailure) throw nativeError(NATIVE_REVIEW_ERROR_CODE.NON_ZERO, operation, mutating, "native process failed", result);
 		if (result.stderr.trim().length > 0 && !maintenancePartialFailure && !toleratedNotice) throw nativeError(NATIVE_REVIEW_ERROR_CODE.UNEXPECTED_STDERR, operation, mutating, "native process wrote stderr", result);
@@ -1587,6 +1550,10 @@ class NativeReviewPlainCli {
 	}
 
 	async reviewStatus(request: NativeReviewStatusRequest): Promise<NativeReviewStatusResult> {
+		return observeNativeStatus(this.timeoutMs, () => this.observedReviewStatus(request));
+	}
+
+	private async observedReviewStatus(request: NativeReviewStatusRequest): Promise<NativeReviewStatusResult> {
 		const { body: result } = await this.execute(NATIVE_REVIEW_OPERATION.STATUS, request.cwd, ["review", "status", "--cwd", request.cwd], false, request.signal);
 		const status = decode(NATIVE_REVIEW_OPERATION.STATUS, false, () => decodeNativeReviewStatus(result));
 		if (!await repositoriesMatch(request.cwd, status.repository)) throw nativeError(NATIVE_REVIEW_ERROR_CODE.IDENTITY_MISMATCH, NATIVE_REVIEW_OPERATION.STATUS, false, "native review status repository mismatch");
@@ -1895,10 +1862,11 @@ function splitNativeConsentInvocation(invocation: string): readonly string[] {
 			continue;
 		}
 		// Provider invocations are not shell commands. Keep every path backslash
-		// verbatim, including quoted UNC and drive-root paths. Outside quotes,
-		// only a backslash before whitespace joins a space-containing token.
+		// verbatim, including quoted UNC and drive-root paths. Outside quotes, a
+		// backslash escapes only whitespace or a quote, so a space-containing token
+		// and a POSIX-quoted apostrophe (`'it'\''s'`) split exactly.
 		const next = source[index + 1];
-		if (character === "\\" && quote === undefined && next !== undefined && /\s/.test(next)) {
+		if (character === "\\" && quote === undefined && next !== undefined && (/\s/.test(next) || next === "'" || next === '"')) {
 			escaping = true;
 			started = true;
 			continue;
@@ -2141,7 +2109,7 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 	): Promise<NegotiatedExecution> {
 		let result: ExecFileResult;
 		try {
-			result = await this.adapter({ file: path, arguments: arguments_, cwd, timeoutMs: mutating ? undefined : this.timeoutMs, maxBufferBytes: this.maxBufferBytes, signal });
+			result = await measureStatusAsync("adapter", () => this.adapter({ file: path, arguments: arguments_, cwd, timeoutMs: mutating ? undefined : this.timeoutMs, maxBufferBytes: this.maxBufferBytes, signal }));
 		} catch (error) {
 			if (error instanceof Error && error.name === "AbortError") throw nativeError(NATIVE_REVIEW_ERROR_CODE.CANCELLED, operation, mutating, "native process was cancelled");
 			throw nativeError(NATIVE_REVIEW_ERROR_CODE.UNAVAILABLE, operation, mutating, "native process could not start");
@@ -2157,7 +2125,7 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 		const body = parseJson(result.stdout, operation, mutating, diagnostics);
 		if (result.exitCode !== 0) {
 			try {
-				throw new NativeReviewIntegrationError(decodeReviewFailureV2(body));
+				throw new NativeReviewIntegrationError(measureStatusSync("decode", () => decodeReviewFailureV2(body)));
 			} catch (error) {
 				if (error instanceof NativeReviewIntegrationError) throw error;
 				throw nativeError(NATIVE_REVIEW_ERROR_CODE.NON_ZERO, operation, mutating, "native negotiated operation failed without a valid failure envelope", result);
@@ -2176,7 +2144,7 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 		signal?: AbortSignal,
 		toleratedStderr: readonly string[] = [],
 	): Promise<NegotiatedExecution> {
-		return this.invoke(operation, cwd, arguments_, mutating, signal, this.executablePath(operation, mutating), toleratedStderr);
+		return this.invoke(operation, cwd, arguments_, mutating, signal, measureStatusSync("resolution", () => this.executablePath(operation, mutating)), toleratedStderr);
 	}
 
 	async start(request: NativeStartRequest): Promise<NativeStartResult> {
@@ -2307,6 +2275,10 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 	}
 
 	async targetStatus(request: NativeTargetStatusRequest): Promise<ReviewStatusV3> {
+		return observeNativeStatus(this.timeoutMs, () => this.observedTargetStatus(request));
+	}
+
+	private async observedTargetStatus(request: NativeTargetStatusRequest): Promise<ReviewStatusV3> {
 		if (request.baseRef !== undefined && !isCanonicalProcessString(request.baseRef)) throw new TypeError("Native STATUS baseRef must be a non-empty, trimmed, NUL-free string");
 		if (request.baseRef !== undefined && request.committedOnly !== true) throw new TypeError("Native STATUS baseRef requires explicit committedOnly acknowledgement");
 		if (request.baseRef === undefined && request.committedOnly !== undefined) throw new TypeError("Native STATUS committedOnly requires an explicit baseRef");
@@ -2349,7 +2321,7 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 			"--next-transition",
 		] : ["review", "status", "--cwd", request.cwd, ...submittedTokens, ...forwardedBaseRef, ...forwardedLineage, ...nativeLensSelectionArguments(request)];
 		const execution = await this.negotiated(NATIVE_REVIEW_OPERATION.STATUS, request.cwd, statusArguments, false, request.signal);
-		assertSupportedNextTransitionOperation(execution.body);
+		measureStatusSync("decode", () => assertSupportedNextTransitionOperation(execution.body));
 		return decode(NATIVE_REVIEW_OPERATION.STATUS, false, () => decodeReviewStatusV3(execution.body));
 	}
 
@@ -2538,13 +2510,17 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 	// mutually exclusive with a path.
 
 	async reviewStatus(request: NativeReviewStatusRequest): Promise<NativeReviewStatusResult> {
+		return observeNativeStatus(this.timeoutMs, () => this.observedReviewStatus(request));
+	}
+
+	private async observedReviewStatus(request: NativeReviewStatusRequest): Promise<NativeReviewStatusResult> {
 		const execution = await this.invoke(
 			NATIVE_REVIEW_OPERATION.STATUS,
 			request.cwd,
 			["review", "status", "--cwd", request.cwd],
 			false,
 			request.signal,
-			this.executablePath(NATIVE_REVIEW_OPERATION.STATUS, false),
+			measureStatusSync("resolution", () => this.executablePath(NATIVE_REVIEW_OPERATION.STATUS, false)),
 		);
 		const status = decode(NATIVE_REVIEW_OPERATION.STATUS, false, () => decodeNativeReviewStatus(execution.body));
 		if (!await repositoriesMatch(request.cwd, status.repository)) throw nativeError(NATIVE_REVIEW_ERROR_CODE.IDENTITY_MISMATCH, NATIVE_REVIEW_OPERATION.STATUS, false, "native review status repository mismatch");
