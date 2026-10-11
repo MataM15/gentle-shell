@@ -7,6 +7,7 @@ import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { resolveAnimationPolicy } from "../lib/animation-policy.ts";
 import { PI_SUBCOMMANDS } from "../lib/gentle-shell-launcher.ts";
+import { selectWithMouse } from "../lib/mouse-select.ts";
 
 
 export type BannerColor = "pink" | "cyan" | "yellow" | "green";
@@ -592,7 +593,7 @@ export default function (pi: ExtensionAPI) {
       description: "Configure the Gentle Pi startup banner.",
       handler: async (_args, ctx) => {
         const config = await readBannerConfig();
-        const selected = await ctx.ui.select("Startup banner", [
+        const selected = await selectWithMouse(ctx, "Startup banner", [
           `Rose: ${config.showRose ? "on" : "off"}`,
           `Text logo: ${config.showTextLogo ? "on" : "off"}`,
           `Color: ${config.color}`,
@@ -601,7 +602,7 @@ export default function (pi: ExtensionAPI) {
         if (selected.startsWith("Rose:")) config.showRose = !config.showRose;
         else if (selected.startsWith("Text logo:")) config.showTextLogo = !config.showTextLogo;
         else if (selected.startsWith("Color:")) {
-          const color = await ctx.ui.select("Startup banner color", [...BANNER_COLORS]);
+          const color = await selectWithMouse(ctx, "Startup banner color", [...BANNER_COLORS]);
           if (!color) return;
           config.color = color as BannerColor;
         }
@@ -630,7 +631,7 @@ export default function (pi: ExtensionAPI) {
         if (BANNER_COLORS.includes(requested)) {
           config.color = requested;
         } else {
-          const selected = await ctx.ui.select("Startup banner color", [...BANNER_COLORS]);
+          const selected = await selectWithMouse(ctx, "Startup banner color", [...BANNER_COLORS]);
           if (!selected) return;
           config.color = selected as BannerColor;
         }

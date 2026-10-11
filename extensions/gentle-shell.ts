@@ -122,6 +122,7 @@ import { installSessionChangeCapture } from "../lib/session-change-capture.ts";
 import { SelectionEngine } from "../lib/selection-engine.ts";
 import { withOverlayRepaint } from "../lib/overlay-repaint.ts";
 import { buildNotificationRows } from "../lib/notification-customize.ts";
+import { releaseFullscreenProbe, selectWithMouse, setFullscreenProbe } from "../lib/mouse-select.ts";
 
 // Gentle Shell: the visual layer gentle-pi puts on top of pi. It installs the
 // status bar, the petal prompt, the working-tree changes widget and overlay,
@@ -1920,6 +1921,10 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		const tracker = changes;
 		ctx.ui.setFooter((tui, theme, footerData) => {
 			sidebarTui = tui;
+			// Sub-menus opened from the palette (selectWithMouse) answer the mouse
+			// only while this TUI is fullscreen; it is read live, on every select.
+			const fullscreenProbe = () => (tui as TUI & { mode?: string }).mode === "fullscreen";
+			setFullscreenProbe(fullscreenProbe);
 			if (tui.terminal) sidebarState(tui).visibility = { todo: visualSettings.visibility.todo };
 			renderHost = { requestRender: () => tui.requestRender(), invalidateSidebar: () => invalidateSidebar(tui) };
 			const bottom = createShellBarComponent(pi, ctx, renderHost, theme, footerData, () => tracker.model.files.length, () => usage.get(ctx.model?.provider ?? ""), () => visualSettings);
@@ -2039,7 +2044,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 					return rows.length === 0 && (tui as TUI & { mode?: string }).mode === "fullscreen"
 						&& resolvePromptLayout(width, cardStyle(), theme.bg?.bind(theme)).background ? [""] : rows;
 				},
-				dispose() { ctx.ui.setWidget(HEADER_WIDGET_KEY, undefined); disposeHeader(); limitsPart.dispose?.(); uninstall(); part.dispose(); if (sidebarTui === tui) { sidebarTui = undefined; groupedChangesOwner = () => false; } } };
+				dispose() { ctx.ui.setWidget(HEADER_WIDGET_KEY, undefined); disposeHeader(); limitsPart.dispose?.(); uninstall(); part.dispose(); if (sidebarTui === tui) { sidebarTui = undefined; groupedChangesOwner = () => false; } releaseFullscreenProbe(fullscreenProbe); } };
 		});
 		void refreshUsage(ctx, true);
 		const ownsPrompt = installPrompt(
@@ -2468,7 +2473,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		handler: async (args, ctx) => {
 			let action = args.trim() || "status";
 			if (!args.trim() && ctx.hasUI && typeof ctx.ui.select === "function") {
-				const selected = await ctx.ui.select(`Gentle Vim (current: ${vimPolicy})`, ["enable", "disable", "status"]);
+				const selected = await selectWithMouse(ctx, `Gentle Vim (current: ${vimPolicy})`, ["enable", "disable", "status"]);
 				if (selected === undefined) return;
 				action = selected;
 			}
@@ -2494,7 +2499,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		handler: async (args, ctx) => {
 			let action = args.trim() || "status";
 			if (args.trim().length === 0 && ctx.hasUI && typeof ctx.ui.select === "function") {
-				const selected = await ctx.ui.select(
+				const selected = await selectWithMouse(ctx,
 					`Gentle animations (current: ${animationPolicy})`,
 					["quality", "performance", "potato", "status"],
 				);

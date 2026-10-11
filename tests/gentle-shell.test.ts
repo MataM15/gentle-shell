@@ -6349,3 +6349,38 @@ test("float hint row carries the label and the same click rules", async () => {
 		assert.equal(await opened(), true);
 	} finally { themeHost.theme = originalTheme; setCardStyle(previous); editor.dispose(); }
 });
+
+// S13 (odd/tasks/palette-button.md): palette sub-menus answer the mouse only
+// while Gentle Shell's TUI is fullscreen; the footer publishes that probe.
+test("palette sub-menus use the mouse-capable select only while the footer's TUI is fullscreen", async (t) => {
+	const home = mkdtempSync(join(tmpdir(), "gentle-vim-mouse-"));
+	t.after(() => rmSync(home, { recursive: true, force: true }));
+	const { pi, handlers, commands } = fakePi();
+	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home, GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" });
+	const selects: string[][] = [];
+	const { ctx, ui } = fakeContext({ select: async (_title, options) => { selects.push(options); return undefined; } });
+	await fire(handlers, "session_start", ctx);
+	const liveFooterData = { getGitBranch: () => "main", getExtensionStatuses: () => new Map(), getAvailableProviderCount: () => 1, onBranchChange: () => () => {} };
+	const tui = { mode: "regular", terminal: { rows: 40, columns: 160 }, requestRender() {} };
+	const factory = ui.footerFactory as (tui: unknown, theme: ShellBarTheme, footerData: unknown) => { render(width: number): string[]; dispose(): void };
+	const component = factory(tui, plainTheme, liveFooterData);
+	const command = commands.get("gentle:vim")!;
+	try {
+		await command.handler("", ctx);
+		assert.equal(selects.length, 1, "regular mode keeps Pi's native select");
+		tui.mode = "fullscreen";
+		const pending = command.handler("", ctx);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.equal(selects.length, 1, "fullscreen does not open the native select");
+		const view = ui.overlayView as { render(width: number): string[]; handleMouse?(event: Record<string, unknown>): unknown };
+		const lines = view.render(80);
+		const y = lines.findIndex((line) => line.includes("status"));
+		view.handleMouse?.({ type: "click", button: "left", x: 3, y, screenX: 3, screenY: y, width: 80, height: lines.length, shift: false, alt: false, ctrl: false });
+		await pending;
+		assert.match(ui.notices.at(-1)!, /vim: off/, "a click on `status` ran the status branch");
+	} finally {
+		component.dispose();
+	}
+	await command.handler("", ctx);
+	assert.equal(selects.length, 2, "after dispose the probe is released and the native select returns");
+});

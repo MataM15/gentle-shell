@@ -248,6 +248,7 @@ import { reconcileUnknownReviewLastEventCapture } from "../lib/review-last-event
 import { registerYoloSessionPolicy, updateYoloPrompt } from "../lib/yolo-session-policy.ts";
 import { acquireChildStandingReviewPermissionClient, type ChildStandingReviewPermissionClient } from "../lib/review-session-standing-permission-ipc.ts";
 import { isPiConsentV3, presentReviewConsentUi } from "../lib/review-consent-ui.ts";
+import { selectWithMouse } from "../lib/mouse-select.ts";
 import {
 	captureReviewSessionIdentity,
 	grantReviewSessionPermission,
@@ -4924,7 +4925,7 @@ async function handleProfilesCommand(ctx: ExtensionContext, live: LiveSession): 
 
 async function handlePersonaCommand(ctx: ExtensionContext): Promise<void> {
 	const current = readPersonaMode(ctx.cwd);
-	const selected = await ctx.ui.select(
+	const selected = await selectWithMouse(ctx,
 		`el Gentleman persona (current: ${current})`,
 		[...PERSONA_OPTIONS],
 	);
@@ -10388,7 +10389,7 @@ function createGentleAiExtensionForTesting(
 		handler: async (args, ctx) => {
 			let subAction = args.trim().length === 0 ? "status" : args.trim();
 			if (args.trim().length === 0 && ctx.hasUI && typeof ctx.ui.select === "function") {
-				const selected = await ctx.ui.select("Background subagents policy", ["status", "enable", "disable"]);
+				const selected = await selectWithMouse(ctx, "Background subagents policy", ["status", "enable", "disable"]);
 				if (selected === undefined) return;
 				subAction = selected;
 			}
