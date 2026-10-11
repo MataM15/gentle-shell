@@ -35,6 +35,8 @@ export interface ShellBarModel {
 	subscription: boolean;
 	usage: ProviderUsage | undefined;
 	statuses: string[];
+	// Short id of the active dev-binary override; set only while it is active.
+	devBinary?: string;
 }
 
 // The live header row above the fullscreen rail: session identity plus the
@@ -212,6 +214,15 @@ function joinSegments(segments: string[], theme: ShellBarTheme): string {
 	return segments.join(` ${theme.fg(ROLE.SEPARATOR, SHELL_BAR_SEPARATOR)} `);
 }
 
+const DEV_BINARY_SHORT_ID_LENGTH = 7;
+const COMMIT_DIRECTORY = /^[0-9a-f]{40}$/i;
+
+/** The 7-char commit from a 40-hex directory in the override path, else the digest's first 7 chars. */
+export function devBinaryShortId(path: string, sha256: string): string {
+	const commit = path.split(/[\\/]/).find((part) => COMMIT_DIRECTORY.test(part));
+	return (commit ?? sha256).slice(0, DEV_BINARY_SHORT_ID_LENGTH).toLowerCase();
+}
+
 // Sidebar groups use structured fields, never positional compact-bar segments
 // or inferred meanings from opaque extension status strings.
 export function renderShellSidebarBar(model: ShellBarModel, theme: ShellBarTheme, width: number, presentation?: Presentation): string[] {
@@ -227,6 +238,10 @@ export function renderShellSidebarBar(model: ShellBarModel, theme: ShellBarTheme
 	// the always-visible header row (and /gentle:usage for the full table);
 	// this event-driven card keeps only what a footer/model-switch event does
 	// not already refresh every frame.
+	const integrations = [
+		...model.statuses.map((status) => theme.fg(ROLE.STATUS, sanitizeStatus(status))),
+		...(model.devBinary ? [theme.fg("warning", `\u{1F339} gentle-ai dev · ${sanitizeStatus(model.devBinary)} · field-test only`)] : []),
+	];
 	const groups: Array<{ title: string; lines: string[] }> = [
 		{
 			title: "Project",
@@ -259,9 +274,7 @@ export function renderShellSidebarBar(model: ShellBarModel, theme: ShellBarTheme
 			title: "Jobs",
 			lines: [...model.jobs].sort((a, b) => b.startedAt - a.startedAt).map((job) => value(sanitizeStatus(job.label))),
 		}] : []),
-		{ title: "Integrations", lines: model.statuses.length
-			? model.statuses.map((status) => theme.fg(ROLE.STATUS, sanitizeStatus(status)))
-			: [label("No status reported")] },
+		{ title: "Integrations", lines: integrations.length ? integrations : [label("No status reported")] },
 	];
 	// Wrap and indent every group line before it reaches the card, so Unicode and
 	// ANSI continuation lines keep the same inset without consuming the right border.

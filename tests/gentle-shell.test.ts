@@ -5575,6 +5575,38 @@ test("gentleShell keeps a dev-binary override visible above the editor for the w
 	assert.deepEqual(factory(fakeTui, plainTheme).render(0), [""], "zero width keeps only the spacer");
 });
 
+test("gentleShell moves the dev-binary notice into the rail Status card while the rail shows it", async (t) => {
+	const found = cardStyle();
+	t.after(() => setCardStyle(found));
+	setCardStyle(CARD_STYLE.NEON);
+	const { pi, handlers } = fakePi();
+	const path = "/home/pablo/.pi/gentle-ai/main/gentle-ai/66bf3e12e338df8ad038de512e8a9fbc82dd6fa1/gentle-ai";
+	const deps = { fetch: fakeFetch({}, false).fetchFn, now: () => 0, devBinary: () => ({ state: "active" as const, path, sha256: "0dac40684a053f2b00" }) };
+	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, deps);
+	const { ctx, ui } = fakeContext();
+	await fire(handlers, "session_start", ctx);
+	const factory = ui.widgets.get("gentle-shell-dev-binary") as (tui: unknown, theme: unknown) => { render(width: number): string[] };
+	const wide = { ...fakeTui, terminal: { rows: 40, columns: 160 } };
+	const state = sidebarState(wide as unknown as TUI);
+	state.ownsHost = () => true;
+	assert.deepEqual(factory(wide, plainTheme).render(100), [], "the rail Status card carries the override, not a card above the editor");
+	state.ownsHost = () => false;
+	assert.match(stripAnsi(factory(wide, plainTheme).render(100)[0]!), /dev binary override/, "no rail (narrow terminal) keeps the startup card");
+	assert.match(stripAnsi(factory(fakeTui, plainTheme).render(100)[0]!), /dev binary override/);
+});
+
+test("gentleShell invalid dev-binary override keeps its error card even with the rail visible", async () => {
+	const { pi, handlers } = fakePi();
+	const deps = { fetch: fakeFetch({}, false).fetchFn, now: () => 0, devBinary: () => ({ state: "invalid" as const, reason: "binary missing" }) };
+	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, deps);
+	const { ctx, ui } = fakeContext();
+	await fire(handlers, "session_start", ctx);
+	const factory = ui.widgets.get("gentle-shell-dev-binary") as (tui: unknown, theme: unknown) => { render(width: number): string[] };
+	const wide = { ...fakeTui, terminal: { rows: 40, columns: 160 } };
+	sidebarState(wide as unknown as TUI).ownsHost = () => true;
+	assert.match(stripAnsi(factory(wide, plainTheme).render(100).join("\n")), /dev binary override invalid[\s\S]*binary missing/);
+});
+
 test("gentle:commands registers alt+k by default", () => {
 	const { pi, shortcuts } = fakePi();
 	gentleShell(pi, {});

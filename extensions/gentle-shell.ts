@@ -8,7 +8,7 @@ import { readSessionProfileBinding } from "../lib/session-profile-binding.ts";
 import { resolveProfilePin } from "../lib/agent-profile-pin.ts";
 import * as os from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { buildShellHeaderModel, renderShellBar, renderShellBelowInputFloat, renderShellBottomOnlyBar, renderShellHeaderChrome, renderShellRailHeader, renderShellSidebarBar, keepNativeWorkingRow, shellEnabled, shellHeaderCommandsHit, shellHeaderUsageHit, shellJobsCount, type ShellBarModel, type ShellBarTheme } from "../lib/shell-bar.ts";
+import { buildShellHeaderModel, devBinaryShortId, renderShellBar, renderShellBelowInputFloat, renderShellBottomOnlyBar, renderShellHeaderChrome, renderShellRailHeader, renderShellSidebarBar, keepNativeWorkingRow, shellEnabled, shellHeaderCommandsHit, shellHeaderUsageHit, shellJobsCount, type ShellBarModel, type ShellBarTheme } from "../lib/shell-bar.ts";
 import { CHANGE_STATUS, RootBranchLabels, renderChangesWidget, type ChangedFile, type ChangesModel, type GitRunner, type WorktreeChanges } from "../lib/shell-changes.ts";
 import { WorktreeChangesView } from "../lib/shell-changes-view.ts";
 import { SessionWorktreeRegistry, resolveSessionWorktree, worktreeGitEnvironment, type WorktreeResolver, type WorktreeIdentity } from "../lib/session-worktree-registry.ts";
@@ -1975,6 +1975,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		}
 		changes = new SessionChanges(ctx.sessionManager.getSessionId(), ctx.sessionManager.getEntries());
 		const tracker = changes;
+		const devNotice = deps.devBinary();
 		ctx.ui.setFooter((tui, theme, footerData) => {
 			sidebarTui = tui;
 			// Sub-menus opened from the palette (selectWithMouse) answer the mouse
@@ -1992,6 +1993,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 				...buildShellBarModel(pi, ctx, footerData, { dirty: tracker.model.files.length, usage: usage.get(ctx.model?.provider ?? ""), profile: deps.activeProfile(), jobs: runningJobs }),
 				changes: { files: tracker.model.files.length, added: tracker.model.added, deleted: tracker.model.deleted, notice: tracker.model.notice },
 				review,
+				...(devNotice?.state === "active" ? { devBinary: devBinaryShortId(devNotice.path, devNotice.sha256) } : {}),
 			});
 			// At narrow fullscreen widths only one status row paints: a top header
 			// suppresses the bottom bar in the layout, and otherwise the bottom bar
@@ -2117,14 +2119,20 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		// thinking blocks remain Pi-owned; this changes only the supported loader UI.
 		// Inside Herdr the row stays: its native Pi detection reads it.
 		if (ownsPrompt && !keepNativeWorkingRow(env)) ctx.ui.setWorkingVisible(false);
-		const notice = deps.devBinary();
+		const notice = devNotice;
 		ctx.ui.setWidget(
 			DEV_BINARY_WIDGET_KEY,
 			notice
 				? (tui, theme) => {
-					// Folding the rail away also folds this startup notice.
+					// The rail's Status card carries an active override; folding the rail
+					// away folds this startup notice too. An invalid override keeps its card.
 					const card = spaced(cardComponent(devBinaryCard(notice), theme, { expanded: true, previewRows: 3 }));
-					return { render: (width: number) => tui.terminal && sidebarState(tui).railAvailable?.() ? [] : card.render(width), invalidate: () => card.invalidate() };
+					const railHasNotice = () => {
+						if (!tui.terminal) return false;
+						const state = sidebarState(tui);
+						return state.railAvailable?.() === true || (notice.state === "active" && state.ownsHost?.() === true && visualSettings.statusPlacement !== "hidden");
+					};
+					return { render: (width: number) => railHasNotice() ? [] : card.render(width), invalidate: () => card.invalidate() };
 				}
 				: undefined,
 		);

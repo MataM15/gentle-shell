@@ -4,6 +4,7 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import { DEFAULT_VISUAL_SETTINGS } from "../lib/visual-customization-policy.ts";
 import {
 	buildShellHeaderModel,
+	devBinaryShortId,
 	formatCost,
 	formatTokens,
 	gaugeTone,
@@ -944,4 +945,30 @@ test("the narrow-layout bottom-only bar stays unchanged in the float style", (t)
 	const neon = renderShellBottomOnlyBar(data, theme, 100, "alt+u");
 	useCardStyle(t, CARD_STYLE.FLOAT);
 	assert.deepEqual(renderShellBottomOnlyBar(data, theme, 100, "alt+u"), neon);
+});
+
+test("dev-binary short id prefers the 40-hex commit directory and falls back to the digest", () => {
+	const commit = "66bf3e12e338df8ad038de512e8a9fbc82dd6fa1";
+	assert.equal(devBinaryShortId(`/home/pablo/.pi/gentle-ai/main/gentle-ai/${commit}/gentle-ai`, "0dac40684a053f2b"), "66bf3e1");
+	assert.equal(devBinaryShortId(`/x/${commit.toUpperCase()}/gentle-ai`, "0dac40684a053f2b"), "66bf3e1", "case-insensitive hex");
+	assert.equal(devBinaryShortId("/Users/me/go/bin/gentle-ai", "6e53bfc6305a3949"), "6e53bfc");
+	assert.equal(devBinaryShortId(`/x/${commit}0/gentle-ai`, "abcdef0123"), "abcdef0", "41 hex chars is not a commit directory");
+});
+
+test("sidebar Integrations carries the dev-binary line only while the override is active", () => {
+	const active = renderShellSidebarBar(model({ statuses: ["MCP connected"], devBinary: "66bf3e1" }), plainTheme, 60).map(stripAnsi);
+	const text = active.join("\n");
+	assert.match(text, /MCP connected/);
+	assert.match(text, /\u{1F339} gentle-ai dev · 66bf3e1 · field-test only/u);
+	assert.ok(text.indexOf("MCP connected") < text.indexOf("gentle-ai dev"), "the line sits after the Engram/status lines");
+	const bare = renderShellSidebarBar(model({ statuses: ["MCP connected"] }), plainTheme, 60).join("\n");
+	assert.doesNotMatch(bare, /gentle-ai dev/);
+	const only = renderShellSidebarBar(model({ devBinary: "66bf3e1" }), plainTheme, 60).join("\n");
+	assert.doesNotMatch(only, /No status reported/, "the line replaces the empty placeholder");
+	for (const width of [1, 8, 24, 30, 46]) {
+		const lines = renderShellSidebarBar(model({ statuses: ["MCP connected"], devBinary: "66bf3e1" }), plainTheme, width);
+		assert.ok(lines.every((line) => visibleWidth(line) <= width), `fits ${width}`);
+	}
+	const wrapped = renderShellSidebarBar(model({ devBinary: "66bf3e1" }), plainTheme, 24).map(stripAnsi).join("").replace(/[│\s]/g, "");
+	assert.ok(wrapped.includes("gentle-aidev·66bf3e1·field-testonly"), "wraps inside the card without losing text");
 });
