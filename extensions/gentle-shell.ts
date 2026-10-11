@@ -2121,7 +2121,11 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		ctx.ui.setWidget(
 			DEV_BINARY_WIDGET_KEY,
 			notice
-				? (_tui, theme) => spaced(cardComponent(devBinaryCard(notice), theme, { expanded: true, previewRows: 3 }))
+				? (tui, theme) => {
+					// Folding the rail away also folds this startup notice.
+					const card = spaced(cardComponent(devBinaryCard(notice), theme, { expanded: true, previewRows: 3 }));
+					return { render: (width: number) => tui.terminal && sidebarState(tui).railAvailable?.() ? [] : card.render(width), invalidate: () => card.invalidate() };
+				}
 				: undefined,
 		);
 		if (changes !== tracker) return;

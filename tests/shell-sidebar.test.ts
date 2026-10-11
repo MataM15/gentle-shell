@@ -84,3 +84,18 @@ test("phone width is terminal columns only: 60 is phone-sized, 61 is not, and un
 	(resized.terminal as { columns: number }).columns = 61;
 	assert.equal(isPhoneWidth(resized), false, "and back up");
 });
+
+// The user folded the rail away (`» hide panel` / alt+h): the Todos card it
+// carried stays hidden instead of moving above the prompt; other parts keep
+// their bottom form.
+test("a folded rail hides the bottom Todos card and nothing else", () => {
+	const tui = host({});
+	const state = sidebarState(tui);
+	const todo = sidebarPart(tui, "todo", component());
+	const footer = sidebarPart(tui, "footer", component());
+	state.railAvailable = () => true;
+	assert.deepEqual(todo.render(80), []);
+	assert.deepEqual(footer.render(80), ["bottom"]);
+	state.railAvailable = () => false;
+	assert.deepEqual(todo.render(80), ["bottom"], "narrow or regular terminals still show Todos above the prompt");
+});

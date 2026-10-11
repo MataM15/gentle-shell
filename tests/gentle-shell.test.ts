@@ -5555,6 +5555,11 @@ test("gentleShell keeps a dev-binary override visible above the editor for the w
 	assert.equal(painted[1], lines[1], "body interior remains transparent");
 	assert.equal(painted[2], lines[2], "bottom frame cells have no background");
 	assert.equal(painted[3], "", "external spacer has no background");
+	const foldable = { ...fakeTui, terminal: { rows: 40, columns: 160 } };
+	sidebarState(foldable as unknown as TUI).railAvailable = () => true;
+	assert.deepEqual(factory(foldable, plainTheme).render(100), [], "a folded rail hides the notice too");
+	sidebarState(foldable as unknown as TUI).railAvailable = () => false;
+	assert.match(stripAnsi(factory(foldable, plainTheme).render(100)[0]!), /dev binary override/);
 	await fire(handlers, "agent_start", ctx);
 	assert.equal(ui.widgets.has("gentle-shell-dev-binary"), false, "the startup notice leaves with the first prompt");
 

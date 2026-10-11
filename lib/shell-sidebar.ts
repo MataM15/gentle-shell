@@ -58,7 +58,11 @@ export function sidebarState(tui: TUI): SidebarState {
 	return terminal[STATE] ??= { active: false, parts: new Map() };
 }
 
-/** Keep the original bottom component mounted, suppressing only its paint. */
+/**
+ * Keep the original bottom component mounted, suppressing only its paint.
+ * A folded rail (`railAvailable`) keeps the Todos card hidden rather than
+ * moving it above the prompt.
+ */
 export function sidebarPart<T extends Component & { dispose?(): void }>(tui: TUI, key: string, bottom: T, rail: SidebarRail = bottom): T {
 	// Minimal extension hosts cannot share terminal-owned layout state.
 	if (!tui.terminal) return bottom;
@@ -66,7 +70,7 @@ export function sidebarPart<T extends Component & { dispose?(): void }>(tui: TUI
 	state.parts.set(key, rail);
 	return {
 		...bottom,
-		render: (width: number) => (key === "todo" && state.visibility?.todo === false) || (key === "footer" && (state.statusHidden?.() || state.headerOwnsStatus?.())) || (state.active && state.ownsHost?.()) ? [] : bottom.render(width),
+		render: (width: number) => (key === "todo" && (state.visibility?.todo === false || state.railAvailable?.() === true)) || (key === "footer" && (state.statusHidden?.() || state.headerOwnsStatus?.())) || (state.active && state.ownsHost?.()) ? [] : bottom.render(width),
 		dispose() {
 			if (state.parts.get(key) === rail) state.parts.delete(key);
 			bottom.dispose?.();
