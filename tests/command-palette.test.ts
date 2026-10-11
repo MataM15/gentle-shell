@@ -484,3 +484,62 @@ test("the wheel moves the selection like up and down", () => {
 	palette.handleInput(KEY.ENTER);
 	assert.deepEqual(results, [{ type: "run", name: "gentle:profiles" }], "down, down, up lands on the second item");
 });
+
+// S12 / P3 (odd/tasks/palette-button.md): a rose icon before each group title
+// and a dim icon per entry in the two-cell left gutter, rose on the selected
+// row. Every icon is one terminal cell, so labels and click columns never move.
+const ICON_GROUPS: CommandPaletteGroup[] = [
+	{ title: "Configuration", icon: "⬢", items: [{ command: "gentle:models", label: "Assign models and effort", icon: "⇄" }, { command: "gentle:profiles", label: "Agent-model profiles", icon: "◫" }] },
+	{ title: "Session", items: [{ command: "gentle:changes", label: "Browse captured changes", shortcut: "alt+g" }] },
+];
+const tagTheme = (bg: boolean): CommandPaletteTheme => ({
+	fg: (color, text) => `<${color}>${text}</${color}>`,
+	...(bg ? { bg: (color: string, text: string) => `[${color}]${text}[/${color}]` } : {}),
+});
+
+test("every catalog group and entry carries a one-cell icon", () => {
+	for (const group of COMMAND_PALETTE_CATALOG) {
+		assert.equal(visibleWidth(group.icon ?? ""), 1, `${group.title} icon`);
+		for (const item of group.items) assert.equal(visibleWidth(item.icon ?? ""), 1, `${item.command} icon`);
+	}
+	const built = buildCommandPaletteGroups([{ name: "gentle:models" }], {});
+	assert.equal(built[0]!.icon, COMMAND_PALETTE_CATALOG[0]!.icon);
+	assert.equal(built[0]!.items[0]!.icon, COMMAND_PALETTE_CATALOG[0]!.items.find((item) => item.command === "gentle:models")!.icon);
+});
+
+test("icons render before titles and in the entry gutter without moving any label", () => {
+	const lines = render(ICON_GROUPS, "", 60, { fg: (_color, text) => text, bg: (_color, text) => text });
+	const row = (label: string) => lines.find((line) => line.includes(label))!;
+	assert.match(row("Configuration"), /^│ ⬢ Configuration +│$/);
+	assert.match(row("Assign models"), /^│ ⇄ Assign models and effort +│$/);
+	assert.match(row("Agent-model"), /^│ ◫ Agent-model profiles +│$/);
+	assert.match(row("Session"), /^│ Session +│$/, "a group without an icon keeps its plain title");
+	assert.match(row("Browse"), /^│   Browse captured changes +alt\+g │$/, "an entry without an icon keeps its blank gutter");
+});
+
+test("group icons are rose, entry icons dim, and the selected entry's icon rose", () => {
+	// Wide enough that the tag markup, which counts as visible text here, never truncates a row.
+	const lines = render(ICON_GROUPS, "", 200, tagTheme(true)).join("\n");
+	assert.match(lines, /<borderAccent>⬢<\/borderAccent> <accent>Configuration/);
+	assert.match(lines, /\[selectedBg\]<borderAccent>⇄<\/borderAccent> Assign models and effort/);
+	assert.match(lines, /<dim>◫<\/dim> <text>Agent-model profiles<\/text>/);
+	const moved = createPalette(ICON_GROUPS, tagTheme(true));
+	moved.palette.handleInput(KEY.DOWN);
+	const after = moved.palette.render(200).join("\n");
+	assert.match(after, /<dim>⇄<\/dim> <text>Assign models and effort<\/text>/);
+	assert.match(after, /\[selectedBg\]<borderAccent>◫<\/borderAccent> Agent-model profiles/);
+});
+
+test("without bg the ▸ marker still replaces the gutter of the selected entry", () => {
+	const lines = render(ICON_GROUPS, "", 60, { fg: (_color, text) => text });
+	assert.ok(lines.some((line) => /^│ ▸ Assign models and effort/.test(line)));
+	assert.ok(lines.some((line) => /^│ ◫ Agent-model profiles/.test(line)));
+});
+
+test("a click on an iconed entry still runs it", () => {
+	const { palette, results } = createPalette(ICON_GROUPS);
+	const lines = palette.render(60);
+	const y = lines.findIndex((line) => line.includes("Agent-model profiles"));
+	palette.handleMouse({ type: "click", button: "left", x: 2, y, screenX: 2, screenY: y, width: 60, height: lines.length, shift: false, alt: false, ctrl: false } as TuiMouseEvent);
+	assert.deepEqual(results, [{ type: "run", name: "gentle:profiles" }]);
+});

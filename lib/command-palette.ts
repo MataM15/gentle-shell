@@ -14,11 +14,15 @@ export interface CommandPaletteItem {
 	label: string;
 	description?: string;
 	shortcut?: string;
+	/** One-cell glyph drawn in the entry's two-cell left gutter: dim, rose when selected. */
+	icon?: string;
 }
 
 export interface CommandPaletteGroup {
 	title: string;
 	items: CommandPaletteItem[];
+	/** One-cell glyph drawn rose before the group title. */
+	icon?: string;
 }
 
 export type CommandPaletteResult = { type: "run"; name: string } | { type: "close" };
@@ -70,7 +74,7 @@ function rankItem(item: CommandPaletteItem, lowerQuery: string): number | undefi
  */
 export function rankPaletteGroups(groups: readonly CommandPaletteGroup[], query: string): CommandPaletteGroup[] {
 	const trimmed = query.trim();
-	if (!trimmed) return groups.map((group) => ({ title: group.title, items: [...group.items] }));
+	if (!trimmed) return groups.map((group) => ({ ...group, items: [...group.items] }));
 	const lower = trimmed.toLowerCase();
 	const result: CommandPaletteGroup[] = [];
 	for (const group of groups) {
@@ -81,12 +85,12 @@ export function rankPaletteGroups(groups: readonly CommandPaletteGroup[], query:
 		}
 		if (ranked.length === 0) continue;
 		ranked.sort((a, b) => a.rank - b.rank);
-		result.push({ title: group.title, items: ranked.map((entry) => entry.item) });
+		result.push({ ...group, items: ranked.map((entry) => entry.item) });
 	}
 	return result;
 }
 
-type Tone = "border" | "muted" | "text" | "title" | "accent";
+type Tone = "border" | "muted" | "text" | "title" | "accent" | "dim" | "rose";
 
 const TONE_COLOR: Record<Tone, string> = {
 	border: "border",
@@ -94,6 +98,8 @@ const TONE_COLOR: Record<Tone, string> = {
 	text: "text",
 	title: "accent",
 	accent: "accent",
+	dim: "dim",
+	rose: "borderAccent",
 };
 
 // Two border glyphs ("│ " and " │") plus the padding space on each side.
@@ -133,7 +139,7 @@ const MIN_TOTAL_ROWS = 12;
 const HEIGHT_RATIO = 0.85;
 const DEFAULT_ROWS = 40;
 
-type PaletteRow = { kind: "title"; text: string } | { kind: "blank" } | { kind: "item"; item: CommandPaletteItem; itemIndex: number };
+type PaletteRow = { kind: "title"; text: string; icon?: string } | { kind: "blank" } | { kind: "item"; item: CommandPaletteItem; itemIndex: number };
 
 // What a body line does under a clean left click: close (on its `esc` span
 // only) or run its command (anywhere on the row). Lines without one are inert.
@@ -150,7 +156,7 @@ function buildRows(groups: readonly CommandPaletteGroup[]): PaletteRow[] {
 	let itemIndex = 0;
 	groups.forEach((group, groupIndex) => {
 		if (groupIndex > 0) rows.push({ kind: "blank" });
-		rows.push({ kind: "title", text: group.title });
+		rows.push({ kind: "title", text: group.title, icon: group.icon });
 		for (const item of group.items) {
 			rows.push({ kind: "item", item, itemIndex });
 			itemIndex += 1;
@@ -347,7 +353,10 @@ export class CommandPalette {
 
 	private renderRow(row: PaletteRow, width: number, selected: number): string {
 		if (row.kind === "blank") return "";
-		if (row.kind === "title") return this.renderLine(row.text, width, "accent");
+		if (row.kind === "title") {
+			if (!row.icon) return this.renderLine(row.text, width, "accent");
+			return `${this.renderText(row.icon, "rose")} ${this.renderLine(row.text, Math.max(1, width - 2), "accent")}`;
+		}
 		return this.renderItemRow(row.item, row.itemIndex === selected, width);
 	}
 
@@ -356,10 +365,11 @@ export class CommandPalette {
 		const label = sanitizeTerminalText(item.label);
 		const shortcut = item.shortcut ? sanitizeTerminalText(item.shortcut) : "";
 		if (canHighlightBg) {
-			const plainRow = this.justifyToWidth(`  ${label}`, shortcut, width);
+			const gutter = item.icon ? this.renderText(item.icon, "rose") : " ";
+			const plainRow = this.justifyToWidth(`${gutter} ${label}`, shortcut, width);
 			return this.theme?.bg?.("selectedBg", plainRow) ?? plainRow;
 		}
-		const prefix = focused ? this.renderText("▸ ", "accent") : "  ";
+		const prefix = focused ? this.renderText("▸ ", "accent") : item.icon ? `${this.renderText(item.icon, "dim")} ` : "  ";
 		const prefixWidth = visibleWidth(stripAnsi(prefix));
 		const availableWidth = Math.max(0, width - prefixWidth);
 		const labelStyled = this.renderText(label, "text");
