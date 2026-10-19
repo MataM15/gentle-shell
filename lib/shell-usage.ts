@@ -20,10 +20,24 @@ export interface UsageWindow {
 	budget?: number;
 }
 
+// Optional hints for the compact Limits card (gentle-pi:usage-source/v1).
+// A source that never sets them renders exactly as before.
+export type UsageFamily = "gemini" | "claude";
+const USAGE_FAMILIES: readonly string[] = ["gemini", "claude"];
+const USAGE_LAYOUT_ACCOUNTS = "accounts";
+
 export interface UsageLimit {
 	name: string;
 	windows: UsageWindow[];
 	limitReached: boolean;
+	// Compact layout: the account this limit belongs to and its model family.
+	account?: string;
+	family?: UsageFamily;
+}
+
+export interface UsageUnavailable {
+	label: string;
+	reason: string;
 }
 
 export interface ProviderUsage {
@@ -31,6 +45,14 @@ export interface ProviderUsage {
 	plan: string | undefined;
 	limits: UsageLimit[];
 	fetchedAt: number;
+	// "accounts": one compact card row per account (see renderUsageCard).
+	layout?: typeof USAGE_LAYOUT_ACCOUNTS;
+	// The card's section title for that layout, in place of provider and plan.
+	heading?: string;
+	// The snapshot is an older one kept because the latest refresh failed.
+	stale?: boolean;
+	// Accounts whose quota could not be read; one failure row each on the card.
+	unavailable?: UsageUnavailable[];
 }
 
 export interface UsageTheme {
@@ -236,7 +258,25 @@ function parseSourceUsageLimit(value: unknown): UsageLimit | undefined {
 		if (!window) return undefined;
 		windows.push(window);
 	}
-	return { name: raw.name, limitReached: raw.limitReached, windows };
+	if (raw.account !== undefined && typeof raw.account !== "string") return undefined;
+	if (raw.family !== undefined && typeof raw.family !== "string") return undefined;
+	const limit: UsageLimit = { name: raw.name, limitReached: raw.limitReached, windows };
+	if (typeof raw.account === "string") limit.account = raw.account;
+	// An unknown family is a hint from a newer source, not a malformed payload.
+	if (typeof raw.family === "string" && USAGE_FAMILIES.includes(raw.family)) limit.family = raw.family as UsageFamily;
+	return limit;
+}
+
+function parseUnavailable(value: unknown): UsageUnavailable[] | undefined {
+	if (!Array.isArray(value)) return undefined;
+	const entries: UsageUnavailable[] = [];
+	for (const entry of value) {
+		if (!entry || typeof entry !== "object") return undefined;
+		const raw = entry as Record<string, unknown>;
+		if (typeof raw.label !== "string" || typeof raw.reason !== "string") return undefined;
+		entries.push({ label: raw.label, reason: raw.reason });
+	}
+	return entries;
 }
 
 // A registered source's resolved value crosses the same trust boundary a
@@ -257,7 +297,17 @@ export function parseProviderUsage(value: unknown, expectedProvider: string): Pr
 		if (!limit) return undefined;
 		limits.push(limit);
 	}
-	return { provider: raw.provider, plan: typeof raw.plan === "string" ? raw.plan : undefined, limits, fetchedAt: raw.fetchedAt };
+	if (raw.heading !== undefined && typeof raw.heading !== "string") return undefined;
+	if (raw.layout !== undefined && typeof raw.layout !== "string") return undefined;
+	if (raw.stale !== undefined && typeof raw.stale !== "boolean") return undefined;
+	const unavailable = raw.unavailable === undefined ? undefined : parseUnavailable(raw.unavailable);
+	if (raw.unavailable !== undefined && !unavailable) return undefined;
+	const usage: ProviderUsage = { provider: raw.provider, plan: typeof raw.plan === "string" ? raw.plan : undefined, limits, fetchedAt: raw.fetchedAt };
+	if (raw.layout === USAGE_LAYOUT_ACCOUNTS) usage.layout = USAGE_LAYOUT_ACCOUNTS;
+	if (typeof raw.heading === "string") usage.heading = raw.heading;
+	if (typeof raw.stale === "boolean") usage.stale = raw.stale;
+	if (unavailable) usage.unavailable = unavailable;
+	return usage;
 }
 
 export function windowLabel(seconds: number): string {
@@ -648,6 +698,14 @@ export function renderUsagePanel(usages: ProviderUsage[], theme: UsageTheme, wid
 const CARD_PROVIDER_NAMES: Record<string, string> = { [CODEX_PROVIDER]: "codex", [ANTHROPIC_PROVIDER]: "claude", cliproxyapi: "antigravity" };
 const CARD_PROVIDER_ORDER = [CODEX_PROVIDER, ANTHROPIC_PROVIDER, "cliproxyapi"];
 const CARD_METER_CELLS = 8;
+const COMPACT_METER_CELLS = 6;
+const COMPACT_LABEL_MIN = 6;
+const COMPACT_LABEL_MAX = 10;
+const COMPACT_ACCOUNT_ORDER = ["Pay01", "Pay02", "Free01", "Free02"];
+const COMPACT_FAMILIES: ReadonlyArray<[family: UsageFamily, mark: string]> = [["gemini", "G"], ["claude", "C"]];
+const FAILURE_MARK = "✕";
+const CARD_FOOTER_HINT = "alt+u";
+const COMPACT_FOOTER_HINT = "click or alt+u: details";
 
 function shortReset(resetAt: number | null, now: number): string {
 	return formatReset(resetAt, now).replace(/^resets in /, "").replace(/^resets now$/, "now");
@@ -655,6 +713,76 @@ function shortReset(resetAt: number | null, now: number): string {
 
 export function usageCardDigest(usages: readonly ProviderUsage[], now: number): string {
 	return `${Math.floor(now / 60_000)}|${usages.map((usage) => `${usage.provider}:${usage.fetchedAt}`).join(",")}`;
+}
+
+interface CompactWindow {
+	window: UsageWindow;
+	reached: boolean;
+}
+
+// The most constraining window: highest use, then the one that resets first.
+function moreConstraining(a: CompactWindow, b: CompactWindow): CompactWindow {
+	if (a.window.usedPercent !== b.window.usedPercent) return a.window.usedPercent > b.window.usedPercent ? a : b;
+	return (a.window.resetAt ?? Number.POSITIVE_INFINITY) <= (b.window.resetAt ?? Number.POSITIVE_INFINITY) ? a : b;
+}
+
+function printable(text: string): string {
+	return text.replace(/[^\x20-\x7e]/g, "");
+}
+
+// One row per account, ordered Pay01..Free02 then the rest as first seen. An
+// account whose quota could not be read gets a failure row instead; a family
+// an account has no data for leaves its column blank rather than reading 0%.
+function compactAccountRows(usage: ProviderUsage, theme: UsageTheme, now: number): string[] | undefined {
+	const accounts = new Map<string, { windows: Map<UsageFamily, CompactWindow[]>; failure?: string }>();
+	const entry = (label: string) => {
+		let found = accounts.get(label);
+		if (!found) accounts.set(label, (found = { windows: new Map() }));
+		return found;
+	};
+	for (const limit of usage.limits) {
+		if (!limit.account || !limit.family) continue;
+		const family = entry(printable(limit.account)).windows;
+		family.set(limit.family, [...(family.get(limit.family) ?? []), ...limit.windows.map((window) => ({ window, reached: limit.limitReached }))]);
+	}
+	for (const failed of usage.unavailable ?? []) {
+		const account = entry(printable(failed.label));
+		if (account.windows.size === 0) account.failure = printable(failed.reason);
+	}
+	if (accounts.size === 0) return undefined;
+	const rank = (label: string) => {
+		const index = COMPACT_ACCOUNT_ORDER.indexOf(label);
+		return index === -1 ? COMPACT_ACCOUNT_ORDER.length : index;
+	};
+	// Array.sort is stable, so unknown accounts keep their first-seen order.
+	const labels = [...accounts.keys()].sort((a, b) => rank(a) - rank(b));
+	const labelWidth = Math.min(COMPACT_LABEL_MAX, Math.max(COMPACT_LABEL_MIN, ...labels.map((label) => label.length)));
+	const segmentWidth = 2 + COMPACT_METER_CELLS + 1 + 4;
+	return labels.map((label) => {
+		const account = accounts.get(label)!;
+		const head = ` ${theme.fg(ROLE.LABEL, truncateToWidth(label, labelWidth, "…").padEnd(labelWidth))}`;
+		if (account.windows.size === 0) return `${head} ${theme.fg("error", FAILURE_MARK)} ${theme.fg(ROLE.RESET, `unavailable (${account.failure ?? "unknown"})`)}`;
+		const chosen: CompactWindow[] = [];
+		const segments = COMPACT_FAMILIES.map(([family, mark]) => {
+			const windows = account.windows.get(family);
+			if (!windows) return " ".repeat(segmentWidth);
+			const best = windows.reduce(moreConstraining);
+			chosen.push(best);
+			const percent = `${Math.round(best.window.usedPercent)}%`.padStart(4);
+			return `${theme.fg(ROLE.LABEL, mark)} ${paintMeter(best.window.usedPercent, COMPACT_METER_CELLS, theme)} ${best.reached ? theme.fg("error", percent) : theme.fg(ROLE.PERCENT, percent)}`;
+		});
+		const reset = shortReset(chosen.reduce(moreConstraining).window.resetAt, now);
+		return `${head} ${segments.join(" ")}${reset ? ` ${theme.fg(ROLE.RESET, reset)}` : ""}`;
+	});
+}
+
+function compactTitle(usage: ProviderUsage, name: string, theme: UsageTheme): string {
+	const heading = usage.heading ?? name;
+	const lead = `${name} · `;
+	const base = heading.startsWith(lead)
+		? `${theme.fg(ROLE.PROVIDER, name)} ${theme.fg(ROLE.SEPARATOR, "·")} ${theme.fg(ROLE.PLAN, heading.slice(lead.length))}`
+		: theme.fg(ROLE.PROVIDER, heading);
+	return usage.stale ? `${base} ${theme.fg(ROLE.SEPARATOR, "·")} ${theme.fg(ROLE.PLAN, "stale")}` : base;
 }
 
 export function renderUsageCard(usages: readonly ProviderUsage[], theme: UsageTheme, width: number, now: number): string[] {
@@ -667,6 +795,8 @@ export function renderUsageCard(usages: readonly ProviderUsage[], theme: UsageTh
 	const innerWidth = cardInnerWidth(width);
 	const sections = sorted.map((usage) => {
 		const name = CARD_PROVIDER_NAMES[usage.provider] ?? usage.provider;
+		const compact = usage.layout === USAGE_LAYOUT_ACCOUNTS ? compactAccountRows(usage, theme, now) : undefined;
+		if (compact) return { title: compactTitle(usage, name, theme), rows: [], compact };
 		const plan = usage.plan && usage.plan !== name ? ` ${theme.fg(ROLE.SEPARATOR, "·")} ${theme.fg(ROLE.PLAN, usage.plan)}` : "";
 		// A single limit is named by its windows; several limits are named by
 		// the limit, plus the window when that limit has more than one.
@@ -677,12 +807,13 @@ export function renderUsageCard(usages: readonly ProviderUsage[], theme: UsageTh
 				reached: limit.limitReached,
 			})),
 		);
-		return { title: `${theme.fg(ROLE.PROVIDER, name)}${plan}`, rows };
+		return { title: `${theme.fg(ROLE.PROVIDER, name)}${plan}`, rows, compact: undefined as string[] | undefined };
 	});
 	const labelWidth = Math.min(10, sections.reduce((widest, section) => Math.max(widest, ...section.rows.map((row) => row.label.length)), 0));
 	const body = sections.flatMap((section, index) => [
 		...(index ? [""] : []),
 		section.title,
+		...(section.compact ?? []).map((line) => truncateToWidth(line, innerWidth, "…")),
 		...section.rows.map((row) => {
 			const label = truncateToWidth(row.label, labelWidth, "…").padEnd(labelWidth);
 			const percent = `${Math.round(row.window.usedPercent)}%`.padStart(4);
@@ -693,7 +824,8 @@ export function renderUsageCard(usages: readonly ProviderUsage[], theme: UsageTh
 		}),
 	]);
 	const oldest = Math.min(...sorted.map((usage) => usage.fetchedAt));
-	body.push("", theme.fg(ROLE.RESET, truncateToWidth(`${updatedAgo(oldest, now)} · alt+u`, innerWidth, "…")));
+	const hint = sections.some((section) => section.compact) ? COMPACT_FOOTER_HINT : CARD_FOOTER_HINT;
+	body.push("", theme.fg(ROLE.RESET, truncateToWidth(`${updatedAgo(oldest, now)} · ${hint}`, innerWidth, "…")));
 	return renderCard({ title: "Limits", body, tone: "info", rail: true }, theme, width, { expanded: true });
 }
 

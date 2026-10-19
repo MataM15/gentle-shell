@@ -2118,6 +2118,13 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 				},
 				render: (width) => renderUsageCard(usage.all(), theme, width, deps.now()),
 				invalidate() {},
+				// The card is a summary: a clean left click anywhere on it opens the
+				// full panel alt+u opens. The rail only dispatches hits on rows it painted.
+				handleMouse(event) {
+					if (event.type !== "click" || event.button !== "left") return undefined;
+					void openUsage(ctx);
+					return { handled: true, render: true };
+				},
 			});
 			const uninstall = installSidebar(tui, theme, () => visualSettings.statusPlacement, () => visualSettings.headerPlacement, () => visualSettings.density, { collapsed: () => railCollapsed, toggle: () => toggleRail(), hint: () => railPanelKey(env) });
 			// The public widget slot follows the editor even when the rail is absent.

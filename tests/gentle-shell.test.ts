@@ -6722,3 +6722,26 @@ for (const kind of ["unset", "empty", "bundled"] as const) {
 		assert.equal(read(), "other (repo)", "the pinned profile exists only in that config home's store");
 	});
 }
+
+test("a left click on the rail's Limits card opens the usage panel; other clicks do not", async (t) => {
+	const home = scopedDoubleEscCancelConfigHome(t);
+	const { pi, handlers } = fakePi();
+	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home, GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" });
+	const { ctx, ui } = fakeContext();
+	await fire(handlers, "session_start", ctx);
+	const tui = { mode: "fullscreen", terminal: { rows: 40, columns: 160 }, requestRender() {} };
+	const footer = (ui.footerFactory as (tui: unknown, theme: ShellBarTheme, data: unknown) => SidebarRail & { dispose(): void })(tui, plainTheme, {
+		getGitBranch: () => "main", getExtensionStatuses: () => new Map(), getAvailableProviderCount: () => 1, onBranchChange: () => () => {},
+	});
+	const limits = sidebarState(tui as unknown as TUI).parts.get("usage")!;
+	const click = (button: "left" | "right", type = "click"): TuiMouseEvent => ({ type, button, x: 3, y: 2, screenX: 3, screenY: 2, width: 48, height: 9, shift: false, alt: false, ctrl: false } as TuiMouseEvent);
+	try {
+		assert.equal(limits.handleMouse?.(click("right")), undefined, "only the left button");
+		assert.equal(limits.handleMouse?.(click("left", "press")), undefined, "only a clean click");
+		assert.equal(ui.overlayView, undefined);
+		assert.equal(limits.handleMouse?.(click("left"))?.handled, true);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.match(ui.overlayView!.render(90).join("\n"), /Subscriptions/, "the same panel alt+u opens");
+		ui.closeOverlay?.();
+	} finally { footer.dispose(); }
+});

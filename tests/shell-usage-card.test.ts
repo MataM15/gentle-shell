@@ -60,3 +60,118 @@ test("source registry lists registered providers", () => {
 	registry.register({ schema: "gentle-pi.usage-source/v1", provider: "cliproxyapi", fetch: async () => undefined });
 	assert.deepEqual(registry.providers(), ["cliproxyapi"]);
 });
+
+// Compact Antigravity section (gentle-pi:usage-source/v1 optional layout hint).
+const HOUR_MS = 3_600_000;
+const DAY_MS = 86_400_000;
+const ERROR_MARK = "\x1b[31m✕\x1b[39m";
+const marked = { fg: (color: string, text: string) => (color === "error" ? `\x1b[31m${text}\x1b[39m` : text) };
+const win = (label: string, usedPercent: number, windowSeconds: number, resetAt: number | null) => ({ label, usedPercent, windowSeconds, resetAt });
+const account = (label: string, family: "gemini" | "claude", windows: ReturnType<typeof win>[], limitReached = false) => ({
+	name: `${label} ${family === "gemini" ? "G" : "C"}${windows[0]!.windowSeconds === 18_000 ? "5h" : "7d"}`,
+	account: label,
+	family,
+	windows,
+	limitReached,
+});
+function antigravity(overrides: Partial<ProviderUsage> = {}): ProviderUsage {
+	const week = win("", 0, 604_800, NOW + 6 * DAY_MS + 23 * HOUR_MS);
+	const fiveHour = win("", 0, 18_000, NOW + 4 * HOUR_MS + 59 * 60_000);
+	return {
+		provider: "cliproxyapi",
+		plan: "antigravity · used · Pay02 unavailable (HTTP 403)",
+		heading: "antigravity · used",
+		layout: "accounts",
+		fetchedAt: NOW,
+		unavailable: [{ label: "Pay02", reason: "HTTP 403" }],
+		limits: [
+			account("Free02", "gemini", [week]), account("Free02", "claude", [week]),
+			account("Pay01", "gemini", [week]), account("Pay01", "gemini", [fiveHour]),
+			account("Pay01", "claude", [week]), account("Pay01", "claude", [fiveHour]),
+			account("Free01", "gemini", [week]), account("Free01", "claude", [week]),
+		],
+		...overrides,
+	} as ProviderUsage;
+}
+const rows = (lines: string[]) => lines.map((line) => line.replace(/^│ ?| ?│$/g, "").trimEnd());
+
+test("S1/S2/S3: compact Antigravity section lists one row per account in the approved order", () => {
+	const lines = renderUsageCard([antigravity()], marked, 48, NOW);
+	const body = rows(lines);
+	assert.equal(body[1], "antigravity · used");
+	assert.match(body[2]!, /^ Pay01 {2}G \S{6} {3}0% C \S{6} {3}0% 4h 59m$/, "most constraining window's reset wins on a 0% tie: the soonest");
+	assert.equal(body[3], ` Pay02  ${ERROR_MARK} unavailable (HTTP 403)`);
+	assert.match(body[4]!, /^ Free01 G \S{6} {3}0% C \S{6} {3}0% 6d 23h$/);
+	assert.match(body[5]!, /^ Free02 G \S{6} {3}0% C \S{6} {3}0% 6d 23h$/);
+	assert.equal(body.at(-2), "updated just now · click or alt+u: details");
+	assert.ok(!lines.join("\n").includes("Pay01 G7d"), "no per-window rows in the compact section");
+	for (const line of lines) assert.ok(visibleWidth(line) <= 48, line);
+});
+
+test("S1: each family shows its most used window and the reset of the most constraining one", () => {
+	const usage = antigravity({
+		unavailable: [],
+		limits: [
+			account("Pay01", "gemini", [win("", 40, 604_800, NOW + 3 * DAY_MS)]),
+			account("Pay01", "gemini", [win("", 12, 18_000, NOW + 2 * HOUR_MS)]),
+			account("Pay01", "claude", [win("", 5, 604_800, NOW + 3 * DAY_MS)]),
+			account("Pay01", "claude", [win("", 77, 18_000, NOW + 2 * HOUR_MS)]),
+		],
+	});
+	const [, , row] = rows(renderUsageCard([usage], marked, 48, NOW));
+	assert.match(row!, /^ Pay01 {2}G \S{6} {2}40% C \S{6} {2}77% 2h 0m$/, "G: weekly 40 beats 5h 12; C: 5h 77 beats weekly 5; the 77% window sets the reset");
+});
+
+test("S1: a family without data is omitted instead of shown as 0%, and unknown accounts sort last", () => {
+	const usage = antigravity({
+		unavailable: [],
+		limits: [
+			account("Zed", "claude", [win("", 9, 604_800, NOW + DAY_MS)]),
+			account("Free01", "gemini", [win("", 3, 604_800, NOW + 2 * DAY_MS)]),
+			account("Pay01", "gemini", [win("", 1, 604_800, NOW + 2 * DAY_MS)]),
+		],
+	});
+	const body = rows(renderUsageCard([usage], marked, 48, NOW));
+	assert.deepEqual(body.slice(2, 5).map((line) => line.slice(0, 7).trim()), ["Pay01", "Free01", "Zed"]);
+	assert.ok(!body[2]!.includes("C "), "no Claude segment for an account that has none");
+	assert.ok(!body[4]!.includes("G "), "no Gemini segment for an account that has none");
+	assert.match(body[4]!, /C \S{6} {3}9% 1d 0h$/);
+});
+
+test("S2: stale data keeps a visible marker in the section title and the title never carries failures", () => {
+	const body = rows(renderUsageCard([antigravity({ stale: true })], marked, 48, NOW));
+	assert.equal(body[1], "antigravity · used · stale");
+	assert.ok(!body[1]!.includes("unavailable"));
+});
+
+test("S2: an account row's failure mark uses the reached-limit color", () => {
+	const text = renderUsageCard([antigravity()], marked, 48, NOW).join("\n");
+	assert.ok(text.includes(`${ERROR_MARK} unavailable (HTTP 403)`));
+});
+
+test("S5: codex and claude sections render exactly as before", () => {
+	const usages: ProviderUsage[] = [
+		{ provider: "anthropic", plan: undefined, fetchedAt: NOW - 60_000, limits: [{ name: "claude", limitReached: false, windows: [win("5h", 11, 18_000, NOW + 3 * HOUR_MS + 54 * 60_000), win("week", 58, 604_800, NOW + 2 * DAY_MS + 15 * HOUR_MS)] }] },
+		{ provider: "openai-codex", plan: "prolite", fetchedAt: NOW, limits: [{ name: "codex", limitReached: false, windows: [win("week", 27, 604_800, NOW + 5 * DAY_MS)] }] },
+	];
+	assert.deepEqual(renderUsageCard(usages, plain, 48, NOW), [
+		"╭─ Limits ─────────────────────────────────────╮",
+		"│ codex · prolite                              │",
+		"│  week ▰▰▱▱▱▱▱▱  27% 5d 0h                    │",
+		"│                                              │",
+		"│ claude                                       │",
+		"│  5h   ▰▱▱▱▱▱▱▱  11% 3h 54m                   │",
+		"│  week ▰▰▰▰▰▱▱▱  58% 2d 15h                   │",
+		"│                                              │",
+		"│ updated 1m ago · alt+u                       │",
+		"╰──────────────────────────────────────────────╯",
+	]);
+});
+
+test("S5: a provider without the layout hint renders as before even beside a compact one", () => {
+	const legacy: ProviderUsage = { provider: "cliproxyapi", plan: "antigravity", fetchedAt: NOW, limits: [{ name: "gemini", limitReached: false, windows: [win("week", 34, 604_800, null)] }] };
+	const text = renderUsageCard([legacy], plain, 48, NOW).join("\n");
+	assert.ok(text.includes("week") && text.includes("34%"));
+	assert.ok(text.includes("updated just now · alt+u"));
+	assert.ok(!text.includes("click or alt+u"), "the footer hint changes only when a compact section is drawn");
+});

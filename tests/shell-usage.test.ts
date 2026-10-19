@@ -680,3 +680,61 @@ test("renderUsagePanel renders the failure note beside a retained snapshot, and 
 	assert.ok(afterFailure.some((line) => /^ {2}fetch failed · r to retry$/.test(line)), "the failure is visible beside the retained snapshot");
 	assert.equal(scopePanel([codex], ["openai-codex"]).some((line) => line.includes("fetch failed")), false, "a provider whose latest refresh succeeded carries no failure note");
 });
+
+// Optional compact-layout fields of the usage-source contract (S6): every one
+// is validated field by field and none of them is required, so a source that
+// predates them keeps parsing exactly as before.
+const COMPACT_USAGE = {
+	provider: "acme-cloud",
+	plan: "Acme",
+	fetchedAt: 100,
+	heading: "acme · used",
+	layout: "accounts",
+	stale: true,
+	unavailable: [{ label: "Pay02", reason: "HTTP 403" }],
+	limits: [{ name: "Pay01 G7d", account: "Pay01", family: "gemini", limitReached: false, windows: [{ label: "", usedPercent: 4, windowSeconds: 604_800, resetAt: null }] }],
+};
+
+test("parseProviderUsage keeps the optional compact-layout fields", () => {
+	const parsed = parseProviderUsage(structuredClone(COMPACT_USAGE), "acme-cloud");
+	assert.equal(parsed?.layout, "accounts");
+	assert.equal(parsed?.heading, "acme · used");
+	assert.equal(parsed?.stale, true);
+	assert.deepEqual(parsed?.unavailable, [{ label: "Pay02", reason: "HTTP 403" }]);
+	assert.equal(parsed?.limits[0]?.account, "Pay01");
+	assert.equal(parsed?.limits[0]?.family, "gemini");
+});
+
+test("parseProviderUsage output without the optional fields is unchanged", () => {
+	const parsed = parseProviderUsage(structuredClone(VALID_SOURCE_USAGE), "acme-cloud");
+	assert.deepEqual(Object.keys(parsed ?? {}).sort(), ["fetchedAt", "limits", "plan", "provider"]);
+	assert.deepEqual(Object.keys(parsed?.limits[0] ?? {}).sort(), ["limitReached", "name", "windows"]);
+});
+
+test("parseProviderUsage rejects malformed optional compact-layout fields", () => {
+	const bad = (patch: Record<string, unknown>) => parseProviderUsage({ ...structuredClone(COMPACT_USAGE), ...patch }, "acme-cloud");
+	assert.equal(bad({ heading: 5 }), undefined);
+	assert.equal(bad({ layout: 5 }), undefined);
+	assert.equal(bad({ stale: "yes" }), undefined);
+	assert.equal(bad({ unavailable: "nope" }), undefined);
+	assert.equal(bad({ unavailable: [{ label: "Pay02" }] }), undefined);
+	assert.equal(bad({ unavailable: [{ label: 3, reason: "x" }] }), undefined);
+	const limit = (patch: Record<string, unknown>) => bad({ limits: [{ ...COMPACT_USAGE.limits[0], ...patch }] });
+	assert.equal(limit({ account: 7 }), undefined);
+	assert.equal(limit({ family: 7 }), undefined);
+});
+
+test("parseProviderUsage ignores a layout or family value it does not know", () => {
+	const parsed = parseProviderUsage({ ...structuredClone(COMPACT_USAGE), layout: "grid", limits: [{ ...COMPACT_USAGE.limits[0], family: "mistral" }] }, "acme-cloud");
+	assert.ok(parsed, "an unknown value is a hint from a newer source, not a malformed payload");
+	assert.equal(parsed?.layout, undefined);
+	assert.equal(parsed?.limits[0]?.family, undefined);
+});
+
+test("S4: the panel still lists every window of a compact-layout provider", () => {
+	const usage = parseProviderUsage(structuredClone(COMPACT_USAGE), "acme-cloud")!;
+	usage.limits.push({ name: "Pay01 G5h", account: "Pay01", family: "gemini", limitReached: false, windows: [{ label: "", usedPercent: 9, windowSeconds: 18_000, resetAt: null }] });
+	const text = renderUsagePanel([usage], { fg: (_color, value) => value }, 80, 0).join("\n");
+	assert.match(text, /Pay01 G7d[\s\S]*4%/);
+	assert.match(text, /Pay01 G5h[\s\S]*9%/);
+});
