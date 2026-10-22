@@ -99,6 +99,11 @@ export class WellnessSession {
 			return key === "dinner" || text.length + 2 > reminderWidth ? text : `${text.padEnd(reminderWidth - 2)}↻ `;
 		});
 		const title = spanish ? "Bienestar" : "Wellness";
+		// A due reminder must be noticed from the rail alone: the transcript notice scrolls away.
+		const dueWord = spanish ? "Ahora" : "Due";
+		const tone = REMINDERS.some((key) => this.deadlines.get(key)! <= now) ? "warning" : "info";
+		// Styled after layout, so padding and slicing still measure plain text.
+		const mark = (row: string) => row.replaceAll(dueWord, theme.fg("warning", theme.bold ? theme.bold(dueWord) : dueWord));
 		if (width < 44) {
 			// Narrow terminals (phones) get a compact card: the time moves into the
 			// title and the reminders pack into as few rows as fit, without reset glyphs.
@@ -114,12 +119,12 @@ export class WellnessSession {
 				if (last >= 0 && rows[last]!.length + 3 + item.length <= innerWidth) rows[last] += ` · ${item}`;
 				else rows.push(item);
 			}
-			return renderCard({ title, subtitle: time, tone: "info", body: rows, rail: true }, theme, width, { expanded: true });
+			return renderCard({ title, subtitle: time, tone, body: rows.map(mark), rail: true }, theme, width, { expanded: true });
 		}
 		const clock = [0, 1, 2].map((row) => [...time].map((digit) => DIGITS[digit][row]).join(" "));
 		const right = [...clock, day];
-		const body = reminders.map((line, row) => line.slice(0, innerWidth - 17).padEnd(innerWidth - 17) + right[row].padStart(17));
-		const output = renderCard({ title, tone: "info", body, rail: true }, theme, width, { expanded: true });
+		const body = reminders.map((line, row) => mark(line.slice(0, innerWidth - 17).padEnd(innerWidth - 17)) + right[row].padStart(17));
+		const output = renderCard({ title, tone, body, rail: true }, theme, width, { expanded: true });
 		this.resetHits = [];
 		for (const key of REMINDERS) {
 			if (key === "dinner") continue;

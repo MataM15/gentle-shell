@@ -74,6 +74,23 @@ test("narrow widths render a compact card with the time in the title", () => {
 	assert.equal(model.render(now, 44, theme).length, 6);
 });
 
+test("a due reminder turns the card and its due label to the warning role at every width", () => {
+	// Zero-width escapes keep wrapping honest; yellow stands in for the warning role.
+	const ansi = { fg: (role: string, text: string) => role === "warning" ? `\x1b[33m${text}\x1b[39m` : text, bold: (text: string) => `\x1b[1m${text}\x1b[22m` };
+	// Dinner away from the fixture's 21:00 so only water comes due 30 minutes later.
+	const model = new WellnessSession({ ...config, dinnerTime: "08:00" }, now);
+	for (const width of [48, 40]) {
+		const before = model.render(now, width, ansi).join("\n");
+		assert.doesNotMatch(before, /\x1b\[33m/, `nothing due at ${width} columns keeps the info tone`);
+		const due = model.render(now + 30 * 60000, width, ansi);
+		const text = due.join("\n");
+		assert.ok(text.includes("\x1b[33m\x1b[1mAhora\x1b[22m\x1b[39m"), `the due label stands out at ${width} columns`);
+		assert.ok(due[0]!.includes("\x1b[33m"), `the frame takes the warning tone at ${width} columns`);
+		assert.equal(text.match(/Ahora/g)?.length, 1, "only the due reminder is marked");
+		assert.ok(due.every((line) => visibleWidth(line) <= width), `bounded at ${width} columns`);
+	}
+});
+
 test("shared revisions synchronize deadlines and rearm notification latches", () => {
 	const model = new WellnessSession(config, now);
 	const shared: WellnessState = { version: 1, reminders: Object.fromEntries(REMINDERS.map(key => [key, { deadline: now, revision: key }])) as WellnessState["reminders"] };
