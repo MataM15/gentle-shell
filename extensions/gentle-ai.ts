@@ -1470,7 +1470,7 @@ Harness principles:
 - el Gentleman is not prompt engineering. It is runtime discipline around powerful agents.
 - Clarify scope, constraints, acceptance criteria, and non-goals before implementation.
 - Use subagents when available for exploration, planning, implementation, and review, while keeping one parent session responsible for orchestration.
-- For behavior changes with applicable runnable deterministic tests and a clear expected outcome, use test-first by default: observe RED, GREEN, then refactor with focused checks. Write one RED test per requested rule. For every existing command or option the change touches, add one test proving its previous behavior still holds; add no other cases. An existing behavior counts as touched when it shares the code you changed (options, parsers, helpers, validation). Before finishing, run a differential check: for each existing command that shares the code you changed, run it with the new or changed input (for example a new option passed to a sibling subcommand) against the previous code (a copy of the base commit in a \`mktemp -d\` scratch directory, never committed as a test; committed tests never read git history or a fixed commit) and against your change, and compare stdout, stderr, and exit code; any difference nobody asked for is a regression to fix and pin with a test. Test presence alone does not establish applicability; no chat or TUI toggle activates it. For passive documentation, non-testable changes, an unavailable runner, or no meaningful RED, explain why and run proportionate ordinary functional or structural verification. Never invent lifecycle evidence or skip checks. Follow orchestrator-delegation.md for ODD forwarding and evidence.
+- For behavior changes with applicable runnable deterministic tests and a clear expected outcome, use test-first by default: observe RED, GREEN, then refactor with focused checks. Write one RED test per requested rule. For every existing command or option the change touches, add one test proving its previous behavior still holds; add no other cases. An existing behavior counts as touched when it shares the code you changed (options, parsers, helpers, validation). Only when your diff changes shared code (options, parsers, helpers) that an existing command the request did not name also uses, run one differential check before finishing, as a single script: for each such command, run it with the new or changed input (for example a new option passed to a sibling subcommand) against the previous code (a copy of the base commit in a \`mktemp -d\` scratch directory, never committed as a test; committed tests never read git history or a fixed commit) and against your change, and compare stdout, stderr, and exit code; any difference nobody asked for is a regression to fix and pin with a test. Test presence alone does not establish applicability; no chat or TUI toggle activates it. For passive documentation, non-testable changes, an unavailable runner, or no meaningful RED, explain why and run proportionate ordinary functional or structural verification. Never invent lifecycle evidence or skip checks. Follow orchestrator-delegation.md for ODD forwarding and evidence.
 - Protect the human reviewer: avoid oversized changes, surface review workload risk, and ask before turning one task into a large multi-area change.
 - Never claim persistent memory is available because of this package. Memory is provided by separate packages or MCP tools when installed and callable.
 
@@ -4506,7 +4506,10 @@ async function showProfilesPanel(
 		agentHome: resolveGentlePiAgentHome(),
 	};
 	const discoveredAgents = discoverAgents(discoveryRoots).agents;
-	const discoveredAgentNames = discoveredAgents.map((agent) => agent.name);
+	// gentle-pi#2271: review-refuter and review-validator are provider review
+	// roles the relay routes by key; they never have an agent file, so they
+	// count as matched instead of being flagged "no matching agent".
+	const discoveredAgentNames = [...new Set([...PROVIDER_REVIEW_ROLES, ...discoveredAgents.map((agent) => agent.name)])];
 	// Issue #2400: launches resolve from the subagents.json model_profiles, which
 	// the effective table only reads per discovered agent, so a key with no match
 	// and no suggestion never appeared. When a session binding or a pin wins, the
@@ -4514,7 +4517,7 @@ async function showProfilesPanel(
 	const unmatchedKeys = sessionBoundName !== undefined || pinnedEffectiveModelConfig(ctx.cwd) !== undefined
 		? []
 		: unmatchedProfileKeys(loadAgentsConfig(discoveryRoots).modelProfiles, discoveredAgents)
-			.filter((entry) => entry.suggestion === undefined)
+			.filter((entry) => entry.suggestion === undefined && !isProviderReviewRole(entry.key))
 			.map((entry) => entry.key);
 	return ctx.ui.custom<ProfilesPanelResult>(
 		(tui, theme, keybindings, done) => {
@@ -7568,11 +7571,24 @@ function reviewHostRelayFailureReport(error: ReviewHostRelayError): Record<strin
 // its provider through the live model registry the caller supplies, or it is
 // refused before materialize ever runs (validateReviewerSelectionConfiguration
 // in lib/review-host-relay.ts).
+//
+// gentle-pi#2271: review-refuter and review-validator are provider review
+// roles, not installable agents, so nothing seeds their entries and profiles
+// never carry them. For those two keys only, a snapshot with no model falls
+// back to Pi's persisted default model and effort, the default the routing
+// panel already labels them with. Lens keys keep the fail-closed rule.
 function reviewHostRelaySelection(lens: string | undefined, config: AgentModelConfig): { selection?: string; thinking?: string; routingKey: string } {
 	const routingKey = lens === undefined || lens.length === 0 ? "review capture" : lens.startsWith("review-") ? lens : `review-${lens}`;
 	const entry = config[routingKey];
-	const model = typeof entry === "object" && entry !== null && typeof (entry as AgentRoutingEntry).model === "string" && (entry as AgentRoutingEntry).model!.length > 0 ? (entry as AgentRoutingEntry).model : undefined;
-	const thinking = typeof entry === "object" && entry !== null && typeof (entry as AgentRoutingEntry).thinking === "string" ? (entry as AgentRoutingEntry).thinking : undefined;
+	let model = typeof entry === "object" && entry !== null && typeof (entry as AgentRoutingEntry).model === "string" && (entry as AgentRoutingEntry).model!.length > 0 ? (entry as AgentRoutingEntry).model : undefined;
+	let thinking = typeof entry === "object" && entry !== null && typeof (entry as AgentRoutingEntry).thinking === "string" ? (entry as AgentRoutingEntry).thinking : undefined;
+	if (model === undefined && isProviderReviewRole(routingKey)) {
+		const persisted = readOrchestratorSettings(orchestratorSettingsPath());
+		if (persisted.status === "valid" && persisted.entry?.model !== undefined) {
+			model = persisted.entry.model;
+			thinking ??= persisted.entry.thinking;
+		}
+	}
 	return {
 		...(model === undefined ? {} : { selection: model }),
 		...(thinking === undefined ? {} : { thinking }),
