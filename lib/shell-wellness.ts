@@ -7,6 +7,8 @@ export type Reminder = typeof REMINDERS[number];
 export const WELLNESS_LABELS: Record<Reminder, string> = { water: "Water", break: "Break", stretch: "Stretch", dinner: "Dinner" };
 export const WELLNESS_LABELS_ES: Record<Reminder, string> = { water: "Agua", break: "Descanso", stretch: "Estirar", dinner: "Cena" };
 export const WELLNESS_NOTICES_ES: Record<Reminder, string> = { water: "Hora de tomar agua.", break: "Hora de descansar.", stretch: "Hora de estirar.", dinner: "Hora de cenar." };
+/** The rail card's title, in both languages: it sits beside Limits and Status, which are English. */
+export const WELLNESS_TITLE = "Breaks";
 const DIGITS: Record<string, string[]> = {
 	"0": ["┌─┐", "│ │", "└─┘"], "1": [" ╷ ", " │ ", " ╵ "],
 	"2": ["╶─┐", "┌─┘", "└─╴"], "3": ["╶─┐", " ─┤", "╶─┘"],
@@ -98,7 +100,7 @@ export class WellnessSession {
 			const text = `${(spanish ? WELLNESS_LABELS_ES : WELLNESS_LABELS)[key].padEnd(spanish ? 9 : 8)}${remaining}`;
 			return key === "dinner" || text.length + 2 > reminderWidth ? text : `${text.padEnd(reminderWidth - 2)}↻ `;
 		});
-		const title = spanish ? "Bienestar" : "Wellness";
+		const title = WELLNESS_TITLE;
 		// A due reminder must be noticed from the rail alone: the transcript notice scrolls away.
 		const dueWord = spanish ? "Ahora" : "Due";
 		const tone = REMINDERS.some((key) => this.deadlines.get(key)! <= now) ? "warning" : "info";

@@ -95,20 +95,22 @@ function antigravity(overrides: Partial<ProviderUsage> = {}): ProviderUsage {
 }
 const rows = (lines: string[]) => lines.map((line) => line.replace(/^│ ?| ?│$/g, "").trimEnd());
 
-test("S1/S2/S3: compact Antigravity section lists one row per account in the approved order", () => {
+test("S1/S2/S3: compact Antigravity section lists one grid row per account and family in the approved order", () => {
 	const lines = renderUsageCard([antigravity()], marked, 48, NOW);
 	const body = rows(lines);
 	assert.equal(body[1], "antigravity · used");
-	assert.match(body[2]!, /^ Pay01 {2}G \S{6} {3}0% C \S{6} {3}0% 4h 59m$/, "most constraining window's reset wins on a 0% tie: the soonest");
-	assert.equal(body[3], ` Pay02  ${ERROR_MARK} unavailable (HTTP 403)`);
-	assert.match(body[4]!, /^ Free01 G \S{6} {3}0% C \S{6} {3}0% 6d 23h$/);
-	assert.match(body[5]!, /^ Free02 G \S{6} {3}0% C \S{6} {3}0% 6d 23h$/);
+	assert.match(body[2]!, /^ Pay01 G +\S{8} {3}0% 4h 59m$/, "a family marker lives inside the name column; a 0% tie resolves to the soonest reset");
+	assert.match(body[3]!, /^ Pay01 C +\S{8} {3}0% 4h 59m$/);
+	assert.match(body[4]!, /^ Pay02 +\x1b\[31m✕\x1b\[39m HTTP 403$/, "a failure writes its reason across the bar/value columns");
+	assert.equal(body[4]!.replace(/\x1b\[[0-9;]*m/g, "").indexOf("✕"), body[3]!.search(/[▰▱]/), "the reason starts where the bars start");
+	assert.match(body[5]!, /^ Free01 G +\S{8} {3}0% 6d 23h$/);
+	assert.match(body[7]!, /^ Free02 G +\S{8} {3}0% 6d 23h$/);
 	assert.equal(body.at(-2), "updated just now · click or alt+u: details");
 	assert.ok(!lines.join("\n").includes("Pay01 G7d"), "no per-window rows in the compact section");
 	for (const line of lines) assert.ok(visibleWidth(line) <= 48, line);
 });
 
-test("S1: each family shows its most used window and the reset of the most constraining one", () => {
+test("S1: each family shows its most used window and the reset of that window", () => {
 	const usage = antigravity({
 		unavailable: [],
 		limits: [
@@ -118,11 +120,12 @@ test("S1: each family shows its most used window and the reset of the most const
 			account("Pay01", "claude", [win("", 77, 18_000, NOW + 2 * HOUR_MS)]),
 		],
 	});
-	const [, , row] = rows(renderUsageCard([usage], marked, 48, NOW));
-	assert.match(row!, /^ Pay01 {2}G \S{6} {2}40% C \S{6} {2}77% 2h 0m$/, "G: weekly 40 beats 5h 12; C: 5h 77 beats weekly 5; the 77% window sets the reset");
+	const [, , gemini, claude] = rows(renderUsageCard([usage], marked, 48, NOW));
+	assert.match(gemini!, /^ Pay01 G +\S{8} {2}40% 3d 0h$/, "G: weekly 40 beats 5h 12 and brings its own reset");
+	assert.match(claude!, /^ Pay01 C +\S{8} {2}77% 2h 0m$/, "C: 5h 77 beats weekly 5 and brings its own reset");
 });
 
-test("S1: a family without data is omitted instead of shown as 0%, and unknown accounts sort last", () => {
+test("S1: a family without data gets no row instead of 0%, and unknown accounts sort last", () => {
 	const usage = antigravity({
 		unavailable: [],
 		limits: [
@@ -132,10 +135,9 @@ test("S1: a family without data is omitted instead of shown as 0%, and unknown a
 		],
 	});
 	const body = rows(renderUsageCard([usage], marked, 48, NOW));
-	assert.deepEqual(body.slice(2, 5).map((line) => line.slice(0, 7).trim()), ["Pay01", "Free01", "Zed"]);
-	assert.ok(!body[2]!.includes("C "), "no Claude segment for an account that has none");
-	assert.ok(!body[4]!.includes("G "), "no Gemini segment for an account that has none");
-	assert.match(body[4]!, /C \S{6} {3}9% 1d 0h$/);
+	assert.deepEqual(body.slice(2, 5).map((line) => line.slice(0, 9).trim()), ["Pay01 G", "Free01 G", "Zed C"]);
+	assert.equal(body.slice(2, 5).filter((line) => /\bC\b/.test(line.slice(0, 9))).length, 1, "no Claude row for an account that has none");
+	assert.match(body[4]!, /^ Zed C +\S{8} {3}9% 1d 0h$/);
 });
 
 test("S2: stale data keeps a visible marker in the section title and the title never carries failures", () => {
@@ -146,7 +148,7 @@ test("S2: stale data keeps a visible marker in the section title and the title n
 
 test("S2: an account row's failure mark uses the reached-limit color", () => {
 	const text = renderUsageCard([antigravity()], marked, 48, NOW).join("\n");
-	assert.ok(text.includes(`${ERROR_MARK} unavailable (HTTP 403)`));
+	assert.ok(text.includes(`${ERROR_MARK} HTTP 403`));
 });
 
 test("S5: codex and claude sections render exactly as before", () => {

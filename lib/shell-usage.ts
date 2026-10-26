@@ -1,4 +1,4 @@
-import { truncateToWidth } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { parseModelRef } from "./agents-config.ts";
 import { paintGauge, type GaugePaint } from "./shell-gauge.ts";
 import { cardInnerWidth, renderCard } from "./shell-card.ts";
@@ -698,9 +698,6 @@ export function renderUsagePanel(usages: ProviderUsage[], theme: UsageTheme, wid
 const CARD_PROVIDER_NAMES: Record<string, string> = { [CODEX_PROVIDER]: "codex", [ANTHROPIC_PROVIDER]: "claude", cliproxyapi: "antigravity" };
 const CARD_PROVIDER_ORDER = [CODEX_PROVIDER, ANTHROPIC_PROVIDER, "cliproxyapi"];
 const CARD_METER_CELLS = 8;
-const COMPACT_METER_CELLS = 6;
-const COMPACT_LABEL_MIN = 6;
-const COMPACT_LABEL_MAX = 10;
 const COMPACT_ACCOUNT_ORDER = ["Pay01", "Pay02", "Free01", "Free02"];
 const COMPACT_FAMILIES: ReadonlyArray<[family: UsageFamily, mark: string]> = [["gemini", "G"], ["claude", "C"]];
 const FAILURE_MARK = "✕";
@@ -730,10 +727,21 @@ function printable(text: string): string {
 	return text.replace(/[^\x20-\x7e]/g, "");
 }
 
-// One row per account, ordered Pay01..Free02 then the rest as first seen. An
-// account whose quota could not be read gets a failure row instead; a family
-// an account has no data for leaves its column blank rather than reading 0%.
-function compactAccountRows(usage: ProviderUsage, theme: UsageTheme, now: number): string[] | undefined {
+// A Limits row before layout. Every row of the card, whatever its provider,
+// lands on one column grid: `name | bar | % | reset`.
+interface GridRow {
+	name: string;
+	// Absent on a failure row, which writes its reason across the bar/value columns.
+	window?: UsageWindow;
+	reached?: boolean;
+	failure?: string;
+}
+
+// Account rows ordered Pay01..Free02 then the rest as first seen, one row per
+// model family the account has data for (the family is a small marker inside
+// the name column). An account whose quota could not be read gets a failure
+// row instead; a family an account has no data for gets no row rather than 0%.
+function compactAccountRows(usage: ProviderUsage): GridRow[] | undefined {
 	const accounts = new Map<string, { windows: Map<UsageFamily, CompactWindow[]>; failure?: string }>();
 	const entry = (label: string) => {
 		let found = accounts.get(label);
@@ -756,24 +764,74 @@ function compactAccountRows(usage: ProviderUsage, theme: UsageTheme, now: number
 	};
 	// Array.sort is stable, so unknown accounts keep their first-seen order.
 	const labels = [...accounts.keys()].sort((a, b) => rank(a) - rank(b));
-	const labelWidth = Math.min(COMPACT_LABEL_MAX, Math.max(COMPACT_LABEL_MIN, ...labels.map((label) => label.length)));
-	const segmentWidth = 2 + COMPACT_METER_CELLS + 1 + 4;
-	return labels.map((label) => {
+	return labels.flatMap((label): GridRow[] => {
 		const account = accounts.get(label)!;
-		const head = ` ${theme.fg(ROLE.LABEL, truncateToWidth(label, labelWidth, "…").padEnd(labelWidth))}`;
-		if (account.windows.size === 0) return `${head} ${theme.fg("error", FAILURE_MARK)} ${theme.fg(ROLE.RESET, `unavailable (${account.failure ?? "unknown"})`)}`;
-		const chosen: CompactWindow[] = [];
-		const segments = COMPACT_FAMILIES.map(([family, mark]) => {
+		if (account.windows.size === 0) return [{ name: label, failure: account.failure ?? "unavailable" }];
+		return COMPACT_FAMILIES.flatMap(([family, mark]): GridRow[] => {
 			const windows = account.windows.get(family);
-			if (!windows) return " ".repeat(segmentWidth);
+			if (!windows) return [];
 			const best = windows.reduce(moreConstraining);
-			chosen.push(best);
-			const percent = `${Math.round(best.window.usedPercent)}%`.padStart(4);
-			return `${theme.fg(ROLE.LABEL, mark)} ${paintMeter(best.window.usedPercent, COMPACT_METER_CELLS, theme)} ${best.reached ? theme.fg("error", percent) : theme.fg(ROLE.PERCENT, percent)}`;
+			return [{ name: `${label} ${mark}`, window: best.window, reached: best.reached }];
 		});
-		const reset = shortReset(chosen.reduce(moreConstraining).window.resetAt, now);
-		return `${head} ${segments.join(" ")}${reset ? ` ${theme.fg(ROLE.RESET, reset)}` : ""}`;
 	});
+}
+
+/**
+ * The account failures the Limits card itself paints, as the `<label>
+ * unavailable (<reason>)` notes an extension may also publish as a status.
+ * The rail's Status card drops exactly these so one fact is not shown twice.
+ */
+export function limitsFailureNotes(usages: readonly ProviderUsage[]): string[] {
+	return usages
+		.filter((usage) => usage.limits.length > 0 && usage.layout === USAGE_LAYOUT_ACCOUNTS)
+		.flatMap((usage) => (compactAccountRows(usage) ?? []).flatMap((row) => (row.failure === undefined ? [] : [`${row.name} unavailable (${row.failure})`])));
+}
+
+// Model tiers that read as noise next to the model name; only the ones with a
+// short form are kept when dropping the tier would make two rows identical.
+const MODEL_TIERS: Readonly<Record<string, string>> = { flash: "fl", pro: "pro", mini: "mini", lite: "lite", turbo: "turbo", air: "air", nano: "nano" };
+
+function modelTokens(name: string): string[] {
+	const tokens = name.split(/[-_]+/).filter((token) => token.length > 0).flatMap((token, index) => {
+		const split = index === 0 ? /^([A-Za-z]+)(\d.*)$/.exec(token) : null;
+		return split ? [split[1]!, split[2]!] : [token];
+	});
+	return tokens.map((token) => /^v\d+\.\d+$/i.test(token) ? token.slice(1) : token);
+}
+
+/**
+ * Readable names for a set of model ids shown together: `mimo-v2.6-flash` ->
+ * `mimo 2.6`, `deepseek-v4-flash` -> `deepseek v4`, `glm5.3-flash` -> `glm 5.3 fl`
+ * (the tier stays, shortened, only when dropping it would collide with a
+ * sibling such as `glm5.3`). A name that is still wider than `max` falls back
+ * to plain truncation. Ids without separators or digits are left alone.
+ */
+export function abbreviateModelNames(names: readonly string[], max: number): string[] {
+	const parts = names.map((name) => {
+		const tokens = modelTokens(name);
+		const last = tokens.at(-1)?.toLowerCase();
+		const tier = tokens.length > 1 && last !== undefined && last in MODEL_TIERS ? last : undefined;
+		return { name, base: (tier ? tokens.slice(0, -1) : tokens).join(" "), tier, tokens };
+	});
+	const taken = new Map<string, number>();
+	for (const part of parts) taken.set(part.base, (taken.get(part.base) ?? 0) + 1);
+	return parts.map((part) => {
+		const simple = part.tokens.length === 1 && part.tier === undefined;
+		const text = simple ? part.name : part.tier && (taken.get(part.base) ?? 0) > 1 ? `${part.base} ${MODEL_TIERS[part.tier]}` : part.base;
+		return clipPlain(text, max);
+	});
+}
+
+// Plain text clip: pi's truncateToWidth wraps its result in resets, and these
+// names are painted by the caller afterwards.
+function clipPlain(text: string, max: number): string {
+	if (visibleWidth(text) <= max) return text;
+	let clipped = "";
+	for (const char of text) {
+		if (visibleWidth(clipped + char) > max - 1) break;
+		clipped += char;
+	}
+	return `${clipped}…`;
 }
 
 function compactTitle(usage: ProviderUsage, name: string, theme: UsageTheme): string {
@@ -785,6 +843,9 @@ function compactTitle(usage: ProviderUsage, name: string, theme: UsageTheme): st
 	return usage.stale ? `${base} ${theme.fg(ROLE.SEPARATOR, "·")} ${theme.fg(ROLE.PLAN, "stale")}` : base;
 }
 
+const GRID_PERCENT_CELLS = 4;
+const GRID_NAME_MIN = 4;
+
 export function renderUsageCard(usages: readonly ProviderUsage[], theme: UsageTheme, width: number, now: number): string[] {
 	const rank = (provider: string) => {
 		const index = CARD_PROVIDER_ORDER.indexOf(provider);
@@ -795,31 +856,44 @@ export function renderUsageCard(usages: readonly ProviderUsage[], theme: UsageTh
 	const innerWidth = cardInnerWidth(width);
 	const sections = sorted.map((usage) => {
 		const name = CARD_PROVIDER_NAMES[usage.provider] ?? usage.provider;
-		const compact = usage.layout === USAGE_LAYOUT_ACCOUNTS ? compactAccountRows(usage, theme, now) : undefined;
-		if (compact) return { title: compactTitle(usage, name, theme), rows: [], compact };
+		const compact = usage.layout === USAGE_LAYOUT_ACCOUNTS ? compactAccountRows(usage) : undefined;
+		if (compact) return { title: compactTitle(usage, name, theme), rows: compact, compact: true };
 		const plan = usage.plan && usage.plan !== name ? ` ${theme.fg(ROLE.SEPARATOR, "·")} ${theme.fg(ROLE.PLAN, usage.plan)}` : "";
 		// A single limit is named by its windows; several limits are named by
 		// the limit, plus the window when that limit has more than one.
-		const rows = groupUsageLimits(usage.limits).flatMap((limit) =>
+		const limits = groupUsageLimits(usage.limits);
+		const labelled = allowanceGroupsSupported(usage.limits);
+		const rows: GridRow[] = limits.flatMap((limit) =>
 			limit.windows.map((window) => ({
-				label: usage.limits.length === 1 ? window.label || limit.name : [limit.name, limit.windows.length > 1 ? window.label : ""].filter(Boolean).join(" "),
+				name: usage.limits.length === 1 ? window.label || limit.name : [limit.name, limit.windows.length > 1 ? window.label : ""].filter(Boolean).join(" "),
 				window,
 				reached: limit.limitReached,
 			})),
 		);
-		return { title: `${theme.fg(ROLE.PROVIDER, name)}${plan}`, rows, compact: undefined as string[] | undefined };
+		// Allowance model ids (NaN) read as words, not as clipped ids.
+		const readable = labelled ? abbreviateModelNames(rows.map((row) => row.name), innerWidth) : undefined;
+		return { title: `${theme.fg(ROLE.PROVIDER, name)}${plan}`, rows: readable ? rows.map((row, index) => ({ ...row, name: readable[index]! })) : rows, compact: false };
 	});
-	const labelWidth = Math.min(10, sections.reduce((widest, section) => Math.max(widest, ...section.rows.map((row) => row.label.length)), 0));
+	// One grid for every row of every provider: bars start at the same column,
+	// percentages end at the same column, resets start at the same column.
+	const resetOf = (row: GridRow) => (row.window ? shortReset(row.window.resetAt, now) : "");
+	const resetWidth = sections.reduce((widest, section) => section.rows.reduce((inner, row) => Math.max(inner, visibleWidth(resetOf(row))), widest), 0);
+	const valueWidth = CARD_METER_CELLS + 1 + GRID_PERCENT_CELLS + (resetWidth > 0 ? 1 + resetWidth : 0);
+	const nameRoom = Math.max(GRID_NAME_MIN, innerWidth - 2 - valueWidth);
+	const nameWidth = Math.min(nameRoom, Math.max(GRID_NAME_MIN, ...sections.flatMap((section) => section.rows.map((row) => visibleWidth(row.name)))));
 	const body = sections.flatMap((section, index) => [
 		...(index ? [""] : []),
 		section.title,
-		...(section.compact ?? []).map((line) => truncateToWidth(line, innerWidth, "…")),
 		...section.rows.map((row) => {
-			const label = truncateToWidth(row.label, labelWidth, "…").padEnd(labelWidth);
-			const percent = `${Math.round(row.window.usedPercent)}%`.padStart(4);
-			const reset = shortReset(row.window.resetAt, now);
+			const name = theme.fg(ROLE.LABEL, truncateToWidth(row.name, nameWidth, "…", true));
+			if (!row.window) {
+				const reason = truncateToWidth(`${FAILURE_MARK} ${row.failure ?? "unavailable"}`, valueWidth, "…");
+				return truncateToWidth(` ${name} ${theme.fg("error", reason.slice(0, 1))}${theme.fg(ROLE.RESET, reason.slice(1))}`, innerWidth, "…");
+			}
+			const percent = `${Math.round(row.window.usedPercent)}%`.padStart(GRID_PERCENT_CELLS);
+			const reset = resetOf(row);
 			const percentText = row.reached ? theme.fg("error", percent) : theme.fg(ROLE.PERCENT, percent);
-			const line = ` ${theme.fg(ROLE.LABEL, label)} ${paintMeter(row.window.usedPercent, CARD_METER_CELLS, theme)} ${percentText}${reset ? ` ${theme.fg(ROLE.RESET, reset)}` : ""}`;
+			const line = ` ${name} ${paintMeter(row.window.usedPercent, CARD_METER_CELLS, theme)} ${percentText}${resetWidth > 0 ? ` ${theme.fg(ROLE.RESET, reset.padEnd(resetWidth))}` : ""}`;
 			return truncateToWidth(line, innerWidth, "…");
 		}),
 	]);

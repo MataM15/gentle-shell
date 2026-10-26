@@ -314,15 +314,18 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 			railLines = [];
 			if (sections.length && branding.length) {
 				railLines.push(...branding.map((line) => " ".repeat(RAIL_PADDING) + line + " ".repeat(RAIL_PADDING)));
-			} else if (sections.length && headerActive && density() === "comfortable" && style === CARD_STYLE.NEON) {
-				// Preserve neon's header gap. Float's painted top padding starts
-				// on the same body row as the transcript, without an external gap.
+			} else if (sections.length && headerActive && style === CARD_STYLE.NEON) {
+				// Neon's header gap, at every density: the pinned header ends in a
+				// solid rule that would otherwise sit on the first card's top
+				// border. Float's painted top padding starts on the same body row
+				// as the transcript, without an external gap.
 				railLines.push("");
 			}
 			for (const section of sections) {
 				// One blank row separates a section from the banner or the
-				// previous section; neon's header gap above is not a section.
-				if ((hits.length > 0 || branding.length > 0) && density() === "comfortable") railLines.push("");
+				// previous section at every density; neon's header gap above is
+				// not a section.
+				if (hits.length > 0 || branding.length > 0) railLines.push("");
 				const startY = railLines.length;
 				railLines.push(...section.lines.map((line) => " ".repeat(RAIL_PADDING) + line + " ".repeat(RAIL_PADDING)));
 				hits.push({ key: section.key, component: section.component, startY, height: section.lines.length, width: contentWidth - RAIL_PADDING * 2 });

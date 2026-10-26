@@ -46,7 +46,7 @@ test("Spanish rail and narrow fallback remain bounded with precise reset hit tar
 	for (const width of [48, 44, 35, 20]) {
 		const lines = model.render(now, width, theme);
 		assert.ok(lines.every(line => visibleWidth(line) <= width));
-		assert.match(lines.join("\n"), /Bienestar/);
+		assert.match(lines.join("\n"), /Breaks/);
 		assert.doesNotMatch(lines[0]!, /✿/, `rail card title has no glyph at ${width}`);
 		assert.match(lines.join("\n"), /Agua/);
 		for (const [y, line] of lines.entries()) {
@@ -65,7 +65,7 @@ test("narrow widths render a compact card with the time in the title", () => {
 		const lines = model.render(now, width, theme);
 		assert.ok(lines.length <= 4, `width ${width} used ${lines.length} rows`);
 		assert.ok(lines.every(line => visibleWidth(line) <= width));
-		assert.match(lines[0]!, /Bienestar · 20:30/);
+		assert.match(lines[0]!, /Breaks · 20:30/);
 		assert.doesNotMatch(lines[0]!, /✿/, "a rail card title: no glyph");
 		const body = lines.join("\n");
 		for (const label of ["Agua", "Descanso", "Estirar", "Cena"]) assert.match(body, new RegExp(label));

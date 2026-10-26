@@ -223,64 +223,101 @@ export function devBinaryShortId(path: string, sha256: string): string {
 	return (commit ?? sha256).slice(0, DEV_BINARY_SHORT_ID_LENGTH).toLowerCase();
 }
 
+// A Status row: a short key and a value. `values` lists the same fact from
+// widest to narrowest; the first that fits the line wins and the last one is
+// truncated, so a value never wraps mid-phrase.
+interface StatusRow {
+	key: string;
+	values: string[];
+}
+
+const STATUS_KEY_MAX = 8;
+const STATUS_KEY_GAP = 2;
+const STATUS_YOLO = /YOLO ON\b.*destructive confirmations remain/i;
+const STATUS_PERMISSIONS = /^Permissions:\s*(.+)$/i;
+const STATUS_MEMORY = /^\u{1F9E0}\s*(.+)$/u;
+
+// Opaque extension statuses carry no structure, so only the shapes the shell
+// itself publishes get a key and a shorter wording; anything else keeps its
+// text under a generic key.
+function statusRow(status: string): StatusRow {
+	if (STATUS_YOLO.test(status)) return { key: "YOLO", values: ["on · confirm destructive", "on"] };
+	const permissions = STATUS_PERMISSIONS.exec(status);
+	if (permissions) return { key: "Perms", values: [permissions[1]!] };
+	const memory = STATUS_MEMORY.exec(status);
+	if (memory) return { key: "Memory", values: [memory[1]!] };
+	return { key: "Info", values: [status] };
+}
+
 // Sidebar groups use structured fields, never positional compact-bar segments
 // or inferred meanings from opaque extension status strings.
 export function renderShellSidebarBar(model: ShellBarModel, theme: ShellBarTheme, width: number, presentation?: Presentation): string[] {
 	const value = (text: string) => theme.fg(ROLE.VALUE, theme.bold(text));
 	const label = (text: string) => theme.fg(ROLE.LABEL, text);
 	const changes = model.changes;
-	const branch = model.branch ? `${label("Branch")} ${value(model.branch)}` : "";
-	// Pre-wrap values before indenting so Unicode/ANSI continuation lines keep
-	// the same inset without consuming the card's right border.
+	// Rows are fitted to one line before they reach the card: the key column is
+	// shared by every group, so the values line up down the whole card.
 	const innerWidth = panelInnerWidth(theme, width);
 	const inset = Math.min(1, innerWidth - 1);
 	// Model, effort, context, cost, and the per-model usage table now live in
 	// the always-visible header row (and /gentle:usage for the full table);
 	// this event-driven card keeps only what a footer/model-switch event does
 	// not already refresh every frame.
-	const integrations = [
-		...model.statuses.map((status) => theme.fg(ROLE.STATUS, sanitizeStatus(status))),
-		...(model.devBinary ? [theme.fg("warning", `\u{1F339} gentle-ai dev · ${sanitizeStatus(model.devBinary)} · field-test only`)] : []),
+	const plain = (text: string) => [text];
+	const integrations: Array<{ key: string; values: string[]; paint: (text: string) => string }> = [
+		...model.statuses.map((status) => ({ ...statusRow(sanitizeStatus(status)), paint: (text: string) => theme.fg(ROLE.STATUS, text) })),
+		...(model.devBinary ? [{
+			key: "Build",
+			values: [`gentle-ai dev · ${sanitizeStatus(model.devBinary)} · field-test`, `dev · ${sanitizeStatus(model.devBinary)} · field-test`],
+			paint: (text: string) => theme.fg("warning", text),
+		}] : []),
 	];
-	const groups: Array<{ title: string; lines: string[] }> = [
+	type Row = { key: string; values: string[]; paint: (text: string) => string };
+	const row = (key: string, text: string | string[], paint: (text: string) => string = value): Row => ({ key, values: typeof text === "string" ? plain(text) : text, paint });
+	const groups: Array<{ title: string; rows: Row[] }> = [
 		{
 			title: "Project",
-			lines: [
-				value(model.cwd),
-				...(branch ? [branch] : []),
-				...(model.sessionName ? [`${label("Session")} ${value(model.sessionName)}`] : []),
-				...(model.profile ? [`${label("Profile")} ${value(sanitizeStatus(model.profile))}`] : []),
+			rows: [
+				row("Path", model.cwd),
+				...(model.branch ? [row("Branch", model.branch)] : []),
+				...(model.sessionName ? [row("Session", model.sessionName)] : []),
+				...(model.profile ? [row("Profile", sanitizeStatus(model.profile))] : []),
 			],
 		},
 		...(presentation?.visibility.changes === false ? [] : [{
 			title: "Changes",
-			lines: [
+			rows: [
 				changes?.files
-					? `${changes.files} ${changes.files === 1 ? "file" : "files"} · ${theme.fg("success", `+${changes.added}`)} ${theme.fg("error", `−${changes.deleted}`)}`
-					: label("No captured changes"),
-				label("/gentle:changes"),
+					? { key: "Changes", values: [`${changes.files} ${changes.files === 1 ? "file" : "files"} · ${theme.fg("success", `+${changes.added}`)} ${theme.fg("error", `−${changes.deleted}`)}`], paint: (text: string) => text }
+					: row("Changes", "No captured changes", label),
+				row("", "/gentle:changes", label),
 			],
 		}]),
 		...(model.review && presentation?.visibility.rdd !== false ? [{
 			title: "🌹 RDD",
-			lines: [
-				value(REVIEW_SIDEBAR_LABELS[model.review.state]),
+			rows: [
+				row("State", REVIEW_SIDEBAR_LABELS[model.review.state]),
 				// Unknown scope is an internal sentinel, not something the user acts on.
-				...(model.review.scope !== REVIEW_SCOPE_UNAVAILABLE ? [label(sanitizeStatus(model.review.scope))] : []),
+				...(model.review.scope !== REVIEW_SCOPE_UNAVAILABLE ? [row("Scope", sanitizeStatus(model.review.scope), label)] : []),
 			],
 		}] : []),
 		...(model.jobs?.length ? [{
 			title: "Jobs",
-			lines: [...model.jobs].sort((a, b) => b.startedAt - a.startedAt).map((job) => value(sanitizeStatus(job.label))),
+			rows: [...model.jobs].sort((a, b) => b.startedAt - a.startedAt).map((job) => row("Job", sanitizeStatus(job.label))),
 		}] : []),
-		{ title: "Integrations", lines: integrations.length ? integrations : [label("No status reported")] },
+		{ title: "Integrations", rows: integrations.length ? integrations : [row("", "No status reported", label)] },
 	];
-	// Wrap and indent every group line before it reaches the card, so Unicode and
-	// ANSI continuation lines keep the same inset without consuming the right border.
+	const keyWidth = Math.min(STATUS_KEY_MAX, groups.reduce((widest, group) => group.rows.reduce((inner, entry) => Math.max(inner, visibleWidth(entry.key)), widest), 0));
+	const valueRoom = Math.max(1, innerWidth - inset - keyWidth - (keyWidth > 0 ? STATUS_KEY_GAP : 0));
+	const fit = (entry: Row) => {
+		const fitting = entry.values.find((candidate) => visibleWidth(candidate) <= valueRoom);
+		return fitting !== undefined ? entry.paint(fitting) : entry.paint(truncateToWidth(entry.values[entry.values.length - 1]!, valueRoom, "…"));
+	};
+	const key = (entry: Row) => label(truncateToWidth(entry.key, keyWidth, "…", true)) + " ".repeat(keyWidth > 0 ? STATUS_KEY_GAP : 0);
 	const body = groups.flatMap((group, index) => [
 		...(index && (!presentation || presentation.density === "comfortable") ? [""] : []),
 		...(presentation?.density === "minimal" ? [] : [label(group.title)]),
-		...group.lines.flatMap((line) => wrapTextWithAnsi(line, innerWidth - inset).map((part) => " ".repeat(inset) + part)),
+		...group.rows.map((entry) => " ".repeat(inset) + key(entry) + fit(entry)),
 	]);
 	return renderCard({ title: "Status", body, tone: CARD_TONE.INFO, rail: true }, theme, width, { expanded: true, panel: true });
 }

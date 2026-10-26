@@ -455,7 +455,7 @@ test("sidebar unifies project, captured changes and integrations in one frame", 
 	assert.match(empty, /Integrations/);
 });
 
-test("sidebar profile wraps long names without changing the compact bar", () => {
+test("sidebar profile truncates long names on one row without changing the compact bar", () => {
 	const profile = "team-" + "x".repeat(59);
 	const base = model();
 	const active = model({ profile });
@@ -463,7 +463,9 @@ test("sidebar profile wraps long names without changing the compact bar", () => 
 		const lines = renderShellSidebarBar(active, plainTheme, width);
 		assert.ok(lines.every((line) => visibleWidth(line) <= width));
 		assert.match(lines.join("\n"), /Profile/);
-		assert.ok(lines.join("").replace(/[│\s]/g, "").includes(profile));
+		const row = lines.find((line) => line.includes("Profile"))!;
+		assert.match(row, /…/, "a value that cannot fit ends in an ellipsis instead of wrapping");
+		assert.equal(lines.filter((line) => line.includes("xxx")).length, 1, "the profile occupies a single row");
 	}
 	assert.deepEqual(renderShellBar(active, plainTheme, 120), renderShellBar(base, plainTheme, 120));
 });
@@ -978,7 +980,7 @@ test("sidebar Integrations carries the dev-binary line only while the override i
 	const active = renderShellSidebarBar(model({ statuses: ["MCP connected"], devBinary: "66bf3e1" }), plainTheme, 60).map(stripAnsi);
 	const text = active.join("\n");
 	assert.match(text, /MCP connected/);
-	assert.match(text, /\u{1F339} gentle-ai dev · 66bf3e1 · field-test only/u);
+	assert.match(text, /Build +gentle-ai dev · 66bf3e1 · field-test/);
 	assert.ok(text.indexOf("MCP connected") < text.indexOf("gentle-ai dev"), "the line sits after the Engram/status lines");
 	const bare = renderShellSidebarBar(model({ statuses: ["MCP connected"] }), plainTheme, 60).join("\n");
 	assert.doesNotMatch(bare, /gentle-ai dev/);
@@ -988,6 +990,7 @@ test("sidebar Integrations carries the dev-binary line only while the override i
 		const lines = renderShellSidebarBar(model({ statuses: ["MCP connected"], devBinary: "66bf3e1" }), plainTheme, width);
 		assert.ok(lines.every((line) => visibleWidth(line) <= width), `fits ${width}`);
 	}
-	const wrapped = renderShellSidebarBar(model({ devBinary: "66bf3e1" }), plainTheme, 24).map(stripAnsi).join("").replace(/[│\s]/g, "");
-	assert.ok(wrapped.includes("gentle-aidev·66bf3e1·field-testonly"), "wraps inside the card without losing text");
+	const narrow = renderShellSidebarBar(model({ devBinary: "66bf3e1" }), plainTheme, 40).map(stripAnsi).filter((line) => line.includes("Build"));
+	assert.equal(narrow.length, 1, "the build value never wraps");
+	assert.match(narrow[0]!, /Build +dev · 66bf3e1 · field-test/, "a shorter wording is chosen before anything is cut");
 });
