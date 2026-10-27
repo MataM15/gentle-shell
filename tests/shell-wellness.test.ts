@@ -229,6 +229,19 @@ async function pollFor(t: TestContext, seconds: number) {
 	}
 }
 
+test("the actual Wellness rail exposes a stable digest that changes when displayed text changes", async t => {
+	const f = await extensionFixture(t, true, true, undefined, Date.parse("2026-09-27T23:30:05Z"));
+	const rail = sidebarState(f.tui).parts.get("wellness")!;
+	assert.equal(typeof rail.digest, "function");
+	rail.render(48);
+	const first = rail.digest!();
+	assert.equal(rail.digest!(), first);
+	await pollFor(t, 5);
+	assert.equal(rail.digest!(), first, "unchanged displayed text retains the same digest");
+	await pollFor(t, 60);
+	assert.notEqual(rail.digest!(), first, "changed clock text invalidates the rail");
+});
+
 // Every Pi render re-lays out the whole transcript, so a 1 s repaint made idle long sessions burn a core.
 test("the 1 s poll requests a render only when the painted card changes", async t => {
 	const f = await extensionFixture(t, true, true, undefined, Date.parse("2026-09-27T23:30:05Z"));

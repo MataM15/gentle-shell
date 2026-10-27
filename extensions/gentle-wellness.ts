@@ -63,13 +63,23 @@ export default function gentleWellness(
 			if (!tui.terminal || !isCurrent()) return { render: () => [], invalidate() {} };
 			session = model;
 			activeStore = store;
-			const repaint = () => { invalidateSidebar(tui); tui.requestRender(); };
-			refresh = repaint;
+			let paintEpoch = 0;
+			const repaint = () => { paintEpoch++; invalidateSidebar(tui); tui.requestRender(); };
 			const currentTheme = theme ?? ctx.ui.theme;
 			const paint = (width: number) => isPhoneWidth(tui) ? [] : model.render(Date.now(), width, currentTheme);
 			// Every Pi render re-lays out the whole transcript, so the poll repaints only when
 			// the last painted card would change (clock minute, countdowns, visibility).
 			let painted: { width: number; text: string } | undefined;
+			// Explicit resets are rare; compare their visible output before invalidating.
+			const refreshVisible = () => {
+				if (painted) {
+					const next = paint(painted.width).join("\n");
+					if (next === painted.text) return;
+					painted = { width: painted.width, text: next };
+				}
+				repaint();
+			};
+			refresh = refreshVisible;
 			let polling = false;
 			let disposed = false;
 			const poll = async () => {
@@ -103,6 +113,8 @@ export default function gentleWellness(
 			const timer = setInterval(poll, 1000);
 			timer.unref();
 			const part = sidebarPart(tui, "wellness", {
+				// Polls and explicit visible changes advance the epoch; reads are O(1).
+				digest: () => String(paintEpoch),
 				// Hidden only in paint: polling, notices, resets and persistence keep running.
 				render: (width: number) => {
 					const lines = paint(width);
@@ -118,7 +130,7 @@ export default function gentleWellness(
 					void store.reset(target, Date.now()).then((state) => {
 						if (!state || !isCurrent() || session !== model) return;
 						model.applySharedState(state);
-						repaint();
+						refreshVisible();
 					}).catch(() => {});
 					return { handled: true, render: true };
 				},
