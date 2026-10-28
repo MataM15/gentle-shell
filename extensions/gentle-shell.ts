@@ -2004,13 +2004,20 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 				.map((provider) => refreshProvider(ctx, provider, usageSources.get(provider), force, now)),
 		);
 	};
-	// The rail's Limits card shows every connected subscription, not only the
-	// session's scope: each provider with a credential is fetched on its own
-	// 5-minute rule, and one without a credential simply never appears.
+	// The rail's Limits card shows every subscribed provider, not only the
+	// session's scope, and this one list is what both sides read: the built-in
+	// subscriptions, the registered sources, whatever the store already holds,
+	// and the routing scope, deduplicated in first-seen order. One set means a
+	// provider the card draws is a provider that gets fetched, and no two lists
+	// can drift: a provider with no snapshot explains itself on the card instead
+	// of silently disappearing. The scope is a parameter because resolving it is
+	// Git/filesystem work: a refresh resolves it, a render reads the cache.
+	const limitsProviders = (scope: readonly string[]): string[] => [
+		...new Set([CODEX_PROVIDER, ANTHROPIC_PROVIDER, NAN_PROVIDER, ...usageSources.providers(), ...usage.all().map((entry) => entry.provider), ...scope]),
+	];
 	const refreshAllUsage = async (ctx: ExtensionContext, force: boolean) => {
 		const now = deps.now();
-		const providers = new Set([CODEX_PROVIDER, ANTHROPIC_PROVIDER, ...usageSources.providers(), ...usage.all().map((entry) => entry.provider), ...resolveUsageScope(ctx)]);
-		await Promise.all([...providers].map((provider) => refreshProvider(ctx, provider, usageSources.get(provider), force, now, true)));
+		await Promise.all(limitsProviders(resolveUsageScope(ctx)).map((provider) => refreshProvider(ctx, provider, usageSources.get(provider), force, now, true)));
 	};
 	// Subscribed once, for the life of the extension: a registration can
 	// arrive before the first session_start (the owning extension's factory
@@ -2368,7 +2375,8 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 					}
 					return `${usageCardDigest(usage.all(), now)}|${cardStyle()}`;
 				},
-				render: (width) => renderUsageCard(usage.all(), theme, width, deps.now()),
+				// The cached scope, never a fresh resolve: this runs per repaint.
+				render: (width) => renderUsageCard(usage.all(), theme, width, deps.now(), { providers: limitsProviders(usageScope), registry: usageSources, failed: usageFailures }),
 				invalidate() {},
 				// The card is a summary: a clean left click anywhere on it opens the
 				// full panel alt+u opens. The rail only dispatches hits on rows it painted.

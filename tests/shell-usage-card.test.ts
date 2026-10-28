@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { parseAnthropicOauthUsage, renderUsageCard, usageCardDigest, UsageSourceRegistry, type ProviderUsage } from "../lib/shell-usage.ts";
+import { parseAnthropicOauthUsage, renderUsageCard, usageCardDigest, UsageSourceRegistry, USAGE_FETCH_FAILED_NOTE, type ProviderUsage } from "../lib/shell-usage.ts";
 
 const plain = { fg: (_color: string, text: string) => text };
 const NOW = Date.parse("2026-09-29T10:00:00Z");
@@ -95,6 +95,11 @@ function antigravity(overrides: Partial<ProviderUsage> = {}): ProviderUsage {
 }
 const rows = (lines: string[]) => lines.map((line) => line.replace(/^│ ?| ?│$/g, "").trimEnd());
 
+// The providers option (S5/L24): the rail lists every credentialed provider,
+// not only the ones the store happens to hold a drawable snapshot for.
+const codexCardUsage: ProviderUsage = { provider: "openai-codex", plan: "plus", fetchedAt: NOW - 120_000, limits: [{ name: "codex", limitReached: false, windows: [win("5h", 23, 18_000, NOW + 3 * HOUR_MS + 10 * 60_000)] }] };
+const emptyNanUsage: ProviderUsage = { provider: "nan", plan: undefined, fetchedAt: NOW, limits: [] };
+
 test("S1/S2/S3: compact Antigravity section lists one grid row per account and family in the approved order", () => {
 	const lines = renderUsageCard([antigravity()], marked, 48, NOW);
 	const body = rows(lines);
@@ -166,6 +171,48 @@ test("S5: codex and claude sections render exactly as before", () => {
 		"│  week ▰▰▰▰▰▱▱▱  58% 2d 15h                   │",
 		"│                                              │",
 		"│ updated 1m ago · alt+u                       │",
+		"╰──────────────────────────────────────────────╯",
+	]);
+});
+
+test("S5/L24: the providers option lists every provider in that exact order with an honest state", () => {
+	const registry = new UsageSourceRegistry();
+	registry.register({ schema: "gentle-pi.usage-source/v1", provider: "cliproxyapi", pendingNote: "waiting for the antigravity quota", fetch: async () => undefined });
+	const lines = renderUsageCard([codexCardUsage, emptyNanUsage], plain, 48, NOW, { providers: ["anthropic", "openai-codex", "nan", "cliproxyapi", "anthropic"], registry });
+	const body = rows(lines);
+	// The rail's short names, in the order the caller asked for, each provider once.
+	const titleAt = (name: string) => body.findIndex((line) => line === name || line.startsWith(`${name} ·`));
+	const positions = ["claude", "codex", "nan", "antigravity"].map(titleAt);
+	assert.deepEqual([...positions].sort((a, b) => a - b), positions, `row order: ${positions.join(",")}`);
+	assert.equal(body.filter((line) => line === "claude").length, 1, "a repeated provider is drawn once");
+	// A provider with no snapshot says so on one line, in the panel's wording.
+	assert.deepEqual(body.slice(positions[0]!, positions[0]! + 2), ["claude", " usage arrives with the first response"]);
+	// A recorded refresh that produced no rows is a pending state, never data.
+	assert.deepEqual(body.slice(positions[2]!, positions[2]! + 2), ["nan", " no usage yet · r to fetch"]);
+	// A registered source keeps its own note instead of a generic one.
+	assert.deepEqual(body.slice(positions[3]!, positions[3]! + 2), ["antigravity", " waiting for the antigravity quota"]);
+	// The provider that does have data keeps its rows and the shared footer.
+	assert.ok(body[positions[1]! + 1]!.includes("23%"), "codex keeps its snapshot row");
+	assert.ok(lines.join("\n").includes("updated 2m ago · alt+u"));
+	for (const line of lines) assert.ok(visibleWidth(line) <= 48, line);
+});
+
+test("S5/L24: a provider whose latest refresh failed says so instead of its pending note", () => {
+	const lines = renderUsageCard([], plain, 48, NOW, { providers: ["openai-codex"], failed: new Set(["openai-codex"]) });
+	const body = rows(lines);
+	assert.equal(body[1], "codex");
+	assert.equal(body[2], ` ${USAGE_FETCH_FAILED_NOTE}`);
+	assert.ok(!lines.join("\n").includes("no usage yet"), "a failure never reads as pending");
+	for (const line of lines) assert.ok(visibleWidth(line) <= 48, line);
+});
+
+test("S5/L24: without the option the card keeps the previous output byte for byte", () => {
+	assert.deepEqual(renderUsageCard([codexCardUsage, emptyNanUsage], plain, 48, NOW), [
+		"╭─ Limits ─────────────────────────────────────╮",
+		"│ codex · plus                                 │",
+		"│  5h   ▰▰▱▱▱▱▱▱  23% 3h 10m                   │",
+		"│                                              │",
+		"│ updated 2m ago · alt+u                       │",
 		"╰──────────────────────────────────────────────╯",
 	]);
 });

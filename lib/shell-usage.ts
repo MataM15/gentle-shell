@@ -854,18 +854,47 @@ function compactTitle(usage: ProviderUsage, name: string, theme: UsageTheme): st
 const GRID_PERCENT_CELLS = 4;
 const GRID_NAME_MIN = 4;
 
-export function renderUsageCard(usages: readonly ProviderUsage[], theme: UsageTheme, width: number, now: number): string[] {
+/**
+ * How the rail card chooses its providers (S5/L24). Without options the card
+ * draws exactly the providers that hold drawable snapshots, as it always has.
+ * With `providers` it draws every provider the caller names, in that exact
+ * order (first-seen, deduplicated), and a provider with no snapshot gets one
+ * honest state line instead of silently vanishing: the failed note when its
+ * latest refresh failed, else its registered pending note, else the generic
+ * no-source note — the same wording and precedence `renderUsagePanel` uses.
+ * `failed` is the scope's own set, so the card and the panel never disagree.
+ */
+export interface UsageCardOptions {
+	providers?: readonly string[];
+	registry?: UsageSourceRegistry;
+	failed?: ReadonlySet<string>;
+}
+
+export function renderUsageCard(usages: readonly ProviderUsage[], theme: UsageTheme, width: number, now: number, options?: UsageCardOptions): string[] {
 	const rank = (provider: string) => {
 		const index = CARD_PROVIDER_ORDER.indexOf(provider);
 		return index === -1 ? CARD_PROVIDER_ORDER.length : index;
 	};
 	const sorted = usages.filter((usage) => usage.limits.length > 0).sort((a, b) => rank(a.provider) - rank(b.provider));
-	if (sorted.length === 0) return [];
+	// One slot per provider either way: a named list keeps the caller's order, the
+	// default keeps the card's fixed order. A provider the store holds without
+	// any drawable row is still a slot, so it can explain itself below.
+	const planned = options?.providers
+		? [...new Set(options.providers)].map((provider) => ({ provider, usage: sorted.find((usage) => usage.provider === provider) }))
+		: sorted.map((usage) => ({ provider: usage.provider, usage }));
+	if (planned.length === 0) return [];
 	const innerWidth = cardInnerWidth(width);
-	const sections = sorted.map((usage) => {
+	const sections = planned.map((slot) => {
+		if (!slot.usage) {
+			// A settled refresh that answered nothing is a failure; otherwise the
+			// provider says what it is waiting for, exactly as the panel does.
+			const note = options?.failed?.has(slot.provider) ? USAGE_FETCH_FAILED_NOTE : providerNote(slot.provider, options?.registry);
+			return { title: theme.fg(ROLE.PROVIDER, CARD_PROVIDER_NAMES[slot.provider] ?? slot.provider), rows: [] as GridRow[], compact: false, note };
+		}
+		const usage = slot.usage;
 		const name = CARD_PROVIDER_NAMES[usage.provider] ?? usage.provider;
 		const compact = usage.layout === USAGE_LAYOUT_ACCOUNTS ? compactAccountRows(usage) : undefined;
-		if (compact) return { title: compactTitle(usage, name, theme), rows: compact, compact: true };
+		if (compact) return { title: compactTitle(usage, name, theme), rows: compact, compact: true, note: undefined };
 		const plan = usage.plan && usage.plan !== name ? ` ${theme.fg(ROLE.SEPARATOR, "·")} ${theme.fg(ROLE.PLAN, usage.plan)}` : "";
 		// A single limit is named by its windows; several limits are named by
 		// the limit, plus the window when that limit has more than one.
@@ -880,7 +909,7 @@ export function renderUsageCard(usages: readonly ProviderUsage[], theme: UsageTh
 		);
 		// Allowance model ids (NaN) read as words, not as clipped ids.
 		const readable = labelled ? abbreviateModelNames(rows.map((row) => row.name), innerWidth) : undefined;
-		return { title: `${theme.fg(ROLE.PROVIDER, name)}${plan}`, rows: readable ? rows.map((row, index) => ({ ...row, name: readable[index]! })) : rows, compact: false };
+		return { title: `${theme.fg(ROLE.PROVIDER, name)}${plan}`, rows: readable ? rows.map((row, index) => ({ ...row, name: readable[index]! })) : rows, compact: false, note: undefined };
 	});
 	// One grid for every row of every provider: bars start at the same column,
 	// percentages end at the same column, resets start at the same column.
@@ -892,6 +921,9 @@ export function renderUsageCard(usages: readonly ProviderUsage[], theme: UsageTh
 	const body = sections.flatMap((section, index) => [
 		...(index ? [""] : []),
 		section.title,
+		// A provider with no snapshot gets exactly one line saying so, never a
+		// zero bar or a fabricated row.
+		...(section.note === undefined ? [] : [truncateToWidth(` ${theme.fg(ROLE.RESET, section.note)}`, innerWidth, "…")]),
 		...section.rows.map((row) => {
 			const name = theme.fg(ROLE.LABEL, truncateToWidth(row.name, nameWidth, "…", true));
 			if (!row.window) {
@@ -905,9 +937,9 @@ export function renderUsageCard(usages: readonly ProviderUsage[], theme: UsageTh
 			return truncateToWidth(line, innerWidth, "…");
 		}),
 	]);
-	const oldest = Math.min(...sorted.map((usage) => usage.fetchedAt));
+	const fetched = planned.flatMap((slot) => (slot.usage ? [slot.usage.fetchedAt] : []));
 	const hint = sections.some((section) => section.compact) ? COMPACT_FOOTER_HINT : CARD_FOOTER_HINT;
-	body.push("", theme.fg(ROLE.RESET, truncateToWidth(`${updatedAgo(oldest, now)} · ${hint}`, innerWidth, "…")));
+	body.push("", theme.fg(ROLE.RESET, truncateToWidth(fetched.length > 0 ? `${updatedAgo(Math.min(...fetched), now)} · ${hint}` : hint, innerWidth, "…")));
 	return renderCard({ title: "Limits", body, tone: "info", rail: true }, theme, width, { expanded: true });
 }
 
