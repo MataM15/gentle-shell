@@ -35,22 +35,28 @@ async function until(check: () => boolean, attempts = 200) {
 	assert.ok(check(), "condition not reached");
 }
 
+type Shortcut = { description?: string; handler(ctx: unknown): Promise<void> | void };
+
 function fakePi() {
 	const commands = new Map<string, { description: string; handler(args: string, ctx: ExtensionCommandContext): Promise<void> }>();
+	const shortcuts = new Map<string, Shortcut>();
 	const handlers = new Map<string, Handler[]>();
-	const counts = { tools: 0, sends: 0 };
+	const counts = { tools: 0, shortcuts: 0, sends: 0 };
+	// Extension-to-extension events, as the parent shell receives them.
+	const emitted: Array<{ channel: string; data: unknown }> = [];
 	const pi = {
 		registerCommand: (name: string, registration: { description: string; handler(args: string, ctx: ExtensionCommandContext): Promise<void> }) => commands.set(name, registration),
 		registerTool: () => { counts.tools++; },
-		registerShortcut: () => { counts.tools++; },
+		registerShortcut: (key: string, options: Shortcut) => { counts.shortcuts++; shortcuts.set(key, options); },
 		sendUserMessage: () => { counts.sends++; },
 		sendMessage: () => { counts.sends++; },
+		events: { emit: (channel: string, data: unknown) => { emitted.push({ channel, data }); }, on: () => () => {} },
 		on: (event: string, handler: Handler) => handlers.set(event, [...(handlers.get(event) ?? []), handler]),
 	} as unknown as ExtensionAPI;
 	const fire = async (event: string, ctx: unknown = {}) => {
 		for (const handler of handlers.get(event) ?? []) await handler({}, ctx);
 	};
-	return { pi, commands, handlers, counts, fire };
+	return { pi, commands, shortcuts, handlers, counts, emitted, fire };
 }
 
 interface UiScript {
@@ -58,7 +64,7 @@ interface UiScript {
 	confirm?: (title: string, message: string) => boolean;
 }
 
-function fakeContext(script: UiScript = {}, mode = "tui", hasUI = true) {
+function fakeContext(script: UiScript = {}, mode = "tui", hasUI = true, sessionId: string | undefined = "session-alpha") {
 	const notices: Array<{ message: string; type?: string }> = [];
 	const selects: Array<{ title: string; options: string[] }> = [];
 	const confirms: Array<{ title: string; message: string }> = [];
@@ -76,6 +82,7 @@ function fakeContext(script: UiScript = {}, mode = "tui", hasUI = true) {
 		hasUI,
 		mode,
 		cwd: "/work/alpha",
+		sessionManager: { getSessionId: () => sessionId },
 		ui: {
 			notify: (message: string, type?: string) => { notices.push({ message, type }); events.push(`notify:${message}`); },
 			select: async (title: string, options: string[]) => { selects.push({ title, options }); return script.select?.(title, options); },
@@ -236,13 +243,15 @@ async function run(pi: ReturnType<typeof fakePi>, ui: ReturnType<typeof fakeCont
 
 // --- registration and refusals ------------------------------------------------
 
-test("registers only /gentle:voice and does no voice work at registration or session start", async () => {
+test("registers only /gentle:voice and one dictation shortcut, and does no voice work at registration or session start", async () => {
 	const h = harness();
 	const pi = register(h);
 	assert.equal(VOICE_COMMAND_NAME, "gentle:voice");
 	assert.deepEqual([...pi.commands.keys()], ["gentle:voice"]);
 	assert.match(pi.commands.get(VOICE_COMMAND_NAME)!.description, /dictation/i);
-	assert.equal(pi.counts.tools, 0, "no model-callable tool or shortcut");
+	assert.equal(pi.counts.tools, 0, "no model-callable tool");
+	assert.deepEqual([...pi.shortcuts.keys()], ["alt+m"], "one shortcut, and it is the free default");
+	assert.equal(pi.counts.sends, 0);
 	await pi.fire("session_start");
 	assert.deepEqual(h.calls, []);
 });
@@ -736,6 +745,200 @@ test("the /gentle:voice menu toggles push-to-talk, persists it and arms or disar
 	assert.equal(fresh.terminal.subscribes, 1);
 });
 
+// --- toggle dictation (one shortcut starts and stops) -------------------------
+
+const TOGGLE_KEY = "alt+m";
+
+// Pi's editor offers each raw key to extension shortcuts before the draft sees
+// it, so a press is the registered handler and the key never reaches the editor.
+function press(pi: ReturnType<typeof fakePi>, ui: ReturnType<typeof fakeContext>, key = TOGGLE_KEY): Promise<void> {
+	const shortcut = pi.shortcuts.get(key);
+	assert.ok(shortcut, `the ${key} shortcut is registered`);
+	return Promise.resolve(shortcut.handler(ui.ctx));
+}
+
+// One press, then the microphone opens: the install check runs lazily on it.
+async function pressUntilRecording(h: Harness, pi: ReturnType<typeof fakePi>, ui: ReturnType<typeof fakeContext>) {
+	const done = press(pi, ui);
+	await until(() => h.sessions.length === 1);
+	const session = h.sessions[0]!;
+	assert.match(ui.statuses.at(-1) ?? "", /prepar/i);
+	session.started.resolve();
+	await until(() => session.state === "recording");
+	return { done, session };
+}
+
+test("the toggle shortcut starts a dictation and the same shortcut stops it, pasting but never sending", async () => {
+	const h = harness({ installed: true });
+	const pi = register(h);
+	const ui = fakeContext();
+	const { done, session } = await pressUntilRecording(h, pi, ui);
+	const status = ui.statuses.at(-1) ?? "";
+	assert.match(status, /recording/i);
+	assert.match(status, /alt\+m/i, "the status names the key that stops it");
+	assert.ok(!ui.open(), "no overlay: the editor keeps the focus");
+	assert.equal(pi.counts.sends, 0, "nothing is sent while recording");
+	await press(pi, ui);
+	await until(() => session.calls.includes("stop"));
+	assert.match(ui.statuses.at(-1) ?? "", /transcrib/i);
+	session.result.resolve({ text: "hola mundo", truncated: false });
+	await done;
+	assert.equal(ui.editor(), "draft: hola mundo");
+	assert.equal(h.sessions.length, 1, "one session for the whole toggle");
+	assert.deepEqual(session.calls, ["start", "stop"]);
+	assert.equal(pi.counts.sends, 0, "the transcript is pasted, never submitted");
+	assert.equal(ui.statuses.at(-1), undefined, "the footer status is cleared");
+});
+
+test("a second press while preparing stops as soon as recording begins", async () => {
+	const h = harness({ installed: true });
+	const pi = register(h);
+	const ui = fakeContext();
+	const done = press(pi, ui);
+	await until(() => h.sessions.length === 1);
+	const session = h.sessions[0]!;
+	await press(pi, ui);
+	assert.deepEqual(session.calls, ["start"], "no stop before the microphone is open");
+	assert.match(ui.statuses.at(-1) ?? "", /prepar/i);
+	session.started.resolve();
+	await until(() => session.calls.includes("stop"));
+	session.result.resolve({ text: "short", truncated: false });
+	await done;
+	assert.equal(ui.editor(), "draft: short");
+	assert.deepEqual(session.calls, ["start", "stop"]);
+});
+
+test("a press while transcribing neither starts a second capture nor pastes twice", async () => {
+	const h = harness({ installed: true });
+	const pi = register(h);
+	const ui = fakeContext();
+	const { done, session } = await pressUntilRecording(h, pi, ui);
+	await press(pi, ui);
+	await until(() => session.calls.includes("stop"));
+	assert.match(ui.statuses.at(-1) ?? "", /transcrib/i);
+	await press(pi, ui);
+	assert.equal(h.sessions.length, 1, "no second session while the first transcribes");
+	assert.equal(h.calls.filter((call) => call.startsWith("session:")).length, 1);
+	assert.deepEqual(session.calls, ["start", "stop"], "no extra stop or cancel");
+	session.result.resolve({ text: "one", truncated: false });
+	await done;
+	assert.equal(ui.editor(), "draft: one");
+});
+
+test("Esc cancels a toggle dictation, is consumed and leaves the draft unchanged", async () => {
+	const h = harness({ installed: true });
+	const pi = register(h);
+	const ui = fakeContext();
+	const { done, session } = await pressUntilRecording(h, pi, ui);
+	ui.type(ESC);
+	await until(() => session.calls.includes("cancel"));
+	session.result.resolve({ text: "dropped", truncated: false });
+	await done;
+	await tick();
+	assert.equal(ui.editor(), "draft: ", "Esc was consumed and nothing was pasted");
+	assert.ok(!ui.events.some((event) => event.startsWith("paste:")));
+	assert.match(ui.notices.at(-1)!.message, /cancelled/i);
+	assert.equal(ui.terminal.unsubscribes, 1, "the Esc listener of the toggle is gone");
+	assert.equal(ui.statuses.at(-1), undefined);
+	assert.equal(pi.counts.sends, 0);
+});
+
+test("Esc while the install check still runs cancels before any session starts", async () => {
+	const gate = deferred<void>();
+	const h = harness({ installed: true });
+	const readStatus = h.deps.readStatus!;
+	h.deps.readStatus = async (target) => {
+		await gate.promise;
+		return readStatus(target);
+	};
+	const pi = register(h);
+	const ui = fakeContext();
+	const done = press(pi, ui);
+	assert.ok(h.calls.includes("probe"), "the first press starts the lazy install check");
+	ui.type(ESC);
+	gate.resolve();
+	await done;
+	assert.equal(h.sessions.length, 0, "nothing was recorded or transcribed");
+	assert.equal(ui.editor(), "draft: ");
+	assert.equal(ui.statuses.at(-1), undefined);
+});
+
+test("a press while /gentle:voice is dictating is refused and starts no second session", async () => {
+	const h = harness({ installed: true });
+	const pi = register(h);
+	const ui = fakeContext({ select: pick(/start dictation/i) });
+	const { done, session } = await startDictation(h, pi, ui);
+	const toggling = fakeContext();
+	await press(pi, toggling);
+	assert.equal(h.sessions.length, 1, "no second capture");
+	assert.match(toggling.notices[0]!.message, /already/i);
+	ui.component()!.handleInput!(ENTER);
+	session.result.resolve({ text: "one", truncated: false });
+	await done;
+	// The lock is free again: the shortcut dictates on its own.
+	const second = fakeContext();
+	const secondDone = press(pi, second);
+	await until(() => h.sessions.length === 2);
+	h.sessions[1]!.started.resolve();
+	await until(() => h.sessions[1]!.state === "recording");
+	await press(pi, second);
+	await until(() => h.sessions[1]!.calls.includes("stop"));
+	h.sessions[1]!.result.resolve({ text: "two", truncated: false });
+	await secondDone;
+	assert.equal(second.editor(), "draft: two");
+});
+
+test("not installed: a press points to /gentle:voice, starts nothing and checks again on the next press", async () => {
+	const h = harness();
+	const pi = register(h);
+	const ui = fakeContext();
+	await press(pi, ui);
+	assert.equal(h.sessions.length, 0);
+	assert.match(ui.notices.at(-1)!.message, /\/gentle:voice/);
+	assert.equal(ui.statuses.at(-1), undefined);
+	assert.equal(ui.terminal.unsubscribes, 1, "the Esc listener is gone");
+	await press(pi, ui);
+	assert.equal(h.calls.filter((call) => call === "probe").length, 2, "a missing install is not cached");
+	assert.equal(h.sessions.length, 0);
+});
+
+test("session shutdown cancels a toggle dictation, clears the lock and drops a late transcript", async () => {
+	const h = harness({ installed: true });
+	const pi = register(h);
+	const ui = fakeContext();
+	const { done, session } = await pressUntilRecording(h, pi, ui);
+	await pi.fire("session_shutdown");
+	await until(() => session.calls.includes("cancel"));
+	session.result.resolve({ text: "too late", truncated: false });
+	await done;
+	await tick();
+	assert.equal(ui.editor(), "draft: ");
+	assert.equal(ui.terminal.unsubscribes, 1);
+	assert.equal(pi.counts.sends, 0);
+});
+
+test("delegated child sessions and non-TUI modes ignore the shortcut without voice work", async () => {
+	for (const [env, mode, hasUI] of [[{ GENTLE_PI_AGENTS_CHILD: "1" }, "tui", true], [{}, "rpc", true], [{}, "print", false]] as const) {
+		const h = harness({ installed: true, env });
+		const pi = register(h);
+		const ui = fakeContext({}, mode, hasUI);
+		await press(pi, ui);
+		assert.deepEqual(h.calls, [], mode);
+		assert.equal(ui.notices.length, 0, mode);
+		assert.equal(ui.terminal.subscribes, 0, mode);
+	}
+});
+
+test("GENTLE_PI_VOICE_TOGGLE_KEY rebinds the shortcut and off disables it", async () => {
+	const custom = harness({ installed: true, env: { GENTLE_PI_VOICE_TOGGLE_KEY: "alt+o" } });
+	const pi = register(custom);
+	assert.deepEqual([...pi.shortcuts.keys()], ["alt+o"]);
+	for (const value of ["off", "OFF", ""]) {
+		const h = harness({ env: { GENTLE_PI_VOICE_TOGGLE_KEY: value } });
+		assert.equal(register(h).shortcuts.size, 0, JSON.stringify(value));
+	}
+});
+
 test("Enable is offered only when voice is installed", async () => {
 	const h = harness();
 	const pi = register(h);
@@ -770,4 +973,391 @@ test("a hold right after a word keeps one space before the pasted transcript", a
 	await until(() => session.calls.includes("stop"));
 	session.result.resolve({ text: "there", truncated: false });
 	await until(() => ui.editor() === "draft: hi there");
+});
+
+// --- session-scoped voice state (display only) --------------------------------
+
+// The display contract the parent shell consumes: one channel, one schema and
+// exactly { schema, sessionId, state } per change, keyed by the real session.
+const VOICE_STATE_CHANNEL = "gentle-ai:voice-state";
+const VOICE_STATE_SCHEMA = "gentle-pi.voice-state/v1";
+
+const voiceEvents = (pi: ReturnType<typeof fakePi>) =>
+	pi.emitted.filter((event) => event.channel === VOICE_STATE_CHANNEL).map((event) => event.data as { schema: string; sessionId: string; state: string });
+const voiceStates = (pi: ReturnType<typeof fakePi>) => voiceEvents(pi).map((event) => event.state);
+
+test("the toggle publishes the exact session-scoped state for one dictation and ends idle", async () => {
+	const h = harness({ installed: true });
+	const pi = register(h);
+	const ui = fakeContext({}, "tui", true, "session-alpha");
+	const { done, session } = await pressUntilRecording(h, pi, ui);
+	assert.deepEqual(voiceEvents(pi), [
+		{ schema: VOICE_STATE_SCHEMA, sessionId: "session-alpha", state: "preparing" },
+		{ schema: VOICE_STATE_SCHEMA, sessionId: "session-alpha", state: "listening" },
+	], "preparing while it opens the microphone, listening only once it records");
+	assert.equal(ui.editor(), "draft: ", "the display never touches the draft");
+	await press(pi, ui);
+	await until(() => session.calls.includes("stop"));
+	assert.deepEqual(voiceStates(pi), ["preparing", "listening", "transcribing"]);
+	session.result.resolve({ text: "hola mundo", truncated: false });
+	await done;
+	assert.deepEqual(voiceStates(pi), ["preparing", "listening", "transcribing", "idle"]);
+	assert.ok(voiceEvents(pi).every((event) => event.sessionId === "session-alpha"));
+	for (const event of voiceEvents(pi)) assert.deepEqual(Object.keys(event).sort(), ["schema", "sessionId", "state"]);
+	assert.equal(ui.editor(), "draft: hola mundo", "the transcript still lands in the draft");
+	assert.equal(pi.counts.sends, 0);
+	assert.equal(ui.statuses.at(-1), undefined, "the footer is cleared with the display");
+});
+
+test("a cancelled hold publishes idle and leaves the draft and the send count untouched", async () => {
+	const h = harness({ installed: true, pushToTalk: true });
+	const pi = register(h);
+	const ui = fakeContext();
+	await startSession(pi, ui);
+	const session = await holdUntilRecording(h, ui);
+	assert.deepEqual(voiceStates(pi), ["idle", "preparing", "listening"], "a fresh session starts idle for its own id");
+	assert.ok(voiceEvents(pi).every((event) => event.sessionId === "session-alpha"));
+	ui.type(ESC);
+	await until(() => session.calls.includes("cancel"));
+	session.result.resolve({ text: "dropped", truncated: false });
+	await until(() => voiceStates(pi).at(-1) === "idle");
+	await tick();
+	assert.deepEqual(voiceStates(pi), ["idle", "preparing", "listening", "idle"], "a cancelled run never reports transcribing");
+	assert.equal(ui.editor(), "draft: ");
+	assert.equal(pi.counts.sends, 0);
+	h.clock.advance(RELEASE);
+	assert.ok(!session.calls.includes("stop"));
+});
+
+test("the /gentle:voice dictation publishes its states for the session and ends idle", async () => {
+	const h = harness({ installed: true });
+	const pi = register(h);
+	const ui = fakeContext({ select: pick(/start dictation/i) });
+	const { done, session } = await startDictation(h, pi, ui);
+	assert.deepEqual(voiceStates(pi), ["preparing", "listening"], "the overlay and the tab agree");
+	ui.component()!.handleInput!(ENTER);
+	await until(() => session.calls.includes("stop"));
+	session.result.resolve({ text: "hola", truncated: false });
+	await done;
+	assert.deepEqual(voiceStates(pi), ["preparing", "listening", "transcribing", "idle"]);
+	assert.equal(ui.editor(), "draft: hola");
+	assert.equal(pi.counts.sends, 0);
+});
+
+test("a failed dictation publishes idle and keeps the draft", async () => {
+	const h = harness({ installed: true, platform: "linux", arch: "x64" });
+	h.deps.probe = () => ({ platform: "linux", arch: "x64", glibcVersion: "2.39" });
+	const pi = register(h);
+	const ui = fakeContext({ select: pick(/start dictation/i) });
+	const done = run(pi, ui);
+	await until(() => h.sessions.length === 1);
+	h.sessions[0]!.started.reject(new VoiceSessionError("runtime-load"));
+	await done;
+	assert.deepEqual(voiceStates(pi), ["preparing", "idle"], "an error clears the display");
+	assert.equal(ui.editor(), "draft: ");
+	assert.equal(pi.counts.sends, 0);
+});
+
+test("session shutdown publishes idle for the ending session and drops a late callback and transcript", async () => {
+	const h = harness({ installed: true });
+	const pi = register(h);
+	const ui = fakeContext();
+	const { done, session } = await pressUntilRecording(h, pi, ui);
+	await pi.fire("session_shutdown", ui.ctx);
+	await until(() => session.calls.includes("cancel"));
+	// A late callback and a late transcript from the dead session arrive after it.
+	session.onStateChange("recording");
+	session.result.resolve({ text: "too late", truncated: false });
+	await done;
+	await tick();
+	assert.deepEqual(voiceStates(pi), ["preparing", "listening", "idle"]);
+	assert.deepEqual(voiceEvents(pi).at(-1), { schema: VOICE_STATE_SCHEMA, sessionId: "session-alpha", state: "idle" });
+	assert.equal(ui.editor(), "draft: ");
+	assert.equal(pi.counts.sends, 0);
+});
+
+test("a new session start cancels the old run, resets its display and starts clean", async () => {
+	const h = harness({ installed: true });
+	const pi = register(h);
+	const first = fakeContext({}, "tui", true, "session-alpha");
+	const { done, session } = await pressUntilRecording(h, pi, first);
+	const second = fakeContext({}, "tui", true, "session-beta");
+	await pi.fire("session_start", second.ctx);
+	await until(() => session.calls.includes("cancel"));
+	// Nothing from the replaced run may reach the new session's display.
+	session.onStateChange("recording");
+	session.result.resolve({ text: "too late", truncated: false });
+	await done;
+	await tick();
+	assert.deepEqual(voiceEvents(pi).filter((event) => event.sessionId === "session-beta"), [
+		{ schema: VOICE_STATE_SCHEMA, sessionId: "session-beta", state: "idle" },
+	], "the new session opens idle and never hears the old run");
+	assert.deepEqual(voiceEvents(pi).at(-1), { schema: VOICE_STATE_SCHEMA, sessionId: "session-beta", state: "idle" });
+	assert.deepEqual(voiceEvents(pi).filter((event) => event.sessionId === "session-alpha").at(-1), { schema: VOICE_STATE_SCHEMA, sessionId: "session-alpha", state: "idle" }, "the replaced session's display is reset");
+	assert.equal(second.editor(), "draft: ", "no stale paste");
+	assert.equal(first.editor(), "draft: ", "no stale paste into the old context either");
+	assert.equal(pi.counts.sends, 0);
+	assert.equal(second.terminal.subscribes, 0, "push-to-talk stays off in the new session");
+	// The lock and the display belong to the new session: a press starts one run.
+	const again = press(pi, second);
+	await until(() => h.sessions.length === 2);
+	const fresh = h.sessions[1]!;
+	fresh.started.resolve();
+	await until(() => fresh.state === "recording");
+	assert.deepEqual(voiceEvents(pi).filter((event) => event.sessionId === "session-beta").map((event) => event.state), ["idle", "preparing", "listening"]);
+	await press(pi, second);
+	await until(() => fresh.calls.includes("stop"));
+	fresh.result.resolve({ text: "nuevo", truncated: false });
+	await again;
+	assert.equal(second.editor(), "draft: nuevo");
+});
+
+test("a new session start publishes no late held transcript or state and frees the lock", async () => {
+	const h = harness({ installed: true, pushToTalk: true });
+	const pi = register(h);
+	const first = fakeContext({}, "tui", true, "session-alpha");
+	await startSession(pi, first);
+	const session = await holdUntilRecording(h, first);
+	const second = fakeContext({}, "tui", true, "session-beta");
+	await pi.fire("session_start", second.ctx);
+	await until(() => session.calls.includes("cancel"));
+	await until(() => session.onStateChange("recording") === undefined);
+	session.result.resolve({ text: "too late", truncated: false });
+	await tick();
+	await tick();
+	assert.equal(first.editor(), "draft: ", "the replaced session pastes nothing");
+	assert.deepEqual(voiceStates(pi).filter((state, index) => voiceEvents(pi)[index]!.sessionId === "session-beta"), ["idle"]);
+	assert.equal(first.terminal.unsubscribes, 1, "the old session is disarmed");
+	assert.equal(pi.counts.sends, 0);
+});
+
+test("a new session start stops a command that was still waiting instead of dictating for it", async () => {
+	const h = harness({ installed: true });
+	const pi = register(h);
+	let answer: ((choice: string | undefined) => void) | undefined;
+	const ui = fakeContext();
+	// A menu that answers only when this test says so: the session is replaced
+	// while the command is still waiting for the user.
+	(ui.ctx as unknown as { ui: { select(title: string, options: string[]): Promise<string | undefined> } }).ui.select =
+		(_title, options) => new Promise<string | undefined>((resolve) => { answer = (choice) => resolve(choice ?? options.find((option) => /start dictation/i.test(option))); });
+	const done = run(pi, ui);
+	await until(() => answer !== undefined);
+	const second = fakeContext({}, "tui", true, "session-beta");
+	await pi.fire("session_start", second.ctx);
+	answer!("Start dictation");
+	await done;
+	await tick();
+	assert.equal(h.sessions.length, 0, "no capture starts for the replaced session");
+	assert.equal(ui.editor(), "draft: ");
+	assert.equal(ui.open(), false, "no overlay opened");
+	assert.deepEqual(voiceEvents(pi).filter((event) => event.sessionId === "session-beta").map((event) => event.state), ["idle"]);
+	assert.equal(ui.notices.length, 0, "nothing is said into the replaced session");
+	assert.equal(pi.counts.sends, 0);
+});
+
+test("child and non-TUI sessions publish no voice state", async () => {
+	for (const [env, mode, hasUI] of [[{ GENTLE_PI_AGENTS_CHILD: "1" }, "tui", true], [{}, "rpc", true], [{}, "print", false]] as const) {
+		const h = harness({ installed: true, env });
+		const pi = register(h);
+		const ui = fakeContext({}, mode, hasUI);
+		await pi.fire("session_start", ui.ctx);
+		await press(pi, ui);
+		assert.deepEqual(voiceEvents(pi), [], mode);
+		assert.deepEqual(h.calls, [], mode);
+		// Teardown of a session that never used voice publishes nothing either.
+		await pi.fire("session_shutdown", ui.ctx);
+		assert.deepEqual(voiceEvents(pi), [], mode);
+	}
+});
+
+// --- one capture at a time across a session replacement -----------------------
+
+// Where the microphone is actually claimed: runDictation creates the session
+// object but only start() launches the worker, so this counts live captures.
+const captureStarts = (h: Harness) => h.sessions.filter((session) => session.calls.includes("start")).length;
+const statesFor = (pi: ReturnType<typeof fakePi>, sessionId: string) =>
+	voiceEvents(pi).filter((event) => event.sessionId === sessionId).map((event) => event.state);
+
+test("a session replacement starts no second capture until the old session's cancel settles", async () => {
+	const h = harness({ installed: true });
+	const pi = register(h);
+	const first = fakeContext({}, "tui", true, "session-alpha");
+	const { done, session } = await pressUntilRecording(h, pi, first);
+	// The replaced session's worker is still alive after it was told to cancel.
+	const release = deferred<void>();
+	let cancelSettled = false;
+	session.cancel = async () => { session.calls.push("cancel"); await release.promise; cancelSettled = true; };
+	const second = fakeContext({}, "tui", true, "session-beta");
+	await pi.fire("session_start", second.ctx);
+	await until(() => session.calls.includes("cancel"));
+	const fresh = press(pi, second);
+	await until(() => h.sessions.length === 2);
+	h.sessions[1]!.started.resolve();
+	await tick();
+	await tick();
+	assert.equal(cancelSettled, false, "the old capture has not closed yet");
+	assert.equal(captureStarts(h), 1, "the replaced session's capture is still the only one");
+	assert.deepEqual(statesFor(pi, "session-beta"), ["idle", "preparing"], "the new run waits without claiming the microphone");
+	release.resolve();
+	await until(() => h.sessions[1]!.state === "recording");
+	assert.equal(captureStarts(h), 2, "the new capture starts once the old one has closed");
+	assert.deepEqual(statesFor(pi, "session-beta"), ["idle", "preparing", "listening"]);
+	await done;
+	await tick();
+	assert.equal(first.editor(), "draft: ", "the replaced session pastes nothing");
+	assert.equal(first.notices.length, 0, "the replaced session is never notified again");
+	await press(pi, second);
+	await until(() => h.sessions[1]!.calls.includes("stop"));
+	h.sessions[1]!.result.resolve({ text: "nuevo", truncated: false });
+	await fresh;
+	assert.equal(second.editor(), "draft: nuevo", "the new session pastes its own transcript once");
+	assert.equal(pi.counts.sends, 0);
+});
+
+test("a hold in the new session waits for the replaced session's capture to close", async () => {
+	const h = harness({ installed: true, pushToTalk: true });
+	const pi = register(h);
+	const first = fakeContext({}, "tui", true, "session-alpha");
+	await startSession(pi, first);
+	const session = await holdUntilRecording(h, first);
+	const release = deferred<void>();
+	let cancelSettled = false;
+	session.cancel = async () => { session.calls.push("cancel"); await release.promise; cancelSettled = true; };
+	const second = fakeContext({}, "tui", true, "session-beta");
+	await pi.fire("session_start", second.ctx);
+	await until(() => session.calls.includes("cancel"));
+	assert.equal(second.terminal.subscribes, 1, "push-to-talk is armed in the new session at once");
+	holdSpace(h, second, 4);
+	await until(() => h.sessions.length === 2);
+	const fresh = h.sessions[1]!;
+	holdSpace(h, second, 1, false);
+	await tick();
+	await tick();
+	assert.equal(cancelSettled, false, "the replaced capture has not closed yet");
+	assert.equal(captureStarts(h), 1, "the new hold waits for the old capture to close");
+	assert.deepEqual(statesFor(pi, "session-beta"), ["idle", "preparing"], "a waiting hold never claims to listen");
+	// Still holding: the detector erases the spaces it typed, so the draft is clean
+	// before any capture exists.
+	holdSpace(h, second, 4, false);
+	assert.equal(second.editor(), "draft: ", "the hold typed nothing during the wait");
+	release.resolve();
+	fresh.started.resolve();
+	await until(() => fresh.state === "recording");
+	assert.equal(captureStarts(h), 2, "the new hold records once the old capture has closed");
+	assert.deepEqual(statesFor(pi, "session-beta"), ["idle", "preparing", "listening"]);
+	h.clock.advance(RELEASE);
+	await until(() => fresh.calls.includes("stop"));
+	fresh.result.resolve({ text: "nuevo", truncated: false });
+	await until(() => second.editor() === "draft: nuevo");
+	assert.equal(first.editor(), "draft: ", "the replaced session pastes nothing");
+	assert.equal(pi.counts.sends, 0);
+});
+
+test("a third session still waits for the capture the first one left closing", async () => {
+	const h = harness({ installed: true });
+	const pi = register(h);
+	const first = fakeContext({}, "tui", true, "session-alpha");
+	const { done, session } = await pressUntilRecording(h, pi, first);
+	const release = deferred<void>();
+	session.cancel = async () => { session.calls.push("cancel"); await release.promise; };
+	// alpha -> beta: beta starts no run, so it must not drop alpha's reservation.
+	const second = fakeContext({}, "tui", true, "session-beta");
+	await pi.fire("session_start", second.ctx);
+	await until(() => session.calls.includes("cancel"));
+	const third = fakeContext({}, "tui", true, "session-gamma");
+	await pi.fire("session_start", third.ctx);
+	const fresh = press(pi, third);
+	await until(() => h.sessions.length === 2);
+	h.sessions[1]!.started.resolve();
+	await tick();
+	await tick();
+	assert.equal(captureStarts(h), 1, "the third session still waits for the first capture");
+	assert.deepEqual(statesFor(pi, "session-gamma"), ["idle", "preparing"]);
+	release.resolve();
+	await done;
+	await until(() => h.sessions[1]!.state === "recording");
+	assert.equal(captureStarts(h), 2, "one capture, then the next, never two");
+	await pi.fire("session_shutdown", third.ctx);
+	await fresh;
+	await tick();
+	for (const ui of [first, second, third]) assert.equal(ui.editor(), "draft: ", "no draft of a replaced session changes");
+	assert.equal(pi.counts.sends, 0);
+});
+
+test("a waiting run in a replaced session cannot release an older capture's reservation", async () => {
+	const h = harness({ installed: true });
+	const pi = register(h);
+	const first = fakeContext({}, "tui", true, "session-alpha");
+	const { done, session } = await pressUntilRecording(h, pi, first);
+	const release = deferred<void>();
+	let cancelSettled = false;
+	session.cancel = async () => { session.calls.push("cancel"); await release.promise; cancelSettled = true; };
+	// beta: its press creates a run that waits for alpha's capture and never starts.
+	const second = fakeContext({}, "tui", true, "session-beta");
+	await pi.fire("session_start", second.ctx);
+	await until(() => session.calls.includes("cancel"));
+	const waiting = press(pi, second);
+	await until(() => h.sessions.length === 2);
+	h.sessions[1]!.started.resolve();
+	await tick();
+	assert.equal(captureStarts(h), 1, "beta waits for alpha's capture");
+	// gamma replaces beta while beta never claimed the microphone. Beta's own
+	// cancel resolves at once (no worker), and must not free alpha's barrier.
+	const third = fakeContext({}, "tui", true, "session-gamma");
+	await pi.fire("session_start", third.ctx);
+	await waiting;
+	const fresh = press(pi, third);
+	await until(() => h.sessions.length === 3);
+	h.sessions[2]!.started.resolve();
+	await tick();
+	await tick();
+	assert.equal(cancelSettled, false, "alpha's worker has still not exited");
+	assert.equal(captureStarts(h), 1, "gamma also waits for alpha's capture, not for beta's empty one");
+	assert.deepEqual(statesFor(pi, "session-gamma"), ["idle", "preparing"], "no capture is claimed");
+	release.resolve();
+	await done;
+	await until(() => h.sessions[2]!.state === "recording");
+	assert.equal(captureStarts(h), 2, "only gamma starts once alpha has closed");
+	assert.deepEqual(h.sessions.map((entry) => entry.calls.includes("start")), [true, false, true], "beta never started a capture");
+	assert.deepEqual(statesFor(pi, "session-gamma"), ["idle", "preparing", "listening"]);
+	await press(pi, third);
+	await until(() => h.sessions[2]!.calls.includes("stop"));
+	h.sessions[2]!.result.resolve({ text: "gamma", truncated: false });
+	await fresh;
+	assert.equal(third.editor(), "draft: gamma", "gamma pastes its transcript once");
+	for (const ui of [first, second]) assert.equal(ui.editor(), "draft: ", "a replaced session pastes nothing");
+	assert.deepEqual([first.notices.length, second.notices.length], [0, 0], "a replaced session is never notified");
+	assert.equal(pi.counts.sends, 0);
+});
+
+test("an abandoned menu holds no capture: the new session dictates while it still waits", async () => {
+	const h = harness({ installed: true });
+	const pi = register(h);
+	let answer: ((choice: string | undefined) => void) | undefined;
+	const first = fakeContext();
+	// A menu that answers only when this test says so: the session is replaced
+	// while the command still waits, and it never reached a capture.
+	(first.ctx as unknown as { ui: { select(title: string, options: string[]): Promise<string | undefined> } }).ui.select =
+		(_title, options) => new Promise<string | undefined>((resolve) => { answer = (choice) => resolve(choice ?? options.find((option) => /start dictation/i.test(option))); });
+	const done = run(pi, first);
+	await until(() => answer !== undefined);
+	const second = fakeContext({ select: pick(/start dictation/i) });
+	await pi.fire("session_start", second.ctx);
+	const fresh = run(pi, second);
+	await until(() => h.sessions.length === 1 && h.sessions[0]!.state === "starting");
+	assert.ok(answer, "the replaced menu is still waiting");
+	assert.equal(captureStarts(h), 1, "the new session captures without waiting for the abandoned menu");
+	h.sessions[0]!.started.resolve();
+	await until(() => h.sessions[0]!.state === "recording");
+	// The abandoned menu answers late and must do nothing at all.
+	answer("Start dictation");
+	await done;
+	await tick();
+	assert.equal(h.sessions.length, 1, "the replaced command never creates a session");
+	assert.equal(first.editor(), "draft: ");
+	assert.equal(first.notices.length, 0);
+	await pi.fire("session_shutdown", second.ctx);
+	await fresh;
+	await tick();
+	assert.equal(pi.counts.sends, 0);
 });

@@ -7,7 +7,8 @@ import { diagnoseVoicePlatform, readVoicePlatformProbe, type VoicePlatformDiagno
 import { SpaceHoldDetector, type PushToTalkOptions } from "./voice-push-to-talk.ts";
 import { createVoiceSession, VoiceSessionError, type VoiceSessionErrorCode, type VoiceSessionState, type VoiceTranscript } from "./voice-session.ts";
 import { readVoicePushToTalk, writeVoicePushToTalk } from "./voice-settings.ts";
-import { pushToTalkStatus, VoiceDictationView, VoiceProgressView, type VoiceViewTheme } from "./voice-ui.ts";
+import { createVoiceStatePublisher, voiceDisplayState, type VoiceDisplayState, type VoiceStatePublisher } from "./voice-status-event.ts";
+import { pushToTalkStatus, voiceToggleStatus, VoiceDictationView, VoiceProgressView, type VoiceViewTheme } from "./voice-ui.ts";
 
 // /gentle:voice (S1-S3): the only entry point to optional local dictation. It
 // shows status, downloads the pinned runtime and model after an explicit
@@ -21,8 +22,31 @@ import { pushToTalkStatus, VoiceDictationView, VoiceProgressView, type VoiceView
 // parent session; reading the toggle is the only startup work. Whether voice is
 // installed is checked at the first hold, and a missing install disarms it.
 // A hold shares the single-operation lock with the command.
+//
+// Toggle dictation is the third way: one shortcut starts listening and the same
+// shortcut stops and inserts. It needs no overlay and no key held down, so the
+// editor keeps the focus; Esc cancels. It shares the same single-operation lock,
+// so the command, a hold and the toggle can never capture at once.
+//
+// Every way publishes its display state (lib/voice-status-event.ts) for the
+// parent shell, keyed by this session's real id. All of the display writers --
+// the footer status of a hold and of a toggle, the terminal idle of every run,
+// and the session teardown -- go through one guarded pair below, so no code
+// path can paint or publish for a run whose session is gone.
 
 export const VOICE_COMMAND_NAME = "gentle:voice";
+
+// Free in Pi's keybindings and in every Gentle shortcut registered today
+// (alt+d, the obvious pick, is Pi's deleteWordForward).
+export const VOICE_TOGGLE_KEY_DEFAULT = "alt+m";
+
+// GENTLE_PI_VOICE_TOGGLE_KEY overrides the shortcut: unset means the default,
+// an empty value or "off" disables it, anything else is used as the key.
+export function voiceToggleKey(env: NodeJS.ProcessEnv = process.env): string | undefined {
+	const value = env.GENTLE_PI_VOICE_TOGGLE_KEY?.trim();
+	if (value === undefined) return VOICE_TOGGLE_KEY_DEFAULT;
+	return value === "" || value.toLowerCase() === "off" ? undefined : value;
+}
 
 // The part of VoiceSession the command drives.
 export interface VoiceDictation {
@@ -76,7 +100,7 @@ const INSTALL_MESSAGES: Record<VoiceInstallErrorCode, string> = {
 	io: "Voice files could not be written to the voice directory. Check its permissions and free space.",
 };
 
-type DictationStart = "command" | "hold";
+type DictationStart = "command" | "hold" | "toggle";
 
 // What the user can do about a session failure, by platform where it differs.
 // Gentle AI never runs an installer for any of these.
@@ -100,7 +124,9 @@ function sessionAction(code: VoiceSessionErrorCode, platform: string, start: Dic
 			return "Run Gentle AI with Node 22 or newer.";
 		case "empty-audio":
 		case "no-speech":
-			return start === "hold" ? "Keep holding Space until recording starts, then speak." : "Speak after recording starts, then press Enter.";
+			if (start === "hold") return "Keep holding Space until recording starts, then speak.";
+			if (start === "toggle") return "Speak after recording starts, then stop it with the same shortcut.";
+			return "Speak after recording starts, then press Enter.";
 		default:
 			return undefined;
 	}
@@ -139,11 +165,16 @@ function deliver(ctx: ExtensionContext, result: Outcome, platform: string, start
 // One dictation session driven to an Outcome. stop() and cancel() settle only
 // after the worker has exited; a transcript that lands while cancelling is
 // dropped. A release before recording starts waits for recording.
-function runDictation(createSession: NonNullable<VoiceCommandDeps["createSession"]>, target: VoiceTarget, onState: (state: VoiceSessionState) => void) {
+//
+// The microphone is claimed at start(), not at creation: creation is inert, and
+// start() first waits for the capture that is still closing, so two workers can
+// never be alive at once, however long the platform takes to release the device.
+function runDictation(createSession: NonNullable<VoiceCommandDeps["createSession"]>, target: VoiceTarget, onState: (state: VoiceSessionState) => void, admission?: () => Promise<void> | undefined) {
 	let settled = false;
 	let stopping = false;
 	let cancelled = false;
 	let released = false;
+	let cancelPending: Promise<void> | undefined;
 	let resolveOutcome!: (outcome: Outcome) => void;
 	const outcome = new Promise<Outcome>((resolve) => { resolveOutcome = resolve; });
 	const settle = (value: Outcome) => {
@@ -157,14 +188,21 @@ function runDictation(createSession: NonNullable<VoiceCommandDeps["createSession
 		stopping = true;
 		session.stop().then((transcript) => settle({ kind: "text", transcript }), (error) => settle({ kind: "error", error }));
 	};
-	const cancel = () => {
-		if (cancelled || settled) return;
+	// Settles only once the worker has exited, and it is the same promise for
+	// every caller, so the next capture can wait on this exact teardown.
+	const cancel = (): Promise<void> => {
+		if (cancelPending) return cancelPending;
+		if (settled) return Promise.resolve();
 		cancelled = true;
-		session.cancel().catch(() => {}).finally(() => settle({ kind: "cancelled" }));
+		cancelPending = session.cancel().catch(() => {}).finally(() => settle({ kind: "cancelled" }));
+		return cancelPending;
 	};
 	// The session calls this synchronously from its own transitions, so it
 	// must never throw: a throw there could leave a closing session unsettled.
 	const onStateChange = (state: VoiceSessionState) => {
+		// A cancelled run discards its recording, so it never reports progress
+		// again: the display must not claim it is transcribing on the way out.
+		if (cancelled) return;
 		try {
 			onState(state);
 			// The recording limit ends capture without a key press.
@@ -174,10 +212,21 @@ function runDictation(createSession: NonNullable<VoiceCommandDeps["createSession
 		}
 	};
 	const session = createSession({ target, onStateChange });
+	const begin = () => {
+		// A run cancelled, stopped or settled while it waited never starts.
+		if (cancelled || settled) return;
+		session.start().catch((error) => settle({ kind: "error", error }));
+	};
 	return {
 		session,
 		outcome,
-		start: () => { session.start().catch((error) => settle({ kind: "error", error })); },
+		start: () => {
+			// Claiming the microphone waits for the previous capture's teardown;
+			// with none pending the session starts at once.
+			const closing = admission?.();
+			if (!closing) begin();
+			else void closing.then(begin, begin);
+		},
 		stop: () => { released = true; collect(); },
 		cancel,
 	};
@@ -255,7 +304,9 @@ function openOverlay<V extends Component & { dispose(): void }>(ctx: ExtensionCo
 
 interface Run {
 	generation: number;
-	abort(): void;
+	// Cancels the run. A run that owns a capture returns the promise that settles
+	// once its worker has exited, and the microphone stays reserved until then.
+	abort(): void | Promise<void>;
 }
 
 export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = {}): void {
@@ -268,8 +319,71 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	const installModel = deps.installModel ?? (({ signal, onProgress }) => installVoiceModel({ env, signal, onProgress }));
 	const createSession = deps.createSession ?? (({ target, onStateChange }) => createVoiceSession({ env, target, onStateChange }));
 	const settings = deps.settings ?? { read: () => readVoicePushToTalk({ env }), write: (enabled: boolean) => { writeVoicePushToTalk(enabled, { env }); } };
+	// The toggle shortcut is fixed for the session: Pi binds shortcuts once.
+	const toggleShortcut = voiceToggleKey(env);
+	const toggleKey = toggleShortcut ?? VOICE_TOGGLE_KEY_DEFAULT;
 	let generation = 0;
 	let active: Run | undefined;
+
+	// --- display: footer status and the session-scoped state event ---------------
+
+	// One publisher per live session. It quotes that session's real id, drops a
+	// state its run no longer owns, and is closed when the session is replaced, so
+	// a late callback can neither publish nor paint into the next session.
+	let statePublisher: VoiceStatePublisher | undefined;
+	let statePublisherCtx: ExtensionContext | undefined;
+	// The context of the session that owns voice right now; a replacement ends it.
+	let sessionCtx: ExtensionContext | undefined;
+	const publisherFor = (ctx: ExtensionContext): VoiceStatePublisher => {
+		if (statePublisher && statePublisherCtx === ctx) return statePublisher;
+		statePublisher?.close();
+		statePublisherCtx = ctx;
+		statePublisher = createVoiceStatePublisher(pi, ctx);
+		return statePublisher;
+	};
+	const publishVoiceState = (ctx: ExtensionContext | undefined, state: VoiceDisplayState, live?: () => boolean): void => {
+		try {
+			// A run that no longer owns the display returns before touching it: a
+			// stale finally must not replace the live session's publisher, which
+			// would drop its duplicate suppression and let it repeat a state.
+			if (live && !live()) return;
+			(ctx ? publisherFor(ctx) : statePublisher)?.publish(state, live);
+		} catch {
+			/* the display is advisory */
+		}
+	};
+	const setVoiceFooter = (ctx: ExtensionContext | undefined, live: () => boolean, text: string | undefined): void => {
+		if (!ctx || !live()) return;
+		try {
+			ctx.ui.setStatus(STATUS_KEY, text);
+		} catch {
+			/* the status is display only */
+		}
+	};
+
+	// --- the microphone slot ----------------------------------------------------
+
+	// One capture at a time. A cancelled capture keeps this slot until its worker
+	// has exited, because that is exactly when session.cancel() settles, so the
+	// next capture awaits a real teardown instead of assuming the cancel was
+	// quick. A run that never reached a worker reserves nothing, so an abandoned
+	// menu or a run that only checked the install cannot block voice.
+	let captureClosing: Promise<void> | undefined;
+	const reserveCapture = (closing: Promise<void> | void): void => {
+		if (!closing) return;
+		// Reservations compose instead of replacing: a run that never reached a
+		// worker settles at once, and that must not free an older capture whose
+		// worker is still exiting. The slot clears only when every teardown
+		// reserved so far has settled, and an older completion never clears a
+		// later combined slot.
+		const pending = captureClosing;
+		const settled = Promise.resolve(closing).then(() => {}, () => {});
+		const slot = (pending ? pending.then(() => settled) : settled).then(() => {
+			if (captureClosing === slot) captureClosing = undefined;
+		});
+		captureClosing = slot;
+	};
+	const captureSlot = (): Promise<void> | undefined => captureClosing;
 
 	const command = async (ctx: ExtensionCommandContext): Promise<void> => {
 		if (env.GENTLE_PI_AGENTS_CHILD === "1") {
@@ -388,8 +502,14 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	};
 
 	const dictate = async (ctx: ExtensionCommandContext, run: Run, target: VoiceTarget, platform: string, say: Say): Promise<void> => {
+		const live = () => run.generation === generation;
 		let overlay: Overlay<VoiceDictationView> | undefined;
-		const dictation = runDictation(createSession, target, (state) => overlay?.view()?.setState(state));
+		// The command shows an overlay instead of a footer, but it publishes the same
+		// session-scoped display state a hold and a toggle publish.
+		const dictation = runDictation(createSession, target, (state) => {
+			overlay?.view()?.setState(state);
+			publishVoiceState(ctx, voiceDisplayState(state), live);
+		}, captureSlot);
 		const { session } = dictation;
 		run.abort = dictation.cancel;
 		overlay = openOverlay(ctx, (theme, requestRender) => {
@@ -403,16 +523,23 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		run.abort = () => {};
 		const tui = overlay.tui();
 		await overlay.close();
-		if (run.generation !== generation) return;
-		deliver(ctx, result, platform, "command", say, () => {
-			setTimeout(() => {
-				try {
-					tui?.requestRender();
-				} catch {
-					/* best-effort repaint after the overlay teardown */
-				}
-			}, 0);
-		});
+		try {
+			// After a session shutdown the old context is stale: say and paste nothing.
+			if (!live()) return;
+			deliver(ctx, result, platform, "command", say, () => {
+				setTimeout(() => {
+					try {
+						tui?.requestRender();
+					} catch {
+						/* best-effort repaint after the overlay teardown */
+					}
+				}, 0);
+			});
+		} finally {
+			// Delivered, empty, cancelled and failed all end idle; a stale run
+			// publishes nothing, because its session teardown already cleared it.
+			publishVoiceState(ctx, "idle", live);
+		}
 	};
 
 	// --- push-to-talk (hold Space) ----------------------------------------------
@@ -425,9 +552,41 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		hold?: { release(): void; cancel(): void };
 	}
 	let armed: Armed | undefined;
-	// Learned at the first hold or from the command: a target once voice is
-	// known to be installed, "checking" while the lazy check runs.
+	// Learned at the first hold, from the command or from the toggle: a target
+	// once voice is known to be installed, "checking" while the lazy check runs.
 	let installed: { target: VoiceTarget; platform: string } | "checking" | undefined;
+	// One check answers every asker. A missing install is not cached, so the
+	// next ask checks again once the user has downloaded it.
+	let installCheck: Promise<{ target: VoiceTarget; platform: string } | undefined> | undefined;
+
+	const probeInstall = async (): Promise<{ target: VoiceTarget; platform: string } | undefined> => {
+		let found: { target: VoiceTarget; platform: string } | undefined;
+		try {
+			const platform = probe();
+			const diagnosis = diagnoseVoicePlatform(platform);
+			if (diagnosis.support !== "unsupported" && diagnosis.target) {
+				const status = await readStatus(diagnosis.target);
+				if (status.runtime?.state === "installed" && status.model.state === "installed") found = { target: diagnosis.target, platform: platform.platform };
+			}
+		} catch {
+			/* an unreadable install counts as not installed */
+		}
+		return found;
+	};
+
+	const resolveInstalled = (): Promise<{ target: VoiceTarget; platform: string } | undefined> => {
+		if (installed && installed !== "checking") return Promise.resolve(installed);
+		if (installCheck) return installCheck;
+		installed = "checking";
+		const check = probeInstall().then((found) => {
+			installCheck = undefined;
+			if (found) installed = found;
+			else if (installed === "checking") installed = undefined;
+			return found;
+		});
+		installCheck = check;
+		return check;
+	};
 
 	const readToggle = (): boolean => {
 		try {
@@ -475,18 +634,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	// meanwhile. A missing install disarms push-to-talk until it is re-enabled.
 	const checkInstalled = async (current: Armed): Promise<void> => {
 		const checkGeneration = generation;
-		let found: { target: VoiceTarget; platform: string } | undefined;
-		try {
-			const platform = probe();
-			const diagnosis = diagnoseVoicePlatform(platform);
-			if (diagnosis.support !== "unsupported" && diagnosis.target) {
-				const status = await readStatus(diagnosis.target);
-				if (status.runtime?.state === "installed" && status.model.state === "installed") found = { target: diagnosis.target, platform: platform.platform };
-			}
-		} catch {
-			/* an unreadable install counts as not installed */
-		}
-		if (installed === "checking") installed = found;
+		const found = await resolveInstalled();
 		if (checkGeneration !== generation || armed !== current || found) return;
 		disarm();
 		current.ctx.ui.notify("Push-to-talk is paused: voice dictation is not installed. Run /gentle:voice to download it.", "warning");
@@ -494,12 +642,12 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 
 	const startHold = (current: Armed): boolean => {
 		if (armed !== current || active) return false;
-		if (installed === undefined) {
-			installed = "checking";
+		// While the check runs the spaces keep typing; it settles once, for every
+		// hold that asked.
+		if (!installed || installed === "checking") {
 			void checkInstalled(current);
 			return false;
 		}
-		if (installed === "checking") return false;
 		const run: Run = { generation, abort: () => {} };
 		active = run;
 		void holdDictation(current, run, installed.target, installed.platform)
@@ -520,18 +668,17 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		const say: Say = (message, type) => {
 			if (live()) ctx.ui.notify(message, type);
 		};
-		const status = (text: string | undefined) => {
+		// The footer status and the display event always move together, so the tab
+		// shows exactly what the footer says, and never a stale run's state.
+		const status = (state: VoiceSessionState) => {
 			if (!live()) return;
-			try {
-				ctx.ui.setStatus(STATUS_KEY, text);
-			} catch {
-				/* the status is display only */
-			}
+			setVoiceFooter(ctx, live, pushToTalkStatus(state));
+			publishVoiceState(ctx, voiceDisplayState(state), live);
 		};
-		const dictation = runDictation(createSession, target, (state) => status(pushToTalkStatus(state)));
+		const dictation = runDictation(createSession, target, (state) => status(state), captureSlot);
 		run.abort = dictation.cancel;
 		current.hold = { release: dictation.stop, cancel: dictation.cancel };
-		status(pushToTalkStatus("starting"));
+		status("starting");
 		try {
 			dictation.start();
 			const result = await dictation.outcome;
@@ -539,7 +686,10 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		} finally {
 			run.abort = () => {};
 			current.hold = undefined;
-			status(undefined);
+			// Cleared and published with the run's own guard: after a session
+			// replacement the teardown already cleared this session's display.
+			setVoiceFooter(ctx, live, undefined);
+			publishVoiceState(ctx, "idle", live);
 		}
 	};
 
@@ -559,18 +709,185 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		}
 	};
 
+	// --- toggle dictation (one shortcut starts and stops) ------------------------
+
+	interface ToggleRun {
+		ctx: ExtensionContext;
+		run: Run;
+		// Set once the session exists; a press before that is applied to it.
+		dictation?: ReturnType<typeof runDictation>;
+		// A press while preparing stops as soon as recording can be stopped.
+		stopRequested: boolean;
+		cancelled: boolean;
+		unsubscribe(): void;
+	}
+	let toggling: ToggleRun | undefined;
+
+	// The toggle's footer status and display event, written only while its run is
+	// still the live one and still the session's only toggle.
+	const toggleDisplay = (current: ToggleRun) => {
+		const live = () => current.run.generation === generation && toggling === current;
+		return (state: VoiceSessionState) => {
+			if (!live()) return;
+			setVoiceFooter(current.ctx, live, voiceToggleStatus(state, toggleKey));
+			publishVoiceState(current.ctx, voiceDisplayState(state), live);
+		};
+	};
+
+	const closeToggle = (current: ToggleRun) => {
+		if (toggling !== current) return;
+		toggling = undefined;
+		if (active === current.run) active = undefined;
+		try {
+			current.unsubscribe();
+		} catch {
+			/* the input listener is already gone */
+		}
+		// A run that settles after its session was replaced publishes nothing: the
+		// generation moved and the session teardown already cleared that display.
+		const live = () => current.run.generation === generation;
+		setVoiceFooter(current.ctx, live, undefined);
+		publishVoiceState(current.ctx, "idle", live);
+	};
+
+	const stopToggle = (current: ToggleRun) => {
+		current.stopRequested = true;
+		current.dictation?.stop();
+	};
+
+	const cancelToggle = (current: ToggleRun) => {
+		if (current.cancelled || toggling !== current) return;
+		current.cancelled = true;
+		if (!current.dictation) {
+			// Still checking the install: nothing was recorded, so end it silently.
+			closeToggle(current);
+			return;
+		}
+		current.dictation.cancel();
+	};
+
+	const openToggle = (ctx: ExtensionContext): ToggleRun => {
+		const current: ToggleRun = { ctx, run: { generation, abort: () => {} }, stopRequested: false, cancelled: false, unsubscribe: () => {} };
+		toggling = current;
+		active = current.run;
+		// Esc has to cancel without reaching the editor's own interrupt.
+		current.unsubscribe = ctx.ui.onTerminalInput((data) => {
+			try {
+				if (toggling !== current) return undefined;
+				if (!isKeyRelease(data) && matchesKey(data, "escape")) {
+					cancelToggle(current);
+					return { consume: true };
+				}
+				return undefined;
+			} catch {
+				return undefined;
+			}
+		});
+		return current;
+	};
+
+	const runToggle = async (current: ToggleRun): Promise<void> => {
+		const { ctx } = current;
+		const live = () => current.run.generation === generation && toggling === current;
+		const say: Say = (message, type) => {
+			if (live()) ctx.ui.notify(message, type);
+		};
+		const display = toggleDisplay(current);
+		try {
+			const found = await resolveInstalled();
+			if (!live()) return;
+			if (!found) {
+				say("Voice dictation is not installed. Run /gentle:voice to download it.", "warning");
+				return;
+			}
+			const dictation = runDictation(createSession, found.target, (state) => display(state), captureSlot);
+			current.dictation = dictation;
+			current.run.abort = dictation.cancel;
+			display("starting");
+			dictation.start();
+			if (current.stopRequested) dictation.stop();
+			const result = await dictation.outcome;
+			if (!live()) return;
+			deliver(ctx, result, found.platform, "toggle", say);
+		} finally {
+			current.run.abort = () => {};
+			closeToggle(current);
+		}
+	};
+
+	const toggleDictation = async (ctx: ExtensionContext): Promise<void> => {
+		if (env.GENTLE_PI_AGENTS_CHILD === "1" || !ctx?.hasUI || ctx.mode !== "tui") return;
+		const current = toggling;
+		if (current) {
+			stopToggle(current);
+			return;
+		}
+		if (active) {
+			ctx.ui.notify("Voice dictation is already running. Finish or cancel it first.", "warning");
+			return;
+		}
+		await runToggle(openToggle(ctx));
+	};
+
+	// Ends every voice activity one session owned. The generation moves first, so
+	// no run of it can publish or paint again even before its capture finishes
+	// cancelling; then the footer and the display go idle under that session's own
+	// id, and its publisher closes. The next session starts from a clean display.
+	const endSession = (ctx: ExtensionContext | undefined): void => {
+		generation++;
+		const running = active;
+		active = undefined;
+		// Its capture, if it reached one, keeps the microphone slot until the worker
+		// is gone: abort() returns the promise that settles exactly then.
+		reserveCapture(running?.abort());
+		disarm();
+		const current = toggling;
+		toggling = undefined;
+		if (current) {
+			try {
+				current.unsubscribe();
+			} catch {
+				/* the input listener is already gone */
+			}
+		}
+		const target = ctx ?? statePublisherCtx;
+		setVoiceFooter(target, () => true, undefined);
+		// Nothing was ever published for this session: no display to clear.
+		if (statePublisher) publishVoiceState(target, "idle");
+		statePublisher?.close();
+		statePublisher = undefined;
+		statePublisherCtx = undefined;
+	};
+
 	pi.registerCommand(VOICE_COMMAND_NAME, {
 		description: "Local voice dictation with Parakeet: download it once, then record and insert the transcript into the draft (never sent).",
 		handler: async (_args, ctx) => command(ctx),
 	});
+	if (toggleShortcut) {
+		pi.registerShortcut(toggleShortcut as Parameters<ExtensionAPI["registerShortcut"]>[0], {
+			description: "Start or stop one voice dictation: the transcript goes into the draft and is never sent.",
+			handler: async (ctx) => toggleDictation(ctx),
+		});
+	}
+
 	pi.on("session_start", (_event, ctx) => {
-		disarm();
+		// A replacement session starts by ending the one it replaced: the old idle
+		// goes out under the old id, then every listener, run and publisher of it is
+		// gone, so none of its callbacks can reach this session.
+		const previous = sessionCtx;
+		sessionCtx = undefined;
+		endSession(previous && previous !== ctx ? previous : undefined);
 		if (env.GENTLE_PI_AGENTS_CHILD === "1" || !ctx?.hasUI || ctx.mode !== "tui") return;
+		sessionCtx = ctx;
+		setVoiceFooter(ctx, () => true, undefined);
+		// A supported session opens idle for its own id: the tab has a baseline and
+		// any footer a replacement left behind is cleared.
+		publishVoiceState(ctx, "idle");
 		if (readToggle()) arm(ctx);
 	});
-	pi.on("session_shutdown", () => {
-		generation++;
-		active?.abort();
-		disarm();
+	pi.on("session_shutdown", (_event, ctx) => {
+		const previous = sessionCtx;
+		sessionCtx = undefined;
+		endSession(ctx ?? previous);
 	});
 }
