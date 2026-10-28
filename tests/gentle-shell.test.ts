@@ -3068,7 +3068,7 @@ test("potato repaints start/settle and shows queued state on the host's next ren
 	// this proves next-render visibility, not real Pi enqueue-to-paint latency.
 	fakeTui.requestRender();
 	assert.equal(renders.mock.callCount(), before + 1);
-	assert.match(stripAnsi(editor.render(60)[0]), /✿ queued/);
+	assert.match(stripAnsi(editor.render(60)[0]), /  queued/);
 	before = renders.mock.callCount();
 	for (const handler of handlers.get("agent_settled") ?? []) handler({}, ctx);
 	assert.ok(renders.mock.callCount() > before);
@@ -5704,7 +5704,7 @@ test("gentleShell draws the review preflight message as a Gentle card", (t) => {
 		assert.doesNotMatch(renderer(message, { expanded }, sentinelTheme).render(80).join("\n"), /\x1b\[44m/);
 	}
 	const expanded = renderer(message, { expanded: true }, plainTheme).render(80).map(stripAnsi);
-	assert.match(expanded[0], /^╭─ ✿ Gentle AI · review preflight ─+ .*collapse ╮$/);
+	assert.match(expanded[0], /^╭─   Gentle AI · review preflight ─+ .*collapse ╮$/);
 	assert.match(expanded[1], /^│ Receipt-driven development is enabled\. +│$/);
 	assert.ok(expanded.some((line) => line.includes("gentle_review")));
 	const collapsed = renderer({ ...message, content: [{ type: "text", text: message.content }] }, { expanded: false }, plainTheme).render(80).map(stripAnsi);
@@ -5727,7 +5727,7 @@ test("the review preflight card paints the rose INFO frame (border) and title (a
 	const message = { customType: "gentle-pi.review-preflight", content: "Receipt-driven development is enabled." };
 	const lines = renderer(message, { expanded: true }, taggedTheme).render(60);
 	assert.match(lines[0]!, /^<border>╭<\/border>/);
-	assert.match(lines[0]!, /<accent>✿ Gentle AI<\/accent>/);
+	assert.match(lines[0]!, /<accent>  Gentle AI<\/accent>/);
 });
 
 test("gentleShell keeps a dev-binary override visible above the editor for the whole session", async (t) => {
@@ -5742,7 +5742,7 @@ test("gentleShell keeps a dev-binary override visible above the editor for the w
 	const factory = ui.widgets.get("gentle-shell-dev-binary") as (tui: unknown, theme: unknown) => { render(width: number): string[] };
 	assert.ok(factory, "dev binary widget missing");
 	const lines = factory(fakeTui, plainTheme).render(100).map(stripAnsi);
-	assert.match(lines[0], /^╭─ \u{1F339} gentle-ai · dev binary override · field-test only ─+╮$/u, "the override notice carries the Gentle AI rose");
+	assert.match(lines[0], /^╭─    gentle-ai · dev binary override · field-test only ─+╮$/u, "the override notice keeps the reserved glyph cells");
 	assert.match(lines[1], /^│ \/Users\/me\/go\/bin\/gentle-ai · sha256:6e53bfc6305a3949 +│$/);
 	assert.match(lines[2], /^╰─+╯$/);
 	assert.equal(lines[3], "", "a blank line keeps the card off the prompt frame");
@@ -5767,7 +5767,7 @@ test("gentleShell keeps a dev-binary override visible above the editor for the w
 
 	const invalid = devBinaryCard({ state: "invalid", reason: "binary missing" });
 	assert.equal(invalid.tone, "error");
-	assert.equal(invalid.glyph, "\u{1F339}", "the invalid override notice keeps the rose too");
+	assert.equal(invalid.glyph, "  ", "the invalid override notice keeps the reserved glyph cells");
 	assert.deepEqual(factory(fakeTui, plainTheme).render(0), [""], "zero width keeps only the spacer");
 });
 
@@ -6617,13 +6617,13 @@ const topBorder = (editor: GentlePromptEditor, width: number) => stripAnsi(edito
 test("editor border shows the commands label only while the rail is hidden, across the 140 column breakpoint", async () => {
 	const { editor, tui } = await paletteEditor({}, { columns: 100 });
 	try {
-		assert.match(topBorder(editor, 100), /^╭─ ✿ ≡ commands · alt\+k ─+╮$/);
+		assert.match(topBorder(editor, 100), /^╭─   ≡ commands · alt\+k ─+╮$/);
 		assert.equal(visibleWidth(editor.render(100)[0]!), 100);
 		tui.terminal.columns = 139;
 		assert.match(topBorder(editor, 139), /≡ commands · alt\+k/, "139 columns: no rail yet");
 		tui.terminal.columns = 140;
 		assert.doesNotMatch(topBorder(editor, 112), /commands/, "140 columns: the rail card carries it");
-		assert.match(topBorder(editor, 112), /^╭─ ✿ ─+╮$/);
+		assert.match(topBorder(editor, 112), /^╭─   ─+╮$/);
 		tui.terminal.columns = 120;
 		assert.match(topBorder(editor, 120), /≡ commands/, "shrinking back restores the label");
 	} finally { editor.dispose(); }
@@ -6633,8 +6633,8 @@ test("editor border label honors a remapped key and drops the hint when the shor
 	const remapped = await paletteEditor({ GENTLE_PI_COMMANDS_KEY: "ctrl+p" });
 	const off = await paletteEditor({ GENTLE_PI_COMMANDS_KEY: "off" });
 	try {
-		assert.match(topBorder(remapped.editor, 100), /^╭─ ✿ ≡ commands · ctrl\+p ─+╮$/);
-		assert.match(topBorder(off.editor, 100), /^╭─ ✿ ≡ commands ─+╮$/);
+		assert.match(topBorder(remapped.editor, 100), /^╭─   ≡ commands · ctrl\+p ─+╮$/);
+		assert.match(topBorder(off.editor, 100), /^╭─   ≡ commands ─+╮$/);
 		assert.equal(off.mouse("click", 7, 0)?.handled, true, "a disabled shortcut still has the clickable label");
 		assert.equal(await off.opened(), true);
 	} finally { remapped.editor.dispose(); off.editor.dispose(); }
@@ -6691,7 +6691,7 @@ test("float hint row carries the label and the same click rules", async () => {
 		setCardStyle(CARD_STYLE.FLOAT);
 		editor.render(100);
 		const row = stripAnsi(editor.render(100)[0]!);
-		assert.match(row, /^ ▎ ✿ ≡ commands · alt\+k/, row);
+		assert.match(row, /^ ▎   ≡ commands · alt\+k/, row);
 		mouse("click", 4, 0);
 		mouse("click", 24, 0);
 		mouse("click", 8, 1);
@@ -6780,7 +6780,7 @@ test("a folded rail shows `« panel · alt+h` on the editor border, and a click 
 	state.active = false;
 	state.railAvailable = () => true;
 	const top = stripAnsi(editor.render(160)[0]!);
-	assert.match(top, /^╭─ ✿ ≡ commands · alt\+k ─+ « panel · alt\+h ─╮$/);
+	assert.match(top, /^╭─   ≡ commands · alt\+k ─+ « panel · alt\+h ─╮$/);
 	const x = top.indexOf("«");
 	const event = (type: string, at: number) => ({ type, button: "left", x: at, y: 0, screenX: at, screenY: 0, width: 160, height: 3, shift: false, alt: false, ctrl: false } as TuiMouseEvent);
 	editor.handleMouse(event("press", x));

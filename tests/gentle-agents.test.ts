@@ -3652,7 +3652,7 @@ test("subagent_list_agents and subagent_run in task mode launch a child with the
 	await fire("session_shutdown", ctx);
 	await tick();
 	assert.deepEqual(harness.children[1].killed, ["SIGTERM"], "closing pi stops the running children");
-	assert.match(tools.get("subagent_run")!.renderCall({ agent: "explore" }, plainTheme).render(60).join(""), /❀ agent run · explore/);
+	assert.match(tools.get("subagent_run")!.renderCall({ agent: "explore" }, plainTheme).render(60).join(""), /  agent run · explore/);
 });
 
 test("running subagent_result polls hide only their tool chrome, not the model result or final completion", async () => {
@@ -3874,7 +3874,7 @@ test("background runs return at once; status, result, send_message, cancel, and 
 	assert.deepEqual(sent[0].options, { triggerTurn: false });
 	assert.match(String(sent[0].message.content), new RegExp(`^Subagent explore \\(task ${id}, "Long job"\\) finished\\.\n\nAll done\\.$`));
 	const card = renderers.get("gentle-agents.result")!(sent[0].message, { expanded: true }, plainTheme).render(70).map(stripAnsi);
-	assert.match(card[0], /^╭─ ❀ Agent result · explore ─+ collapse ╮$/);
+	assert.match(card[0], /^╭─   Agent result · explore ─+ collapse ╮$/);
 	assert.match(card[1], /Subagent explore/);
 	assert.match(card[card.length - 2], /All done\./);
 	const resumed = tools.get("subagent_continue")!.execute("c8", { task_id: id, prompt: "Now summarize", mode: "task" }, undefined, undefined, ctx);
@@ -3946,7 +3946,7 @@ test("the Agent result card previews the answer or error when collapsed and keep
 
 	const done = render(message(base), { expanded: false }, plainTheme).render(80).map(stripAnsi);
 	assert.ok(done.length <= 5, "the collapsed card stays bounded");
-	assert.match(done[0]!, /^╭─ ❀ Agent result · explore ─+ expand ╮$/);
+	assert.match(done[0]!, /^╭─   Agent result · explore ─+ expand ╮$/);
 	assert.match(done[1]!, /^│ All done\. +│$/, "the answer leads the collapsed preview");
 	assert.doesNotMatch(done.join("\n"), /Subagent explore \(task/, "the bookkeeping header stays out of the collapsed preview");
 	assert.match(render(message(base), { expanded: false }, taggedTheme).render(80)[0]!, /^<success>╭/);
@@ -3984,7 +3984,7 @@ test("the Stale agent result card previews its truthful warning when collapsed",
 	const entry = { type: "custom", customType: "gentle-agents.stale-result", data: { taskId: "t9", agent: "explore", label: "map lib", status: "completed", ageSeconds: 120 } };
 	const collapsed = render(entry, { expanded: false }, plainTheme).render(80).map(stripAnsi);
 	assert.ok(collapsed.length > 3 && collapsed.length <= 5, "a bounded multi-row preview");
-	assert.match(collapsed[0]!, /^╭─ ❀ Stale agent result · explore · task t9 ─+ expand ╮$/);
+	assert.match(collapsed[0]!, /^╭─   Stale agent result · explore · task t9 ─+ expand ╮$/);
 	assert.match(collapsed.join("\n"), /Subagent explore \(task t9, "map lib"\) completed about 2m ago/);
 	assert.doesNotMatch(collapsed.join("\n"), /All done|Last answer/, "no invented answer");
 	assert.match(render(entry, { expanded: false }, { fg: (color: string, text: string) => `<${color}>${text}</${color}>` }).render(80)[0]!, /^<warning>╭/);
@@ -4003,7 +4003,7 @@ test("a task-mode child's dialog reaches the host UI and the answer goes back to
 	harness.children[0].emit({ type: "extension_ui_request", id: "u1", method: "select", title: "Which file?", options: ["a.ts", "b.ts"] });
 	await tick();
 	await tick();
-	assert.deepEqual(dialogs, ["select:❀ Which file?:a.ts|b.ts"]);
+	assert.deepEqual(dialogs, ["select:  Which file?:a.ts|b.ts"]);
 	assert.deepEqual(harness.children[0].written.at(-1), { type: "extension_ui_response", id: "u1", value: "a.ts" });
 	assert.match(widget()![1], /◐  explore  Ask me/);
 	harness.children[0].emit({ type: "agent_end", messages: [] });

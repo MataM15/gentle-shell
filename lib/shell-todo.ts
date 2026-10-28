@@ -91,7 +91,7 @@ export interface TodoRenderOptions {
 /** Tool results carry the snapshot under this key; the old rpiv-todo shape is read too. */
 export const TODO_DETAILS_KEY = "gentleTodo";
 export const TODO_TOOL_NAME = "todo";
-export const TODO_GLYPH = "❀";
+export const TODO_GLYPH = " ";
 /** Emitted on pi.events after each successful todo write; gentle-agents publishes it as session progress. */
 export const TODO_PROGRESS_EVENT = "gentle-pi:todo:progress";
 

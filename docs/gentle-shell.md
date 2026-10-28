@@ -41,7 +41,7 @@ Gentle Shell is the Pi workspace experience provided by the `gentle-pi` package.
 At 140 columns or wider, fullscreen defaults to a full-height transcript beside a 50-column right rail, driven by [`lib/shell-sidebar-layout.ts`](../lib/shell-sidebar-layout.ts). The live header is pinned at the top of the rail, above its scrollable cards, not above the transcript:
 
 ```text
-✿ Gentle Shell
+  Gentle Shell
 gpt-5.5 · medium
 ctx ▰▰▰▰▱▱▱▱ 45% ⟡ $9.49 sub
 ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
@@ -61,7 +61,7 @@ ctx ▰▰▰▰▱▱▱▱ 45% ⟡ $9.49 sub
 The regular-mode compact bar replaces pi's three-line footer with a single line of segments:
 
 ```text
-✿ gentle shell ⟡ ~/work/gentle-pi main ⟡ gpt-5.5 · medium ⟡ ctx ▰▰▰▰▱▱▱▱ 45% ⟡ $9.49 sub ⟡ MCP: 3 servers enabled        Release notes
+  gentle shell ⟡ ~/work/gentle-pi main ⟡ gpt-5.5 · medium ⟡ ctx ▰▰▰▰▱▱▱▱ 45% ⟡ $9.49 sub ⟡ MCP: 3 servers enabled        Release notes
 ```
 
 - Context is a gauge, not a number. It turns amber at 80% and red at 95%; after compaction it shows `?%` until the next response.
@@ -72,7 +72,7 @@ The regular-mode compact bar replaces pi's three-line footer with a single line 
 The prompt follows the selected card style. `neon` keeps pi's editor in its rounded frame:
 
 ```text
-╭─ ✿ working ──────────────────────────────────────────╮
+╭─   working ──────────────────────────────────────────╮
 │ type, or / for commands                              │
 ╰──────────────────────────────────────────────────────╯
 ```
@@ -145,14 +145,14 @@ Captured evidence (`gentle-pi.session-change/v1`) is still stored for session st
 
 The rail can be folded away: its last row, pinned below the cards, reads `» hide panel · alt+h`, and a clean left click on it (or `alt+h`, or `/gentle:panel`, or **Toggle side panel** in the command palette) gives the transcript and the prompt the full width; the Todos card and the startup dev-binary card fold away with it instead of moving above the prompt (terminals 61–139 columns wide, where the rail cannot show, keep Todos above the prompt). While it is folded and the terminal could show it (fullscreen, 140 columns or wider, a Status placement that allows the rail), the prompt's top border ends with `« panel · alt+h`; a click on `« panel` unfolds it. The choice is remembered across sessions in `rail.json` under the Gentle config home (`GENTLE_PI_CONFIG_HOME`, default `~/.pi/gentle-ai`). `GENTLE_PI_PANEL_KEY` rebinds the shortcut; `off` disables it.
 
-Without the rail, the prompt's top border carries the same entry point: `╭─ ✿ ≡ commands · alt+k ──╮` (one cell between petal, icon and label; float shows it on its hint row). It appears only in fullscreen while the right rail is not visible (under 140 columns, or a rail placement that hides it) and is re-evaluated on every render, so it disappears as the rail appears. Regular mode never delivers mouse events to Pi, so no label is drawn there. The key hint follows `GENTLE_PI_COMMANDS_KEY` and is omitted when the shortcut is `off`; the label is dropped, not truncated, when the border is too narrow. Only a clean left click (press and release on the same cell) on the `≡ commands` cells of the border row (not the key hint) opens the palette; presses, drags, and clicks anywhere else, including the input rows, keep the editor's native behavior. Built-in Pi commands are not listed. The default is `alt+k`, not `ctrl+k`, because Pi reserves `ctrl+k` for the editor's delete-to-line-end action.
+Without the rail, the prompt's top border carries the same entry point: `╭─   ≡ commands · alt+k ──╮` (the former flower cell remains blank; float shows the label on its hint row). It appears only in fullscreen while the right rail is not visible (under 140 columns, or a rail placement that hides it) and is re-evaluated on every render, so it disappears as the rail appears. Regular mode never delivers mouse events to Pi, so no label is drawn there. The key hint follows `GENTLE_PI_COMMANDS_KEY` and is omitted when the shortcut is `off`; the label is dropped, not truncated, when the border is too narrow. Only a clean left click (press and release on the same cell) on the `≡ commands` cells of the border row (not the key hint) opens the palette; presses, drags, and clicks anywhere else, including the input rows, keep the editor's native behavior. Built-in Pi commands are not listed. The default is `alt+k`, not `ctrl+k`, because Pi reserves `ctrl+k` for the editor's delete-to-line-end action.
 
 To use `ctrl+p` like OpenCode, rebind Pi's `app.model.cycleForward` in `~/.pi/agent/keybindings.json` (Pi reserves that action, so an extension cannot take `ctrl+p` while it holds it) and set `GENTLE_PI_COMMANDS_KEY=ctrl+p`.
 
 Subscription usage shows in the bar after the cost as `◔ usage <windows> <key>` (the same icon, rose label and dim key hint as the rail's usage action row), and `/gentle:usage` opens a panel with one row per window of every provider: the limit name, its meter, its percentage and, when that window reports one, its reset, all on one line. Codex, Claude and NaN all read the same way. In fullscreen mode, clicking the header's `usage` segment opens this same panel. The panel's own footer hints (`r refresh`, `esc close`) are clickable too, not just keyboard shortcuts, and hovering either one paints it in the shell's shared hover role while a refresh already in flight ignores a repeated click. The panel opens immediately: it draws whatever snapshots the store already holds and says `refreshing…` while the open refresh runs underneath it, repainting as answers land.
 
 ```text
-✿ gentle shell ⟡ … ⟡ $9.49 sub ⟡ codex 5h ▰▰▰▰▰▱▱▱ 62% · week 31%
+  gentle shell ⟡ … ⟡ $9.49 sub ⟡ codex 5h ▰▰▰▰▰▱▱▱ 62% · week 31%
 ```
 
 The panel rows a provider reports its windows with:
@@ -189,7 +189,7 @@ active nan · updated just now
 Gentle notices follow the selected card style. In `neon`, informational cards use the rounded frame in the theme's border role and an accent title; warning, error, and success cards use their own tone colors. In `float`, notices use the tone-background panel described below. The following example shows `neon`:
 
 ```text
-╭─ ✿ Gentle AI · review preflight ─────────────────────────────────────╮
+╭─   Gentle AI · review preflight ─────────────────────────────────────╮
 │ Receipt-driven development is enabled, and this worktree holds an    │
 │ unreviewed candidate (target sha256:…). First determine whether the  │
 │ user explicitly left this exact target unreviewed. If yes, do not    │
@@ -197,9 +197,9 @@ Gentle notices follow the selected card style. In `neon`, informational cards us
 ```
 
 - Quiet tools use the selected card style with their actual name in the heading (`read`, `bash`, `grep`, `find`, `ls`, `edit`, `write`); bash keeps its command visible. Collapsed results show up to three physical preview rows, including search/list entries or changed diff lines alongside useful totals. Expand with the configured key shown in the top rule for complete available output and image handling. Expanded successful `write` cards show the complete written content; collapsed cards keep their concise confirmation. Failed writes show the error instead.
-- Every call into the gentle-ai binary and every `gentle_review` tool draws a rose card titled like the quiet `read` card: the colored 🌹 emoji, a short name, then the operation (`🌹 rdd inspect`, `🌹 gentle-ai version`), with `running`/`preparing`/`failed` shown until the call completes (`🌹 rdd running · start`). The rail uses the existing theme roles: warning while running/partial, success on completion, error on failure. Collapsed results show up to three useful physical rows, not just a line count. A JSON envelope instead collapses to one summary line of its key fields (status, outcome, risk, action, reason code, diagnostic message, e.g. `blocked · start · fresh_target_ready`) and expands as pretty-printed JSON. The expand key sits in the top rule once finished, and elapsed timing stays on the closing rule. Reviewer captures name their lens (`rdd capture · risk`; the group lists all four).
+- Every call into the gentle-ai binary and every `gentle_review` tool draws a rose card titled like the quiet `read` card: a short name and the operation (`rdd inspect`, `gentle-ai version`), with `running`/`preparing`/`failed` shown until the call completes (`rdd running · start`). The rail uses the existing theme roles: warning while running/partial, success on completion, error on failure. Collapsed results show up to three useful physical rows, not just a line count. A JSON envelope instead collapses to one summary line of its key fields (status, outcome, risk, action, reason code, diagnostic message, e.g. `blocked · start · fresh_target_ready`) and expands as pretty-printed JSON. The expand key sits in the top rule once finished, and elapsed timing stays on the closing rule. Reviewer captures name their lens (`rdd capture · risk`; the group lists all four).
 - The review preflight reminder renders as a card in the transcript with the expand key in its top rule. Collapsed, it previews up to three non-blank physical rows of the reminder; expanded, it shows the full text.
-- An active dev-binary override shows in the rail's Status card, under Integrations next to the other status lines, as an amber `🌹 gentle-ai dev · <short id> · field-test only` line that stays for the whole session (the short id is the 7-character commit from a 40-hex directory in the binary's path, else the first 7 characters of its sha256). Where the rail cannot show (narrow terminals, Status hidden) the override keeps the startup card above the editor, in amber, naming the binary and its digest, which leaves with the first prompt. An invalid override always shows that card in red with the reason.
+- An active dev-binary override shows in the rail's Status card, under Integrations next to the other status lines, as an amber `gentle-ai dev · <short id> · field-test only` line that stays for the whole session (the short id is the 7-character commit from a 40-hex directory in the binary's path, else the first 7 characters of its sha256). Where the rail cannot show (narrow terminals, Status hidden) the override keeps the startup card above the editor, in amber, naming the binary and its digest, which leaves with the first prompt. An invalid override always shows that card in red with the reason.
 - Subagents draw their own card; see Gentle Agents below.
 
 ### Card style
@@ -219,7 +219,7 @@ Pick the conversation-card and shell-chrome style in `/gentle:customize` → **C
  ▎
 ```
 
-- `float` applies to tool, Code and 🌹 cards, Agent result and stale cards, the review preflight reminder, the dev-binary notice, and the Agents, Todos and Status panels. The prompt and fullscreen header/footer use their specialized float chrome described above. The regular-mode one-line Status bar is unchanged.
+- `float` applies to tool, Code and Gentle AI cards, Agent result and stale cards, the review preflight reminder, the dev-binary notice, and the Agents, Todos and Status panels. The prompt and fullscreen header/footer use their specialized float chrome described above. The regular-mode one-line Status bar is unchanged.
 - A theme without a tool background, or a card narrower than 10 columns, falls back to `neon`. A malformed `card-style.json` reads as `float` and the panel refuses to overwrite it.
 
 ### Card content
@@ -262,7 +262,7 @@ The `subagent_*` tools and the agents card replace the third-party subagents pac
 Agent paths follow `GENTLE_PI_AGENT_HOME`, then `PI_CODING_AGENT_DIR`, then `~/.pi/agent` for definitions, config, history, child sessions, and transcripts. These overrides select the agent profile; they do not sandbox project or shared global resources.
 
 ```text
-╭─ ❀ Agents · 1 active · 1 done ─────────────────────────────── 1m24s ╮
+╭─   Agents · 1 active · 1 done ─────────────────────────────── 1m24s ╮
 │ ✓  gentle-ai-explore  map footer sources   gpt-5.6-terra ·  34k ·  $0.27 · 25s │
 │ ◐  gentle-ai-worker   write shell footer   gpt-5.6-terra · 120k · $12.50 · 41s │
 ╰──────────────────────────────────────────────────────────────────────────────────╯
@@ -332,7 +332,7 @@ The `todo` tool and its card replace the third-party todo extension (remove `npm
 ╰─────────────────────────────────────────────────────────╯
 ```
 
-Like the other rail cards (Status, Limits, Wellness), its title carries no glyph: the name is rose and bold, and the `▾ Collapse` control and the count stay dim beside it, so the teal `✿ Gentle Shell` heading is the only flower in the rail.
+Like the other rail cards (Status, Limits, Wellness), its title carries no glyph: the name is rose and bold, and the `▾ Collapse` control and the count stay dim beside it, and the rail heading remains `Gentle Shell`.
 
 The runtime helps keep the list current beyond a static tool description:
 
@@ -355,7 +355,7 @@ Expanded cards reserve at most one third of the terminal height (up to 16 rows, 
 `/gentle:stats` opens a full-terminal panel over your local usage history, read from the session files Pi already writes. It combines the active home's `sessions` directory with your regular Pi home's (`~/.pi/agent/sessions`, or the custom `PI_CODING_AGENT_DIR` that `gentle-shell` recorded as `GENTLE_SHELL_USER_PI_HOME` before isolating). The same directory reached twice counts once, and a session present in both homes counts once (the copy with more usage records, then the most recent one). Nothing new is stored. Subscription limits stay in `/gentle:usage`.
 
 ```text
-╭─ ✿ Stats ─────────────────────────────────────── [×] ─╮
+╭─   Stats ─────────────────────────────────────── [×] ─╮
 │ [Overview]  Models   Session                 │
 │     May Jun       Jul     Aug       Sep      │
 │ Mon · · · · · · · · · · · · · · · · · · · █  │
@@ -363,7 +363,7 @@ Expanded cards reserve at most one third of the terminal height (up to 16 rows, 
 │     Less · ░ ▒ ▓ █ More                      │
 │ Favorite model  claude-opus-5-5              │
 │ Total tokens    2.8k                         │
-│ ✿ That's ~0.5% of the tokens in Don Quixote. │
+│   That's ~0.5% of the tokens in Don Quixote. │
 ```
 
 - **Overview**: a weekday-by-week heatmap (up to 52 weeks for all time), favorite model, total tokens, sessions, longest session, active days, longest and current streak, most active day, the input/output/cache breakdown, and cost.

@@ -21,8 +21,8 @@ export interface Card {
 	glyph?: string;
 	/**
 	 * Rail cards (Status, Limits, Wellness, Todos): no glyph, and an info title
-	 * paints rose (`borderAccent`) and bold, so it reads apart from the teal
-	 * `✿ Gentle Shell` heading above it. Other tones keep their own role.
+	 * paints rose (`borderAccent`) and bold, so it reads apart from the plain
+	 * `Gentle Shell` heading above it. Other tones keep their own role.
 	 */
 	rail?: boolean;
 	/** Pre-styled text right after the title, outside its role (the Todos control). */
@@ -80,7 +80,7 @@ export interface CardRenderOptions {
 	compact?: boolean;
 }
 
-export const CARD_GLYPH = "✿";
+export const CARD_GLYPH = " ";
 // Frame and title paint with the same role for every tone except INFO, whose
 // rounded frame stays in the theme's plain border role while its title
 // carries the accent role — the rose look every informational card (sidebar,
@@ -145,7 +145,8 @@ const RAIL_TITLE_ROLE = "borderAccent";
 // The glyph and title in the title role, then any pre-styled suffix. The
 // width counts the unstyled title, so a theme's own escapes never shift it.
 function titleHead(card: Card, theme: CardTheme): { styled: string; width: number } {
-	const plain = card.rail ? card.title : `${card.glyph ?? CARD_GLYPH} ${card.title}`;
+	const glyph = card.glyph ?? CARD_GLYPH;
+	const plain = card.rail ? card.title : `${glyph} ${card.title}`;
 	const role = card.rail && card.tone === CARD_TONE.INFO ? RAIL_TITLE_ROLE : TITLE_ROLE[card.tone];
 	const title = theme.fg(role, card.rail && theme.bold ? theme.bold(plain) : plain);
 	const suffix = card.titleSuffix ? ` ${card.titleSuffix}` : "";
@@ -270,7 +271,8 @@ export function cardTopRows(card: Card, theme: CardTheme, width: number, hint?: 
 	const [first = "", ...rest] = card.title.split("\n");
 	// Reserve the hint before wrapping, plus one rule column and enough heading
 	// space to retain identity. This policy belongs only to continuing tool tops.
-	const available = target - 6 - visibleWidth(`${card.glyph ?? CARD_GLYPH} `) - (card.subtitle ? visibleWidth(card.subtitle) + 3 : 0);
+	const glyph = card.glyph ?? CARD_GLYPH;
+	const available = target - 6 - visibleWidth(`${glyph} `) - (card.subtitle ? visibleWidth(card.subtitle) + 3 : 0);
 	const hintWidth = hint ? visibleWidth(hint) + 2 : 0;
 	const shownHint = hint && available - hintWidth >= 12 ? hint : undefined;
 	const room = Math.max(1, available - (shownHint ? hintWidth : 0));

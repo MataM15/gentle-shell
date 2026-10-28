@@ -62,9 +62,18 @@ function options(overrides: Partial<PromptFrameOptions> = {}): PromptFrameOption
 	};
 }
 
+test("prompt preserves working and queued text without decorative flowers", () => {
+	for (const state of [PROMPT_STATE.IDLE, PROMPT_STATE.WORKING, PROMPT_STATE.QUEUED]) {
+		const text = framePromptLines(editorLines(40), 40, options({state, fg:(_role,value)=>value})).join("\n");
+		assert.doesNotMatch(text, /[✿❀❁✾🌹🌸]/u);
+		if (state === PROMPT_STATE.WORKING) assert.match(text,/working/);
+		if (state === PROMPT_STATE.QUEUED) assert.match(text,/queued/);
+	}
+});
+
 test("framePromptLines sets the petal in bold when the theme offers it", () => {
 	const lines = framePromptLines(editorLines(40), 40, options({ bold: (text) => `*${text}*` }));
-	assert.match(lines[0], /<borderAccent>\*✿\*<\/borderAccent>/);
+	assert.match(lines[0], /<borderAccent>\* \*<\/borderAccent>/);
 });
 
 function editorLines(width: number, content: string[] = [` ${CURSOR}`]): string[] {
@@ -77,14 +86,14 @@ test("framePromptLines draws rounded corners, side rules, and keeps every line a
 	const lines = framePromptLines(editorLines(width), width, options({ fg: (_c, t) => t }));
 	assert.equal(lines.length, 3);
 	for (const line of lines) assert.equal(visibleWidth(line), width, `line "${stripAnsi(line)}" is not ${width} wide`);
-	assert.match(stripAnsi(lines[0]), /^╭─ ✿ ─+╮$/);
+	assert.match(stripAnsi(lines[0]), /^╭─   ─+╮$/);
 	assert.match(stripAnsi(lines[1]), /^│ .* │$/);
 	assert.match(stripAnsi(lines[2]), /^╰─+╯$/);
 });
 
 test("framePromptLines paints the frame with the editor border color and the petal with the state tone", () => {
 	const lines = framePromptLines(editorLines(40), 40, options({ borderColor: (text) => `[b]${text}[/b]`, bold: (text) => `*${text}*` }));
-	assert.match(lines[0], /^\[b\]╭─ \[\/b\]<borderAccent>\*✿\*<\/borderAccent>\[b\] ─+╮\[\/b\]$/);
+	assert.match(lines[0], /^\[b\]╭─ \[\/b\]<borderAccent>\* \*<\/borderAccent>\[b\] ─+╮\[\/b\]$/);
 	assert.match(lines[1], /^\[b\]│\[\/b\].*\[b\]│\[\/b\]$/);
 	assert.match(lines[2], /^\[b\]╰─+╯\[\/b\]$/);
 });
@@ -92,14 +101,14 @@ test("framePromptLines paints the frame with the editor border color and the pet
 test("framePromptLines renders an explicit ODD phase workingLabel instead of the generic working label", () => {
 	const plain = (_color: string, text: string) => text;
 	const phased = framePromptLines(editorLines(40), 40, options({ state: PROMPT_STATE.WORKING, tick: 3, fg: plain, workingLabel: "exploring…" }));
-	assert.match(stripAnsi(phased[0]), /^╭─ ✾ exploring… ─+╮$/);
+	assert.match(stripAnsi(phased[0]), /^╭─   exploring… ─+╮$/);
 	assert.equal(visibleWidth(phased[0]), 40);
 });
 
 test("framePromptLines falls back to the generic working label when no phase was reported", () => {
 	const plain = (_color: string, text: string) => text;
 	const fallback = framePromptLines(editorLines(40), 40, options({ state: PROMPT_STATE.WORKING, tick: 3, fg: plain, workingLabel: undefined }));
-	assert.match(stripAnsi(fallback[0]), /^╭─ ✾ working… ─+╮$/);
+	assert.match(stripAnsi(fallback[0]), /^╭─   working… ─+╮$/);
 });
 
 test("framePromptLines ignores workingLabel outside the working state", () => {
@@ -107,7 +116,7 @@ test("framePromptLines ignores workingLabel outside the working state", () => {
 	const idle = framePromptLines(editorLines(40), 40, options({ state: PROMPT_STATE.IDLE, fg: plain, workingLabel: "exploring…" }));
 	assert.equal(stripAnsi(idle[0]).includes("exploring"), false);
 	const queued = framePromptLines(editorLines(40), 40, options({ state: PROMPT_STATE.QUEUED, fg: plain, workingLabel: "exploring…" }));
-	assert.match(stripAnsi(queued[0]), /^╭─ ✿ queued ─+╮$/);
+	assert.match(stripAnsi(queued[0]), /^╭─   queued ─+╮$/);
 });
 
 test("framePromptLines stays width-safe at narrow widths with the longest ODD phase label", () => {
@@ -129,27 +138,27 @@ test("petalTone rests bright, walks the rose ramp while working, and turns to wa
 	assert.equal(petalTone(PROMPT_STATE.QUEUED, 1), "warning");
 });
 
-test("petalGlyph spins through the flowers while working and rests otherwise", () => {
-	assert.equal(petalGlyph(PROMPT_STATE.IDLE, 3), "✿");
-	assert.deepEqual([0, 1, 2, 3, 4].map((tick) => petalGlyph(PROMPT_STATE.WORKING, tick)), ["✿", "❀", "❁", "✾", "✿"]);
-	assert.equal(petalGlyph(PROMPT_STATE.QUEUED, 1), "❀");
+test("the former glyph slot stays one blank cell in every state", () => {
+	assert.equal(petalGlyph(PROMPT_STATE.IDLE, 3), " ");
+	assert.deepEqual([0, 1, 2, 3, 4].map((tick) => petalGlyph(PROMPT_STATE.WORKING, tick)), [" ", " ", " ", " ", " "]);
+	assert.equal(petalGlyph(PROMPT_STATE.QUEUED, 1), " ");
 });
 
 test("framePromptLines scans the working word while preserving the frame and queued state", () => {
 	const plain = (_color: string, text: string) => text;
 	const working = framePromptLines(editorLines(40), 40, options({ state: PROMPT_STATE.WORKING, tick: 3 }));
-	assert.match(working[0], /<borderAccent>✾<\/borderAccent>/);
+	assert.match(working[0], /<borderAccent> <\/borderAccent>/);
 	assert.match(working[0], /<borderAccent>w<\/borderAccent><accent>o<\/accent><thinkingHigh>r<\/thinkingHigh>/);
 	assert.equal(working[0].replace(/<[^>]+>/g, "").includes("working…"), true);
 	const workingPlain = framePromptLines(editorLines(40), 40, options({ state: PROMPT_STATE.WORKING, tick: 3, fg: plain }));
-	assert.match(stripAnsi(workingPlain[0]), /^╭─ ✾ working… ─+╮$/);
+	assert.match(stripAnsi(workingPlain[0]), /^╭─   working… ─+╮$/);
 	assert.equal(visibleWidth(workingPlain[0]), 40);
 
 	const queued = framePromptLines(editorLines(40), 40, options({ state: PROMPT_STATE.QUEUED }));
-	assert.match(queued[0], /<warning>✿<\/warning>/);
+	assert.match(queued[0], /<warning> <\/warning>/);
 	assert.match(queued[0], /<muted>queued<\/muted>/);
 	const queuedPlain = framePromptLines(editorLines(40), 40, options({ state: PROMPT_STATE.QUEUED, fg: plain }));
-	assert.match(stripAnsi(queuedPlain[0]), /^╭─ ✿ queued ─+╮$/);
+	assert.match(stripAnsi(queuedPlain[0]), /^╭─   queued ─+╮$/);
 	assert.equal(visibleWidth(queuedPlain[0]), 40);
 });
 
@@ -159,7 +168,7 @@ test("framePromptLines keeps the editor scroll indicators inside the frame", () 
 	const top = `─── ↑ 2 more ${"─".repeat(inner - 13)}`;
 	const bottom = `─── ↓ 3 more ${"─".repeat(inner - 13)}`;
 	const lines = framePromptLines([top, ` x${" ".repeat(inner - 2)}`, bottom], width, options({ fg: (_c, t) => t }));
-	assert.match(stripAnsi(lines[0]), /^╭─ ✿ ↑ 2 more ─+╮$/);
+	assert.match(stripAnsi(lines[0]), /^╭─   ↑ 2 more ─+╮$/);
 	assert.match(stripAnsi(lines[2]), /^╰─ ↓ 3 more ─+╯$/);
 	for (const line of lines) assert.equal(visibleWidth(line), width);
 });
@@ -236,7 +245,7 @@ test("T2 float prompt keeps status and content inside the background with inset 
 		style: "float", bg: floatBg, fg: (_c, t) => t, state: PROMPT_STATE.WORKING, workingLabel: "exploring…", escHint: "esc again to cancel",
 	}));
 	assert.equal(rows.length, 3);
-	assert.match(stripAnsi(rows[0]), /^ ▎ ✿ exploring… · ↑ 2 more · esc again to cancel/);
+	assert.match(stripAnsi(rows[0]), /^ ▎   exploring… · ↑ 2 more · esc again to cancel/);
 	assert.match(stripAnsi(rows[1]), /^ ▎ ab cd + $/);
 	assert.ok(rows[1].includes(`${CURSOR}\x1b[48;2;20;30;40m`));
 	assert.equal(stripAnsi(rows[2]), ` ▎${" ".repeat(77)} `);
@@ -270,7 +279,7 @@ test("T2 float prompt idle label uses the quiet card background without changing
 	};
 	for (const state of [PROMPT_STATE.IDLE, PROMPT_STATE.WORKING, PROMPT_STATE.QUEUED]) {
 		const rows = framePromptLines(["──", "draft", "──"], 80, options({ style: "float", bg, state, fg: (_c, t) => t }));
-		assert.match(stripAnsi(rows[0]), state === PROMPT_STATE.IDLE ? /✿ waiting for input/ : state === PROMPT_STATE.WORKING ? /working…/ : /queued/);
+		assert.match(stripAnsi(rows[0]), state === PROMPT_STATE.IDLE ? /  waiting for input/ : state === PROMPT_STATE.WORKING ? /working…/ : /queued/);
 		if (state !== PROMPT_STATE.IDLE) assert.doesNotMatch(stripAnsi(rows[0]), /waiting for input/);
 	}
 	const neon = framePromptLines(["──", "draft", "──"], 80, options({ style: "neon", state: PROMPT_STATE.IDLE, fg: (_c, t) => t }));
@@ -292,17 +301,17 @@ test("T2 float prompt rearms real SGR resets without altering inversion or marke
 test("neon top border shows the commands label with one cell around petal and icon", () => {
 	const chrome = framePromptChrome(editorLines(60), 60, options({ fg: (_role, text) => text, commandsLabel: { hint: "alt+k" } }));
 	const top = stripAnsi(chrome.lines[0]!);
-	assert.equal(top, "╭─ ✿ ≡ commands · alt+k " + "─".repeat(60 - 24 - 1) + "╮");
+	assert.equal(top, "╭─   ≡ commands · alt+k " + "─".repeat(60 - 24 - 1) + "╮");
 	assert.equal(visibleWidth(top), 60);
 	assert.deepEqual(chrome.commandsSpan, { start: 5, end: 15 }, "only the icon and name are clickable, not the key hint");
-	assert.equal(top.slice(0, 5), "╭─ ✿ ");
+	assert.equal(top.slice(0, 5), "╭─   ");
 });
 
 test("neon commands label honors a remapped key, no hint when disabled, and stays absent by default", () => {
 	const plain = { fg: (_role: string, text: string) => text };
-	assert.match(stripAnsi(framePromptLines(editorLines(60), 60, options({ ...plain, commandsLabel: { hint: "ctrl+p" } }))[0]!), /^╭─ ✿ ≡ commands · ctrl\+p ─+╮$/);
+	assert.match(stripAnsi(framePromptLines(editorLines(60), 60, options({ ...plain, commandsLabel: { hint: "ctrl+p" } }))[0]!), /^╭─   ≡ commands · ctrl\+p ─+╮$/);
 	const off = framePromptChrome(editorLines(60), 60, options({ ...plain, commandsLabel: {} }));
-	assert.match(stripAnsi(off.lines[0]!), /^╭─ ✿ ≡ commands ─+╮$/);
+	assert.match(stripAnsi(off.lines[0]!), /^╭─   ≡ commands ─+╮$/);
 	assert.deepEqual(off.commandsSpan, { start: 5, end: 15 });
 	const absent = framePromptChrome(editorLines(60), 60, options(plain));
 	assert.equal(absent.commandsSpan, undefined);
@@ -312,11 +321,11 @@ test("neon commands label honors a remapped key, no hint when disabled, and stay
 test("neon commands label keeps working/queued labels and scroll indicators after it", () => {
 	const plain = { fg: (_role: string, text: string) => text, commandsLabel: { hint: "alt+k" } };
 	const working = framePromptChrome(editorLines(70), 70, options({ ...plain, state: PROMPT_STATE.WORKING }));
-	assert.match(stripAnsi(working.lines[0]!), /^╭─ [✿❀❁✾] ≡ commands · alt\+k · working… ─+╮$/);
+	assert.match(stripAnsi(working.lines[0]!), /^╭─   ≡ commands · alt\+k · working… ─+╮$/);
 	assert.deepEqual(working.commandsSpan, { start: 5, end: 15 });
 	const lines = editorLines(70);
 	lines[0] = "─── ↑ 3 more ───";
-	assert.match(stripAnsi(framePromptLines(lines, 70, options(plain))[0]!), /^╭─ ✿ ≡ commands · alt\+k · ↑ 3 more ─+╮$/);
+	assert.match(stripAnsi(framePromptLines(lines, 70, options(plain))[0]!), /^╭─   ≡ commands · alt\+k · ↑ 3 more ─+╮$/);
 });
 
 test("neon commands label is dropped when it cannot fit, never truncated", () => {
@@ -334,7 +343,7 @@ test("float hint row carries the same label at the same columns", () => {
 	const bg = (_role: string, text: string) => `\x1b[44m${text}\x1b[49m`;
 	const chrome = framePromptChrome(editorLines(55), 60, options({ style: "float", bg, fg: (_role, text) => text, commandsLabel: { hint: "alt+k" } }));
 	const hint = stripAnsi(chrome.lines[0]!);
-	assert.match(hint, /^ ▎ ✿ ≡ commands · alt\+k · waiting for input\s*$/);
+	assert.match(hint, /^ ▎   ≡ commands · alt\+k · waiting for input\s*$/);
 	assert.equal(visibleWidth(chrome.lines[0]!), 60);
 	assert.deepEqual(chrome.commandsSpan, { start: 5, end: 15 });
 	assert.equal(hint.indexOf("≡"), 5);
@@ -348,7 +357,7 @@ test("float hint row carries the same label at the same columns", () => {
 test("neon top border ends with `« panel · key` when the folded rail could be shown", () => {
 	const chrome = framePromptChrome(editorLines(80), 80, options({ fg: (_role, text) => text, commandsLabel: { hint: "alt+k" }, panelLabel: { hint: "alt+h" } }));
 	const top = stripAnsi(chrome.lines[0]!);
-	assert.match(top, /^╭─ ✿ ≡ commands · alt\+k ─+ « panel · alt\+h ─╮$/);
+	assert.match(top, /^╭─   ≡ commands · alt\+k ─+ « panel · alt\+h ─╮$/);
 	assert.equal(visibleWidth(top), 80);
 	assert.deepEqual(chrome.commandsSpan, { start: 5, end: 15 }, "the commands label does not move");
 	const start = top.indexOf("«");
@@ -358,7 +367,7 @@ test("neon top border ends with `« panel · key` when the folded rail could be 
 
 test("the panel label works without the commands label or a key, and is dropped when it does not fit", () => {
 	const alone = framePromptChrome(editorLines(60), 60, options({ fg: (_role, text) => text, panelLabel: {} }));
-	assert.match(stripAnsi(alone.lines[0]!), /^╭─ ✿ ─+ « panel ─╮$/);
+	assert.match(stripAnsi(alone.lines[0]!), /^╭─   ─+ « panel ─╮$/);
 	assert.equal(alone.panelSpan?.end, 60 - 3);
 	const tight = framePromptChrome(editorLines(30), 30, options({ fg: (_role, text) => text, commandsLabel: { hint: "alt+k" }, panelLabel: { hint: "alt+h" } }));
 	assert.equal(tight.panelSpan, undefined, "no room: dropped whole, never truncated");
@@ -372,7 +381,7 @@ test("float hint row right-aligns the same `« panel · key` label", () => {
 	const bg = (_role: string, text: string) => `\x1b[44m${text}\x1b[49m`;
 	const chrome = framePromptChrome(editorLines(75), 80, options({ style: "float", bg, fg: (_role, text) => text, commandsLabel: { hint: "alt+k" }, panelLabel: { hint: "alt+h" } }));
 	const hint = stripAnsi(chrome.lines[0]!);
-	assert.match(hint, /^ ▎ ✿ ≡ commands · alt\+k · waiting for input +« panel · alt\+h +$/);
+	assert.match(hint, /^ ▎   ≡ commands · alt\+k · waiting for input +« panel · alt\+h +$/);
 	assert.equal(visibleWidth(chrome.lines[0]!), 80);
 	const start = hint.indexOf("«");
 	assert.deepEqual(chrome.panelSpan, { start, end: start + "« panel".length });

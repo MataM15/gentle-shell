@@ -119,7 +119,7 @@ test("Status groups running job descriptions beside RDD without a compact count"
 		const lines = renderShellSidebarBar(data, plainTheme, width);
 		const text = lines.join("\n");
 		assert.match(text, /Jobs[\s\S]*CI for PR 1860[\s\S]*Build runtime/);
-		assert.match(text, /🌹 RDD/);
+		assert.match(text, /   RDD/);
 		assert.doesNotMatch(text, /2 jobs/);
 		assert.ok(lines.every((line) => visibleWidth(line) <= width));
 	}
@@ -231,29 +231,29 @@ test("bottom-only and hidden below-input chrome retain a compact jobs count", (t
 test("Status title stays plain without an active review", () => {
 	const lines = renderShellSidebarBar(model(), plainTheme, 60);
 	assert.match(lines[0], /^╭─ Status ─+╮$/);
-	assert.doesNotMatch(lines.slice(1).join("\n"), /🌹 RDD/);
+	assert.doesNotMatch(lines.slice(1).join("\n"), /   RDD/);
 });
 
 test("Status title stays plain above the review lifecycle block", () => {
 	const lines = renderShellSidebarBar(model({ review: { state: "reviewing", scope: "first.ts +2 files" } }), plainTheme, 60);
 	assert.match(lines[0], /^╭─ Status ─+╮$/);
-	assert.match(lines.slice(1).join("\n"), /🌹 RDD[\s\S]*Reviewers running…[\s\S]*first\.ts \+2 files/);
+	assert.match(lines.slice(1).join("\n"), /   RDD[\s\S]*Reviewers running…[\s\S]*first\.ts \+2 files/);
 });
 
 test("review lifecycle block omits the scope line when the candidate scope is unknown", () => {
 	const known = renderShellSidebarBar(model({ review: { state: "checking", scope: "first.ts" } }), plainTheme, 60);
 	const unknown = renderShellSidebarBar(model({ review: { state: "checking", scope: REVIEW_SCOPE_UNAVAILABLE } }), plainTheme, 60);
 	const text = unknown.join("\n");
-	assert.match(text, /🌹 RDD[\s\S]*Updating…/);
+	assert.match(text, /   RDD[\s\S]*Updating…/);
 	assert.doesNotMatch(text, /Candidate scope unavailable/);
 	assert.equal(unknown.length, known.length - 1);
 });
 
 test("rdd visibility hides only the review lifecycle block", () => {
 	const data = model({ review: { state: "reviewing", scope: "first.ts +2" }, changes: { files: 2, added: 1, deleted: 1 } });
-	assert.match(renderShellSidebarBar(data, plainTheme, 60, DEFAULT_VISUAL_SETTINGS).join("\n"), /🌹 RDD[\s\S]*Reviewers running…/);
+	assert.match(renderShellSidebarBar(data, plainTheme, 60, DEFAULT_VISUAL_SETTINGS).join("\n"), /   RDD[\s\S]*Reviewers running…/);
 	const hidden = renderShellSidebarBar(data, plainTheme, 60, { ...DEFAULT_VISUAL_SETTINGS, visibility: { ...DEFAULT_VISUAL_SETTINGS.visibility, rdd: false } }).join("\n");
-	assert.doesNotMatch(hidden, /🌹 RDD|Reviewers running|first\.ts \+2 files/);
+	assert.doesNotMatch(hidden, /   RDD|Reviewers running|first\.ts \+2 files/);
 	assert.match(hidden, /Changes[\s\S]*2 files/);
 });
 
@@ -296,7 +296,7 @@ test("renderShellBar renders one line with the segments in order", () => {
 	assert.equal(rest.length, 0);
 	assert.equal(
 		line,
-		"✿ gentle shell ⟡ ~/work/gentle-pi main ⟡ gpt-5.5 · medium ⟡ ctx ▰▰▰▰▱▱▱▱ 45% ⟡ $9.49 sub",
+		"  gentle shell ⟡ ~/work/gentle-pi main ⟡ gpt-5.5 · medium ⟡ ctx ▰▰▰▰▱▱▱▱ 45% ⟡ $9.49 sub",
 	);
 });
 
@@ -309,7 +309,7 @@ test("renderShellBar paints the context gauge with the given gauge roles", () =>
 
 test("renderShellBar colors the brand, model, effort, and gauge by role", () => {
 	const [line] = renderShellBar(model(), taggedTheme, 400);
-	assert.match(line, /<accent>✿ gentle shell<\/accent>/);
+	assert.match(line, /<accent>  gentle shell<\/accent>/);
 	assert.match(line, /<text>gpt-5\.5<\/text>/);
 	assert.match(line, /<syntaxFunction>medium<\/syntaxFunction>/);
 	assert.match(line, /<accent>▰▰▰▰<\/accent><border>▱▱▱▱<\/border>/);
@@ -414,7 +414,7 @@ test("renderShellBar drops the session name, then trailing segments, before trun
 
 	const [atFifty] = renderShellBar(wide, plainTheme, 50);
 	assert.ok(visibleWidth(atFifty) <= 50, `line overflowed: ${visibleWidth(atFifty)}`);
-	assert.match(atFifty, /^✿ gentle shell/);
+	assert.match(atFifty, /^  gentle shell/);
 });
 
 test("shellEnabled stays off inside a Gentle Agents child", () => {
@@ -517,7 +517,7 @@ test("buildShellHeaderModel keeps only the header's fields from the bar model", 
 test("renderShellHeaderBar draws the brand, identity, and right-aligned counters (plus the standing usage segment) in one line", () => {
 	const header = buildShellHeaderModel(model({ profile: "team" }));
 	const { text: line } = renderShellHeaderBar(header, plainTheme, 120);
-	const left = "✿ Gentle Shell ⟡ ~/work/gentle-pi main ⟡ gpt-5.5 · medium · team";
+	const left = "  Gentle Shell ⟡ ~/work/gentle-pi main ⟡ gpt-5.5 · medium · team";
 	const right = "ctx ▰▰▰▰▱▱▱▱ 45% ⟡ $9.49 sub ⟡ ◔ usage";
 	assert.equal(line, left + " ".repeat(120 - visibleWidth(left) - visibleWidth(right)) + right);
 	assert.equal(visibleWidth(line), 120);
@@ -534,7 +534,7 @@ test("renderShellHeaderBar colors the brand bold and by role", () => {
 	const bolding = { fg: (color: string, text: string) => `<${color}>${text}</${color}>`, bold: (text: string) => `**${text}**` };
 	const header = buildShellHeaderModel(model());
 	const { text: line } = renderShellHeaderBar(header, bolding, 120);
-	assert.match(line, /<accent>\*\*✿ Gentle Shell\*\*<\/accent>/);
+	assert.match(line, /<accent>\*\*  Gentle Shell\*\*<\/accent>/);
 });
 
 test("renderShellHeaderBar drops the profile, then the effort, then the whole location before the right group", () => {
@@ -563,7 +563,7 @@ test("renderShellHeaderBar drops the profile, then the effort, then the whole lo
 	const { text: noLocation } = renderShellHeaderBar(withProfile, plainTheme, 82);
 	assert.doesNotMatch(noLocation, /~\/work\/gentle-pi/);
 	assert.match(noLocation, /gpt-5\.5/);
-	assert.match(noLocation, /✿ Gentle Shell/);
+	assert.match(noLocation, /  Gentle Shell/);
 	assert.match(noLocation, /ctx ▰▰▰▰▱▱▱▱ 45% ⟡ \$9\.49 sub ⟡ ◔ usage$/);
 	assert.equal(visibleWidth(noLocation), 82);
 
@@ -572,14 +572,14 @@ test("renderShellHeaderBar drops the profile, then the effort, then the whole lo
 	assert.doesNotMatch(noUsage, /~\/work\/gentle-pi/);
 	assert.doesNotMatch(noUsage, /usage/);
 	assert.match(noUsage, /gpt-5\.5/);
-	assert.match(noUsage, /✿ Gentle Shell/);
+	assert.match(noUsage, /  Gentle Shell/);
 	assert.match(noUsage, /ctx ▰▰▰▰▱▱▱▱ 45% ⟡ \$9\.49 sub$/);
 	assert.equal(visibleWidth(noUsage), 60);
 });
 
 test("renderShellHeaderBar returns an empty string only once the brand itself cannot fit", () => {
 	assert.equal(renderShellHeaderBar(buildShellHeaderModel(model()), plainTheme, 3).text, "");
-	assert.match(renderShellHeaderBar(buildShellHeaderModel(model()), plainTheme, 40).text, /✿ Gentle Shell/);
+	assert.match(renderShellHeaderBar(buildShellHeaderModel(model()), plainTheme, 40).text, /  Gentle Shell/);
 });
 
 // T8: the usage segment. It rides after cost in the right group, shows every

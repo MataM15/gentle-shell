@@ -91,10 +91,9 @@ export interface PromptChrome {
 	panelSpan?: PromptLabelSpan;
 }
 
-// A terminal cell cannot grow, so the petal earns presence with weight and
-// the brightest rose in the theme. Working spins through four flowers.
-export const PROMPT_PETAL = "✿";
-const PETAL_FRAMES = ["✿", "❀", "❁", "✾"] as const;
+// Keep the original one-cell slot; working/queued state remains in its text.
+export const PROMPT_PETAL = " ";
+const PETAL_FRAMES = [" ", " ", " ", " "] as const;
 export const PROMPT_HINT = "type, or / for commands";
 export const DOUBLE_ESC_CANCEL_HINT = "esc again to cancel";
 export const IDLE_ESC_CLEAR_HINT = "esc again to clear";
@@ -174,7 +173,7 @@ function topRule(width: number, options: PromptFrameOptions, indicator: string |
 	const label = indicator ?? stateLabel(options);
 	const scanning = options.state === PROMPT_STATE.WORKING;
 	const glyph = petalGlyph(options.state, options.tick);
-	const petal = options.fg(petalTone(options.state, options.tick), options.bold ? options.bold(glyph) : glyph);
+	const petal = glyph ? options.fg(petalTone(options.state, options.tick), options.bold ? options.bold(glyph) : glyph) : "";
 	const paintedLabel = label && scanning && !indicator ? scanWorkingText(label, options.tick, options.fg) : label ? options.fg(LABEL_ROLE, label) : "";
 	const commands = commandsLabel(options);
 	const glyphWidth = visibleWidth(glyph);
@@ -182,11 +181,11 @@ function topRule(width: number, options: PromptFrameOptions, indicator: string |
 		// Petal, icon, and label each sit one cell apart; the rule resumes one
 		// cell after the last label. Without room for at least one rule cell the
 		// label is dropped rather than truncated.
-		const titleWidth = glyphWidth + 1 + commands.width + (label ? COMMANDS_SEPARATOR.length + visibleWidth(label) : 0);
+		const titleWidth = glyphWidth + (glyph ? 1 : 0) + commands.width + (label ? COMMANDS_SEPARATOR.length + visibleWidth(label) : 0);
 		const fill = width - titleWidth - 5;
 		if (fill >= 1) {
-			const title = petal + " " + commands.text + (paintedLabel ? options.fg(HINT_ROLE, COMMANDS_SEPARATOR) + paintedLabel : "");
-			const start = 3 + glyphWidth + 1;
+			const title = (petal ? petal + " " : "") + commands.text + (paintedLabel ? options.fg(HINT_ROLE, COMMANDS_SEPARATOR) + paintedLabel : "");
+			const start = 3 + glyphWidth + (glyph ? 1 : 0);
 			const close = closeTopRule(width, fill, options);
 			return { line: options.borderColor("╭─ ") + title + close.tail, span: { start, end: start + commands.nameWidth }, panelSpan: close.span };
 		}
@@ -274,7 +273,7 @@ export function floatPromptRow(line: string, layout: PromptLayout, borderColor: 
 
 function floatPromptHint(top: string, bottom: string, options: PromptFrameOptions, width: number): { text: string; span?: PromptLabelSpan; panelSpan?: PromptLabelSpan } {
 	const glyph = petalGlyph(options.state, options.tick);
-	const petal = options.fg(petalTone(options.state, options.tick), options.bold ? options.bold(glyph) : glyph);
+	const petal = glyph ? options.fg(petalTone(options.state, options.tick), options.bold ? options.bold(glyph) : glyph) : "";
 	const label = stateLabel(options) ?? "waiting for input";
 	let paintedLabel = "";
 	if (label) {
@@ -289,13 +288,13 @@ function floatPromptHint(top: string, bottom: string, options: PromptFrameOption
 	// The label must end inside `width` (lead included); otherwise it is dropped whole.
 	const commands = commandsLabel(options);
 	const glyphWidth = visibleWidth(glyph);
-	const leadWidth = 2 + glyphWidth + 1;
-	let text = "  " + petal + tail(" ");
+	const leadWidth = 2 + glyphWidth + (glyph ? 1 : 0);
+	let text = "  " + petal + tail(glyph ? " " : "");
 	let span: PromptLabelSpan | undefined;
 	if (commands && leadWidth + commands.width <= width) {
-		text = "  " + petal + " " + commands.text + tail(options.fg(HINT_ROLE, COMMANDS_SEPARATOR));
+		text = "  " + (petal ? petal + " " : "") + commands.text + tail(options.fg(HINT_ROLE, COMMANDS_SEPARATOR));
 		// Columns on the painted row: " ▎ " precedes the stripped content.
-		const start = 3 + glyphWidth + 1;
+		const start = 3 + glyphWidth + (glyph ? 1 : 0);
 		span = { start, end: start + commands.nameWidth };
 	}
 	const hint = truncateToWidth(text, width, "");

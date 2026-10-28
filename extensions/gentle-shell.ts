@@ -2617,13 +2617,13 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 					animationPolicy = resolveAnimationPolicy(animationOptions).policy;
 					prompt?.setAnimationPolicy(animationPolicy);
 				},
-				() => ({ title: `${policy} · static animation sample`, sample: policy === "potato" ? "✿  idle → working (no pulse)" : policy === "performance" ? "✿  short pulse → settle (static)" : "✿  gentle wave → settle (static)" }),
+				() => ({ title: `${policy} · static animation sample`, sample: policy === "potato" ? "   idle → working (no pulse)" : policy === "performance" ? "   short pulse → settle (static)" : "   gentle wave → settle (static)" }),
 			);
 			category = "Banner";
 			const bannerColors = { pink: [255, 118, 195], cyan: [95, 210, 255], yellow: [255, 210, 95], green: [110, 220, 145] } as const;
 			const bannerPreview = (next: typeof banner) => {
 				const [r, g, b] = bannerColors[next.color];
-				return { title: `Banner · ${next.color} (static)`, sample: `${next.showRose ? `\x1b[38;2;${r};${g};${b}m🌹\x1b[0m` : "·"}  ${next.showTextLogo ? "GENTLE SHELL" : "(logo hidden)"}` };
+				return { title: `Banner · ${next.color} (static)`, sample: `${next.showRose ? `\x1b[38;2;${r};${g};${b}m  \x1b[0m` : "·"}  ${next.showTextLogo ? "GENTLE SHELL" : "(logo hidden)"}` };
 			};
 			add(() => `Banner rose: ${banner.showRose ? "on" : "off"}`, "Banner saved; applies at next startup.", async () => {
 				const next = { ...await readBannerConfigForEdit(bannerHome) };
@@ -2800,7 +2800,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			for (const value of Object.values(DENSITY)) add(() => `Density: ${value}${visual().density === value ? " (current)" : ""}`, pending, () => updateVisual((settings) => ({ ...settings, density: value })), () => layoutPreview({ ...visual(), density: value }));
 			category = "Cards";
 			// One live style for conversation cards, panels, header/footer and prompt.
-			const cardStylePreview = { [CARD_STYLE.NEON]: "╭─ ✿ read ─╮  outlined chrome + prompt", [CARD_STYLE.FLOAT]: "▎ ✿ read  painted chrome + prompt" };
+			const cardStylePreview = { [CARD_STYLE.NEON]: "╭─   read ─╮  outlined chrome + prompt", [CARD_STYLE.FLOAT]: "▎   read  painted chrome + prompt" };
 			for (const style of Object.values(CARD_STYLE)) add(
 				() => {
 					const current = resolveCardStyle(home);

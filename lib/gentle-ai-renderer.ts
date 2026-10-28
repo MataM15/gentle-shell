@@ -71,7 +71,7 @@ const BINARY_TITLE = "gentle-ai";
 const SEPARATOR = " · ";
 // The binary keeps its rose as a colored emoji (2 cells, no text-presentation
 // selector); Gentle Shell notices keep the flower.
-const CARD_GLYPH = "\u{1F339}";
+const CARD_GLYPH = "  ";
 const DETAIL_ROLE = "dim";
 const passthroughTheme: CardTheme = { fg: (_color, text) => text };
 
