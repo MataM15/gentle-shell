@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { pushToTalkStatus, VoiceDictationView, VoiceProgressView } from "../lib/voice-ui.ts";
+import { pushToTalkStatus, voiceToggleStatus, VoiceDictationView, VoiceProgressView } from "../lib/voice-ui.ts";
 
 // The compact /gentle:voice overlays: rendering within the width, the keys
 // each state accepts, and no repaint after disposal.
@@ -87,11 +87,22 @@ test("a disposed view ignores state changes and keys without repainting", () => 
 	assert.doesNotThrow(() => throwing.setState("recording"));
 });
 
-test("push-to-talk status names each phase in one line and how to finish", () => {
-	assert.match(pushToTalkStatus("starting"), /keep holding Space/i);
+test("push-to-talk status names each phase in one line and how to finish", () => {	assert.match(pushToTalkStatus("starting"), /keep holding Space/i);
 	assert.match(pushToTalkStatus("recording"), /recording/i);
 	assert.match(pushToTalkStatus("recording"), /release Space/i);
 	assert.match(pushToTalkStatus("recording"), /esc cancel/i);
 	assert.match(pushToTalkStatus("transcribing"), /transcrib/i);
 	for (const state of ["idle", "starting", "recording", "transcribing", "finished"] as const) assert.ok(!pushToTalkStatus(state).includes("\n"), state);
+});
+
+test("toggle status says the same shortcut stops it and that esc cancels, in one line", () => {
+	assert.match(voiceToggleStatus("starting", "alt+m"), /prepar/i);
+	assert.match(voiceToggleStatus("starting", "alt+m"), /alt\+m/);
+	assert.match(voiceToggleStatus("recording", "alt+m"), /recording/i);
+	assert.match(voiceToggleStatus("recording", "alt+m"), /alt\+m stop/i);
+	assert.match(voiceToggleStatus("recording", "alt+m"), /esc cancel/i);
+	assert.match(voiceToggleStatus("transcribing", "alt+m"), /transcrib/i);
+	assert.match(voiceToggleStatus("transcribing", "alt+m"), /esc cancel/i);
+	assert.equal(voiceToggleStatus("recording", "ctrl+shift+v"), voiceToggleStatus("recording", "alt+m").replace("alt+m", "ctrl+shift+v"), "the configured key is the one shown");
+	for (const state of ["idle", "starting", "recording", "transcribing", "finished"] as const) assert.ok(!voiceToggleStatus(state, "alt+m").includes("\n"), state);
 });

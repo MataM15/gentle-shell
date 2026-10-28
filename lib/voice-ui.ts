@@ -125,6 +125,20 @@ export function pushToTalkStatus(state: VoiceSessionState): string {
 	return PUSH_TO_TALK_STATUS[state];
 }
 
+const TOGGLE_STATUS: Record<VoiceSessionState, (shortcut: string) => string> = {
+	idle: (shortcut) => `Voice: preparing… ${shortcut} stops it · esc cancel`,
+	starting: (shortcut) => `Voice: preparing… ${shortcut} stops it · esc cancel`,
+	recording: (shortcut) => `● Voice: recording · ${shortcut} stop and insert · esc cancel`,
+	transcribing: () => "Voice: transcribing… · esc cancel",
+	finished: () => "Voice: finishing…",
+};
+
+// The footer status of a toggle dictation: it has no overlay either, so it has
+// to name the shortcut that stops it and the key that cancels.
+export function voiceToggleStatus(state: VoiceSessionState, shortcut: string): string {
+	return TOGGLE_STATUS[state](shortcut);
+}
+
 export class VoiceDictationView extends VoiceView {
 	private state: VoiceSessionState = "starting";
 	private stopping = false;

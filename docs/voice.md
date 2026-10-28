@@ -17,6 +17,9 @@ from `/gentle:voice`; nothing described here runs at startup.
    Long transcripts are therefore not displayed as editable text in the draft.
 4. Or hold Space in the editor: push-to-talk is turned on by a successful
    download. See [Push-to-talk](#push-to-talk-hold-space).
+5. Or press the dictation shortcut once to start listening and the same
+   shortcut again to stop, with no key held down. See
+   [Toggle dictation](#toggle-dictation-one-shortcut).
 
 ## The command
 
@@ -27,7 +30,7 @@ from `/gentle:voice`; nothing described here runs at startup.
 | Dictation | A compact overlay shows preparing, recording, transcribing. Enter stops recording; the overlay stays until the transcript is ready. |
 | Recording limit | After 2 minutes recording stops by itself, and the transcript is pasted without a key press. |
 | Insertion | The recognized text goes through Pi's editor paste pipeline, which may collapse long text into a paste marker. A blank result pastes nothing. |
-| One at a time | A second `/gentle:voice` while a download or dictation runs is refused with a notice. A Space hold during either one types spaces as usual. |
+| One at a time | A second `/gentle:voice` while a download or dictation runs is refused with a notice. A Space hold during either one types spaces as usual. The dictation shortcut is refused the same way. |
 | Cancel and shutdown | Esc, reload or session shutdown aborts the download or cancels the session. A transcript that arrives afterwards is dropped. |
 | Where it runs | Interactive TUI parent sessions only. RPC, print, JSON and delegated child sessions refuse it. No model-callable tool exists. |
 | Errors | Fixed messages with the action to take, such as installing ALSA or the Visual C++ runtime. Gentle AI never runs those installers. |
@@ -40,7 +43,7 @@ download, native load or microphone recording has been exercised through it.
 Hold Space in the editor to record; release it to stop. The transcript is
 pasted at the cursor and never sent. Esc cancels while recording or
 transcribing. A one-line footer status shows preparing, recording and
-transcribing; no overlay opens, so the editor keeps the focus.
+transcribing; no overlay opens, so the editor keeps the focus. In a wide fullscreen sidebar, a pinned voice line shows preparing, listening, or transcribing while active. It uses session-scoped voice events and hides when idle; listening is published after recording starts. The indicator is tested with simulated sessions, not a real microphone or keypress.
 
 | Topic | Behavior |
 |-------|----------|
@@ -92,6 +95,64 @@ while a dialog or overlay has the focus does not change the draft and is
 ignored. Push-to-talk is tested with fake terminals, editors and sessions
 only.
 
+## Toggle dictation (one shortcut)
+
+Press `alt+m` in the editor to start listening and press it again to stop. The
+key is not held down, the editor keeps the focus and no overlay opens, so the
+transcript is pasted at the cursor when it is ready and is never sent. Esc
+cancels while recording or transcribing. A one-line footer status names the
+phase and the key: preparing, recording (`alt+m stop and insert`), transcribing.
+
+| Topic | Behavior |
+|-------|----------|
+| Shortcut | `alt+m` by default. `GENTLE_PI_VOICE_TOGGLE_KEY` replaces it; an empty value or `off` disables the shortcut. It is read when the session starts, because Pi binds extension shortcuts once, so a change applies to the next session. |
+| Independent of the toggle | Turning push-to-talk off leaves the shortcut working: someone who dislikes held keys can use the shortcut and never arm Space. Disable the shortcut on its own with `GENTLE_PI_VOICE_TOGGLE_KEY=off`. |
+| First press | Checks that the runtime and model are installed, then records. If voice is not installed, a notice points to `/gentle:voice` and nothing is recorded; the next press checks again. |
+| Second press while preparing | Remembered, not dropped: recording stops as soon as the microphone is open. |
+| Second press while transcribing | Ignored. No second capture starts and the transcript is pasted once. |
+| One at a time | Refused with a notice while a download, a `/gentle:voice` dictation or a Space hold is running, and those are refused while the shortcut records. A Space hold during a toggle dictation types spaces as usual. |
+| Cancel and shutdown | Esc cancels and consumes the key, so it does not reach the editor or the agent. Reload or session shutdown cancels the session and drops a transcript that arrives afterwards. |
+| Where it works | Interactive TUI parent sessions only. Delegated child sessions, RPC and print modes ignore the shortcut without probing or reading anything. |
+
+### Why this shortcut
+
+`alt+m` is free in both key spaces this extension shares:
+
+- **Pi built-ins** (`tui.input.*`, editor and app keybindings): `alt+m` appears
+  in none of them. The nearby letters that look available are not: `alt+d` is
+  `deleteWordForward`, `alt+b` and `alt+f` are word motion, `alt+left` and
+  `alt+right` are word motion too, and `ctrl+m` arrives as Enter.
+- **Gentle shortcuts:** `alt+k` (command palette), `alt+u` (usage), `alt+g`
+  (changes), `alt+a` (agents view and selection select-all), `alt+s` (agents
+  stop), `alt+e` (selection engine), `ctrl+shift+a`, `ctrl+shift+t`,
+  `ctrl+shift+r`. None of them is `alt+m`.
+- **Pi extension conflicts:** Pi refuses an extension shortcut that matches a
+  reserved app keybinding (interrupt, clear, exit, suspend, thinking, model
+  cycle and select, tool expand, external editor, message copy and follow-up,
+  and the editor's submit, select, copy and delete-to-line-end keys). `alt+m`
+  is not among them, so the registration is not silently skipped.
+
+A user keybinding in `~/.pi/agent/keybindings.json` can still take `alt+m`; it
+belongs to the user, so Gentle AI neither reads nor changes it.
+
+### Terminal limitations
+
+- Option must be reported as Meta. In macOS Terminal and iTerm2, enable
+  "Use Option as Meta key"; otherwise `alt+m` arrives as `µ` and types that
+  character into the draft instead of toggling.
+- Terminals and multiplexers that do not distinguish `alt`, or that rewrite
+  Alt combinations, cannot deliver the key. `herdr` and `tmux` pass it through
+  when their own configuration does not bind `alt+m`; if yours does, the
+  shortcut never fires and the draft receives nothing.
+- Keyboard-protocol terminals only: `super+…` and `ctrl+shift+letter` need the
+  Kitty keyboard protocol. Prefer a plain `alt+…` key when unsure, and set
+  `GENTLE_PI_VOICE_TOGGLE_KEY` to one that types nothing in your terminal.
+- No shortcut key ever reaches the draft while the shortcut is enabled: the
+  key is consumed by the toggle, so it cannot also be typed.
+
+The shortcut is covered by tests with a fake terminal and fake session. No real
+key press in a real terminal has been exercised.
+
 ## What gets downloaded
 
 All versions, sizes and digests are pinned in `lib/voice-artifacts.ts`.
@@ -123,9 +184,11 @@ voice/
 
 The platform package sits next to `sherpa-onnx-node` because its loader resolves
 `../sherpa-onnx-<platform>-<arch>/sherpa-onnx.node`. node-cpal loads
-`bin/<platform>-<arch>/index.node` from its own directory. The runtime directory
-names both native versions, so a runtime installed with other pins is never
-reported as the current one.
+`bin/<platform>-<arch>/index.node` from its own directory, or
+`bin/backend-pulseaudio/<platform>-<arch>/index.node` when its PulseAudio
+backend is selected under WSL. The runtime directory names both native
+versions, so a runtime installed with other pins is never reported as the
+current one.
 
 ## How an install stays safe
 
@@ -167,7 +230,12 @@ submits the text or touches the editor; the caller decides what to do with it.
   the native code that uses them: every entry in the runtime and model
   directories must be a plain directory or regular file, owned by the current
   user and not writable by everyone (ownership and modes are not checked on
-  Windows). Each required runtime file must be present, and each model file
+  Windows). Each runtime file the session loads must be present, including the
+  capture backend it selected: the default facade with `bin/<target>/index.node`,
+  or, on a Microsoft kernel, the PulseAudio facade with
+  `bin/backend-pulseaudio/<target>/index.node`. That second native file is
+  checked because the PulseAudio facade otherwise falls back to the default
+  binary when its own file is missing. Each model file
   must match its pinned size and SHA-256. The digests are recomputed on every
   session, which reads the whole model (about 670 MB). Directories above the
   voice home are not checked. These checks catch broken or swapped installs;
@@ -197,7 +265,8 @@ submits the text or touches the editor; the caller decides what to do with it.
   opening the microphone) and transcribing (the rest of the model
   verification, the model load and the decode) each have a 120-second limit. Audio is kept in memory
   only up to the recording limit. All of these are options.
-- **Audio.** The worker opens the default input device through node-cpal,
+- **Audio.** The worker opens the default input device through node-cpal's
+  default (ALSA) backend, or through its PulseAudio backend under WSL,
   preferring 32-bit float samples and otherwise using the device's default
   integer or float format. It mixes all channels down to mono and resamples to
   16 kHz in JavaScript (averaging when downsampling, linear interpolation when
@@ -217,9 +286,10 @@ submits the text or touches the editor; the caller decides what to do with it.
   `result` or `error`. Any other message, an unknown field, more than 16 lines
   or a line over 64 KB stops the worker.
 
-The session has been tested only with scripted fake workers and with the real
-worker driving fake capture and recognizer modules. It has not loaded the real
-native modules, opened a real microphone or transcribed real speech.
+Automated session tests use scripted fake workers and the real worker with fake
+capture and recognizer modules. One user confirmed that dictation works on WSLg
+with the PulseAudio backend; this is not automated coverage of native loading,
+microphone capture, or transcription on other setups.
 
 ## Platform support
 
@@ -239,11 +309,36 @@ on an older Node. Gentle AI never downloads or installs the Visual C++ runtime;
 a missing runtime is expected to surface as a runtime load failure, which has
 not been observed on hardware. `/gentle:voice` then names the runtime to install.
 
-None of these targets has been verified on real hardware yet: native loading,
-library paths and microphone capture have not been executed. Linux with a glibc
+Apart from the user-confirmed WSLg session described below, these targets have not
+been verified on real hardware. Linux with a glibc
 older than 2.34 is unsupported and the diagnosis names the version found.
 Windows ARM64 has no native sherpa-onnx package and is unsupported. musl Linux
-is unsupported. WSL is reported as unproven.
+is unsupported.
+
+### WSL
+
+A Linux kernel whose release names Microsoft (WSL2) has no ALSA hardware device
+to record from, so the worker loads node-cpal's PulseAudio facade
+(`backend-pulseaudio.js`) instead of the default one, and checks that facade and
+its `bin/backend-pulseaudio/<target>/index.node` before loading. The PulseAudio
+binaries ship in the same pinned `node-cpal@1.0.0` tarball, so a WSL install
+downloads nothing extra. Before this path existed, WSL reported the fixed
+message "The default microphone uses an unsupported audio format.", because the
+ALSA default device there exposes no usable format. Requirements, none of them
+checked before loading:
+
+- WSLg (Windows 11 WSL, audio support enabled), which provides a
+  PulseAudio-compatible server, or another PulseAudio server reachable through
+  `PULSE_SERVER`. The worker passes `PULSE_SERVER` and `PULSE_COOKIE` through.
+- The PulseAudio server socket in the runtime directory named by
+  `XDG_RUNTIME_DIR`, also passed through.
+
+Without a reachable PulseAudio server the session reports a microphone or
+capture error rather than falling back to ALSA, which cannot record there. One
+user confirmed that dictation works with this backend on WSLg. Automated backend
+selection tests use fake modules; the current shortcut and sidebar integration
+have not yet been verified with a real WSL microphone. The platform limitation and
+the ALSA advice in `/gentle:voice` do not change for WSL yet.
 
 ## Licenses and attribution
 
