@@ -3583,7 +3583,7 @@ test("while pi-subagents-j0k3r is still installed the tools stay unregistered an
 	const notices: string[] = [];
 	const ctx = { hasUI: true, ui: { notify: (message: string, level: string) => notices.push(`${level}:${message}`) } } as unknown as ExtensionContext;
 	await fire("session_start", ctx);
-	assert.match(notices[0] ?? "", /^warning:❀ Gentle Agents is waiting: remove the old package first with "pi remove npm:pi-subagents-j0k3r"/);
+	assert.match(notices[0] ?? "", /^warning:  Gentle Agents is waiting: remove the old package first with "pi remove npm:pi-subagents-j0k3r"/);
 });
 
 test("subagent_list_agents publishes each agent's declared tool inventory so routing can check capabilities", async () => {
@@ -3632,7 +3632,7 @@ test("subagent_list_agents and subagent_run in task mode launch a child with the
 	assert.equal(args[args.indexOf("--tools") + 1], "read,grep,subagent_parent_message");
 	await tick();
 	assert.match(String(harness.children[0].written[1].message), /Map lib\/ and report every module\.\n\n## Context\nFocus on agents-\*\.ts/);
-	assert.match(widget()![0], /^╭─ ❀ Agents ▾ Collapse · 1 active ─+╮$/);
+	assert.match(widget()![0], /^╭─   Agents ▾ Collapse · 1 active ─+╮$/);
 	assert.match(widget()![1], /^│ ◐  explore  map lib modules +gpt-5\.6-terra · low · \d+s │$/);
 	harness.children[0].emit({ type: "tool_execution_start", toolCallId: "c", toolName: "grep", args: {} });
 	harness.children[0].emit({ type: "message_end", message: { role: "assistant", usage: { totalTokens: 12_000, cost: { total: 0.09 } } } });
@@ -3682,6 +3682,27 @@ test("running subagent_result polls hide only their tool chrome, not the model r
 	assert.match(renderers.get("gentle-agents.result")!(sent[0].message, { expanded: true }, plainTheme).render(80).join("\n"), /Agent result.*All done\./s, "background completion card remains visible");
 });
 
+test("phone width hides only Agents presentation while running tasks and detail remain available", async () => {
+	const {pi,tools,fire,commands,shortcuts}=fakePi(); const harness=deps(); gentleAgents(pi,{},harness.deps);
+	const tui={requestRender(){},terminal:{columns:61,rows:40}}; const {ctx,widgetComponent,overlays}=fakeContext(tui);
+	await fire("session_start",ctx);
+	const started=await tools.get("subagent_run")!.execute("a",{agent:"explore",task:"Keep running",label:"Live task",mode:"background"},undefined,undefined,ctx);
+	const id=(started.details.gentleAgents as {taskId:string}).taskId; await tick();
+	const bottom=widgetComponent()!, rail=sidebarState(tui as unknown as TUI).parts.get("agents")!;
+	assert.match(bottom.render(61).join("\n"),/Live task/);
+	tui.terminal.columns=60; assert.deepEqual(bottom.render(60),[]); assert.ok(rail.render(46).length>0);
+	harness.children[0].emit({type:"message_update",assistantMessageEvent:{type:"text_delta",delta:"still running"}}); await tick();
+	assert.deepEqual(bottom.render(60),[]); assert.equal(harness.children.length,1);
+	const status=await tools.get("subagent_status")!.execute("status",{task_id:id},undefined,undefined,ctx); assert.match(status.content[0]!.text,/running/);
+	assert.ok(commands.has("gentle:agents"));
+	const open=commands.get("gentle:agents")!.handler("",ctx); await tick(); assert.equal(overlays.length,1); overlays[0]!.handleInput("q"); await open;
+	const collapse=shortcuts.get(agentsCollapseKey({})!); assert.ok(collapse);
+	await collapse.handler(ctx); assert.deepEqual(bottom.render(60),[]);
+	tui.terminal.columns=61; assert.match(bottom.render(61).join("\n"),/Expand/); assert.match(bottom.render(61).join("\n"),/Live task/);
+	await collapse.handler(ctx); assert.match(bottom.render(61).join("\n"),/Collapse/);
+	tui.terminal.columns=60; assert.deepEqual(bottom.render(60),[]); await fire("session_shutdown",ctx);
+});
+
 test("the Agents card moves to the fullscreen rail like Todos and its header toggles collapse on left click", async () => {
 	const { pi, tools, fire } = fakePi();
 	const harness = deps();
@@ -3727,27 +3748,6 @@ test("the Agents card moves to the fullscreen rail like Todos and its header tog
 	assert.equal(rail.render(46).filter((line) => /explore/.test(stripAnsi(line))).length, 1, "both surfaces share the collapsed state");
 });
 
-test("the Agents rail digest stays stable while no task is running, so an idle card never rebuilds the rail every second", async () => {
-	const { pi, fire } = fakePi();
-	gentleAgents(pi, {}, deps().deps);
-	const terminalTui = { requestRender() {}, terminal: { columns: 160, rows: 40 } };
-	const { ctx, widgetComponent } = fakeContext(terminalTui);
-	await fire("session_start", ctx);
-	widgetComponent();
-	const rail = sidebarState(terminalTui as unknown as TUI).parts.get("agents")!;
-	// The harness clock advances on every read, so three digests span more than a second.
-	const digests = [rail.digest!(), rail.digest!(), rail.digest!()];
-	assert.deepEqual(new Set(digests).size, 1, "the clock only enters the digest while a task runs");
-});
-
-test("background runs return at once; status, result, send_message, cancel, and continue follow the task", async () => {
-	const { pi, tools, fire, sent, renderers } = fakePi();
-	const harness = deps();
-	gentleAgents(pi, {}, harness.deps);
-	const { ctx } = fakeContext();
-	await fire("session_start", ctx);
-	const started = await tools.get("subagent_run")!.execute("c1", { agent: "explore", task: "Long job", mode: "background" }, undefined, undefined, ctx);
-	const id = (started.details.gentleAgents as { taskId: string }).taskId;
 test("Agents rail task click opens the matching local task and rejects stale geometry", async () => {
 	const { pi, tools, fire } = fakePi(); const harness = deps(); harness.deps.now = () => 10000;
 	gentleAgents(pi, {}, harness.deps);
@@ -3830,6 +3830,27 @@ test("clipped Agents sidebar dispatches a scrolled task click to its local detai
 	} finally { stop(); await fire("session_shutdown",ctx); }
 });
 
+test("the Agents rail digest stays stable while no task is running, so an idle card never rebuilds the rail every second", async () => {
+	const { pi, fire } = fakePi();
+	gentleAgents(pi, {}, deps().deps);
+	const terminalTui = { requestRender() {}, terminal: { columns: 160, rows: 40 } };
+	const { ctx, widgetComponent } = fakeContext(terminalTui);
+	await fire("session_start", ctx);
+	widgetComponent();
+	const rail = sidebarState(terminalTui as unknown as TUI).parts.get("agents")!;
+	// The harness clock advances on every read, so three digests span more than a second.
+	const digests = [rail.digest!(), rail.digest!(), rail.digest!()];
+	assert.deepEqual(new Set(digests).size, 1, "the clock only enters the digest while a task runs");
+});
+
+test("background runs return at once; status, result, send_message, cancel, and continue follow the task", async () => {
+	const { pi, tools, fire, sent, renderers } = fakePi();
+	const harness = deps();
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx } = fakeContext();
+	await fire("session_start", ctx);
+	const started = await tools.get("subagent_run")!.execute("c1", { agent: "explore", task: "Long job", mode: "background" }, undefined, undefined, ctx);
+	const id = (started.details.gentleAgents as { taskId: string }).taskId;
 	assert.match(started.content[0].text, new RegExp(`background as task ${id}`));
 	await tick();
 	assert.match((await tools.get("subagent_status")!.execute("c2", { task_id: id }, undefined, undefined, ctx)).content[0].text, /running · background/);
@@ -6593,27 +6614,6 @@ test("job_list and job_stop cover this session's jobs; stopped jobs send no noti
 	}
 });
 
-test("/gentle:jobs opens this session's jobs overlay, stops the selected job, and the footer counts running jobs", async () => {
-	const { pi, tools, commands, fire, sent } = fakePi();
-	const jobs = fakeJobShell();
-	gentleAgents(pi, {}, { ...deps().deps, jobShell: jobs.shell, jobOutputDir: () => jobs.dir });
-	const { ctx, overlays } = fakeContext();
-	const statuses: Array<string | undefined> = [];
-	const snapshots: Array<{ sessionId: string; snapshot: { jobs: Array<{ id: string; label: string; startedAt: number }> } }> = [];
-	const unsubscribe = pi.events.on("gentle-ai:jobs-sidebar", (value) => { snapshots.push(value as typeof snapshots[number]); });
-	Object.assign(ctx.ui, { setStatus: (key: string, value: string | undefined) => { if (key === "gentle-jobs") statuses.push(value); } });
-	try {
-		await fire("session_start", ctx);
-		await tools.get("bash_background")!.execute("b1", { command: "gh run watch 42 --exit-status", label: "CI" }, undefined, undefined, ctx);
-		assert.equal(statuses.at(-1), "⧗ 1 job");
-		assert.equal(snapshots.at(-1)?.sessionId, ctx.sessionManager.getSessionId());
-		assert.deepEqual(snapshots.at(-1)?.snapshot.jobs.map(({ id, label }) => ({ id, label })), [{ id: "job-1", label: "CI" }]);
-		const opened = commands.get("gentle:jobs")!.handler("", ctx);
-		await tick();
-		const view = overlays.at(-1)!;
-		const screen = view.render(100).map(stripAnsi).join("\n");
-		assert.match(screen, /Jobs · 1 running · 0 finished/);
-		assert.match(screen, /gh run watch 42 --exit-status/);
 test("sidebar job events and rows hide default command labels but retain explicit labels", async () => {
 	const { pi, tools, fire } = fakePi();
 	const jobs = fakeJobShell();
@@ -6640,6 +6640,27 @@ test("sidebar job events and rows hide default command labels but retain explici
 	}
 });
 
+test("/gentle:jobs opens this session's jobs overlay, stops the selected job, and the footer counts running jobs", async () => {
+	const { pi, tools, commands, fire, sent } = fakePi();
+	const jobs = fakeJobShell();
+	gentleAgents(pi, {}, { ...deps().deps, jobShell: jobs.shell, jobOutputDir: () => jobs.dir });
+	const { ctx, overlays } = fakeContext();
+	const statuses: Array<string | undefined> = [];
+	const snapshots: Array<{ sessionId: string; snapshot: { jobs: Array<{ id: string; label: string; startedAt: number }> } }> = [];
+	const unsubscribe = pi.events.on("gentle-ai:jobs-sidebar", (value) => { snapshots.push(value as typeof snapshots[number]); });
+	Object.assign(ctx.ui, { setStatus: (key: string, value: string | undefined) => { if (key === "gentle-jobs") statuses.push(value); } });
+	try {
+		await fire("session_start", ctx);
+		await tools.get("bash_background")!.execute("b1", { command: "gh run watch 42 --exit-status", label: "CI" }, undefined, undefined, ctx);
+		assert.equal(statuses.at(-1), "⧗ 1 job");
+		assert.equal(snapshots.at(-1)?.sessionId, ctx.sessionManager.getSessionId());
+		assert.deepEqual(snapshots.at(-1)?.snapshot.jobs.map(({ id, label }) => ({ id, label })), [{ id: "job-1", label: "CI" }]);
+		const opened = commands.get("gentle:jobs")!.handler("", ctx);
+		await tick();
+		const view = overlays.at(-1)!;
+		const screen = view.render(100).map(stripAnsi).join("\n");
+		assert.match(screen, /Jobs · 1 running · 0 finished/);
+		assert.match(screen, /gh run watch 42 --exit-status/);
 		view.handleInput("s");
 		assert.equal(jobs.runs[0]!.signal?.aborted, true, "s stops the selected job");
 		assert.equal(statuses.at(-1), undefined, "the footer count clears when nothing runs");

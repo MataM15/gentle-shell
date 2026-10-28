@@ -79,6 +79,26 @@ function fakeContext(branch: unknown[] = [], hasUI = true) {
 	return { ctx, widgets, widget, widgetComponent };
 }
 
+test("phone width hides only Todo presentation while updates and progress continue", async () => {
+	const {pi,tools,fire,shortcuts}=fakePi(); const emitted: unknown[]=[];
+	Object.assign(pi,{events:{emit:(name:string,value:unknown)=>{if(name===TODO_PROGRESS_EVENT) emitted.push(value);},on:()=>()=>{}}});
+	gentleTodo(pi,{}); const {ctx,widgets}=fakeContext(); await fire("session_start",ctx);
+	await tools.get("todo")!.execute("w",{action:"write",tasks:[{title:"First",status:"in_progress"}]},undefined,undefined,ctx);
+	await fire("tool_execution_end",ctx,{toolName:"todo"});
+	const tui={terminal:{columns:61,rows:30},requestRender(){}};
+	let bottom=widgets.get("gentle-todo")!(tui,plainTheme); const rail=sidebarState(tui as unknown as TUI).parts.get("todo")!;
+	assert.match(bottom.render(61).join("\n"),/First/);
+	tui.terminal.columns=60; assert.deepEqual(bottom.render(60),[]); assert.match(rail.render(60).join("\n"),/First/);
+	assert.equal(bottom.handleMouse?.({type:"click",button:"left",x:1,y:0,width:60,height:1,screenX:1,screenY:0,shift:false,alt:false,ctrl:false}),undefined);
+	await tools.get("todo")!.execute("a",{action:"add",title:"Second"},undefined,undefined,ctx); await fire("tool_execution_end",ctx,{toolName:"todo"});
+	bottom=widgets.get("gentle-todo")!(tui,plainTheme); assert.deepEqual(bottom.render(60),[]); assert.ok(emitted.length>=2);
+	const list=await tools.get("todo")!.execute("l",{action:"list"},undefined,undefined,ctx); assert.match(JSON.stringify(list.details),/Second/);
+	await shortcuts.get("ctrl+shift+t")!.handler(ctx); assert.deepEqual(bottom.render(60),[]);
+	tui.terminal.columns=61; assert.match(bottom.render(61).join("\n"),/Expand/);
+	await shortcuts.get("ctrl+shift+t")!.handler(ctx); assert.match(bottom.render(61).join("\n"),/Second/);
+	tui.terminal.columns=60; assert.deepEqual(bottom.render(60),[]);
+});
+
 test("long Todo widgets stay bounded, scroll, resize and keep their collapse control in mobile and sidebar", async (t) => {
 	for (const style of [CARD_STYLE.NEON, CARD_STYLE.FLOAT]) {
 		setCardStyle(style);
@@ -215,7 +235,7 @@ test("the todo tool writes the list, shows the card after the call, and carries 
 	const bad = await tool.execute("c2", { action: "update", id: 9, status: "done" }, undefined, undefined, ctx);
 	assert.match(bad.content[0].text, /Error: no task #9/);
 	assert.equal(bad.details.error, "no task #9");
-	assert.match(tool.renderCall({ action: "write" }, plainTheme).render(40).join(""), /❀ todo · write/);
+	assert.match(tool.renderCall({ action: "write" }, plainTheme).render(40).join(""), /  todo · write/);
 	assert.equal(tool.renderResult({ content: [{ type: "text", text: "a\nb" }] }, { expanded: false }, plainTheme).render(40).join("|").trimEnd(), "a");
 });
 
@@ -786,9 +806,9 @@ test("a list left with only dropped tasks open finishes and clears; a blocked-on
 	assert.match(widget()![2], /⊘ Deploy · waiting for an admin/);
 });
 
-// Phone-sized terminals (<= 60 columns) compact only the regular-mode Todos widget.
+// Phone-width terminals hide only the above-editor Todos widget.
 async function compactFixture(columns: number) {
-	const { pi, tools, fire } = fakePi();
+	const { pi, tools, fire, shortcuts } = fakePi();
 	gentleTodo(pi, {});
 	const { ctx, widgets } = fakeContext();
 	await fire("session_start", ctx);
@@ -802,28 +822,15 @@ async function compactFixture(columns: number) {
 		type, button: type === "move" ? "none" as const : "left" as const, x: 1, y, screenX: 1, screenY: y, width, height: 6, shift: false, alt: false, ctrl: false,
 	});
 	const rows = () => component.render(terminal.columns).map(stripAnsi);
-	return { terminal, component, pointer, rows };
+	return { terminal, component, pointer, rows, shortcuts, ctx };
 }
 
-test("neon: the Todos widget is two borderless rows when collapsed at <= 60 columns and the original box at 61", async () => {
+test("neon: phone hides Todos while 61 columns restores the same collapse state", async () => {
 	const f = await compactFixture(60);
 	for (const width of [60, 40]) {
 		f.terminal.columns = width;
-		// A long first task may wrap at narrower widths, so only the extra rows are pinned.
-		assert.equal(f.rows().length, width === 60 ? 4 : 5, "expanded: header + tasks, no spacer");
-		assert.notEqual(f.rows().at(-1), "", "no spacer row");
-		assert.match(f.rows()[0]!, /^Todos ▾ Collapse · 0 of 3/u);
-		assert.doesNotMatch(f.rows().join("\n"), /[╭╮╰╯│]/u);
-		assert.deepEqual(f.component.handleMouse?.(f.pointer("click", 1)), undefined, "a body row is not the control");
-		assert.equal(f.component.handleMouse?.(f.pointer("click", 0))?.handled, true, "the header row toggles");
-		const collapsed = f.rows();
-		assert.equal(collapsed.length, 2, `collapsed is two rows at ${width}`);
-		assert.match(collapsed[0]!, /^Todos ▸ Expand · 0 of 3/u);
-		assert.match(collapsed[1]!, /^ ◐ Implementar la vista/u);
-		assert.doesNotMatch(collapsed.join("\n"), /[╭╮╰╯│]/u);
-		assert.equal(f.component.handleMouse?.(f.pointer("click", 1)), undefined, "the task row is not the control");
-		assert.equal(f.component.handleMouse?.(f.pointer("click", 0))?.handled, true);
-		assert.match(f.rows()[0]!, /Collapse/);
+		assert.deepEqual(f.rows(), [], `hidden at ${width}`);
+		assert.equal(f.component.handleMouse?.(f.pointer("click", 0)), undefined, "hidden card has no pointer target");
 	}
 	// 61 columns: the original outlined card (box, spacer row), clickable on row 0.
 	f.terminal.columns = 61;
@@ -835,13 +842,16 @@ test("neon: the Todos widget is two borderless rows when collapsed at <= 60 colu
 	assert.equal(f.component.handleMouse?.(f.pointer("click", 1)), undefined);
 	assert.equal(f.component.handleMouse?.(f.pointer("click", 0))?.handled, true);
 	assert.equal(f.rows().length, 4, "collapsed box is 3 rows plus the spacer");
-	// Back down: compact again, same state.
+	// Back down: hidden; the keyboard still changes state without painting.
 	f.terminal.columns = 60;
-	assert.equal(f.rows().length, 2);
-	assert.match(f.rows()[0]!, /Todos ▸ Expand/);
+	assert.deepEqual(f.rows(), []);
+	await f.shortcuts.get("ctrl+shift+t")!.handler(f.ctx);
+	assert.deepEqual(f.rows(), []);
+	f.terminal.columns = 61;
+	assert.match(f.rows()[0]!, /Todos ▾ Collapse/);
 });
 
-test("float: the Todos widget drops margins, padding and spacer at <= 60 columns, with the header control on row 0", async (t) => {
+test("float: phone hides Todos and 61 columns retains padded header control", async (t) => {
 	const found = cardStyle();
 	t.after(() => setCardStyle(found));
 	const f = await compactFixture(60);
@@ -854,19 +864,8 @@ test("float: the Todos widget drops margins, padding and spacer at <= 60 columns
 	assert.equal(f.component.handleMouse?.(f.pointer("click", 0)), undefined, "above 60: the padding row is not the control");
 	for (const width of [60, 40, 30]) {
 		f.terminal.columns = width;
-		const rows = f.rows();
-		assert.match(rows[0]!, /^▎ Todos ▾ Collapse/, `compact header is row 0 at ${width}`);
-		assert.equal(rows.length, width === 60 ? 4 : 5, "header + tasks, no padding or spacer");
-		assert.doesNotMatch(rows[1]!, /^▎ +$/, "no blank row under the header");
-		assert.doesNotMatch(rows.at(-1)!, /^▎? *$/, "no padding or spacer row at the bottom");
-		assert.ok(rows.every((row) => row.length === width), "edge to edge, no transparent margins");
-		assert.equal(f.component.handleMouse?.(f.pointer("click", 1)), undefined);
-		assert.equal(f.component.handleMouse?.(f.pointer("click", 0))?.handled, true);
-		const collapsed = f.rows();
-		assert.equal(collapsed.length, 2);
-		assert.match(collapsed[0]!, /^▎ Todos ▸ Expand/);
-		assert.match(collapsed[1]!, /^▎ ◐ Implementar/);
-		assert.equal(f.component.handleMouse?.(f.pointer("click", 0))?.handled, true);
+		assert.deepEqual(f.rows(), [], `hidden at ${width}`);
+		assert.equal(f.component.handleMouse?.(f.pointer("click", 0)), undefined);
 	}
 	// Back above the breakpoint: header returns to row 1.
 	f.terminal.columns = 61;
@@ -875,7 +874,7 @@ test("float: the Todos widget drops margins, padding and spacer at <= 60 columns
 	assert.equal(f.component.handleMouse?.(f.pointer("click", 1))?.handled, true);
 });
 
-test("compact phone widget keeps the upstream height cap and scroll for long expanded lists, in both card styles", async (t) => {
+test("hidden phone widget leaves the registered rail scrollable in both card styles", async (t) => {
 	t.after(() => setCardStyle(CARD_STYLE.NEON));
 	for (const style of [CARD_STYLE.NEON, CARD_STYLE.FLOAT]) {
 		setCardStyle(style);
@@ -890,17 +889,14 @@ test("compact phone widget keeps the upstream height cap and scroll for long exp
 		const theme = { ...plainTheme, bg: (_color: string, text: string) => `\x1b[48;5;22m${text}\x1b[49m` };
 		const bottom = widgets.get("gentle-todo")!(tui, theme);
 		const rail = sidebarState(tui as never).parts.get("todo")!;
-		const before = bottom.render(40).map(stripAnsi);
-		assert.ok(before.length <= 10, `${style}: capped at one third of the terminal`);
-		assert.match(before[0]!, /^▎? ?Todos ▾/u, `${style}: compact header stays on row 0`);
-		assert.doesNotMatch(before.join("\n"), /[╭╮╰╯│]/u, `${style}: still borderless`);
-		assert.match(before.at(-1)!, /^↑↓ 1–/u, `${style}: no footer or spacer, only the scroll hint`);
-		bottom.handleMouse?.({ type: "wheel", button: "none", wheelDelta: 10000, x: 5, y: 2, screenX: 5, screenY: 2, width: 40, height: before.length, shift: false, alt: false, ctrl: false });
-		const after = bottom.render(40).map(stripAnsi);
-		assert.match(after.join("\n"), /TASK29/, `${style}: every task is reachable by scrolling`);
-		assert.match(after[0]!, /^▎? ?Todos ▾/u);
-		// The rail never compacts, even at a phone-sized column count.
-		assert.match(stripAnsi(rail.render(40)[0]!), style === CARD_STYLE.FLOAT ? /^ ▎ +$/u : /^╭─/u, `${style}: the rail keeps its original card`);
+		assert.deepEqual(bottom.render(40), [], `${style}: bottom is hidden`);
+		const before = rail.render(40).map(stripAnsi);
+		assert.ok(before.length <= 10, `${style}: rail retains its height cap`);
+		assert.match(before.join("\n"), /↑↓ 1–/, `${style}: rail retains the scroll hint`);
+		rail.handleMouse?.({ type: "wheel", button: "none", wheelDelta: 10000, x: 5, y: 2, screenX: 5, screenY: 2, width: 40, height: before.length, shift: false, alt: false, ctrl: false });
+		const after = rail.render(40).map(stripAnsi);
+		assert.match(after.join("\n"), /TASK29/, `${style}: every task remains reachable`);
+		assert.match(after[0]!, style === CARD_STYLE.FLOAT ? /^ ▎ +$/u : /^╭─/u, `${style}: rail retains its full card`);
 	}
 });
 

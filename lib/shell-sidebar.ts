@@ -5,7 +5,7 @@ import type { Component, TUI } from "@earendil-works/pi-tui";
 const STATE = Symbol.for("gentle-pi.experimental-sidebar.state");
 /** In-process notification after a visual preference is persisted. */
 export const VISUAL_SETTINGS_CHANGED = "gentle-pi.visual-settings-changed";
-/** Terminals this narrow or narrower are phone-sized: Wellness stays hidden and the Todos panel compacts. */
+/** Phone-width terminals: Wellness and the above-editor Agents/Todos cards stay hidden. */
 export const PHONE_COLUMNS = 60;
 export function isPhoneWidth(tui: TUI): boolean {
 	const columns = tui.terminal?.columns;
@@ -72,9 +72,13 @@ export function sidebarPart<T extends Component & { dispose?(): void }>(tui: TUI
 	if (!tui.terminal) return bottom;
 	const state = sidebarState(tui);
 	state.parts.set(key, rail);
+	// Hide only the bottom copies. Rail registrations, tasks and their updates
+	// remain live; columns are read on every paint and pointer dispatch.
+	const phoneHidden = () => (key === "agents" || key === "todo") && isPhoneWidth(tui);
 	return {
 		...bottom,
-		render: (width: number) => (key === "todo" && (state.visibility?.todo === false || state.railAvailable?.() === true)) || (key === "footer" && (state.statusHidden?.() || state.headerOwnsStatus?.())) || (state.active && state.ownsHost?.()) ? [] : bottom.render(width),
+		render: (width: number) => phoneHidden() || (key === "todo" && (state.visibility?.todo === false || state.railAvailable?.() === true)) || (key === "footer" && (state.statusHidden?.() || state.headerOwnsStatus?.())) || (state.active && state.ownsHost?.()) ? [] : bottom.render(width),
+		...(bottom.handleMouse ? { handleMouse: (event: Parameters<NonNullable<Component["handleMouse"]>>[0]) => phoneHidden() ? undefined : bottom.handleMouse?.(event) } : {}),
 		dispose() {
 			if (state.parts.get(key) === rail) state.parts.delete(key);
 			bottom.dispose?.();

@@ -151,7 +151,7 @@ const PENDING_NOTE: Record<string, string> = {
 	[ANTHROPIC_PROVIDER]: "usage arrives with the first response",
 };
 const UNSUPPORTED_NOTE = "no subscription usage for this provider";
-const ACTIVE_MARK = "✿";
+const ACTIVE_MARK = "active";
 // What a targeted provider with no snapshot says after a refresh actually ran
 // and answered nothing. Generic on purpose: it names no endpoint, key, or
 // account detail, exactly like the other notes here.
@@ -643,7 +643,7 @@ export interface UsagePanelScope {
 	failed: ReadonlySet<string>;
 }
 
-// The active provider comes first, marked with the petal, and explains
+// The active provider comes first, marked in plain text, and explains
 // itself when it has no data yet. Other providers seen this session follow.
 // With a scope, the panel draws exactly the targeted providers in scope order:
 // one with no snapshot explains itself (its latest refresh failed, or its
@@ -671,7 +671,8 @@ export function renderUsagePanel(usages: ProviderUsage[], theme: UsageTheme, wid
 		}
 		const usage = row.usage;
 		const plan = usage.plan ? ` ${theme.fg(ROLE.SEPARATOR, "·")} ${theme.fg(ROLE.PLAN, usage.plan)}` : "";
-		lines.push(`${mark}${theme.fg(ROLE.PROVIDER, usage.provider)}${plan} ${theme.fg(ROLE.SEPARATOR, "·")} ${theme.fg(ROLE.RESET, updatedAgo(usage.fetchedAt, now))}`);
+		const stale = usage.stale ? ` ${theme.fg(ROLE.SEPARATOR, "·")} ${theme.fg(ROLE.RESET, "stale")}` : "";
+		lines.push(`${mark}${theme.fg(ROLE.PROVIDER, usage.provider)}${plan} ${theme.fg(ROLE.SEPARATOR, "·")} ${theme.fg(ROLE.RESET, updatedAgo(usage.fetchedAt, now))}${stale}`);
 		// One row per window: the limit name, its meter, its percentage and the reset
 		// that window reports, all on one line. A window without its own label (the
 		// model's allowance) is named by its limit alone, and one without a reset ends
@@ -685,6 +686,13 @@ export function renderUsagePanel(usages: ProviderUsage[], theme: UsageTheme, wid
 			const reset = formatReset(row.window.resetAt, now);
 			const tail = reset.length > 0 ? ` ${theme.fg(ROLE.SEPARATOR, "·")} ${theme.fg(ROLE.RESET, reset)}` : "";
 			lines.push(`  ${theme.fg(ROLE.LABEL, row.name.padEnd(nameWidth))} ${paintMeter(row.window.usedPercent, PANEL_METER_CELLS, theme, paint)} ${theme.fg(ROLE.PERCENT, percent)}${tail}`);
+		}
+		// Use the same sanitized account failure rows as the rail, rather than
+		// inventing a zero or exposing a different account label here.
+		if (usage.layout === USAGE_LAYOUT_ACCOUNTS) {
+			for (const row of compactAccountRows(usage) ?? []) {
+				if (row.failure !== undefined) lines.push(`  ${theme.fg(ROLE.LABEL, row.name)} ${theme.fg(ROLE.RESET, `unavailable (${row.failure})`)}`);
+			}
 		}
 		// A failure after a good snapshot never hides either fact: the last good
 		// snapshot stays on its rows and the failed refresh says so beside it.

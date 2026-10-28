@@ -2009,7 +2009,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 	// 5-minute rule, and one without a credential simply never appears.
 	const refreshAllUsage = async (ctx: ExtensionContext, force: boolean) => {
 		const now = deps.now();
-		const providers = new Set([CODEX_PROVIDER, ANTHROPIC_PROVIDER, ...usageSources.providers()]);
+		const providers = new Set([CODEX_PROVIDER, ANTHROPIC_PROVIDER, ...usageSources.providers(), ...usage.all().map((entry) => entry.provider), ...resolveUsageScope(ctx)]);
 		await Promise.all([...providers].map((provider) => refreshProvider(ctx, provider, usageSources.get(provider), force, now, true)));
 	};
 	// Subscribed once, for the life of the extension: a registration can
@@ -2052,10 +2052,10 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 					now: () => deps.now(),
 					active: () => (ctx.model ? { provider: ctx.model.provider } : undefined),
 					registry: () => usageSources,
-					onRefresh: () => refreshUsage(ctx, true),
+					onRefresh: () => refreshAllUsage(ctx, true),
 					onClose: () => withOverlayRepaint(tui, done)(null),
 					requestRender: () => tui.requestRender(),
-					scope: () => ({ providers: usageScope, failed: new Set(usageFailures) }),
+					scope: () => ({ providers: [...new Set([...usageScope, ...usageSources.providers(), ...usage.all().map((entry) => entry.provider)])], failed: new Set(usageFailures) }),
 					gauge: () => gaugePaint(ctx),
 				});
 				// Open promptly: the panel draws whatever the store already holds

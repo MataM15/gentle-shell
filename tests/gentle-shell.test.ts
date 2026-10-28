@@ -1075,7 +1075,7 @@ test("gentleShell frames the editor with the petal prompt and a hint while empty
 	assert.equal(ui.workingVisible, false, "pi's own Working row must be hidden");
 	editor.focused = true;
 	const lines = editor.render(60).map(stripAnsi);
-	assert.match(lines[0], /^╭─ ✿ ─+╮$/);
+	assert.match(lines[0], /^╭─   ─+╮$/);
 	assert.doesNotMatch(editor.render(60).join("\n"), /\x1b\[44m/, "prompt must not paint passive backgrounds");
 	assert.match(lines[1], /^│.*type, or \/ for commands +│$/);
 	assert.match(lines[lines.length - 1], /^╰─+╯$/);
@@ -2232,14 +2232,14 @@ test("gentleShell shows working while the agent runs and queued when messages wa
 	const editor = installedPrompt(ctx, ui, handlers);
 
 	for (const handler of handlers.get("agent_start") ?? []) handler({}, ctx);
-	assert.match(stripAnsi(editor.render(60)[0]), /^╭─ ✿ working… ─+╮$/);
+	assert.match(stripAnsi(editor.render(60)[0]), /^╭─   working… ─+╮$/);
 	pending.value = true;
-	assert.match(stripAnsi(editor.render(60)[0]), /^╭─ [✿❀❁✾] queued ─+╮$/);
+	assert.match(stripAnsi(editor.render(60)[0]), /^╭─   queued ─+╮$/);
 	for (const handler of handlers.get("agent_end") ?? []) handler({}, ctx);
 	assert.match(stripAnsi(editor.render(60)[0]), /queued/, "low-level run end is not settled");
 	pending.value = false;
 	for (const handler of handlers.get("agent_settled") ?? []) handler({}, ctx);
-	assert.match(stripAnsi(editor.render(60)[0]), /^╭─ ✿ ─+╮$/);
+	assert.match(stripAnsi(editor.render(60)[0]), /^╭─   ─+╮$/);
 	editor.dispose();
 });
 
@@ -3059,7 +3059,7 @@ test("potato repaints start/settle and shows queued state on the host's next ren
 	let before = renders.mock.callCount();
 	for (const handler of handlers.get("agent_start") ?? []) handler({}, ctx);
 	assert.ok(renders.mock.callCount() > before);
-	assert.match(stripAnsi(editor.render(60)[0]), /✿ working/);
+	assert.match(stripAnsi(editor.render(60)[0]), /  working/);
 	before = renders.mock.callCount();
 	pending.value = true;
 	assert.equal(renders.mock.callCount(), before, "changing the queue flag is not a Gentle repaint event");
@@ -3409,6 +3409,17 @@ test("T3 live style Cards action refreshes cached TODO, header, footer and promp
 			prompt: editor.render(100).join("\n"),
 		};
 	}
+	// Each card must be selected through the actual pinned tab control: hidden
+	// sections intentionally do not render when the style changes.
+	function selectRailTab(label: string) {
+		const layout = root[node]() as unknown as { entries: { component: { [node](): { entries: { component: Component }[] } } }[] };
+		const pinned = layout.entries[1]!.component[node]().entries[0]!.component;
+		const rows = pinned.render(50);
+		const y = rows.findIndex((row) => stripAnsi(row).includes("Activity") && stripAnsi(row).includes("Status"));
+		const x = stripAnsi(rows[y]!).indexOf(label);
+		assert.ok(y >= 0 && x >= 0);
+		assert.equal(pinned.handleMouse?.({ type: "click", button: "left", x, y, width: 50, height: rows.length, screenX: 110 + x, screenY: y, shift: false, alt: false, ctrl: false } as TuiMouseEvent)?.handled, true);
+	}
 	ready = true;
 	paint();
 	assert.equal(todoRenders, 1);
@@ -3422,8 +3433,11 @@ test("T3 live style Cards action refreshes cached TODO, header, footer and promp
 	t.mock.method(fakeTui, "requestRender", () => { overlayRenders++; });
 	for (const style of [CARD_STYLE.FLOAT, CARD_STYLE.NEON]) {
 		const before = { ...frame };
-		const beforeHost = hostRenders;
 		const beforeTodo = todoRenders;
+		selectRailTab("Status");
+		assert.match(frame.rail, /Status/);
+		const beforeStatusFrame = frame.rail;
+		const beforeHost = hostRenders;
 		const beforeStatus = statusRenders;
 		const beforeOverlay = overlayRenders;
 		await customizeAction(ui, `Card style: ${style}`);
@@ -3431,8 +3445,12 @@ test("T3 live style Cards action refreshes cached TODO, header, footer and promp
 		assert.equal(cardStyle(), style);
 		assert.ok(hostRenders > beforeHost, "action requests the main render without another state change");
 		assert.ok(overlayRenders > beforeOverlay, "customize redraws too");
-		assert.equal(todoRenders, beforeTodo + 1, "revision invalidation refreshes digest-less TODO");
-		assert.equal(statusRenders, beforeStatus + 1, "live style digest refreshes cached Status");
+		assert.equal(todoRenders, beforeTodo, "hidden TODO is not rendered");
+		assert.equal(statusRenders, beforeStatus + 1, "live style digest refreshes selected Status");
+		assert.notEqual(frame.rail, beforeStatusFrame, "Status changes immediately");
+		selectRailTab("Activity");
+		assert.equal(todoRenders, beforeTodo + 1, "reselected TODO reflects the new style");
+		assert.equal(statusRenders, beforeStatus + 1, "hidden Status is not rendered");
 		for (const key of ["rail", "prompt"] as const) assert.notEqual(frame[key], before[key], `${key} changes immediately`);
 		assert.match(frame.header, /Gentle Shell/, "the pinned rail header stays painted across the switch");
 		assert.match(ui.notices.at(-1)!, /Conversation cards and shell chrome redraw now/);
@@ -5399,7 +5417,7 @@ test("gentleShell shows the unsupported note for a provider with no built-in or 
 	const opened = commands.get("gentle:usage")!.handler("", ctx);
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	const plain = ui.overlayView!.render(90).map(stripAnsi);
-	assert.match(plain[1], /✿ acme-cloud · no subscription usage for this provider/);
+	assert.match(plain[1], /active acme-cloud · no subscription usage for this provider/);
 	ui.closeOverlay?.();
 	await opened;
 });
@@ -5468,7 +5486,7 @@ test("a registered source's rejecting fetch never crashes the shell or poisons t
 	const opened = commands.get("gentle:usage")!.handler("", ctx);
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	const plain = ui.overlayView!.render(90).map(stripAnsi);
-	assert.match(plain[1], /✿ acme-cloud · fetch failed · r to retry/);
+	assert.match(plain[1], /active acme-cloud · fetch failed · r to retry/);
 	ui.closeOverlay?.();
 	await opened;
 });
@@ -5519,7 +5537,7 @@ test("gentleShell leaves a generic failure note when a registered source resolve
 	const opened = commands.get("gentle:usage")!.handler("", ctx);
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	const plain = ui.overlayView!.render(90).map(stripAnsi);
-	assert.match(plain[1], /✿ acme-cloud · fetch failed · r to retry/);
+	assert.match(plain[1], /active acme-cloud · fetch failed · r to retry/);
 	ui.closeOverlay?.();
 	await opened;
 });
@@ -5600,6 +5618,38 @@ test("gentleShell ignores incomplete Codex headers and retains the last real quo
 	}
 });
 
+test("Limits detail and rail share all registered provider data and refresh once per action", async (t) => {
+	const home=scopedDoubleEscCancelConfigHome(t), {pi,handlers,shortcuts}=fakePi(), {ctx,ui}=fakeContext();
+	const counts=new Map<string,number>(); const providers=["openai-codex","anthropic","cliproxyapi","nan"];
+	gentleShell(pi,{GENTLE_PI_CONFIG_HOME:home,GENTLE_PI_SHELL_CHANGES_WATCH_MS:"off"},{activeProfile:()=>"team",now:()=>1_788_600_000_000,fetch:async()=>{throw new Error("network forbidden");}});
+	for (const [index,provider] of providers.entries()) pi.events.emit(USAGE_SOURCE_EVENT,{
+		schema:USAGE_SOURCE_SCHEMA,provider,
+		fetch:async()=>{counts.set(provider,(counts.get(provider)??0)+1);return {provider,plan:`Plan${index}`,fetchedAt:1_788_600_000_000,limits:[{name:provider,limitReached:false,windows:[{label:"week",usedPercent:(index+1)*11,windowSeconds:604800,resetAt:null}]}]};},
+	});
+	await fire(handlers,"session_start",ctx); await settle();
+	const tui={mode:"fullscreen",terminal:{rows:40,columns:160},requestRender(){}};
+	const factory=ui.footerFactory as (tui:unknown,theme:ShellBarTheme,data:unknown)=>{dispose():void};
+	const component=factory(tui,plainTheme,{getGitBranch:()=>"main",getExtensionStatuses:()=>new Map(),getAvailableProviderCount:()=>1,onBranchChange:()=>()=>{}});
+	try {
+		const rail=sidebarState(tui as unknown as TUI).parts.get("usage")!; rail.digest?.(); await settle();
+		const railText=rail.render(48).map(stripAnsi).join("\n");
+		for(const pct of [11,22,33,44]) assert.match(railText,new RegExp(`${pct}%`));
+		for(const name of ["codex","claude","antigravity","nan"]) assert.match(railText,new RegExp(name,"i"));
+		const before=new Map(counts); const opened=shortcuts.get("alt+u")!.handler(ctx); await settle();
+		const detail=ui.overlayView!.render(120).map(stripAnsi).join("\n");
+		for(const provider of providers) {assert.match(detail,new RegExp(provider));assert.equal(counts.get(provider),(before.get(provider)??0)+1,`${provider} refreshes once`);}
+		for(const pct of [11,22,33,44]) assert.match(detail,new RegExp(`${pct}%`));
+		ui.overlayView!.render(120); ui.overlayView!.render(120); await settle();
+		for(const provider of providers) assert.equal(counts.get(provider),(before.get(provider)??0)+1,"rendering does not refetch");
+		ui.closeOverlay?.(); await opened;
+		const beforeClick=new Map(counts);
+		assert.equal(rail.handleMouse?.({type:"click",button:"left",x:2,y:1,width:48,height:10,screenX:2,screenY:1,shift:false,alt:false,ctrl:false} as TuiMouseEvent)?.handled,true);
+		await settle(); const clicked=ui.overlayView!.render(120).map(stripAnsi).join("\n");
+		for(const provider of providers) { assert.match(clicked,new RegExp(provider)); assert.equal(counts.get(provider),(beforeClick.get(provider)??0)+1,`${provider} refreshes once on click`); }
+		ui.closeOverlay?.(); await settle();
+	} finally { component.dispose(); await fire(handlers,"session_shutdown",ctx); }
+});
+
 test("gentleShell registers /gentle:usage and opens the subscriptions overlay", async () => {
 	const { pi, handlers, commands } = fakePi();
 	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, { fetch: fakeFetch().fetchFn, now: () => 1_788_600_000_000 });
@@ -5609,7 +5659,7 @@ test("gentleShell registers /gentle:usage and opens the subscriptions overlay", 
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	const plain = ui.overlayView!.render(90).map(stripAnsi);
 	assert.match(plain[0], /Subscriptions/);
-	assert.match(plain[1], /✿ openai-codex · pro/);
+	assert.match(plain[1], /active openai-codex · pro/);
 	ui.closeOverlay?.();
 	await opened;
 });
@@ -6197,7 +6247,7 @@ test("the panel keeps a headers-only subagent provider pending instead of a fals
 	await opened;
 });
 
-test("after a profile switch the panel stops presenting the old profile's provider", async (t) => {
+test("after a profile switch cached provider usage remains visible without being marked active", async (t) => {
 	const home = mkdtempSync(join(tmpdir(), "shell-usage-switch-"));
 	t.after(() => rmSync(home, { recursive: true, force: true }));
 	writeProfilesStore(home, { team: { reviewer: { model: "nan/glm5.3" } }, solo: {} }, "team");
@@ -6217,7 +6267,10 @@ test("after a profile switch the panel stops presenting the old profile's provid
 	t.after(() => resetSessionProfileBindingsForTesting());
 	const reopened = commands.get("gentle:usage")!.handler("", ctx);
 	await settle();
-	assert.equal(ui.overlayView!.render(90).map(stripAnsi).some((line) => line.includes("nan")), false, "a provider recorded under the previous profile's routing is not current scope");
+	const switched = ui.overlayView!.render(90).map(stripAnsi);
+	assert.ok(switched.some((line) => /^│ nan ·/.test(line)), "the rail's cached subscription remains visible in detail");
+	assert.equal(switched.some((line) => /active nan/.test(line)), false, "the old route is never marked as the active provider");
+	assert.ok(switched.some((line) => /active openai-codex/.test(line)), "the current provider remains explicitly active");
 	ui.closeOverlay?.();
 	await reopened;
 });
@@ -6396,13 +6449,13 @@ test("a valid response-header snapshot clears a prior refresh failure", async (_
 	await settle();
 	const opened = commands.get("gentle:usage")!.handler("", ctx);
 	await settle();
-	assert.ok(openPanelLines(ui).some((line) => line.includes("✿ openai-codex · fetch failed")), "the failed refresh is visible first");
+	assert.ok(openPanelLines(ui).some((line) => line.includes("active openai-codex · fetch failed")), "the failed refresh is visible first");
 
 	for (const handler of handlers.get("after_provider_response") ?? []) {
 		handler({ status: 200, headers: { "x-codex-primary-used-percent": "10", "x-codex-primary-window-minutes": "300" } }, ctx);
 	}
 	const lines = openPanelLines(ui);
-	assert.ok(lines.some((line) => line.includes("✿ openai-codex · updated just now")), "the header snapshot is recorded");
+	assert.ok(lines.some((line) => line.includes("active openai-codex · updated just now")), "the header snapshot is recorded");
 	assert.ok(lines.some((line) => line.includes("10%")), "the header snapshot's window renders");
 	assert.equal(lines.some((line) => line.includes("fetch failed")), false, "a valid header snapshot clears the failure");
 	ui.closeOverlay?.();
@@ -6458,12 +6511,12 @@ test("an older overlapping refresh cannot mark a provider failed after a newer o
 	await settle();
 	const opened = commands.get("gentle:usage")!.handler("", ctx);
 	await settle();
-	assert.ok(openPanelLines(ui).some((line) => line.includes("✿ openai-codex · pro")), "the newer refresh's snapshot is showing");
+	assert.ok(openPanelLines(ui).some((line) => line.includes("active openai-codex · pro")), "the newer refresh's snapshot is showing");
 
 	releaseStaleFailure();
 	await settle();
 	const lines = openPanelLines(ui);
-	assert.ok(lines.some((line) => line.includes("✿ openai-codex")), "the newer refresh's snapshot stands");
+	assert.ok(lines.some((line) => line.includes("active openai-codex")), "the newer refresh's snapshot stands");
 	assert.equal(lines.some((line) => line.includes("fetch failed")), false, "the older refresh's late failure must not mark the provider failed");
 	ui.closeOverlay?.();
 	await opened;
