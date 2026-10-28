@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { after, afterEach } from "node:test";
 import { initTheme, type ExtensionAPI, type ExtensionContext, type SlashCommandInfo, type SourceInfo } from "@earendil-works/pi-coding-agent";
-import { CURSOR_MARKER, matchesKey, stripTerminalSequences as stripAnsi, TuiMainScreen, visibleWidth, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import { CURSOR_MARKER, matchesKey, stripTerminalSequences as stripAnsi, TuiMainScreen, visibleWidth, type Component, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import installGentleShell, { backgroundChangeRefreshesSettled, buildShellBarModel, createActiveProfileReader, changesShortcut, devBinaryCard, extractQueuedText, fetchCodexUsage, fetchNanUsage, loadFileDiff, shellGitRunner, openInExternalEditor, usageShortcut, GentlePromptEditor } from "../extensions/gentle-shell.ts";
 import { CODEX_USAGE_URL, NAN_QUOTA_URL, USAGE_SOURCE_EVENT, USAGE_SOURCE_SCHEMA } from "../lib/shell-usage.ts";
 import { bindSessionProfile, clearSessionProfileBinding, resetSessionProfileBindingsForTesting } from "../lib/session-profile-binding.ts";
@@ -24,6 +24,8 @@ import type { ShellBarTheme } from "../lib/shell-bar.ts";
 import { createGentleAiExtension } from "../extensions/gentle-ai.ts";
 import { decodeReviewStatusV3 } from "../lib/review-integration-v2.ts";
 import { REVIEW_SIDEBAR_EVENT } from "../lib/review-sidebar-state.ts";
+import { createVoiceStatePublisher, VOICE_STATE_EVENT, VOICE_STATE_SCHEMA } from "../lib/voice-status-event.ts";
+import { SESSION_REFRESH_EVENT, SESSION_SNAPSHOT_EVENT } from "../lib/shell-session-state.ts";
 import type { NativeReviewCli } from "../lib/native-review-cli.ts";
 import { resolveVisualSettings, writeVisualSettings } from "../lib/visual-customization-policy.ts";
 import { resolveAnimationPolicy } from "../lib/animation-policy.ts";
@@ -501,6 +503,89 @@ test("review sidebar rejects foreign-session events and unsubscribes on shutdown
 	} finally {
 		await harness.dispose();
 	}
+});
+
+test("Sessions selection requests current-session metadata and renders only validated snapshots", async (t) => {
+	const home=scopedDoubleEscCancelConfigHome(t), {pi,handlers}=fakePi(), {ctx,ui}=fakeContext();
+	gentleShell(pi,{GENTLE_PI_CONFIG_HOME:home,GENTLE_PI_SHELL_CHANGES_WATCH_MS:"off"},{activeProfile:()=>"team"});
+	let session="shell-session"; (ctx.sessionManager as unknown as {getSessionId():string}).getSessionId=()=>session;
+	await fire(handlers,"session_start",ctx);
+	const node=Symbol.for("@earendil-works/pi-tui/layout-node"),root={render:()=>[],invalidate(){},[node]:()=>({type:"vstack",entries:[]})};
+	const tui={mode:"fullscreen",terminal:{rows:40,columns:160},layoutRoot:root,requestRender(){}};
+	const factory=ui.footerFactory as (tui:unknown,theme:ShellBarTheme,data:unknown)=>{dispose():void};
+	const component=factory(tui,plainTheme,{getGitBranch:()=>"main",getExtensionStatuses:()=>new Map(),getAvailableProviderCount:()=>1,onBranchChange:()=>()=>{}});
+	const section=sidebarState(tui as unknown as TUI).parts.get("sessions")!; const original=section.render.bind(section); let paints=0;
+	section.render=(w)=>{paints++;return original(w);}; let requests:unknown[]=[]; const off=pi.events.on(SESSION_REFRESH_EVENT,(value)=>requests.push(value));
+	const entries=()=>{const tree=root[node]() as unknown as {entries:Array<{component:{[node]():{entries:Array<{component:Component}>}}}>};return tree.entries[1]!.component[node]().entries;};
+	const select=(label:string)=>{const p=entries()[0]!.component, rows=p.render(50).map(stripAnsi), y=rows.findIndex(row=>row.includes("Sessions")&&row.includes("Status")),x=rows[y]!.indexOf(label);assert.ok(x>=0);assert.equal(p.handleMouse?.({type:"click",button:"left",x,y,width:50,height:rows.length,screenX:110+x,screenY:y,shift:false,alt:false,ctrl:false} as TuiMouseEvent)?.handled,true);};
+	const body=()=>entries()[1]!.component.render(50).map(stripAnsi).join("\n");
+	try {
+		entries(); entries(); assert.equal(paints,0); assert.equal(requests.length,0);
+		select("Sessions"); assert.deepEqual(requests,[{sessionId:"shell-session"}]); assert.match(body(),/Sessions unavailable/);
+		select("Sessions"); assert.equal(requests.length,1,"reselecting the same tab does not rescan");
+		const ready={kind:"ready",rows:[{name:"Peer topic",freshness:"recent",active:2}],incomplete:false};
+		pi.events.emit(SESSION_SNAPSHOT_EVENT,{sessionId:"foreign",snapshot:ready}); assert.match(body(),/Sessions unavailable/);
+		pi.events.emit(SESSION_SNAPSHOT_EVENT,{sessionId:session,snapshot:ready}); assert.match(body(),/Peer topic/); assert.match(body(),/reachability unknown/i);
+		const count=paints; body(); assert.equal(paints,count,"stable session rows are cached");
+		select("Status"); const hidden=paints; pi.events.emit(SESSION_SNAPSHOT_EVENT,{sessionId:session,snapshot:{kind:"ready",rows:[],incomplete:false}}); entries(); assert.equal(paints,hidden,"hidden Sessions does not render");
+		select("Sessions"); assert.match(body(),/No other sessions/); assert.equal(requests.length,2);
+		session="replacement"; assert.match(body(),/Sessions unavailable/,"old parent snapshot cannot leak to replacement");
+	} finally {off();component.dispose();await fire(handlers,"session_shutdown",ctx);}
+});
+
+test("scoped voice and waits events reach the actual pinned rail and clear on replacement", async (t) => {
+	const home = scopedDoubleEscCancelConfigHome(t);
+	const { pi, handlers } = fakePi();
+	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home, GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, { activeProfile: () => "team" });
+	const { ctx, ui } = fakeContext(); let session = "shell-session";
+	(ctx.sessionManager as unknown as { getSessionId(): string }).getSessionId = () => session;
+	await fire(handlers, "session_start", ctx);
+	const node = Symbol.for("@earendil-works/pi-tui/layout-node");
+	const root = { render: () => ["transcript"], invalidate() {}, [node]: () => ({ type: "vstack", entries: [] }) };
+	const tui = { mode: "fullscreen", terminal: { rows: 40, columns: 160 }, layoutRoot: root, requestRender() {} };
+	const data = { getGitBranch: () => "main", getExtensionStatuses: () => new Map(), getAvailableProviderCount: () => 1, onBranchChange: () => () => {} };
+	const factory = ui.footerFactory as (tui: unknown, theme: ShellBarTheme, data: unknown) => { dispose(): void };
+	const component = factory(tui, plainTheme, data);
+	const status = sidebarState(tui as unknown as TUI).parts.get("footer")!; const render = status.render.bind(status); let statusRenders = 0;
+	status.render = (width) => { statusRenders++; return render(width); };
+	const parts = () => {
+		const tree = root[node]() as unknown as { entries: Array<{ component: { [node](): { entries: Array<{ component: Component }> } } }> };
+		const entries = tree.entries[1]!.component[node]().entries;
+		return { pinned: entries[0]!.component, scroll: entries[1]!.component };
+	};
+	const text = () => { const p = parts(); return { pinned: p.pinned.render(50).map(stripAnsi).join("\n"), body: p.scroll.render(50).map(stripAnsi).join("\n") }; };
+	const select = (label: string) => {
+		const pin = parts().pinned, rows = pin.render(50).map(stripAnsi), y = rows.findIndex(row => row.includes("Activity") && row.includes("Status")), x = rows[y]!.indexOf(label);
+		assert.ok(x >= 0); assert.equal(pin.handleMouse?.({ type:"click", button:"left", x, y, width:50, height:rows.length, screenX:110+x, screenY:y, shift:false, alt:false, ctrl:false } as TuiMouseEvent)?.handled,true);
+	};
+	const voice = createVoiceStatePublisher(pi, ctx);
+	try {
+		assert.match(text().body, /Waits unavailable/); assert.doesNotMatch(text().pinned, /Voice ·/);
+		pi.events.emit("background-waits:pending", { waits: [{id:"w",label:"old",startedAt:1}] });
+		pi.events.emit("background-waits:pending", { sessionId:"foreign", waits:[{id:"w",label:"foreign",startedAt:1}] });
+		assert.match(text().body,/Waits unavailable/);
+		pi.events.emit("background-waits:pending", { sessionId:session, waits:[{id:"w",label:"CI check",startedAt:1}] });
+		assert.match(text().body,/CI check/); assert.match(text().pinned,/Waits 1/);
+		voice.publish("preparing"); assert.match(text().pinned,/Voice · preparing/);
+		voice.publish("listening"); assert.match(text().pinned,/Voice · listening/);
+		pi.events.emit(VOICE_STATE_EVENT,{schema:VOICE_STATE_SCHEMA,sessionId:"foreign",state:"transcribing"});
+		pi.events.emit(VOICE_STATE_EVENT,{schema:VOICE_STATE_SCHEMA,sessionId:session,state:"recording"});
+		assert.match(text().pinned,/Voice · listening/);
+		assert.equal(statusRenders,0,"hidden Status never renders for events");
+		select("Status"); assert.match(text().pinned,/Waits 1/); assert.match(text().pinned,/Voice · listening/); assert.ok(statusRenders>0);
+		voice.publish("transcribing"); assert.match(text().pinned,/Voice · transcribing/);
+		voice.publish("idle"); assert.doesNotMatch(text().pinned,/Voice ·/);
+		pi.events.emit("background-waits:pending", {sessionId:session,waits:[]}); assert.match(text().pinned,/Waits 0/);
+		component.dispose(); session = "replacement"; await fire(handlers,"session_start",ctx);
+		const next = (ui.footerFactory as typeof factory)(tui,plainTheme,data);
+		try {
+			voice.publish("preparing"); pi.events.emit("background-waits:pending",{sessionId:"shell-session",waits:[{id:"w",label:"stale",startedAt:1}]});
+			assert.doesNotMatch(text().pinned,/Voice ·|Waits 1/); assert.match(text().body,/Waits unavailable/);
+			await fire(handlers,"session_shutdown",ctx);
+			pi.events.emit(VOICE_STATE_EVENT,{schema:VOICE_STATE_SCHEMA,sessionId:session,state:"listening"});
+			assert.doesNotMatch(text().pinned,/Voice ·/);
+		} finally { next.dispose(); }
+	} finally { voice.close(); component.dispose(); }
 });
 
 test("jobs snapshots populate Status, use one compact fallback, and reject stale sessions", async () => {

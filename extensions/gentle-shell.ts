@@ -124,7 +124,10 @@ import { sidebarHeader, sidebarPart, sidebarState, VISUAL_SETTINGS_CHANGED, type
 import { installSidebar, invalidateSidebar, narrowStatusOwner, SIDEBAR_BREAKPOINT, STATUS_OWNER } from "../lib/shell-sidebar-layout.ts";
 import { sessionChangeRoots } from "../lib/session-changes.ts";
 import { REVIEW_SIDEBAR_EVENT, isReviewSidebarSnapshot, type ReviewSidebarSnapshot } from "../lib/review-sidebar-state.ts";
-import { JOBS_SIDEBAR_EVENT, JOBS_STATUS_KEY, isJobsSidebarSnapshot, type RunningJobDisplay } from "../lib/jobs-sidebar-state.ts";
+import { JOBS_SIDEBAR_EVENT, JOBS_STATUS_KEY, type RunningJobDisplay } from "../lib/jobs-sidebar-state.ts";
+import { acceptedJobs, commandRows, createWaitsReceiver } from "../lib/shell-activity-state.ts";
+import { createVoiceReceiver } from "../lib/shell-voice-state.ts";
+import { acceptedSessionSnapshot, sessionRows, SESSION_REFRESH_EVENT, SESSION_SNAPSHOT_EVENT, type SessionSnapshot } from "../lib/shell-session-state.ts";
 import { installSessionChangeCapture } from "../lib/session-change-capture.ts";
 import { SelectionEngine } from "../lib/selection-engine.ts";
 import { withOverlayRepaint } from "../lib/overlay-repaint.ts";
@@ -1727,7 +1730,7 @@ function spaced(component: { render(width: number): string[]; invalidate(): void
 }
 
 // Same rose identity as the Gentle AI tool cards (lib/gentle-ai-renderer.ts).
-const GENTLE_AI_GLYPH = "\u{1F339}";
+const GENTLE_AI_GLYPH = "  ";
 
 export function devBinaryCard(notice: DevBinaryNotice): Card {
 	if (notice.state === "invalid") {
@@ -2144,10 +2147,24 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 	let currentContext: ExtensionContext | undefined;
 	let review: ReviewSidebarSnapshot | undefined;
 	let runningJobs: RunningJobDisplay[] | undefined;
+	let sessionSnapshot: SessionSnapshot | undefined;
+	let sessionSnapshotOwner: string | undefined;
 	const redrawReview = () => {
 		renderHost?.invalidateSidebar?.();
 		renderHost?.requestRender();
 	};
+	const sessionId = () => currentContext?.sessionManager.getSessionId();
+	const waitsReceiver = createWaitsReceiver(pi.events, sessionId, redrawReview);
+	const voiceReceiver = createVoiceReceiver(pi.events, sessionId, redrawReview);
+	const sessionData = () => sessionSnapshotOwner && sessionSnapshotOwner === sessionId() ? sessionSnapshot : undefined;
+	const unsubscribeSessions = pi.events.on(SESSION_SNAPSHOT_EVENT, (value) => {
+		const id = sessionId();
+		const snapshot = acceptedSessionSnapshot(id, value);
+		if (!id || !snapshot || (sessionSnapshotOwner === id && JSON.stringify(sessionSnapshot) === JSON.stringify(snapshot))) return;
+		sessionSnapshotOwner = id;
+		sessionSnapshot = snapshot;
+		redrawReview();
+	});
 	const unsubscribeReview = pi.events.on(REVIEW_SIDEBAR_EVENT, (value) => {
 		const event = value as { sessionId?: unknown; snapshot?: unknown } | undefined;
 		if (!currentContext || event?.sessionId !== currentContext.sessionManager.getSessionId()) return;
@@ -2156,10 +2173,10 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		redrawReview();
 	});
 	const unsubscribeJobs = pi.events.on(JOBS_SIDEBAR_EVENT, (value) => {
-		const event = value as { sessionId?: unknown; snapshot?: unknown } | undefined;
-		if (!currentContext || event?.sessionId !== currentContext.sessionManager.getSessionId()) return;
-		if (!isJobsSidebarSnapshot(event.snapshot)) return;
-		runningJobs = event.snapshot.jobs.map(({ id, label, startedAt }) => ({ id, label, startedAt }));
+		if (!currentContext) return;
+		const jobs = acceptedJobs(currentContext.sessionManager.getSessionId(), value);
+		if (!jobs) return;
+		runningJobs = jobs;
 		redrawReview();
 	});
 	pi.on("session_tree", () => {
@@ -2206,6 +2223,10 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 	pi.on("session_start", async (_event, ctx) => {
 		closeCustomize?.();
 		runningJobs = undefined;
+		sessionSnapshot = undefined;
+		sessionSnapshotOwner = undefined;
+		waitsReceiver.reset();
+		voiceReceiver.reset();
 		adaptiveReasoningNotices.clear();
 		// A restored or default session never emits model_select, so the startup model
 		// announces itself here when it manages its own depth.
@@ -2357,7 +2378,30 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 					return { handled: true, render: true };
 				},
 			});
-			const uninstall = installSidebar(tui, theme, () => visualSettings.statusPlacement, () => visualSettings.headerPlacement, () => visualSettings.density, { collapsed: () => railCollapsed, toggle: () => toggleRail(), hint: () => railPanelKey(env) }, { tabs: true });
+			const activityPart = sidebarPart(tui, "activity", { render: () => [], invalidate() {}, dispose() {} }, {
+				commandsCount: () => runningJobs?.length,
+				waitsCount: () => waitsReceiver.current()?.length,
+				digest: () => {
+					const waits = waitsReceiver.current();
+					const now = deps.now();
+					return JSON.stringify([runningJobs, waits, runningJobs?.map((job) => Math.max(0, Math.floor((now - job.startedAt) / 60000))), waits?.map((wait) => Math.max(0, Math.floor((now - wait.startedAt) / 60000)))]);
+				},
+				render: (width) => renderCard({ title: "Background", tone: CARD_TONE.INFO, rail: true, body: commandRows(runningJobs, deps.now(), waitsReceiver.current()) }, theme, width, { expanded: true, panel: true }),
+				invalidate() {},
+			});
+			const voicePart = sidebarPart(tui, "voice", { render: () => [], invalidate() {}, dispose() {} }, {
+				digest: () => voiceReceiver.current() ?? "idle",
+				render: () => { const voice = voiceReceiver.current(); return voice ? [`Voice · ${voice}`] : []; },
+				invalidate() {},
+			});
+			const sessionsPart = sidebarPart(tui, "sessions", { render: () => [], invalidate() {}, dispose() {} }, {
+				digest: () => JSON.stringify(sessionData()),
+				render: (width) => renderCard({ title: "Sessions", tone: CARD_TONE.INFO, rail: true, body: sessionRows(sessionData()) }, theme, width, { expanded: true, panel: true }),
+				invalidate() {},
+			});
+			const uninstall = installSidebar(tui, theme, () => visualSettings.statusPlacement, () => visualSettings.headerPlacement, () => visualSettings.density, { collapsed: () => railCollapsed, toggle: () => toggleRail(), hint: () => railPanelKey(env) }, {
+				tabs: true, onTabSelect: (tab) => { const id = sessionId(); if (tab === "sessions" && id) pi.events.emit(SESSION_REFRESH_EVENT, { sessionId: id }); },
+			});
 			// The public widget slot follows the editor even when the rail is absent.
 			const belowHeader = () => visualSettings.headerPlacement === "below-input" && (tui as TUI & { mode?: string }).mode === "fullscreen" && statusOwner() !== STATUS_OWNER.BOTTOM;
 			const widgetChrome = (width: number) => belowFloat(width, false) ?? headerBar(width);
@@ -2385,7 +2429,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 					return rows.length === 0 && (tui as TUI & { mode?: string }).mode === "fullscreen"
 						&& resolvePromptLayout(width, cardStyle(), theme.bg?.bind(theme)).background ? [""] : rows;
 				},
-				dispose() { ctx.ui.setWidget(HEADER_WIDGET_KEY, undefined); disposeHeader(); limitsPart.dispose?.(); uninstall(); part.dispose(); if (sidebarTui === tui) { sidebarTui = undefined; groupedChangesOwner = () => false; } releaseFullscreenProbe(fullscreenProbe); } };
+				dispose() { ctx.ui.setWidget(HEADER_WIDGET_KEY, undefined); disposeHeader(); limitsPart.dispose?.(); activityPart.dispose?.(); voicePart.dispose?.(); sessionsPart.dispose?.(); uninstall(); part.dispose(); if (sidebarTui === tui) { sidebarTui = undefined; groupedChangesOwner = () => false; } releaseFullscreenProbe(fullscreenProbe); } };
 		});
 		void refreshUsage(ctx, true);
 		const ownsPrompt = installPrompt(
@@ -2454,6 +2498,11 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		// fork, quit), so the factory-level subscription never needs to be restored.
 		unsubscribeReview();
 		unsubscribeJobs();
+		unsubscribeSessions();
+		sessionSnapshot = undefined;
+		sessionSnapshotOwner = undefined;
+		waitsReceiver.dispose();
+		voiceReceiver.dispose();
 		runningJobs = undefined;
 		stopProfilePoll();
 		oddPhaseRegistry.clear(ctx.sessionManager.getSessionId());

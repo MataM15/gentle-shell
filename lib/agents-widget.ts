@@ -22,6 +22,8 @@ export interface AgentsWidgetOptions {
 	// same control the Todos card carries; hovered paints its hover role.
 	collapseControl?: boolean;
 	hovered?: boolean;
+	/** Optional painted task-row geometry, end-exclusive and local to this card. */
+	onTaskRows?(rows: Array<{ id: string; startY: number; endY: number }>): void;
 }
 
 interface StatusLook {
@@ -309,7 +311,7 @@ export function agentsCardTone(tasks: readonly TaskRecord[], now: number): CardT
 
 export function renderAgentsCard(tasks: readonly TaskRecord[], theme: CardTheme, width: number, now: number, options: AgentsWidgetOptions): string[] {
 	const shown = widgetTasks(tasks, now);
-	if (shown.length === 0) return [];
+	if (shown.length === 0) { options.onTaskRows?.([]); return []; }
 	const cols = columns(shown, panelInnerWidth(theme, width, tone(shown)), now);
 	// The float panel spends two more rows on padding above its header and the
 	// separator below it, so it gives them back from the task budget to stay as
@@ -318,7 +320,14 @@ export function renderAgentsCard(tasks: readonly TaskRecord[], theme: CardTheme,
 	const maxRows = options.maxRows === undefined ? undefined : options.maxRows - extraRows;
 	const { listed, hidden } = options.collapsed ? { listed: [shown[0]], hidden: 0 } : visibleRows(shown, maxRows, extraRows > 0);
 	const hint = options.collapsed && options.collapseKey ? `${options.collapseKey} expand` : shown.length > 1 ? batchElapsed(shown, now) : undefined;
-	const body = listed.flatMap((task) => row(task, theme, cols, now, options.maxRows === undefined));
+	const body: string[] = [];
+	const hits: Array<{ id: string; startY: number; endY: number }> = [];
+	for (const task of listed) {
+		const startY = 1 + extraRows + body.length;
+		body.push(...row(task, theme, cols, now, options.maxRows === undefined));
+		hits.push({ id: task.id, startY, endY: 1 + extraRows + body.length });
+	}
+	options.onTaskRows?.(hits);
 	if (hidden > 0) body.push(overflowRow(hidden, theme, options.viewKey));
 	const icon = options.collapsed ? "▸" : "▾";
 	const control = `${icon} ${width >= 28 ? (options.collapsed ? "Expand" : "Collapse") : ""}`.trimEnd();

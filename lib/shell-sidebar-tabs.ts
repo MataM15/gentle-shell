@@ -7,8 +7,8 @@ export const SIDEBAR_TABS: ReadonlyArray<{ id: SidebarTab; label: string; start:
 ];
 export function sidebarTabSections(tab: SidebarTab): readonly string[] {
  switch (tab) {
-  case 'activity': return ['agents', 'todo'];
-  case 'sessions': return [];
+  case 'activity': return ['agents', 'activity', 'todo'];
+  case 'sessions': return ['sessions'];
   case 'resources': return ['usage'];
   case 'status': return ['footer'];
  }

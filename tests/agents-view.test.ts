@@ -42,6 +42,20 @@ function clickLabel(view: AgentsView, label: string, width = 60): void {
 	assert.equal(view.handleMouse(mouse(x, y, width, frame.length, "click"))?.handled, true);
 }
 
+test("initial task selection is local to the current session and otherwise falls back", () => {
+	const store = new TaskStore();
+	store.add(task("a", { createdAt: 1000 }));
+	store.add(task("b", { createdAt: 2000 }));
+	store.add(task("foreign", { parentSessionId: "other", createdAt: 3000 }));
+	const make = (initialTaskId?: string) => new AgentsView({ theme: plainTheme, rows: 8, store, sessionId: "s", initialTaskId, now: () => 61000, onCancel() {}, onOpen() {}, onClose() {}, requestRender() {} });
+	const baseline = make(); const fallback = baseline.selectedTask()?.id;
+	assert.ok(fallback && fallback !== "foreign");
+	const selected = make("a"); assert.equal(selected.selectedTask()?.id, "a");
+	const missing = make("missing"); assert.equal(missing.selectedTask()?.id, fallback);
+	const foreign = make("foreign"); assert.equal(foreign.selectedTask()?.id, fallback);
+	for (const view of [baseline, selected, missing, foreign]) view.dispose();
+});
+
 test("narrow navigation enters a direct child, retains manual thread position, and Escape backs out", () => {
 	const { store, view, events } = harness(8);
 	store.add(task("a"));

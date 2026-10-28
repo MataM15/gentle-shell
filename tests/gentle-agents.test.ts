@@ -13,8 +13,10 @@ import test, { after, afterEach, before, mock } from "node:test";
 import type { TestContext } from "node:test";
 import { generateUnifiedPatch, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream, type AssistantMessage } from "@earendil-works/pi-ai";
-import { visibleWidth, type Component, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
-import { sidebarState } from "../lib/shell-sidebar.ts";
+import { ScrollView, visibleWidth, type Component, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import { installSidebar } from "../lib/shell-sidebar-layout.ts";
+import { sidebarPart, sidebarState } from "../lib/shell-sidebar.ts";
+import { acceptedSessionSnapshot, sessionRows, SESSION_REFRESH_EVENT, SESSION_SNAPSHOT_EVENT, type SessionSnapshot } from "../lib/shell-session-state.ts";
 import { CHILD_PACKAGE_INJECTION_ENV, encodeChildPackageInjection } from "../lib/child-package-injection.ts";
 import gentleAgents, { agentRuntimePaths, agentsCollapseKey, agentsEnabled, agentsStopKey, agentsViewKey, agentResultPreview, answerThroughUi, childContextExtensionPaths, completionText, createDefaultSessionTransport, legacySubagentsInstalled, PARENT_WAKE_GRACE_MS, type AgentsDeps, type SessionTransportFactory } from "../extensions/gentle-agents.ts";
 import { ActiveSessionClient, ActiveSessionListener, SessionPresenceError, SessionPresenceRegistry } from "../lib/agents-session-transport.ts";
@@ -3746,6 +3748,88 @@ test("background runs return at once; status, result, send_message, cancel, and 
 	await fire("session_start", ctx);
 	const started = await tools.get("subagent_run")!.execute("c1", { agent: "explore", task: "Long job", mode: "background" }, undefined, undefined, ctx);
 	const id = (started.details.gentleAgents as { taskId: string }).taskId;
+test("Agents rail task click opens the matching local task and rejects stale geometry", async () => {
+	const { pi, tools, fire } = fakePi(); const harness = deps(); harness.deps.now = () => 10000;
+	gentleAgents(pi, {}, harness.deps);
+	const terminalTui = { requestRender() {}, terminal: { columns: 160, rows: 40 } };
+	const { ctx, widgetComponent, overlays } = fakeContext(terminalTui);
+	await fire("session_start", ctx);
+	await tools.get("subagent_run")!.execute("a", { agent: "explore", task: "First", label: "first task", mode: "background" }, undefined, undefined, ctx);
+	await tools.get("subagent_run")!.execute("b", { agent: "explore", task: "Second", label: "second task", mode: "background" }, undefined, undefined, ctx);
+	await tick();
+	harness.children[0].emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "FIRST_THREAD_MARKER" } });
+	harness.children[1].emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "SECOND_THREAD_MARKER" } });
+	await tick(); widgetComponent();
+	const rail = sidebarState(terminalTui as unknown as TUI).parts.get("agents")!;
+	let lines = rail.render(80).map(stripAnsi); let y = lines.findIndex((line) => line.includes("second task")); assert.ok(y > 0);
+	const event = (x: number, row: number, width = 80) => ({ type: "click", button: "left", x, y: row, width, height: lines.length, screenX: x, screenY: row, shift: false, alt: false, ctrl: false } as TuiMouseEvent);
+	assert.equal(rail.handleMouse?.(event(0,y)), undefined, "outside card content is inert");
+	assert.equal(rail.handleMouse?.(event(3,y,79)), undefined, "stale width is inert");
+	const oldStyle = cardStyle(); setCardStyle(oldStyle === CARD_STYLE.NEON ? CARD_STYLE.FLOAT : CARD_STYLE.NEON);
+	try { assert.equal(rail.handleMouse?.(event(3,y)), undefined, "style change invalidates the map"); } finally { setCardStyle(oldStyle); }
+	harness.children[1].emit({ type: "tool_execution_start", toolCallId: "read-1", toolName: "read", args: {} }); await tick();
+	assert.equal(rail.handleMouse?.(event(3,y)), undefined, "changed task state invalidates the map");
+	terminalTui.terminal.columns = 159; assert.equal(rail.handleMouse?.(event(3,y)), undefined, "resize invalidates the map"); terminalTui.terminal.columns = 160;
+	lines = rail.render(80).map(stripAnsi); y = lines.findIndex((line) => line.includes("second task"));
+	assert.equal(rail.handleMouse?.(event(3,y))?.handled, true);
+	await tick(); assert.equal(overlays.length, 1);
+	const screen = stripAnsi(overlays[0]!.render(100).join("\n"));
+	assert.match(screen, /SECOND_THREAD_MARKER/); assert.doesNotMatch(screen, /FIRST_THREAD_MARKER/);
+	overlays[0]!.handleInput("q"); await tick();
+	lines = rail.render(80).map(stripAnsi); y = lines.findIndex((line) => line.includes("second task"));
+	(ctx.sessionManager as unknown as {getSessionId(): string}).getSessionId = () => "other";
+	assert.equal(rail.handleMouse?.(event(3,y)), undefined, "a replacement session cannot use old hits");
+	assert.equal(overlays.length, 1);
+	await fire("session_shutdown", ctx);
+});
+
+test("Sessions tab selection reads bounded synthetic presence through the real agents publisher and event bus", async (t) => {
+	const profile=mkdtempSync(join(tmpdir(),"sidebar-presence-")); t.after(()=>rmSync(profile,{recursive:true,force:true}));
+	const peer=PresencePublisher.start({profile,sessionId:"peer-synthetic",label:"Peer topic",activity:[]}); t.after(()=>peer.dispose());
+	const {pi,fire}=fakePi(); const runtime=deps(); runtime.deps.agentHome=profile; runtime.deps.now=()=>Date.now(); gentleAgents(pi,{},runtime.deps);
+	const node=Symbol.for("@earendil-works/pi-tui/layout-node"); const root={render:()=>[],invalidate(){},[node]:()=>({type:"vstack",entries:[]})};
+	const terminalTui={mode:"fullscreen",layoutRoot:root,requestRender(){},terminal:{columns:160,rows:40}}; const tui=terminalTui as unknown as TUI;
+	const {ctx,widgetComponent}=fakeContext(terminalTui); await fire("session_start",ctx); widgetComponent();
+	let snapshot:SessionSnapshot|undefined; let publishes=0, paints=0;
+	const unsub=pi.events.on(SESSION_SNAPSHOT_EVENT,(value)=>{const accepted=acceptedSessionSnapshot(ctx.sessionManager.getSessionId(),value);if(accepted){snapshot=accepted;publishes++;}});
+	sidebarPart(tui,"sessions",{digest:()=>JSON.stringify(snapshot),render:()=>{paints++;return sessionRows(snapshot);},invalidate(){}});
+	const stop=installSidebar(tui,{...plainTheme,bold:(s:string)=>s},()=>"auto",()=>"top",undefined,undefined,{tabs:true,onTabSelect:(tab)=>{if(tab==="sessions") pi.events.emit(SESSION_REFRESH_EVENT,{sessionId:ctx.sessionManager.getSessionId()});}});
+	try {
+		const entries=()=>{const tree=root[node]() as unknown as {entries:Array<{component:{[node]():{entries:Array<{component:Component}>}}}>};return tree.entries[1]!.component[node]().entries;};
+		const pinned=entries()[0]!.component; const lines=pinned.render(50).map(stripAnsi), y=lines.findIndex(line=>line.includes("Sessions")), x=lines[y]!.indexOf("Sessions");
+		assert.equal(paints,0); entries(); entries(); assert.equal(paints,0,"hidden tab never renders"); assert.equal(publishes,0,"no registry read from frames");
+		assert.equal(pinned.handleMouse?.({type:"click",button:"left",x,y,width:50,height:lines.length,screenX:110+x,screenY:y,shift:false,alt:false,ctrl:false} as TuiMouseEvent)?.handled,true);
+		await tick(); const scroll=entries().find(entry=>entry.component instanceof ScrollView)!.component;
+		assert.match(scroll.render(50).map(stripAnsi).join("\n"),/Peer topic/); assert.match(scroll.render(50).map(stripAnsi).join("\n"),/reachability unknown/i);
+		assert.equal(publishes,1); const painted=paints; entries(); entries(); assert.equal(paints,painted,"stable session frame stays cached");
+		pi.events.emit(SESSION_REFRESH_EVENT,{sessionId:"foreign"}); await tick(); assert.equal(publishes,1);
+	} finally { stop(); unsub(); await fire("session_shutdown",ctx); }
+});
+
+test("clipped Agents sidebar dispatches a scrolled task click to its local detail", async () => {
+	const { pi, tools, fire } = fakePi(); const harness=deps(); harness.deps.now=()=>10000; gentleAgents(pi,{},harness.deps);
+	const node=Symbol.for("@earendil-works/pi-tui/layout-node");
+	const root={render:()=>[],invalidate(){},[node]:()=>({type:"vstack",entries:[]})};
+	const terminalTui={mode:"fullscreen",layoutRoot:root,requestRender(){},terminal:{columns:160,rows:40}};
+	const {ctx,widgetComponent,overlays}=fakeContext(terminalTui);
+	await fire("session_start",ctx);
+	await tools.get("subagent_run")!.execute("a",{agent:"explore",task:"First",label:"first task",mode:"background"},undefined,undefined,ctx);
+	await tools.get("subagent_run")!.execute("b",{agent:"explore",task:"Second",label:"second task",mode:"background"},undefined,undefined,ctx);
+	await tick(); harness.children[1].emit({type:"message_update",assistantMessageEvent:{type:"text_delta",delta:"SCROLL_SECOND_MARKER"}}); await tick(); widgetComponent();
+	const stop=installSidebar(terminalTui as unknown as TUI,{...plainTheme,bold:(text:string)=>text},()=>"auto",()=>"top",undefined,undefined,{tabs:true});
+	try {
+		const tree=root[node]() as unknown as {entries:Array<{component:{[node]():{entries:Array<{component:Component}>}}}>};
+		const scroll=tree.entries[1]!.component[node]().entries.find((entry)=>entry.component instanceof ScrollView)?.component as ScrollView; assert.ok(scroll);
+		const rows=scroll.render(50).map(stripAnsi); const taskRows=rows.map((line,i)=>line.includes("explore") ? i : -1).filter(i=>i>=0);
+		assert.equal(taskRows.length,2); scroll.updateLayout(rows.length,1,()=>{}); scroll.scrollBy(taskRows[1]!);
+		const click={type:"click",button:"left",x:4,y:0,width:50,height:1,screenX:114,screenY:0,shift:false,alt:false,ctrl:false} as TuiMouseEvent;
+		assert.equal(scroll.handleMouse(click)?.handled,true); await tick(); assert.equal(overlays.length,1);
+		assert.match(stripAnsi(overlays[0]!.render(100).join("\n")),/SCROLL_SECOND_MARKER/);
+		assert.equal(scroll.handleMouse({...click,y:1}),undefined,"outside clipped viewport is inert");
+		overlays[0]!.handleInput("q"); await tick();
+	} finally { stop(); await fire("session_shutdown",ctx); }
+});
+
 	assert.match(started.content[0].text, new RegExp(`background as task ${id}`));
 	await tick();
 	assert.match((await tools.get("subagent_status")!.execute("c2", { task_id: id }, undefined, undefined, ctx)).content[0].text, /running · background/);
@@ -6530,6 +6614,32 @@ test("/gentle:jobs opens this session's jobs overlay, stops the selected job, an
 		const screen = view.render(100).map(stripAnsi).join("\n");
 		assert.match(screen, /Jobs · 1 running · 0 finished/);
 		assert.match(screen, /gh run watch 42 --exit-status/);
+test("sidebar job events and rows hide default command labels but retain explicit labels", async () => {
+	const { pi, tools, fire } = fakePi();
+	const jobs = fakeJobShell();
+	gentleAgents(pi, {}, { ...deps().deps, jobShell: jobs.shell, jobOutputDir: () => jobs.dir });
+	const { ctx } = fakeContext();
+	const snapshots: Array<{ sessionId: string; snapshot: { jobs: Array<{ id: string; label: string; startedAt: number }> } }> = [];
+	const unsubscribe = pi.events.on("gentle-ai:jobs-sidebar", (value) => snapshots.push(value as typeof snapshots[number]));
+	try {
+		await fire("session_start", ctx);
+		const sentinel = "RAW_COMMAND_SENTINEL_2384";
+		await tools.get("bash_background")!.execute("b1", { command: sentinel }, undefined, undefined, ctx);
+		await tools.get("bash_background")!.execute("b2", { command: "OTHER_COMMAND_SENTINEL_2384", label: "CI build" }, undefined, undefined, ctx);
+		const event = snapshots.at(-1)!;
+		assert.equal(event.sessionId, ctx.sessionManager.getSessionId());
+		assert.doesNotMatch(JSON.stringify(event), /RAW_COMMAND_SENTINEL_2384|OTHER_COMMAND_SENTINEL_2384/);
+		assert.ok(event.snapshot.jobs.some((job) => job.label === "Background command"));
+		assert.ok(event.snapshot.jobs.some((job) => job.label === "CI build"));
+		const { commandRows } = await import("../lib/shell-activity-state.ts");
+		const rows = commandRows(event.snapshot.jobs, Date.now()).join("\n");
+		assert.doesNotMatch(rows, /RAW_COMMAND_SENTINEL_2384|OTHER_COMMAND_SENTINEL_2384/);
+		assert.match(rows, /Background command/); assert.match(rows, /CI build/);
+	} finally {
+		unsubscribe(); await fire("session_shutdown", ctx); jobs.cleanup();
+	}
+});
+
 		view.handleInput("s");
 		assert.equal(jobs.runs[0]!.signal?.aborted, true, "s stops the selected job");
 		assert.equal(statuses.at(-1), undefined, "the footer count clears when nothing runs");

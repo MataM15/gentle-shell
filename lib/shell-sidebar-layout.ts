@@ -1,6 +1,7 @@
 import { ScrollView, VStack, truncateToWidth, visibleWidth, type Component, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { sidebarState, type SidebarHeaderRail, type SidebarRail } from "./shell-sidebar.ts";
 import { SIDEBAR_TABS, sidebarTabSections, type SidebarTab } from "./shell-sidebar-tabs.ts";
+import { activitySummary } from "./shell-activity-state.ts";
 import type { ShellBarTheme } from "./shell-bar.ts";
 import { CARD_STYLE, cardStyle, type CardStyle } from "./shell-card.ts";
 import { renderSidebarBanner } from "./shell-sidebar-banner.ts";
@@ -43,6 +44,7 @@ type PreparedRail = {
 	headerLines: string[];
 	headerActive: boolean;
 	tabPin?: { headerHeight: number; wellnessStart: number; wellnessHeight: number; tabRow: number };
+	summaryKey?: string;
 	presentation?: SidebarPresentation;
 };
 const CACHE = Symbol.for("gentle-pi.experimental-sidebar.cache");
@@ -106,7 +108,7 @@ export interface RailControl {
 const RAIL_FOOTER_ARROW = "»";
 const RAIL_FOOTER_LABEL = "hide panel";
 
-export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => StatusPlacement = () => "auto", headerPlacement: () => HeaderPlacement = () => "top", density: () => Density = () => "comfortable", control?: RailControl, options?: { tabs?: boolean }): () => void {
+export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => StatusPlacement = () => "auto", headerPlacement: () => HeaderPlacement = () => "top", density: () => Density = () => "comfortable", control?: RailControl, options?: { tabs?: boolean; onTabSelect?: (tab: SidebarTab) => void }): () => void {
 	if (!tui.terminal) return () => {};
 	const host = tui as Host;
 	const state = sidebarState(tui);
@@ -127,6 +129,10 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 	// section with no digest (or a throwing one) falls back to the shared
 	// revision counter, exactly like the whole-rail memo already did.
 	const sectionCache = new Map<string, SectionCacheEntry>();
+	const currentSummary = () => {
+		try { return activitySummary(state.parts.get("agents")?.activitySummary?.(), state.parts.get("activity")?.commandsCount?.(), state.parts.get("activity")?.waitsCount?.()); }
+		catch { return activitySummary(undefined, undefined); }
+	};
 	state.active = false;
 	// Hidden removes Status everywhere, including regular mode where the rail
 	// never mounts, so it is published independently of the fullscreen layout.
@@ -176,12 +182,15 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 				if (!current.active || stopped || failed || folded() || host.mode !== "fullscreen" || host.layoutRoot !== current.root ||
 					tui.terminal.columns !== current.width || cache.revision !== current.revision || event.x < 0 || event.x >= RAIL_WIDTH ||
 					event.y < 0 || event.y >= current.headerLines.length || current.parts.length !== state.parts.size ||
-					current.parts.some(([key, part], i) => state.parts.get(key) !== part || (current.digests[i] !== undefined && railDigest(part) !== current.digests[i]))) return undefined;
+					current.parts.some(([key, part], i) => state.parts.get(key) !== part || (current.digests[i] !== undefined && railDigest(part) !== current.digests[i])) || current.summaryKey !== currentSummary()) return undefined;
 				const pin = current.tabPin;
 				if (event.y === pin.tabRow && event.type === "click" && event.button === "left") {
 					const target = SIDEBAR_TABS.find((tab) => event.x >= tab.start && event.x < tab.end);
 					if (!target) return undefined;
-					if (target.id !== selectedTab) { selectedTab = target.id; scroll.scrollBy(-scroll.scrollTop); invalidateSidebar(tui); tui.requestRender(); }
+					if (target.id !== selectedTab) {
+						selectedTab = target.id; scroll.scrollBy(-scroll.scrollTop); invalidateSidebar(tui); tui.requestRender();
+						try { options.onTabSelect?.(target.id); } catch { /* Display notifications must not break the rail. */ }
+					}
 					return { handled: true, render: true };
 				}
 				if (event.y >= pin.wellnessStart && event.y < pin.wellnessStart + pin.wellnessHeight) {
@@ -297,9 +306,10 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 		// Digest closures read live session state, so they must be evaluated once
 		// per frame and stored for the next comparison (issue #1681): the sections
 		// loop below reuses this pass instead of calling each digest a second time.
-		const visibleKeys = options?.tabs ? new Set(["header", "wellness", ...sidebarTabSections(selectedTab)]) : undefined;
+		const visibleKeys = options?.tabs ? new Set(["header", "wellness", "voice", ...sidebarTabSections(selectedTab)]) : undefined;
 		const digests = parts.map(([key, rail]) => !visibleKeys || visibleKeys.has(key) ? railDigest(rail) : undefined);
-		const unchanged = prepared?.revision === cache.revision &&
+		const summaryKey = options?.tabs ? currentSummary() : undefined;
+		const unchanged = prepared?.revision === cache.revision && prepared.summaryKey === summaryKey &&
 			prepared.width === width && prepared.mode === host.mode && prepared.headerPlacement === headerPlacement() && prepared.cardStyle === style && prepared.root === root && prepared.theme === theme &&
 			prepared.parts.length === parts.length && prepared.parts.every(([key, part], index) => parts[index]?.[0] === key && parts[index]?.[1] === part) &&
 			prepared.digests.length === digests.length && prepared.digests.every((digest, index) => digest === digests[index]);
@@ -336,6 +346,7 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 				return { key, component, lines };
 			};
 			const wellness = options?.tabs ? renderSection("wellness") : undefined;
+			const voice = options?.tabs ? renderSection("voice") : undefined;
 			const keys = options?.tabs ? sidebarTabSections(selectedTab) : ["wellness", "usage", "footer", "agents", "todo"];
 			const sections = keys.filter((key) => key !== "todo" || state.visibility?.todo !== false).map((key) => renderSection(key))
 				.filter((section) => section.component !== undefined && section.lines.length > 0) as Array<{ key: string; component: Component; lines: string[] }>;
@@ -380,6 +391,8 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 					tabLine += theme.fg(tab.id === selectedTab ? "accent" : "dim", ` ${tab.label} `);
 				}
 				headerLines.push(tabLine);
+				headerLines.push(truncateToWidth(` ${summaryKey}`, RAIL_WIDTH, "…"));
+				headerLines.push(...(voice?.lines ?? []).map((line) => ` ${line}`));
 				tabPin = { headerHeight, wellnessStart, wellnessHeight: wellness?.lines.length ?? 0, tabRow };
 			}
 			const supported = !options?.tabs || ["wellness", "agents", "todo", "usage", "footer"].some((key) => state.parts.has(key));
@@ -390,7 +403,7 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 				realHeaderPainted = headerLines.length > 0;
 				tabPin = undefined;
 			}
-			prepared = { revision: cache.revision, width, mode: host.mode, headerPlacement: headerPlacement(), cardStyle: style, root, theme, parts, digests, contentWidth, active, lines: railLines, hits, headerLines, headerActive: realHeaderPainted, tabPin };
+			prepared = { revision: cache.revision, width, mode: host.mode, headerPlacement: headerPlacement(), cardStyle: style, root, theme, parts, digests, contentWidth, active, lines: railLines, hits, headerLines, headerActive: realHeaderPainted, tabPin, summaryKey };
 			state.active = active;
 			return active;
 		} catch {

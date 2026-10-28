@@ -44,6 +44,10 @@ export interface SidebarRail extends Component {
 	 * one; explicit invalidateSidebar() stays for discrete state changes.
 	 */
 	digest?(): string;
+	/** Optional session-local counts used by the pinned activity summary. */
+	activitySummary?(): { active: number; attention: number };
+	commandsCount?(): number | undefined;
+	waitsCount?(): number | undefined;
 }
 /** The header slot: one part, painted as the narrow top row or pinned above the wide rail. */
 export interface SidebarHeaderRail extends SidebarRail {

@@ -29,6 +29,8 @@ export interface AgentsViewDeps {
 	rows: number | (() => number);
 	store: TaskStore;
 	sessionId?: string;
+	/** Initial selection is restricted to tasks belonging to this session. */
+	initialTaskId?: string;
 	presence?: { profile: string; target?: Readonly<Target> };
 	now(): number;
 	onCancel(task: TaskRecord): void;
@@ -297,6 +299,9 @@ export class AgentsView {
 			onClick: (event) => this.clickMode(event),
 		});
 		this.refreshTasks();
+		if (deps.sessionId && deps.initialTaskId && this.tasks.some((task) => task.id === deps.initialTaskId && task.parentSessionId === deps.sessionId)) {
+			this.selectedId = `task:${deps.initialTaskId}`;
+		}
 		this.unsubscribeSummary = deps.store.subscribeSummary(() => {
 			this.clearFooterLayout();
 			this.refreshTasks();

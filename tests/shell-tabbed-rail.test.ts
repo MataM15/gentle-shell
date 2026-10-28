@@ -34,7 +34,7 @@ function fixture(headerPlacement: 'top' | 'below-input' = 'top') {
 }
 test('production sidebar opts into the tested tabbed layout', () => {
  const source=readFileSync(new URL('../extensions/gentle-shell.ts',import.meta.url),'utf8');
- assert.match(source, /installSidebar\(tui, theme,[^\n]*\{ tabs: true \}\)/);
+ assert.match(source, /installSidebar\(tui, theme,[\s\S]*?tabs: true, onTabSelect:/);
 });
 test('enabled rail keeps header and Wellness pinned, empty Activity navigable, and hidden sections cached', t => {
  const f=fixture(); t.after(f.dispose);
@@ -76,6 +76,25 @@ test('a card style change invalidates pinned section cache', t => {
  const f=fixture(); t.after(f.dispose); f.frame(); assert.equal(f.count.wellness,1);
  setCardStyle(initial === CARD_STYLE.NEON ? CARD_STYLE.FLOAT : CARD_STYLE.NEON);
  f.frame(); assert.equal(f.count.wellness,2);
+});
+test('activity counts remain pinned across tabs and update without rendering hidden agents', t => {
+ const root={render:()=>[],invalidate(){},[NODE]:()=>({type:'vstack',entries:[]})};
+ const host={mode:'fullscreen',terminal:{columns:160},layoutRoot:root,requestRender(){}}; const tui=host as unknown as TUI;
+ let active=2, attention=1, jobs: number | undefined=1, renders=0;
+ sidebarHeader(tui,{digest:()=> 'model',render:()=>['MODEL'],invalidate(){}});
+ sidebarPart(tui,'agents',{digest:()=>String(active),activitySummary:()=>({active,attention}),render:()=>{renders++;return ['AGENTS'];},invalidate(){}});
+ sidebarPart(tui,'activity',{digest:()=>String(jobs),commandsCount:()=>jobs,render:()=>['COMMANDS'],invalidate(){}});
+ sidebarPart(tui,'footer',{digest:()=> 'status',render:()=>['STATUS'],invalidate(){}});
+ t.after(installSidebar(tui,theme,()=> 'auto',()=> 'top',undefined,undefined,{tabs:true}));
+ const frame=()=>renderLayoutFrame(root,160,24,()=>{});
+ const find=(box:LayoutBox):Component|undefined=>box.children.length===0 && box.component.render(box.rect.width).some(s=>s.includes('Activity')&&s.includes('Status')) ? box.component : box.children.map(find).find(Boolean);
+ let view=frame(); assert.match(view.lines.join('\n'),/Agents 2 active.*1 waiting.*1 command/); assert.equal(renders,1);
+ let pinned=find(view.root)!; let rows=pinned.render(50), y=rows.findIndex(s=>s.includes('Activity')), x=rows[y]!.indexOf('Status');
+ const click={type:'click',button:'left',x,y,width:50,height:rows.length,screenX:110+x,screenY:y,shift:false,alt:false,ctrl:false} as TuiMouseEvent;
+ assert.equal(pinned.handleMouse?.(click)?.handled,true); view=frame(); assert.match(view.lines.join('\n'),/STATUS/);
+ active=3; attention=2; jobs=undefined; view=frame();
+ assert.match(view.lines.join('\n'),/Agents 3 active.*2 waiting.*Commands \?/); assert.equal(renders,1, 'hidden Agents is not repainted');
+ pinned=find(view.root)!; rows=pinned.render(50); assert.match(rows.join('\n'),/Agents 3 active/);
 });
 test('tab hit geometry rejects stale digest and resized terminal', t => {
  const f=fixture(); t.after(f.dispose); const pinned=f.find(f.frame().root)!;

@@ -52,6 +52,23 @@ function task(overrides: Partial<TaskRecord>): TaskRecord {
 	return { id: "t", agent: "sdd-explore", mode: "task", prompt: "map footer data sources", label: "map footer data sources", cwd: "/r", parentSessionId: "s", status: TASK_STATUS.RUNNING, createdAt: 1000, startedAt: 1000, endedAt: null, model: "anthropic/claude-sonnet-5", thinking: undefined, sessionPath: null, error: null, result: null, lastStep: "grep", lastActivityAt: 1000, turns: 0, toolCalls: 0, tokens: 34_000, cost: 0.27, ...overrides };
 }
 
+test("task row geometry comes from the rendered rows in neon and float", (t) => {
+	const tasks = [task({id:"a", agent:"alpha", createdAt:1000}), task({id:"b", agent:"bravo", createdAt:2000, model:"model-with-a-very-long-name-and-reasoning"})];
+	for (const style of [CARD_STYLE.NEON, CARD_STYLE.FLOAT]) {
+		useCardStyle(t, style);
+		for (const width of [30, 48, 84]) {
+			let hits: Array<{id:string;startY:number;endY:number}> = [];
+			const lines = renderAgentsCard(tasks, withBackground(plainTheme), width, 5000, {collapsed:false, onTaskRows: (value) => { hits = value; }});
+			assert.deepEqual(hits.map((hit) => hit.id), ["a", "b"]);
+			for (const hit of hits) {
+				assert.ok(hit.endY > hit.startY && hit.endY < lines.length);
+				assert.match(stripAnsi(lines[hit.startY]!), hit.id === "a" ? /alpha/ : /bravo/);
+			}
+			assert.equal(hits[0]!.endY, hits[1]!.startY);
+		}
+	}
+});
+
 test("formatElapsed renders seconds, minutes, and hours compactly", () => {
 	assert.equal(formatElapsed(4_000), "4s");
 	assert.equal(formatElapsed(65_000), "1m05s");
