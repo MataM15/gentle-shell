@@ -66,9 +66,10 @@ export default function gentleWellness(
 			let paintEpoch = 0;
 			const repaint = () => { paintEpoch++; invalidateSidebar(tui); tui.requestRender(); };
 			const currentTheme = theme ?? ctx.ui.theme;
-			// The folded band owns the card in its glyph format; the rail keeps the plain one.
-			const resetGlyphs = () => sidebarState(tui).foldedBand?.() === true;
-			const paint = (width: number) => isPhoneWidth(tui) ? [] : model.render(Date.now(), width, currentTheme, { resetGlyphs: resetGlyphs() });
+			// The wide card (rail or folded band) always shows its ↻ reset column:
+			// the owner wants the reset affordance visible; the renderer still drops
+			// it on narrow cards.
+			const paint = (width: number) => isPhoneWidth(tui) ? [] : model.render(Date.now(), width, currentTheme, { resetGlyphs: true });
 			// Every Pi render re-lays out the whole transcript, so the poll repaints only when
 			// the last painted card would change (clock minute, countdowns, visibility).
 			let painted: { width: number; text: string } | undefined;
@@ -117,7 +118,7 @@ export default function gentleWellness(
 			const part = sidebarPart(tui, "wellness", {
 				// Polls and explicit visible changes advance the epoch; reads are O(1).
 				// The format flag rides it so lines cached for the rail never serve the band, or the reverse.
-				digest: () => `${paintEpoch}|${resetGlyphs()}`,
+				digest: () => String(paintEpoch),
 				// Hidden only in paint: polling, notices, resets and persistence keep running.
 				render: (width: number) => {
 					const lines = paint(width);

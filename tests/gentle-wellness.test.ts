@@ -8,7 +8,7 @@ import { REMINDERS } from "../lib/shell-wellness.ts";
 import type { WellnessState } from "../lib/wellness-state.ts";
 
 // Wellness inside the folded band (odd/tasks/folded-band.md S2d, S5, S6, S7):
-// the extension paints ↻ glyphs only while the band owns the card, hides its
+// the extension paints ↻ glyphs in the rail and the band alike, hides its
 // standalone below-editor paint then, and keeps its resets honest.
 
 const theme = { fg: (_: string, text: string) => text, bold: (text: string) => text };
@@ -46,25 +46,23 @@ test("S2d: the standalone below-editor Breaks paint steps aside while the folded
 	assert.ok(f.widget.render(160).length > 0);
 });
 
-test("S5: the registered part paints ↻ glyphs only while the band owns the card", async (t) => {
+test("the registered part paints ↻ glyphs in the rail and in the folded band alike", async (t) => {
 	const f = await fixture(t);
-	assert.doesNotMatch(f.raw().render(50).join("\n"), /↻/, "rail format outside the band");
+	const rail = f.raw().render(50);
+	assert.equal((rail.join("\n").match(/↻/g) ?? []).length, 3, "the rail card keeps the reset affordance visible");
 	f.state.foldedBand = () => true;
 	const lines = f.raw().render(50);
 	assert.equal((lines.join("\n").match(/↻/g) ?? []).length, 3);
 	assert.ok(lines.every((line) => visibleWidth(line) === 50));
-	f.state.foldedBand = () => false;
-	assert.doesNotMatch(f.raw().render(50).join("\n"), /↻/, "unfolding restores the no-glyph rail card");
+	assert.deepEqual(lines, rail, "band and rail share one format");
 });
 
-test("S7: toggling between band and rail changes the digest so cached lines never keep the wrong format", async (t) => {
+test("S7: toggling between band and rail keeps the digest stable while nothing changes", async (t) => {
 	const f = await fixture(t);
 	f.raw().render(50);
 	const rail = f.raw().digest!();
 	f.state.foldedBand = () => true;
-	const band = f.raw().digest!();
-	assert.notEqual(band, rail);
-	assert.equal(f.raw().digest!(), band, "stable while nothing changes");
+	assert.equal(f.raw().digest!(), rail, "same format, same digest");
 	f.state.foldedBand = () => false;
 	assert.equal(f.raw().digest!(), rail);
 });
@@ -85,7 +83,7 @@ test("S6: a click on the ↻ glyph or the label resets that reminder through the
 	assert.equal(click(glyph, 4), undefined, "Cena is inert");
 });
 
-test("a rail click right after leaving the band never fires a stale glyph hit", async (t) => {
+test("a rail click on the ↻ glyph resets that reminder after leaving the band too", async (t) => {
 	const f = await fixture(t);
 	f.state.foldedBand = () => true;
 	const glyphLines = f.raw().render(50);
@@ -94,6 +92,6 @@ test("a rail click right after leaving the band never fires a stale glyph hit", 
 	f.raw().render(50);
 	const result = f.raw().handleMouse?.({ type: "click", button: "left", x: glyph, y: 1, screenX: glyph, screenY: 1, width: 50, height: 6, shift: false, alt: false, ctrl: false } as never);
 	await flush();
-	assert.equal(result, undefined);
-	assert.deepEqual(f.resets, []);
+	assert.equal(result?.handled, true);
+	assert.equal(f.resets.length, 1);
 });
