@@ -6,7 +6,7 @@
 import { keyHint, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { BASH_BACKGROUND_TOOL, MAX_RUNNING_JOBS, MONITOR_TOOL, type JobRecord, type JobRegistry } from "./background-jobs.ts";
 import { MONITOR_BATCH_MS, MONITOR_FLOOD_LINES, MONITOR_FLOOD_WINDOW_MS, MONITOR_LINES_PER_NOTICE, MONITOR_MAX_TIMEOUT_SECONDS, type MonitorBatch, type MonitorController, type MonitorStopReason } from "./background-monitor.ts";
-import { CARD_TONE, renderCard, type CardTheme } from "./shell-card.ts";
+import { CARD_TONE, panelExtraRows, renderCard, type CardTheme } from "./shell-card.ts";
 import { sanitizeTerminalText } from "./terminal-theme.ts";
 
 export const JOB_NOTICE_TYPE = "gentle-jobs.notice";
@@ -194,7 +194,11 @@ export function registerBackgroundJobTools(pi: ExtensionAPI, options: Background
 		try { hint = keyHint("app.tools.expand", renderOptions.expanded ? "collapse" : "expand"); } catch { hint = renderOptions.expanded ? "collapse" : "expand"; }
 		return {
 			render(width: number) {
-				return renderCard({ title: details?.kind === "monitor" ? "Monitor" : "Background job", subtitle: details?.label, body: lines, tone, glyph: JOB_GLYPH }, theme as CardTheme, width, { expanded: renderOptions.expanded, previewRows: 3, hint });
+				const cardTheme = theme as CardTheme;
+				const margin = width < 8 ? 0 : panelExtraRows(cardTheme, width - 2, tone) ? 1 : 2;
+				const title = details?.kind === "monitor" ? "Monitor" : width < 45 ? "Job" : "Background job";
+				const rows = renderCard({ title, subtitle: details?.label, body: lines, tone, glyph: JOB_GLYPH }, cardTheme, width - margin * 2, { expanded: renderOptions.expanded, previewRows: 3, hint });
+				return margin ? rows.map((row) => `${" ".repeat(margin)}${row}`) : rows;
 			},
 			invalidate() {},
 		};

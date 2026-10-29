@@ -96,6 +96,15 @@ test('activity counts remain pinned across tabs and update without rendering hid
  assert.match(view.lines.join('\n'),/Agents 3 active.*2 waiting.*Commands \?/); assert.equal(renders,1, 'hidden Agents is not repainted');
  pinned=find(view.root)!; rows=pinned.render(50); assert.match(rows.join('\n'),/Agents 3 active/);
 });
+test('full activity summary fits the fixed rail without dropping counts', t => {
+ const root={render:()=>[],invalidate(){},[NODE]:()=>({type:'vstack',entries:[]})};
+ const host={mode:'fullscreen',terminal:{columns:160},layoutRoot:root,requestRender(){}}; const tui=host as unknown as TUI;
+ sidebarPart(tui,'agents',{digest:()=> 'a',activitySummary:()=>({active:12345,attention:67890}),render:()=>['AGENTS'],invalidate(){}});
+ sidebarPart(tui,'activity',{digest:()=> 'b',commandsCount:()=>12345,waitsCount:()=>67890,render:()=>['COMMANDS'],invalidate(){}});
+ t.after(installSidebar(tui,theme,()=> 'auto',()=> 'top',undefined,undefined,{tabs:true}));
+ const view=renderLayoutFrame(root,160,24,()=>{}); const text=view.lines.join('\n');
+ assert.match(text,/Agents 12345 active/); assert.match(text,/67890 waiting/); assert.match(text,/12345 commands/); assert.match(text,/Waits 67890/); assert.doesNotMatch(text,/…/);
+});
 test('tab hit geometry rejects stale digest and resized terminal', t => {
  const f=fixture(); t.after(f.dispose); const pinned=f.find(f.frame().root)!;
  const lines=pinned.render(50), y=lines.findIndex(s=>s.includes('Activity')), x=lines[y]!.indexOf('Status');

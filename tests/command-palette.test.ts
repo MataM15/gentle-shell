@@ -362,7 +362,6 @@ test("COMMAND_PALETTE_CATALOG matches the curated command set, in order", () => 
 	);
 	const byTitle = (title: string) => COMMAND_PALETTE_CATALOG.find((group) => group.title === title)?.items.map((item) => item.command);
 	assert.deepEqual(byTitle("Configuration"), [
-		"gentle:models",
 		"gentle:profiles",
 		"gentle:persona",
 		"gentle:review-mode",
@@ -374,7 +373,7 @@ test("COMMAND_PALETTE_CATALOG matches the curated command set, in order", () => 
 		"gentle:telemetry",
 		"gentle:dev-binary",
 	]);
-	assert.deepEqual(byTitle("Session"), ["gentle:yolo", "gentle:changes", "gentle:agents", "gentle:jobs", "gentle:usage", "gentle:panel", "gentle:review-session-permission", "gentle:voice"]);
+	assert.deepEqual(byTitle("Session"), ["gentle:yolo", "gentle:changes", "gentle:agents", "gentle:jobs", "gentle:usage", "gentle:panel", "gentle:review-session-permission", "gentle:voice", "gentle:design"]);
 	assert.deepEqual(byTitle("Diagnostics"), ["gentle:status", "gentle:doctor"]);
 	assert.equal(byTitle("SDD"), undefined);
 	assert.deepEqual(byTitle("Skills"), ["skill-registry:refresh"]);
@@ -407,7 +406,7 @@ test("retired SDD commands are absent from the palette and extension registratio
 
 test("buildCommandPaletteGroups keeps only registered commands, attaches descriptions and shortcuts, drops empty groups, preserves catalog order", () => {
 	const registered = [
-		{ name: "gentle:models", description: "Configure models" },
+		{ name: "gentle:profiles", description: "Configure models" },
 		{ name: "gentle:changes", description: "Browse changes" },
 		{ name: "gentle:status", description: "Show status" },
 		{ name: "skill-registry:refresh", description: "Refresh registry" },
@@ -419,7 +418,8 @@ test("buildCommandPaletteGroups keeps only registered commands, attaches descrip
 		["Configuration", "Session", "Diagnostics", "Skills"],
 	);
 	const configuration = groups.find((group) => group.title === "Configuration");
-	assert.deepEqual(configuration?.items.map((item) => item.command), ["gentle:models"]);
+	assert.deepEqual(configuration?.items.map((item) => item.command), ["gentle:profiles"]);
+	assert.equal(configuration?.items[0]?.label, "Models and profiles");
 	assert.equal(configuration?.items[0]?.description, "Configure models");
 	assert.equal(configuration?.items[0]?.shortcut, undefined);
 	const session = groups.find((group) => group.title === "Session");
@@ -512,9 +512,9 @@ test("every catalog group and entry carries a one-cell icon", () => {
 		assert.equal(visibleWidth(group.icon ?? ""), 1, `${group.title} icon`);
 		for (const item of group.items) assert.equal(visibleWidth(item.icon ?? ""), 1, `${item.command} icon`);
 	}
-	const built = buildCommandPaletteGroups([{ name: "gentle:models" }], {});
+	const built = buildCommandPaletteGroups([{ name: "gentle:profiles" }], {});
 	assert.equal(built[0]!.icon, COMMAND_PALETTE_CATALOG[0]!.icon);
-	assert.equal(built[0]!.items[0]!.icon, COMMAND_PALETTE_CATALOG[0]!.items.find((item) => item.command === "gentle:models")!.icon);
+	assert.equal(built[0]!.items[0]!.icon, COMMAND_PALETTE_CATALOG[0]!.items.find((item) => item.command === "gentle:profiles")!.icon);
 });
 
 test("icons render before titles and in the entry gutter without moving any label", () => {

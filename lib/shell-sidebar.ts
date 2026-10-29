@@ -32,6 +32,10 @@ export interface SidebarState {
 	railAvailable?: () => boolean;
 	/** True while a painting top header is the only status row of a narrow fullscreen terminal: the bottom Status bar steps aside. */
 	headerOwnsStatus?: () => boolean;
+	/** Whether the current rail presents the Status section. */
+	statusSectionVisible?: () => boolean;
+	/** Whether Limits and Status are presented together in the current rail. */
+	limitsAlongsideStatus?: () => boolean;
 	parts: Map<string, SidebarRail>;
 }
 

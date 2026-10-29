@@ -25,8 +25,7 @@ export const COMMAND_PALETTE_CATALOG: readonly CommandPaletteCatalogGroup[] = [
 		title: "Configuration",
 		icon: "⬢",
 		items: [
-			{ command: "gentle:models", label: "Assign models and effort", icon: "⇄" },
-			{ command: "gentle:profiles", label: "Agent-model profiles", icon: "◫" },
+			{ command: "gentle:profiles", label: "Models and profiles", icon: "◫" },
 			{ command: "gentle:persona", label: "Switch persona", icon: "◉" },
 			{ command: "gentle:review-mode", label: "Review mode (receipt-driven development)", icon: "⊛" },
 			{ command: "gentle:background-subagents", label: "Background subagents", icon: "⧉" },
@@ -50,6 +49,7 @@ export const COMMAND_PALETTE_CATALOG: readonly CommandPaletteCatalogGroup[] = [
 			{ command: "gentle:panel", label: "Toggle side panel", icon: "◨" },
 			{ command: "gentle:review-session-permission", label: "Review session permission", icon: "✓" },
 			{ command: "gentle:voice", label: "Voice dictation · local Parakeet", icon: "◉" },
+			{ command: "gentle:design", label: "Design · HTML artboards", icon: "◇" },
 		],
 	},
 	{

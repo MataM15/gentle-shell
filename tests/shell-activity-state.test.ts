@@ -12,6 +12,12 @@ test('session-scoped jobs reject malformed and foreign snapshots', () => {
  assert.deepEqual(acceptedJobs('mine',{sessionId:'mine',snapshot}),snapshot.jobs);
  assert.equal(acceptedJobs(undefined,{sessionId:undefined,snapshot}),undefined);
 });
+test('accepted jobs publish only the projected fields and drop producer extras', () => {
+ const snapshot={jobs:[{id:'j',label:'Build preview',startedAt:1000,command:'RAW_COMMAND_SENTINEL',cwd:'/repo',pid:42}]};
+ const accepted=acceptedJobs('mine',{sessionId:'mine',snapshot});
+ assert.deepEqual(accepted,[{id:'j',label:'Build preview',startedAt:1000}]);
+ assert.doesNotMatch(JSON.stringify(accepted),/RAW_COMMAND_SENTINEL|\/repo/);
+});
 test('wait snapshots require the current session and well-formed rows', () => {
  const event={sessionId:'here',waits:[{id:'w',label:'CI',startedAt:5}]};
  assert.deepEqual(acceptedWaits('here',event),event.waits);

@@ -156,7 +156,11 @@ test("T2 float prompt actual editor fallback and neon bytes remain exact at all 
 			assert.deepEqual(fallback.render(width), neon);
 			const rows = editor.render(width);
 			if (width < 10) assert.deepEqual(rows, neon);
-			else assert.match(stripAnsi(rows[0]), /^ ▎ ✿/);
+			else {
+				const first = stripAnsi(rows[0] ?? "");
+				assert.match(first, /^ ▎ {3}/, "the float frame keeps its inset and a blank petal slot");
+				assert.doesNotMatch(first, /[✿❀🌹]/, "the petal prompt paints no flower glyph");
+			}
 			assert.ok(rows.every((row) => visibleWidth(row) <= width));
 		}
 	} finally { editor.dispose(); fallback.dispose(); setCardStyle(previous); }

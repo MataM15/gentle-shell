@@ -8,21 +8,21 @@ import { projectSessionPage, createSessionRefresh, readSessionSnapshot, accepted
 
 test('bounded peer projection distinguishes empty, incomplete, and unavailable metadata', () => {
  const header=(id:string, recent:boolean)=>({sessionHash:id,incarnation:'synthetic',schema:1 as const,label:'Peer name',heartbeat:1,generation:1,counts:{running:2,queued:1,waiting:1,finished:9},digest:null,unavailable:null,recent});
- assert.deepEqual(projectSessionPage({entries:[],scanned:0,rejected:0,overflow:false},'self'),{kind:'ready',rows:[],incomplete:false});
+ assert.deepEqual(projectSessionPage({entries:[],scanned:0,rejected:0,overflow:false},'self',1),{kind:'ready',rows:[],incomplete:false,observedAt:1});
  assert.equal(projectSessionPage({entries:[],scanned:0,rejected:0,overflow:false,unavailable:'missing'},'self').kind,'unavailable');
  const result=projectSessionPage({entries:[header('self',true),header('peer',false)],scanned:2,rejected:0,overflow:true},'self');
  assert.equal(result.kind,'ready'); if(result.kind==='ready') { assert.equal(result.rows.length,1); assert.equal(result.rows[0]!.freshness,'stale'); assert.equal(result.rows[0]!.active,4); assert.equal(result.incomplete,true); }
- const duplicate=projectSessionPage({entries:[header('peer',true),header('peer',false)],scanned:2,rejected:0,overflow:false},'self');
- assert.deepEqual(duplicate,{kind:'ready',rows:[],incomplete:true});
+ const duplicate=projectSessionPage({entries:[header('peer',true),header('peer',false)],scanned:2,rejected:0,overflow:false},'self',1);
+ assert.deepEqual(duplicate,{kind:'ready',rows:[],incomplete:true,observedAt:1});
 });
 test('snapshot validation is bounded, session scoped, and distinguishes no peers from unavailable', () => {
- const ready={kind:'ready',rows:[{name:'Peer',freshness:'recent',active:2}],incomplete:false};
+ const ready={kind:'ready',rows:[{name:'Peer',freshness:'recent',active:2}],incomplete:false,observedAt:1};
  assert.deepEqual(acceptedSessionSnapshot('one',{sessionId:'one',snapshot:ready}),ready);
  assert.equal(acceptedSessionSnapshot('two',{sessionId:'one',snapshot:ready}),undefined);
  assert.equal(acceptedSessionSnapshot('one',{sessionId:'one',snapshot:{...ready,rows:Array(9).fill(ready.rows[0])}}),undefined);
  assert.equal(acceptedSessionSnapshot('one',{sessionId:'one',snapshot:{...ready,rows:[{name:'x',freshness:'alive',active:0}]}}),undefined);
- assert.match(sessionRows({kind:'ready',rows:[],incomplete:false}).join('\n'),/No other sessions/);
- assert.match(sessionRows({kind:'ready',rows:[],incomplete:true}).join('\n'),/Results incomplete/);
+ assert.match(sessionRows({kind:'ready',rows:[],incomplete:false,observedAt:1}).join('\n'),/No other sessions/);
+ assert.match(sessionRows({kind:'ready',rows:[],incomplete:true,observedAt:1}).join('\n'),/Results incomplete/);
  assert.match(sessionRows(undefined).join('\n'),/unavailable/);
 });
 test('synthetic same-profile publisher projects headers without exposing session ids', (t) => {
@@ -35,6 +35,17 @@ test('synthetic same-profile publisher projects headers without exposing session
   assert.equal(result.kind,'ready'); if (result.kind==='ready') assert.deepEqual(result.rows,[{name:'Peer topic',freshness:'recent',active:0}]);
   assert.doesNotMatch(JSON.stringify(result),/current|other/);
  } finally { self.dispose(); peer.dispose(); }
+});
+test('snapshot prioritizes recent records and labels the bounded observation time and all counted states', () => {
+ const header=(id:string,recent:boolean)=>({sessionHash:id,incarnation:'synthetic',schema:1 as const,label:id,heartbeat:1,generation:1,counts:{running:2,queued:1,waiting:1,finished:9},digest:null,unavailable:null,recent});
+ const page={entries:[...Array.from({length:8},(_,i)=>header(`stale${i}`,false)),header('recent',true)],scanned:9,rejected:0,overflow:false};
+ const result=projectSessionPage(page,'self',Date.UTC(2026,0,2,3,4,5));
+ assert.equal(result.kind,'ready'); if(result.kind!=='ready') return;
+ assert.equal(result.rows[0]!.name,'recent'); assert.equal(result.rows.length,8); assert.equal(result.incomplete,true);
+ const text=sessionRows(result).join('\n');
+ assert.match(text,/2026-01-02 03:04:05 UTC/); assert.match(text,/running.*queued.*waiting/);
+ assert.match(text,/not verified live/i); assert.match(text,/recent at snapshot/i);
+ assert.equal(acceptedSessionSnapshot('one',{sessionId:'one',snapshot:{...result,observedAt:NaN}}),undefined);
 });
 test('asynchronous refresh discards stale successes and failures for old parent sessions', async () => {
  let current='a'; const pending:Array<{resolve:(value:any)=>void;reject:(error:Error)=>void}>=[]; const published:any[]=[];

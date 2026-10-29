@@ -11,7 +11,15 @@ export function acceptedJobs(sessionId: string | undefined, value: unknown): Run
  if (!sessionId || !value || typeof value !== 'object') return undefined;
  const event = value as { sessionId?: unknown; snapshot?: unknown };
  if (event.sessionId !== sessionId || !isJobsSidebarSnapshot(event.snapshot)) return undefined;
- return event.snapshot.jobs.map(({id,label,startedAt}) => ({id,label,startedAt}));
+ // Optional finished-tail fields pass through only when the publisher set
+ // them: a running job keeps the exact {id,label,startedAt} shape.
+ return event.snapshot.jobs.map(({id,label,startedAt,status,endedAt,exitCode}) => {
+  const display: RunningJobDisplay = {id,label,startedAt};
+  if (status !== undefined) display.status = status;
+  if (endedAt !== undefined) display.endedAt = endedAt;
+  if (exitCode !== undefined) display.exitCode = exitCode;
+  return display;
+ });
 }
 export interface WaitDisplay { id: string; label: string; startedAt: number }
 /** Validation only: do not subscribe until the scoped producer is verified. */
@@ -49,12 +57,14 @@ export function activitySummary(agents: AgentSummary | undefined, jobs: number |
  const waitText = waits === undefined ? 'Waits ?' : `Waits ${waits}`;
  return `${agentText} · ${jobText} · ${waitText}`;
 }
+export function waitRows(waits: readonly WaitDisplay[] | undefined, now: number): string[] {
+ return waits === undefined ? ['Waits unavailable'] : waits.length === 0 ? ['No local waits'] : waits.map((wait) => `Wait · ${wait.label} · ${Math.max(0, Math.floor((now - wait.startedAt) / 60000))}m`);
+}
 export function commandRows(jobs: readonly RunningJobDisplay[] | undefined, now: number, waits?: readonly WaitDisplay[]): string[] {
  const rows = jobs === undefined ? ['Commands unavailable'] : jobs.length === 0 ? ['No running commands'] : jobs.map((job) => {
   const elapsed = Math.max(0, Math.floor((now - job.startedAt) / 60000));
   const label = sanitizeTerminalText(job.label).replace(/\s+/g, ' ').trim().slice(0, 120) || 'Command';
   return `${label} · running · ${elapsed}m`;
  });
- const waitRows = waits === undefined ? ['Waits unavailable'] : waits.length === 0 ? ['No local waits'] : waits.map((wait) => `Wait · ${wait.label} · ${Math.max(0, Math.floor((now - wait.startedAt) / 60000))}m`);
- return [...rows, ...waitRows];
+ return [...rows, ...waitRows(waits, now)];
 }

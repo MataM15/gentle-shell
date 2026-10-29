@@ -301,10 +301,8 @@ export function renderShellSidebarBar(model: ShellBarModel, theme: ShellBarTheme
 				...(model.review.scope !== REVIEW_SCOPE_UNAVAILABLE ? [row("Scope", sanitizeStatus(model.review.scope), label)] : []),
 			],
 		}] : []),
-		...(model.jobs?.length ? [{
-			title: "Jobs",
-			rows: [...model.jobs].sort((a, b) => b.startedAt - a.startedAt).map((job) => row("Job", sanitizeStatus(job.label))),
-		}] : []),
+		// Running jobs live in their own sidebar card (extensions/gentle-shell.ts
+		// registers the "jobs" rail part); the compact bar keeps the count.
 		{ title: "Integrations", rows: integrations.length ? integrations : [row("", "No status reported", label)] },
 	];
 	const keyWidth = Math.min(STATUS_KEY_MAX, groups.reduce((widest, group) => group.rows.reduce((inner, entry) => Math.max(inner, visibleWidth(entry.key)), widest), 0));

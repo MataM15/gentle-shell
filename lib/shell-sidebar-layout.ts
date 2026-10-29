@@ -22,7 +22,7 @@ type LayoutRoot = Component & { [NODE]?: () => LayoutNode };
 type Host = TUI & { mode?: string; layoutRoot?: LayoutRoot };
 type SidebarCache = { revision: number };
 type RailHit = { key: string; component: Component; startY: number; height: number; width: number };
-type SectionCacheEntry = { component: Component; digest: string | undefined; revision: number; contentWidth: number; theme: ShellBarTheme; cardStyle: CardStyle; lines: string[] };
+type SectionCacheEntry = { component: Component; digest: string | undefined; revision: number; contentWidth: number; theme: ShellBarTheme; cardStyle: CardStyle; themeSignature: string; lines: string[] };
 type SidebarPresentation = { scrollTop: number; output: LayoutNode };
 type PreparedRail = {
 	revision: number;
@@ -32,6 +32,7 @@ type PreparedRail = {
 	cardStyle: CardStyle;
 	root: LayoutRoot;
 	theme: ShellBarTheme;
+	themeSignature: string;
 	parts: Array<[string, SidebarRail]>;
 	digests: Array<string | undefined>;
 	contentWidth: number;
@@ -70,6 +71,20 @@ function railDigest(rail: SidebarRail): string | undefined {
 		return rail.digest?.();
 	} catch {
 		return undefined;
+	}
+}
+
+// Pi passes extensions one live theme proxy, so identity never changes on a
+// theme switch, and the switch only calls ui.invalidate(), which does not reach
+// the rail inside the layout tree. How the current theme paints a few roles is
+// what changes, so the memo keys on that: a digest-only section (Status,
+// Agents, Todos) would otherwise keep the previous theme's colors.
+const THEME_SIGNATURE_ROLES = ["accent", "border", "borderAccent", "muted", "dim", "text", "success", "warning", "error"];
+function themeSignature(theme: ShellBarTheme): string {
+	try {
+		return THEME_SIGNATURE_ROLES.map((role) => theme.fg(role, "·")).join("") + theme.bold("·");
+	} catch {
+		return "";
 	}
 }
 
@@ -148,6 +163,10 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 	const railPossible = () => !stopped && host.mode === "fullscreen" && tui.terminal.columns >= SIDEBAR_BREAKPOINT && (placement() === "auto" || placement() === "right") && !!host.layoutRoot && roots.has(host.layoutRoot);
 	state.ownsHost = () => railPossible() && !folded();
 	state.railAvailable = () => railPossible() && folded();
+	state.statusSectionVisible = () => state.active && state.ownsHost?.() === true && state.parts.has("footer") &&
+		(!options?.tabs || sidebarTabSections(selectedTab).includes("footer"));
+	state.limitsAlongsideStatus = () => state.ownsHost?.() === true && state.parts.has("usage") &&
+		(!options?.tabs || (sidebarTabSections(selectedTab).includes("usage") && sidebarTabSections(selectedTab).includes("footer")));
 	const rail: Component = {
 		render: () => railLines,
 		invalidate() {
@@ -309,8 +328,9 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 		const visibleKeys = options?.tabs ? new Set(["header", "wellness", "voice", ...sidebarTabSections(selectedTab)]) : undefined;
 		const digests = parts.map(([key, rail]) => !visibleKeys || visibleKeys.has(key) ? railDigest(rail) : undefined);
 		const summaryKey = options?.tabs ? currentSummary() : undefined;
+		const signature = themeSignature(theme);
 		const unchanged = prepared?.revision === cache.revision && prepared.summaryKey === summaryKey &&
-			prepared.width === width && prepared.mode === host.mode && prepared.headerPlacement === headerPlacement() && prepared.cardStyle === style && prepared.root === root && prepared.theme === theme &&
+			prepared.width === width && prepared.mode === host.mode && prepared.headerPlacement === headerPlacement() && prepared.cardStyle === style && prepared.root === root && prepared.theme === theme && prepared.themeSignature === signature &&
 			prepared.parts.length === parts.length && prepared.parts.every(([key, part], index) => parts[index]?.[0] === key && parts[index]?.[1] === part) &&
 			prepared.digests.length === digests.length && prepared.digests.every((digest, index) => digest === digests[index]);
 		if (unchanged) {
@@ -336,18 +356,19 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 				const digest = digestByPart.get(key);
 				const existing = sectionCache.get(key);
 				const reusable = existing?.component === component && existing.contentWidth === contentWidth && existing.theme === theme && existing.cardStyle === style &&
+					existing.themeSignature === signature &&
 					(digest !== undefined ? existing.digest === digest : existing.digest === undefined && existing.revision === cache.revision);
 				const lines = reusable ? existing.lines : (() => {
 					const rendered = [...(component.render(contentWidth - RAIL_PADDING * 2) ?? [])];
 					while (rendered.length && rendered[rendered.length - 1]?.trim() === "") rendered.pop();
 					return rendered;
 				})();
-				sectionCache.set(key, { component, digest, revision: cache.revision, contentWidth, theme, cardStyle: style, lines });
+				sectionCache.set(key, { component, digest, revision: cache.revision, contentWidth, theme, cardStyle: style, themeSignature: signature, lines });
 				return { key, component, lines };
 			};
 			const wellness = options?.tabs ? renderSection("wellness") : undefined;
 			const voice = options?.tabs ? renderSection("voice") : undefined;
-			const keys = options?.tabs ? sidebarTabSections(selectedTab) : ["wellness", "usage", "footer", "agents", "todo"];
+			const keys = options?.tabs ? sidebarTabSections(selectedTab) : ["wellness", "usage", "footer", "jobs", "agents", "todo"];
 			const sections = keys.filter((key) => key !== "todo" || state.visibility?.todo !== false).map((key) => renderSection(key))
 				.filter((section) => section.component !== undefined && section.lines.length > 0) as Array<{ key: string; component: Component; lines: string[] }>;
 			// The header carries the brand once it is active; the banner is the
@@ -391,11 +412,18 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 					tabLine += theme.fg(tab.id === selectedTab ? "accent" : "dim", ` ${tab.label} `);
 				}
 				headerLines.push(tabLine);
-				headerLines.push(truncateToWidth(` ${summaryKey}`, RAIL_WIDTH, "…"));
+				// Wrap at summary separators instead of clipping the trailing counts.
+				let summaryLine = " ";
+				for (const part of (summaryKey ?? "").split(" · ")) {
+					const next = summaryLine === " " ? ` ${part}` : `${summaryLine} · ${part}`;
+					if (visibleWidth(next) > RAIL_WIDTH && summaryLine !== " ") { headerLines.push(summaryLine); summaryLine = ` ${part}`; }
+					else summaryLine = next;
+				}
+				headerLines.push(summaryLine);
 				headerLines.push(...(voice?.lines ?? []).map((line) => ` ${line}`));
 				tabPin = { headerHeight, wellnessStart, wellnessHeight: wellness?.lines.length ?? 0, tabRow };
 			}
-			const supported = !options?.tabs || ["wellness", "agents", "todo", "usage", "footer"].some((key) => state.parts.has(key));
+			const supported = !options?.tabs || ["wellness", "agents", "jobs", "todo", "usage", "footer"].some((key) => state.parts.has(key));
 			const active = supported && (railLines.length > 0 || headerLines.length > 0) && railLines.every((line) => visibleWidth(line) <= contentWidth) && (!options?.tabs || headerLines.every((line) => visibleWidth(line) <= RAIL_WIDTH));
 			if (options?.tabs && !active) {
 				headerLines = headerPlacement() === "top" && headerPart ? [...(headerPart.render(width) ?? [])] : [];
@@ -403,7 +431,7 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 				realHeaderPainted = headerLines.length > 0;
 				tabPin = undefined;
 			}
-			prepared = { revision: cache.revision, width, mode: host.mode, headerPlacement: headerPlacement(), cardStyle: style, root, theme, parts, digests, contentWidth, active, lines: railLines, hits, headerLines, headerActive: realHeaderPainted, tabPin, summaryKey };
+			prepared = { revision: cache.revision, width, mode: host.mode, headerPlacement: headerPlacement(), cardStyle: style, root, theme, themeSignature: signature, parts, digests, contentWidth, active, lines: railLines, hits, headerLines, headerActive: realHeaderPainted, tabPin, summaryKey };
 			state.active = active;
 			return active;
 		} catch {

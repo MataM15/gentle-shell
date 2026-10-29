@@ -4,7 +4,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSy
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test, { after, afterEach } from "node:test";
+import test, { after, afterEach, type TestContext } from "node:test";
 import { initTheme, type ExtensionAPI, type ExtensionContext, type SlashCommandInfo, type SourceInfo } from "@earendil-works/pi-coding-agent";
 import { CURSOR_MARKER, matchesKey, stripTerminalSequences as stripAnsi, TuiMainScreen, visibleWidth, type Component, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import installGentleShell, { backgroundChangeRefreshesSettled, buildShellBarModel, createActiveProfileReader, changesShortcut, devBinaryCard, extractQueuedText, fetchCodexUsage, fetchNanUsage, loadFileDiff, shellGitRunner, openInExternalEditor, usageShortcut, GentlePromptEditor } from "../extensions/gentle-shell.ts";
@@ -19,6 +19,7 @@ afterEach(() => resetFrozenInheritedProfilesForTesting());
 import { buildCommandPaletteGroups } from "../lib/command-palette-catalog.ts";
 import { CHANGE_STATUS, DIFF_MAX_BYTES, DIFF_MAX_LINES, DIFF_TOO_LARGE } from "../lib/shell-changes.ts";
 import { sidebarPart, sidebarState, type SidebarHeaderRail, type SidebarRail } from "../lib/shell-sidebar.ts";
+import { installSidebar } from "../lib/shell-sidebar-layout.ts";
 import { renderTodoCard } from "../lib/shell-todo.ts";
 import type { ShellBarTheme } from "../lib/shell-bar.ts";
 import { createGentleAiExtension } from "../extensions/gentle-ai.ts";
@@ -26,6 +27,7 @@ import { decodeReviewStatusV3 } from "../lib/review-integration-v2.ts";
 import { REVIEW_SIDEBAR_EVENT } from "../lib/review-sidebar-state.ts";
 import { createVoiceStatePublisher, VOICE_STATE_EVENT, VOICE_STATE_SCHEMA } from "../lib/voice-status-event.ts";
 import { SESSION_REFRESH_EVENT, SESSION_SNAPSHOT_EVENT } from "../lib/shell-session-state.ts";
+import { isJobsSidebarSnapshot } from "../lib/jobs-sidebar-state.ts";
 import type { NativeReviewCli } from "../lib/native-review-cli.ts";
 import { resolveVisualSettings, writeVisualSettings } from "../lib/visual-customization-policy.ts";
 import { resolveAnimationPolicy } from "../lib/animation-policy.ts";
@@ -113,7 +115,7 @@ const renderers = new Map<string, MessageRenderer>();
 const FAKE_SOURCE_INFO: SourceInfo = { path: "extensions/gentle-shell.ts", source: "gentle-shell", scope: "project", origin: "top-level" };
 
 const DEFAULT_COMMANDS: SlashCommandInfo[] = [
-	{ name: "gentle:models", description: "Configure models", source: "extension", sourceInfo: FAKE_SOURCE_INFO },
+	{ name: "gentle:profiles", description: "Configure models", source: "extension", sourceInfo: FAKE_SOURCE_INFO },
 	{ name: "gentle:changes", description: "Browse changes", source: "extension", sourceInfo: FAKE_SOURCE_INFO },
 	{ name: "gentle:status", description: "Show Gentle AI status", source: "extension", sourceInfo: FAKE_SOURCE_INFO },
 	{ name: "skill-registry:refresh", description: "Regenerate the skill registry", source: "extension", sourceInfo: FAKE_SOURCE_INFO },
@@ -505,6 +507,36 @@ test("review sidebar rejects foreign-session events and unsubscribes on shutdown
 	}
 });
 
+test("account failures follow Status and Resources visibility without legacy duplicates", async (t) => {
+	const home = scopedDoubleEscCancelConfigHome(t), { pi, handlers } = fakePi(), { ctx, ui } = fakeContext({ token: "fixture" });
+	(ctx as unknown as { model: { provider: string } }).model.provider = "acme-cloud";
+	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home, GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, { activeProfile: () => "team", now: () => 1_788_600_000_000 });
+	pi.events.emit(USAGE_SOURCE_EVENT, { schema: USAGE_SOURCE_SCHEMA, provider: "acme-cloud", fetch: async () => ({ provider: "acme-cloud", layout: "accounts", fetchedAt: 1_788_600_000_000, unavailable: [{ label: "Pay02", reason: "HTTP 403" }], limits: [{ name: "Pay01 C7d", account: "Pay01", family: "claude", limitReached: false, windows: [{ label: "week", usedPercent: 40, windowSeconds: 604800, resetAt: null }] }] }) });
+	await fire(handlers, "session_start", ctx); await settle();
+	const node = Symbol.for("@earendil-works/pi-tui/layout-node"), root = { render: () => [], invalidate() {}, [node]: () => ({ type: "vstack", entries: [] }) };
+	const tui = { mode: "fullscreen", terminal: { rows: 40, columns: 160 }, layoutRoot: root, requestRender() {} };
+	const factory = ui.footerFactory as (tui: unknown, theme: ShellBarTheme, data: unknown) => { dispose(): void };
+	const component = factory(tui, plainTheme, { getGitBranch: () => "main", getExtensionStatuses: () => new Map([["failure", "Pay02 unavailable (HTTP 403)"]]), getAvailableProviderCount: () => 1, onBranchChange: () => () => {} });
+	const entries = () => { const tree = root[node]() as unknown as { entries: Array<{ component: { [node](): { entries: Array<{ component: Component }> } } }> }; return tree.entries[1]!.component[node]().entries; };
+	const select = (label: string) => { const p = entries()[0]!.component, rows = p.render(50).map(stripAnsi), y = rows.findIndex(row => row.includes("Sessions") && row.includes("Status")), x = rows[y]!.indexOf(label); assert.ok(x >= 0); assert.equal(p.handleMouse?.({ type: "click", button: "left", x, y, width: 50, height: rows.length, screenX: x, screenY: y, shift: false, alt: false, ctrl: false } as TuiMouseEvent)?.handled, true); };
+	const body = () => entries()[1]!.component.render(50).map(stripAnsi).join("\n");
+	try {
+		assert.doesNotMatch(body(), /Pay02/);
+		select("Status"); assert.match(body(), /Pay02 unavailable \(HTTP 403\)/);
+		select("Resources"); assert.match(body(), /Pay02.*HTTP 403/); assert.doesNotMatch(body(), /Pay02 unavailable/);
+		select("Activity"); assert.doesNotMatch(body(), /Pay02/);
+		select("Status"); assert.match(body(), /Pay02 unavailable \(HTTP 403\)/);
+		const disposeLegacy = installSidebar(tui as unknown as TUI, plainTheme);
+		try {
+			root[node](); const parts = sidebarState(tui as unknown as TUI).parts;
+			const usage = parts.get("usage")!, footer = parts.get("footer")!;
+			assert.match(usage.render(48).join("\n"), /Pay02.*HTTP 403/);
+			assert.doesNotMatch(footer.render(48).join("\n"), /Pay02 unavailable/);
+			parts.delete("usage"); assert.match(footer.render(48).join("\n"), /Pay02 unavailable \(HTTP 403\)/); parts.set("usage", usage);
+		} finally { disposeLegacy(); }
+	} finally { component.dispose(); await fire(handlers, "session_shutdown", ctx); }
+});
+
 test("Sessions selection requests current-session metadata and renders only validated snapshots", async (t) => {
 	const home=scopedDoubleEscCancelConfigHome(t), {pi,handlers}=fakePi(), {ctx,ui}=fakeContext();
 	gentleShell(pi,{GENTLE_PI_CONFIG_HOME:home,GENTLE_PI_SHELL_CHANGES_WATCH_MS:"off"},{activeProfile:()=>"team"});
@@ -523,11 +555,12 @@ test("Sessions selection requests current-session metadata and renders only vali
 		entries(); entries(); assert.equal(paints,0); assert.equal(requests.length,0);
 		select("Sessions"); assert.deepEqual(requests,[{sessionId:"shell-session"}]); assert.match(body(),/Sessions unavailable/);
 		select("Sessions"); assert.equal(requests.length,1,"reselecting the same tab does not rescan");
-		const ready={kind:"ready",rows:[{name:"Peer topic",freshness:"recent",active:2}],incomplete:false};
+		const ready={kind:"ready",rows:[{name:"Peer topic",freshness:"recent",active:2}],incomplete:false,observedAt:1};
 		pi.events.emit(SESSION_SNAPSHOT_EVENT,{sessionId:"foreign",snapshot:ready}); assert.match(body(),/Sessions unavailable/);
 		pi.events.emit(SESSION_SNAPSHOT_EVENT,{sessionId:session,snapshot:ready}); assert.match(body(),/Peer topic/); assert.match(body(),/reachability unknown/i);
+		assert.match(body(),/1970-01-01 00:00:00 UTC/); assert.match(body(),/not verified live/); assert.match(body(),/running \+ queued \+ waiting/); assert.match(body(),/recent at snapshot/);
 		const count=paints; body(); assert.equal(paints,count,"stable session rows are cached");
-		select("Status"); const hidden=paints; pi.events.emit(SESSION_SNAPSHOT_EVENT,{sessionId:session,snapshot:{kind:"ready",rows:[],incomplete:false}}); entries(); assert.equal(paints,hidden,"hidden Sessions does not render");
+		select("Status"); const hidden=paints; pi.events.emit(SESSION_SNAPSHOT_EVENT,{sessionId:session,snapshot:{kind:"ready",rows:[],incomplete:false,observedAt:1}}); entries(); assert.equal(paints,hidden,"hidden Sessions does not render");
 		select("Sessions"); assert.match(body(),/No other sessions/); assert.equal(requests.length,2);
 		session="replacement"; assert.match(body(),/Sessions unavailable/,"old parent snapshot cannot leak to replacement");
 	} finally {off();component.dispose();await fire(handlers,"session_shutdown",ctx);}
@@ -545,7 +578,9 @@ test("scoped voice and waits events reach the actual pinned rail and clear on re
 	const tui = { mode: "fullscreen", terminal: { rows: 40, columns: 160 }, layoutRoot: root, requestRender() {} };
 	const data = { getGitBranch: () => "main", getExtensionStatuses: () => new Map(), getAvailableProviderCount: () => 1, onBranchChange: () => () => {} };
 	const factory = ui.footerFactory as (tui: unknown, theme: ShellBarTheme, data: unknown) => { dispose(): void };
-	const component = factory(tui, plainTheme, data);
+	const voicePaint: Array<{ role: string; text: string }> = [];
+	const voiceTheme = { ...plainTheme, fg: (role: string, value: string) => { if (value.includes("Voice ·")) voicePaint.push({ role, text: value }); return plainTheme.fg(role, value); } };
+	const component = factory(tui, voiceTheme, data);
 	const status = sidebarState(tui as unknown as TUI).parts.get("footer")!; const render = status.render.bind(status); let statusRenders = 0;
 	status.render = (width) => { statusRenders++; return render(width); };
 	const parts = () => {
@@ -566,14 +601,14 @@ test("scoped voice and waits events reach the actual pinned rail and clear on re
 		assert.match(text().body,/Waits unavailable/);
 		pi.events.emit("background-waits:pending", { sessionId:session, waits:[{id:"w",label:"CI check",startedAt:1}] });
 		assert.match(text().body,/CI check/); assert.match(text().pinned,/Waits 1/);
-		voice.publish("preparing"); assert.match(text().pinned,/Voice · preparing/);
-		voice.publish("listening"); assert.match(text().pinned,/Voice · listening/);
+		voice.publish("preparing"); assert.match(text().pinned,/Voice · preparing/); assert.equal(voicePaint.at(-1)?.role, "warning");
+		voice.publish("listening"); assert.match(text().pinned,/Voice · listening/); assert.equal(voicePaint.at(-1)?.role, "success");
 		pi.events.emit(VOICE_STATE_EVENT,{schema:VOICE_STATE_SCHEMA,sessionId:"foreign",state:"transcribing"});
 		pi.events.emit(VOICE_STATE_EVENT,{schema:VOICE_STATE_SCHEMA,sessionId:session,state:"recording"});
 		assert.match(text().pinned,/Voice · listening/);
 		assert.equal(statusRenders,0,"hidden Status never renders for events");
 		select("Status"); assert.match(text().pinned,/Waits 1/); assert.match(text().pinned,/Voice · listening/); assert.ok(statusRenders>0);
-		voice.publish("transcribing"); assert.match(text().pinned,/Voice · transcribing/);
+		voice.publish("transcribing"); assert.match(text().pinned,/Voice · transcribing/); assert.equal(voicePaint.at(-1)?.role, "accent");
 		voice.publish("idle"); assert.doesNotMatch(text().pinned,/Voice ·/);
 		pi.events.emit("background-waits:pending", {sessionId:session,waits:[]}); assert.match(text().pinned,/Waits 0/);
 		component.dispose(); session = "replacement"; await fire(handlers,"session_start",ctx);
@@ -588,7 +623,39 @@ test("scoped voice and waits events reach the actual pinned rail and clear on re
 	} finally { voice.close(); component.dispose(); }
 });
 
-test("jobs snapshots populate Status, use one compact fallback, and reject stale sessions", async () => {
+test("tabbed rail keeps job counts and owns the active dev notice only on Status", async (t) => {
+	const previous = cardStyle(); t.after(() => setCardStyle(previous));
+	const home = scopedDoubleEscCancelConfigHome(t), { pi, handlers } = fakePi(), { ctx, ui } = fakeContext();
+	writeCardStyle("float", { gentlePiConfigHome: home });
+	writeVisualSettings({ ...resolveVisualSettings({ gentlePiConfigHome: home }).settings, headerPlacement: "below-input" }, { gentlePiConfigHome: home });
+	const bg = "\x1b[48;5;22m", theme = { ...plainTheme, bg: (_role: string, text: string) => `${bg}${text}\x1b[49m`, getBgAnsi: () => bg };
+	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home, GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, { now: () => 0, fetch: fakeFetch({}, false).fetchFn, devBinary: () => ({ state: "active", path: "/fixture/gentle-ai", sha256: "0dac40684a053f2b00" }) });
+	await fire(handlers, "session_start", ctx);
+	const node = Symbol.for("@earendil-works/pi-tui/layout-node"), root = { render: () => [], invalidate() {}, [node]: () => ({ type: "vstack", entries: [] }) };
+	const tui = { mode: "fullscreen", terminal: { rows: 40, columns: 160 }, layoutRoot: root, requestRender() {} };
+	const factory = ui.footerFactory as (tui: unknown, theme: ShellBarTheme, data: unknown) => { dispose(): void };
+	const component = factory(tui, theme, { getGitBranch: () => "main", getExtensionStatuses: () => new Map(), getAvailableProviderCount: () => 1, onBranchChange: () => () => {} });
+	const widget = (ui.widgets.get("gentle-shell-dev-binary") as (tui: unknown, theme: ShellBarTheme) => Component)(tui, theme);
+	const below = (ui.widgets.get("gentle-shell-below-input-header") as (tui: unknown, theme: ShellBarTheme) => Component)(tui, theme);
+	const entries = () => { const tree = root[node]() as unknown as { entries: Array<{ component: { [node](): { entries: Array<{ component: Component }> } } }> }; return tree.entries[1]!.component[node]().entries; };
+	const text = () => { const e = entries(); return { pinned: e[0]!.component.render(50).map(stripAnsi).join("\n"), body: e[1]!.component.render(50).map(stripAnsi).join("\n"), widget: widget.render(100).map(stripAnsi).join("\n") }; };
+	const select = (label: string) => { const p = entries()[0]!.component, rows = p.render(50).map(stripAnsi), y = rows.findIndex(row => row.includes("Sessions") && row.includes("Status")), x = rows[y]!.indexOf(label); assert.ok(x >= 0); assert.equal(p.handleMouse?.({ type: "click", button: "left", x, y, width: 50, height: rows.length, screenX: x, screenY: y, shift: false, alt: false, ctrl: false } as TuiMouseEvent)?.handled, true); };
+	try {
+		pi.events.emit("gentle-ai:jobs-sidebar", { sessionId: "shell-session", snapshot: { jobs: [{ id: "job-1", label: "CI for PR 1860", startedAt: 1 }] } });
+		for (const tab of ["Activity", "Sessions", "Resources"]) {
+			if (tab !== "Activity") select(tab);
+			const view = text(); assert.match(view.pinned, /1 command\b/); assert.doesNotMatch(view.body, /field-test/);
+			assert.doesNotMatch(below.render(100).map(stripAnsi).join("\n"), /1 job/, "pinned summary owns the count, not the float");
+			if (tab === "Activity") assert.match(view.body, /CI for PR 1860/);
+			assert.match(view.widget, /dev binary override/, `${tab} needs the startup notice when Status is hidden`);
+		}
+		select("Status"); const status = text(); assert.match(status.pinned, /1 command\b/); assert.match(status.body, /field-test/); assert.doesNotMatch(status.body, /CI for PR 1860/, "jobs keep their own card instead of repeating inside Status"); assert.equal(status.widget, "");
+		select("Resources"); assert.match(text().widget, /dev binary override/);
+		await fire(handlers, "agent_start", ctx); assert.equal(ui.widgets.has("gentle-shell-dev-binary"), false);
+	} finally { component.dispose(); await fire(handlers, "session_shutdown", ctx); }
+});
+
+test("jobs snapshots feed their own rail card, keep one compact fallback, and reject stale sessions", async () => {
 	const { pi, handlers } = fakePi();
 	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" });
 	const { ctx, ui } = fakeContext();
@@ -600,40 +667,61 @@ test("jobs snapshots populate Status, use one compact fallback, and reject stale
 	const component = factory(tui, plainTheme, data);
 	const state = sidebarState(tui as unknown as TUI);
 	const rail = state.parts.get("footer")!;
+	const jobs = state.parts.get("jobs")!;
 	const header = state.parts.get("header")!;
 	const publish = (sessionId: string, jobs: unknown) => pi.events.emit("gentle-ai:jobs-sidebar", { sessionId, snapshot: { jobs } });
 	try {
 		publish("shell-session", [{ id: "job-1", label: "CI for PR 1860", startedAt: 1 }]);
-		assert.match(rail.render(46).join("\n"), /Jobs[\s\S]*CI for PR 1860/);
+		assert.doesNotMatch(rail.render(46).join("\n"), /Jobs|CI for PR 1860/, "the Status card never prints jobs; the jobs card owns them");
 		assert.match(rail.render(46).join("\n"), /MCP: 3 servers/);
-		assert.doesNotMatch(rail.render(46).join("\n"), /1 job/, "Jobs replaces the generic integration counter");
+		assert.match(jobs.render(46).join("\n"), /Jobs[\s\S]*CI for PR 1860/);
+		publish("shell-session", [{ id: "job-1", label: "CI for PR 1860", startedAt: 1 }, { id: "job-0", label: "Build runtime", startedAt: 1, status: "exited", endedAt: Date.now(), exitCode: 0 }]);
+		assert.match(jobs.render(60).join("\n"), /1 running · 1 finished/, "finished tails ride the same snapshot");
+		assert.match(jobs.render(60).join("\n"), /✓\s+Build runtime/);
+		// The compact count is running-only: a finished tail still paints the
+		// card, but the header's ⧗ N jobs derives from running entries alone.
+		publish("shell-session", [{ id: "job-2", label: "Fresh tail", startedAt: 1, status: "exited", endedAt: Date.now(), exitCode: 0 }]);
+		tui.terminal.columns = 80;
+		assert.match(jobs.render(46).join("\n"), /Fresh tail/, "the finished tail still paints the card");
+		assert.doesNotMatch(header.render(80).join("\n"), /⧗ 1 job/, "the compact count is running-only");
+		tui.terminal.columns = 160;
+		publish("shell-session", [{ id: "job-0", label: "Stale tail", startedAt: 1, status: "exited", endedAt: 5, exitCode: 0 }]);
+		assert.doesNotMatch(jobs.render(46).join("\n"), /Stale tail/, "a finished job past the TTL paints nothing");
+		assert.doesNotMatch(rail.render(46).join("\n"), /1 job/, "the jobs counter never joins the integration statuses while display data exists");
 		state.active = true;
 		state.ownsHost = () => true;
-		assert.doesNotMatch(header.render(160).join("\n"), /1 job/, "the visible Status card owns jobs details");
+		assert.doesNotMatch(header.render(160).join("\n"), /1 job/, "the visible rail owns job details");
 		state.active = false;
 		tui.terminal.columns = 80;
-		assert.match(header.render(80).join("\n"), /1 job/, "mobile topbar preserves the count");
-		const before = rail.digest?.();
+		publish("shell-session", [{ id: "job-1", label: "CI for PR 1860", startedAt: 1 }]);
+		assert.match(header.render(80).join("\n"), /1 job/, "mobile topbar preserves the count of a running job");
+		const before = jobs.render(46).join("\n");
 		publish("foreign", []);
 		publish("shell-session", [{ label: "invalid" }]);
-		assert.equal(rail.digest?.(), before);
+		assert.equal(jobs.render(46).join("\n"), before);
 		publish("shell-session", []);
-		assert.doesNotMatch(rail.render(46).join("\n"), /Jobs|CI for PR/);
+		assert.doesNotMatch(jobs.render(46).join("\n"), /Jobs|CI for PR/);
 		assert.doesNotMatch(header.render(80).join("\n"), /1 job/);
 		publish("shell-session", [{ id: "job-2", label: "Build runtime", startedAt: 2 }]);
 		await fire(handlers, "session_start", ctx);
-		assert.doesNotMatch(rail.render(46).join("\n"), /Build runtime/);
+		assert.doesNotMatch(state.parts.get("jobs")!.render(46).join("\n"), /Build runtime/);
 		await fire(handlers, "session_shutdown", ctx);
 		publish("shell-session", [{ id: "job-3", label: "late", startedAt: 3 }]);
-		assert.doesNotMatch(rail.render(46).join("\n"), /late/);
+		assert.doesNotMatch(state.parts.get("jobs")!.render(46).join("\n"), /late/);
 	} finally { component.dispose(); }
+});
+
+test("the jobs snapshot validator admits the finished-tail statuses", () => {
+	assert.ok(isJobsSidebarSnapshot({ jobs: [{ id: "job-1", label: "Spawn failed", startedAt: 1, status: "failed", endedAt: 60_000, exitCode: null }] }));
+	assert.ok(isJobsSidebarSnapshot({ jobs: [{ id: "job-2", label: "Stopped", startedAt: 1, status: "stopped", endedAt: 2 }] }));
+	assert.equal(isJobsSidebarSnapshot({ jobs: [{ id: "job-3", label: "Bad", startedAt: 1, status: "exploded" }] }), false);
 });
 
 test("hidden Status leaves only a jobs count in regular bottom and fullscreen header chrome", async (t) => {
 	const home = scopedDoubleEscCancelConfigHome(t);
 	writeVisualSettings({ ...resolveVisualSettings({ gentlePiConfigHome: home }).settings, statusPlacement: "hidden" }, { gentlePiConfigHome: home });
 	const { pi, handlers } = fakePi();
-	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home, GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" });
+	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home, GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, { devBinary: () => ({ state: "active", path: "/fixture/gentle-ai", sha256: "0dac40684a053f2b00" }) });
 	const { ctx, ui } = fakeContext();
 	await fire(handlers, "session_start", ctx);
 	const tui = { mode: "regular", terminal: { rows: 40, columns: 160 }, requestRender() {} };
@@ -644,7 +732,12 @@ test("hidden Status leaves only a jobs count in regular bottom and fullscreen he
 		pi.events.emit("gentle-ai:jobs-sidebar", { sessionId: "shell-session", snapshot: { jobs: [{ id: "job-1", label: "CI for PR 1860", startedAt: 1 }] } });
 		assert.equal(component.render(80).join("\n"), "⧗ 1 job");
 		assert.doesNotMatch(component.render(80).join("\n"), /CI for PR|gpt-5/);
+		pi.events.emit("gentle-ai:jobs-sidebar", { sessionId: "shell-session", snapshot: { jobs: [{ id: "job-1", label: "CI for PR 1860", startedAt: 1, status: "exited", endedAt: Date.now(), exitCode: 0 }] } });
+		assert.doesNotMatch(component.render(80).join("\n"), /⧗/, "a finished-only tail never paints a ⧗ 0 jobs row");
+		pi.events.emit("gentle-ai:jobs-sidebar", { sessionId: "shell-session", snapshot: { jobs: [{ id: "job-1", label: "CI for PR 1860", startedAt: 1 }] } });
 		tui.mode = "fullscreen";
+		const notice = (ui.widgets.get("gentle-shell-dev-binary") as (tui: unknown, theme: ShellBarTheme) => Component)(tui, plainTheme);
+		assert.match(notice.render(100).map(stripAnsi).join("\n"), /dev binary override/, "hidden Status keeps the separate startup notice without showing Status");
 		const header = sidebarState(tui as unknown as TUI).parts.get("header")!;
 		assert.match(header.render(160).join("\n"), /⧗ 1 job/);
 		assert.doesNotMatch(component.render(160).join("\n"), /1 job/, "the hidden fullscreen footer does not duplicate the topbar count");
@@ -1006,6 +1099,14 @@ test("gentleShell stays out of the way without a UI or when disabled", () => {
 
 const fakeTui = { terminal: { rows: 40, columns: 120 }, requestRender() {} };
 const editorTheme = { borderColor: (text: string) => text, selectList: {} };
+// Marks every painted role so a frame reveals the working-label scan, which is
+// invisible under an identity theme now that the local frame has no flower.
+const markedTheme = {
+	...plainTheme,
+	fg(color: string, value: string) {
+		return `<${color}>${value}</${color}>`;
+	},
+};
 const fakeKeybindings = { matches: () => false };
 
 function installedPrompt(
@@ -2349,7 +2450,7 @@ test("vim NORMAL slash uses Pi's command and skill completion without displacing
 		fg: (_color, text) => text, bold: (text) => text, requestRender() {}, pending: () => false,
 		now: () => 0, doubleEscCancelEnabled: () => false, dispatchQueuedText() {}, tuiVersion: () => INSTALLED_PI,
 	});
-	const entries = ["gentle:vim", "gentle:models", "skill:example"];
+	const entries = ["gentle:vim", "gentle:profiles", "skill:example"];
 	const requests: string[] = [];
 	editor.setAutocompleteProvider({
 		async getSuggestions(lines: string[], line: number, col: number) {
@@ -3005,7 +3106,7 @@ test("vim selector exposes enable, disable and status; status and cancellation d
  } finally { editor.dispose(); }
 });
 
-test("animations command reports without writing and switches the live pulse", async (t) => {
+test("animations command reports without writing and switches the live watchdog", async (t) => {
 	const configHome = scopedDoubleEscCancelConfigHome(t);
 	const delays: number[] = [];
 	let active = 0;
@@ -3023,9 +3124,9 @@ test("animations command reports without writing and switches the live pulse", a
 	assert.match(ui.notices.at(-1)!, /animations: quality/);
 	assert.equal(existsSync(join(configHome, "animations.json")), false);
 	for (const handler of handlers.get("agent_start") ?? []) handler({}, ctx);
-	assert.deepEqual(delays, [2000, 80]);
+	assert.deepEqual(delays, [2000, 1000]);
 	await command.handler("performance", ctx);
-	assert.deepEqual(delays, [2000, 80, 1000]);
+	assert.deepEqual(delays, [2000, 1000, 1000]);
 	assert.equal(active, 2);
 	await command.handler("potato", ctx);
 	assert.equal(active, 1);
@@ -3034,7 +3135,7 @@ test("animations command reports without writing and switches the live pulse", a
 	await command.handler("invalid", ctx);
 	assert.equal(JSON.parse(readFileSync(join(configHome, "animations.json"), "utf8")).policy, "potato");
 	await command.handler("quality", ctx);
-	assert.deepEqual(delays, [2000, 80, 1000, 80]);
+	assert.deepEqual(delays, [2000, 1000, 1000, 1000]);
 	for (const handler of handlers.get("agent_settled") ?? []) handler({}, ctx);
 	assert.equal(active, 1);
 	editor.dispose();
@@ -3123,7 +3224,7 @@ test("animations with no argument opens a selectable menu and applies the chosen
 	assert.equal(existsSync(join(dismissHome, "animations.json")), false);
 });
 
-test("prompt uses the compact banner cadence and releases its unref timer at settlement", async (t) => {
+test("prompt installs the silence watchdog unref'd and releases it at settlement", async (t) => {
 	const configHome = scopedDoubleEscCancelConfigHome(t);
 	writeFileSync(join(configHome, "animations.json"), '{"schema":"gentle-pi.animations/v1","policy":"quality"}');
 	const delays: number[] = [];
@@ -3141,13 +3242,119 @@ test("prompt uses the compact banner cadence and releases its unref timer at set
 	const editor = installedPrompt(ctx, ui, handlers);
 	assert.equal(active, 1);
 	for (const handler of handlers.get("agent_start") ?? []) handler({}, ctx);
-	assert.deepEqual(delays, [2000, 80]);
+	assert.deepEqual(delays, [2000, 1000]);
 	assert.equal(unrefs, 2);
 	for (const handler of handlers.get("agent_settled") ?? []) handler({}, ctx);
 	assert.equal(active, 1);
 	editor.dispose();
 	await fire(handlers, "session_shutdown", ctx);
 	assert.equal(active, 0);
+});
+
+// gentle-shell#994: the working animation is render-driven. Frames the host
+// already paints while streaming advance the petal for free; a low-cadence
+// watchdog repaints only silent phases (long tool runs with no output).
+interface RecordedInterval { tick: () => void; delay: number; stopped: boolean }
+
+function recordIntervals(t: TestContext): RecordedInterval[] {
+	const intervals: RecordedInterval[] = [];
+	t.mock.method(globalThis, "setInterval", (tick: () => void, delay: number) => {
+		const timer: RecordedInterval = { tick, delay, stopped: false };
+		intervals.push(timer);
+		return { unref() {}, timer };
+	});
+	t.mock.method(globalThis, "clearInterval", (handle: { timer: RecordedInterval }) => { handle.timer.stopped = true; });
+	return intervals;
+}
+
+// The local prompt frame carries no decorative flower: the working animation
+// lives in the scanning label, so a frame advances when its painted ANSI
+// differs (the visible text stays the same).
+function workingFrameOf(editor: GentlePromptEditor): string {
+	return editor.render(60)[0] ?? "";
+}
+
+test("streaming frames advance the working label scan and the quality watchdog stays silent while renders flow", (t) => {
+	const configHome = scopedDoubleEscCancelConfigHome(t);
+	writeFileSync(join(configHome, "animations.json"), '{"schema":"gentle-pi.animations/v1","policy":"quality"}');
+	const intervals = recordIntervals(t);
+	const renders = t.mock.method(fakeTui, "requestRender", () => {});
+	const { pi, handlers } = fakePi();
+	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: configHome }, { now: () => 1_000_000 });
+	const { ctx, ui } = fakeContext({ theme: markedTheme });
+	const editor = installedPrompt(ctx, ui, handlers);
+	for (const handler of handlers.get("agent_start") ?? []) handler({}, ctx);
+	const watchdog = intervals.find((entry) => entry.delay === 1000);
+	assert.ok(watchdog, "working installs the 1000ms silence watchdog");
+	const glyphs = [0, 1, 2, 3].map(() => workingFrameOf(editor));
+	assert.ok(new Set(glyphs).size > 1, `each streamed frame must advance the working label scan`);
+	const before = renders.mock.callCount();
+	watchdog!.tick();
+	assert.equal(renders.mock.callCount(), before, "renders are already flowing, so the watchdog must not force one");
+	editor.dispose();
+	assert.equal(watchdog!.stopped, true);
+});
+
+test("silent working phases repaint only through the 1000ms watchdog window", (t) => {
+	const configHome = scopedDoubleEscCancelConfigHome(t);
+	writeFileSync(join(configHome, "animations.json"), '{"schema":"gentle-pi.animations/v1","policy":"quality"}');
+	const intervals = recordIntervals(t);
+	const renders = t.mock.method(fakeTui, "requestRender", () => {});
+	let clock = 1_000_000;
+	const { pi, handlers } = fakePi();
+	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: configHome }, { now: () => clock });
+	const { ctx, ui } = fakeContext({ theme: markedTheme });
+	const editor = installedPrompt(ctx, ui, handlers);
+	for (const handler of handlers.get("agent_start") ?? []) handler({}, ctx);
+	const watchdog = intervals.find((entry) => entry.delay === 1000);
+	assert.ok(watchdog, "working installs the 1000ms silence watchdog");
+	const baseline = workingFrameOf(editor);
+	const before = renders.mock.callCount();
+	watchdog!.tick();
+	assert.equal(renders.mock.callCount(), before, "no frame painted within the window, but the window has not elapsed yet");
+	clock += 1000;
+	watchdog!.tick();
+	assert.equal(renders.mock.callCount(), before + 1, "silence past the window forces exactly one repaint");
+	assert.notEqual(workingFrameOf(editor), baseline, "the watchdog advanced the working tick");
+	const afterForced = renders.mock.callCount();
+	watchdog!.tick();
+	assert.equal(renders.mock.callCount(), afterForced, "the watchdog's own repaint counts as render traffic for the next window");
+	editor.dispose();
+});
+
+test("potato installs no working watchdog and the working frame never advances", (t) => {
+	const configHome = scopedDoubleEscCancelConfigHome(t);
+	writeFileSync(join(configHome, "animations.json"), '{"schema":"gentle-pi.animations/v1","policy":"potato"}');
+	const intervals = recordIntervals(t);
+	const { pi, handlers } = fakePi();
+	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: configHome });
+	const { ctx, ui } = fakeContext();
+	const editor = installedPrompt(ctx, ui, handlers);
+	for (const handler of handlers.get("agent_start") ?? []) handler({}, ctx);
+	assert.ok(!intervals.some((entry) => entry.delay !== 2000), "potato must not animate: no watchdog interval at all");
+	const glyphs = [0, 1, 2].map(() => workingFrameOf(editor));
+	assert.equal(new Set(glyphs).size, 1, "potato keeps the working frame static");
+	editor.dispose();
+});
+
+test("the working watchdog is cleared on settlement and on dispose", (t) => {
+	const configHome = scopedDoubleEscCancelConfigHome(t);
+	writeFileSync(join(configHome, "animations.json"), '{"schema":"gentle-pi.animations/v1","policy":"quality"}');
+	const intervals = recordIntervals(t);
+	const { pi, handlers } = fakePi();
+	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: configHome });
+	const { ctx, ui } = fakeContext();
+	const editor = installedPrompt(ctx, ui, handlers);
+	for (const handler of handlers.get("agent_start") ?? []) handler({}, ctx);
+	const watchdog = intervals.filter((entry) => entry.delay === 1000).at(-1);
+	assert.ok(watchdog && !watchdog.stopped, "working keeps the watchdog armed");
+	for (const handler of handlers.get("agent_settled") ?? []) handler({}, ctx);
+	assert.equal(watchdog!.stopped, true, "settlement must clear the watchdog");
+	for (const handler of handlers.get("agent_start") ?? []) handler({}, ctx);
+	const rearmWatchdog = intervals.filter((entry) => entry.delay === 1000).at(-1);
+	assert.ok(rearmWatchdog && rearmWatchdog !== watchdog && !rearmWatchdog.stopped, "the next turn re-arms a fresh watchdog");
+	editor.dispose();
+	assert.equal(rearmWatchdog!.stopped, true, "dispose must clear the watchdog");
 });
 
 // ---------------------------------------------------------------------------
@@ -5836,11 +6043,11 @@ test("/gentle:commands shows only curated, registered commands, grouped, by thei
 	assert.match(rendered, /Diagnostics/);
 	assert.match(rendered, /Skills/);
 	assert.doesNotMatch(rendered, /\bSDD\b/, "the SDD group has no registered commands and must not appear");
-	assert.match(rendered, /Assign models and effort/);
+	assert.match(rendered, /Models and profiles/);
 	assert.match(rendered, /Browse changes/);
 	assert.match(rendered, /Gentle AI status/);
 	assert.match(rendered, /Refresh skill registry/);
-	assert.doesNotMatch(rendered, /gentle:models|gentle:changes|gentle:status|skill-registry:refresh/, "raw command names must not leak; only labels are shown");
+	assert.doesNotMatch(rendered, /gentle:profiles|gentle:changes|gentle:status|skill-registry:refresh/, "raw command names must not leak; only labels are shown");
 	assert.doesNotMatch(rendered, /gentle:not-in-catalog/);
 	assert.doesNotMatch(rendered, /skill:foo/);
 	const changesLine = lines.find((line) => line.includes("Browse changes"));
@@ -5855,13 +6062,13 @@ test("selecting a command from the palette by its label sends the underlying com
 	const { ctx, ui, overlayReady } = fakeContext();
 	const opened = commands.get("gentle:commands")!.handler("", ctx);
 	await overlayReady;
-	// "mod" only matches the "Assign models and effort" label (it contains
-	// "mod" via "models"); nothing else in the fixture does.
+	// "mod" only matches the "Models and profiles" label (it contains "mod"
+	// via "Models"); nothing else in the fixture does.
 	for (const ch of "mod") ui.overlayView!.handleInput(ch);
-	assert.match(ui.overlayView!.render(100).join("\n"), /Assign models and effort/);
+	assert.match(ui.overlayView!.render(100).join("\n"), /Models and profiles/);
 	ui.overlayView!.handleInput("\r");
 	await opened;
-	assert.deepEqual(sentMessages, [{ content: "/gentle:models", options: { expandPromptTemplates: true } }]);
+	assert.deepEqual(sentMessages, [{ content: "/gentle:profiles", options: { expandPromptTemplates: true } }]);
 });
 
 test("escaping the palette sends no message", async () => {
@@ -5904,7 +6111,7 @@ test("the alt+k shortcut opens the same command palette as the command", async (
 	assert.ok(shortcut, "alt+k not registered");
 	const opened = shortcut.handler(ctx);
 	await overlayReady;
-	assert.match(ui.overlayView!.render(100).join("\n"), /Assign models and effort/);
+	assert.match(ui.overlayView!.render(100).join("\n"), /Models and profiles/);
 	ui.overlayView!.handleInput("\x1b");
 	await opened;
 });
