@@ -12,7 +12,7 @@ import { profilesFilePath, profileRoleEntries, readProfilesFileResult } from "..
 import { resolveSessionProfile, sessionProfileLabel, sessionProfileModelProfiles } from "../lib/session-profile-freeze.ts";
 import * as os from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { buildShellHeaderModel, devBinaryShortId, renderShellBar, renderShellBelowInputFloat, renderShellBottomOnlyBar, renderShellHeaderChrome, renderShellRailHeader, renderShellSidebarBar, keepNativeWorkingRow, shellEnabled, shellHeaderCommandsHit, shellHeaderUsageHit, shellJobsCount, type ShellBarModel, type ShellBarTheme } from "../lib/shell-bar.ts";
+import { buildShellHeaderModel, devBinaryShortId, renderShellBar, renderShellBelowInputFloat, renderShellBottomOnlyBar, renderShellHeaderChrome, renderShellStatusesOnlyBar, renderShellRailHeader, renderShellSidebarBar, keepNativeWorkingRow, shellEnabled, shellHeaderCommandsHit, shellHeaderUsageHit, shellJobsCount, type ShellBarModel, type ShellBarTheme } from "../lib/shell-bar.ts";
 import { CHANGE_STATUS, DIFF_MAX_BYTES, DIFF_MAX_LINES, DIFF_TOO_LARGE, WorktreeChangesTracker, changesDigest, renderChangesWidget, type ChangedFile, type ChangesModel, type FileRevision, type GitRunner, type LineCounter, type WorktreeChanges } from "../lib/shell-changes.ts";
 import { WorktreeChangesView } from "../lib/shell-changes-view.ts";
 import { createNativeFullscreenInteraction } from "../lib/native-fullscreen-interaction.ts";
@@ -2335,7 +2335,9 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			groupedChangesOwner = (width) => belowFloat(width, !footerSuppressed()) !== undefined;
 			const bottomBar = {
 				...bottom,
-				render: (width: number) => belowFloat(width, true)?.rows ?? (statusOwner() === STATUS_OWNER.BOTTOM ? renderShellBottomOnlyBar(footerModel(), theme, width, usageShortcutKey, visualSettings, undefined, gaugePaint(ctx)) : bottom.render(width)),
+				// A folded wide rail keeps its top header: the bottom bar then paints only
+				// what that header leaves out instead of repeating the identity row.
+				render: (width: number) => belowFloat(width, true)?.rows ?? (statusOwner() === STATUS_OWNER.BOTTOM ? renderShellBottomOnlyBar(footerModel(), theme, width, usageShortcutKey, visualSettings, undefined, gaugePaint(ctx)) : tui?.terminal && sidebarState(tui).headerOwnsIdentity?.() ? renderShellStatusesOnlyBar(footerModel(), theme, width) : bottom.render(width)),
 				handleMouse(event: Parameters<NonNullable<SidebarRail["handleMouse"]>>[0]) {
 					if (footerSuppressed() || event.type !== "click" || event.button !== "left") return undefined;
 					const chrome = belowFloat(event.width, true);
@@ -2563,13 +2565,15 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			DEV_BINARY_WIDGET_KEY,
 			notice
 				? (tui, theme) => {
-					// Status carries an active override only while its section is selected;
-					// folding the rail still folds the notice. Invalid overrides keep their card.
+					// The rail Status card owns an active override while the rail is mounted,
+					// whichever tab is selected: switching tabs never bounces the notice back
+					// into the transcript. Folding the rail still folds the notice; hidden
+					// Status and invalid overrides keep their card.
 					const card = spaced(cardComponent(devBinaryCard(notice), theme, { expanded: true, previewRows: 3 }));
 					const railHasNotice = () => {
 						if (!tui.terminal) return false;
 						const state = sidebarState(tui);
-						return state.railAvailable?.() === true || (notice.state === "active" && state.ownsHost?.() === true && (state.statusSectionVisible?.() ?? true) && visualSettings.statusPlacement !== "hidden");
+						return state.railAvailable?.() === true || (notice.state === "active" && state.ownsHost?.() === true && visualSettings.statusPlacement !== "hidden");
 					};
 					return { render: (width: number) => railHasNotice() ? [] : card.render(width), invalidate: () => card.invalidate() };
 				}

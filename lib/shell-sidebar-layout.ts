@@ -163,6 +163,9 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 	const railPossible = () => !stopped && host.mode === "fullscreen" && tui.terminal.columns >= SIDEBAR_BREAKPOINT && (placement() === "auto" || placement() === "right") && !!host.layoutRoot && roots.has(host.layoutRoot);
 	state.ownsHost = () => railPossible() && !folded();
 	state.railAvailable = () => railPossible() && folded();
+	// Folded at full width the native layout returns, but the top header still
+	// paints the identity row; the bottom bar then keeps only the statuses.
+	state.headerOwnsIdentity = () => !failed && railPossible() && folded() && realHeaderPainted && headerPlacement() === "top";
 	state.statusSectionVisible = () => state.active && state.ownsHost?.() === true && state.parts.has("footer") &&
 		(!options?.tabs || sidebarTabSections(selectedTab).includes("footer"));
 	state.limitsAlongsideStatus = () => state.ownsHost?.() === true && state.parts.has("usage") &&

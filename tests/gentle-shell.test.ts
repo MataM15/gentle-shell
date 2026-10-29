@@ -627,7 +627,7 @@ test("scoped voice and waits events reach the actual pinned rail and clear on re
 	} finally { voice.close(); component.dispose(); }
 });
 
-test("tabbed rail keeps job counts and owns the active dev notice only on Status", async (t) => {
+test("tabbed rail keeps job counts and keeps the active dev notice out of the transcript on every tab", async (t) => {
 	const previous = cardStyle(); t.after(() => setCardStyle(previous));
 	const home = scopedDoubleEscCancelConfigHome(t), { pi, handlers } = fakePi(), { ctx, ui } = fakeContext();
 	writeCardStyle("float", { gentlePiConfigHome: home });
@@ -652,10 +652,10 @@ test("tabbed rail keeps job counts and owns the active dev notice only on Status
 			const view = text(); assert.doesNotMatch(view.pinned, /1 command\b/); assert.doesNotMatch(view.body, /field-test/);
 			assert.doesNotMatch(below.render(100).map(stripAnsi).join("\n"), /1 job/, "the Activity card owns the count, not the float");
 			if (tab === "Activity") { assert.match(view.body, /Commands\s+1 command\b/); assert.match(view.body, /CI for PR 1860/); }
-			assert.match(view.widget, /dev binary override/, `${tab} needs the startup notice when Status is hidden`);
+			assert.equal(view.widget, "", `${tab} keeps the startup notice inside the rail Status section, never in the transcript`);
 		}
 		select("Status"); const status = text(); assert.doesNotMatch(status.pinned, /1 command\b/); assert.match(status.body, /field-test/); assert.doesNotMatch(status.body, /CI for PR 1860/, "jobs keep their own card instead of repeating inside Status"); assert.equal(status.widget, "");
-		select("Resources"); assert.match(text().widget, /dev binary override/);
+		select("Resources"); assert.equal(text().widget, "", "leaving Status does not bounce the notice back into the transcript");
 		await fire(handlers, "agent_start", ctx); assert.equal(ui.widgets.has("gentle-shell-dev-binary"), false);
 	} finally { component.dispose(); await fire(handlers, "session_shutdown", ctx); }
 });
@@ -720,6 +720,30 @@ test("the jobs snapshot validator admits the finished-tail statuses", () => {
 	assert.ok(isJobsSidebarSnapshot({ jobs: [{ id: "job-1", label: "Spawn failed", startedAt: 1, status: "failed", endedAt: 60_000, exitCode: null }] }));
 	assert.ok(isJobsSidebarSnapshot({ jobs: [{ id: "job-2", label: "Stopped", startedAt: 1, status: "stopped", endedAt: 2 }] }));
 	assert.equal(isJobsSidebarSnapshot({ jobs: [{ id: "job-3", label: "Bad", startedAt: 1, status: "exploded" }] }), false);
+});
+
+test("a folded wide rail with a top header leaves only statuses in the bottom bar", async (t) => {
+	const home = scopedDoubleEscCancelConfigHome(t);
+	const { pi, handlers } = fakePi();
+	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home, GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" });
+	const { ctx, ui } = fakeContext();
+	await fire(handlers, "session_start", ctx);
+	const tui = { mode: "fullscreen", terminal: { rows: 40, columns: 160 }, requestRender() {} };
+	const data = { getGitBranch: () => "main", getExtensionStatuses: () => new Map([["mcp", "MCP connected"]]), getAvailableProviderCount: () => 1, onBranchChange: () => () => {} };
+	const factory = ui.footerFactory as (tui: unknown, theme: ShellBarTheme, footerData: unknown) => { render(width: number): string[]; dispose(): void };
+	const component = factory(tui, plainTheme, data);
+	const state = sidebarState(tui as unknown as TUI);
+	try {
+		pi.events.emit("gentle-ai:jobs-sidebar", { sessionId: "shell-session", snapshot: { jobs: [{ id: "job-1", label: "CI for PR 1860", startedAt: 1 }] } });
+		state.railAvailable = () => true;
+		state.headerOwnsIdentity = () => true;
+		const folded = component.render(160).map(stripAnsi).join("\n");
+		assert.match(folded, /⧗ 1 job/);
+		assert.match(folded, /MCP connected/);
+		assert.doesNotMatch(folded, /main|ctx|\$/, "the top header already paints path, branch, model, context and cost");
+		state.headerOwnsIdentity = () => false;
+		assert.match(component.render(160).map(stripAnsi).join("\n"), /main/, "without the header the bottom bar keeps the whole row");
+	} finally { component.dispose(); }
 });
 
 test("hidden Status leaves only a jobs count in regular bottom and fullscreen header chrome", async (t) => {

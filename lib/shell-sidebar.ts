@@ -32,6 +32,12 @@ export interface SidebarState {
 	railAvailable?: () => boolean;
 	/** True while a painting top header is the only status row of a narrow fullscreen terminal: the bottom Status bar steps aside. */
 	headerOwnsStatus?: () => boolean;
+	/**
+	 * True while the rail is folded at full width and a top header paints: the
+	 * header carries the session identity and counters, so the bottom Status bar
+	 * keeps only the jobs count and extension statuses instead of repeating them.
+	 */
+	headerOwnsIdentity?: () => boolean;
 	/** Whether the current rail presents the Status section. */
 	statusSectionVisible?: () => boolean;
 	/** Whether Limits and Status are presented together in the current rail. */

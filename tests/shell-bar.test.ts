@@ -11,6 +11,7 @@ import {
 	renderGauge,
 	renderShellBar,
 	renderShellBottomOnlyBar,
+	renderShellStatusesOnlyBar,
 	renderShellBelowInputFloat,
 	renderShellHeaderBar,
 	renderShellHeaderChrome,
@@ -214,6 +215,20 @@ test("pinned rail header groups the running job count with context/cost and keep
 	assert.equal(hiddenJobs.headerRow, -1);
 	assert.equal(hiddenJobs.usageSpan, undefined);
 	assert.doesNotMatch(renderShellRailHeader(none, plainTheme, 50, "alt+u", hidden).rows.join("\n"), /jobs?\b/);
+});
+
+// Folded rail at full width: the top header already carries the identity, so
+// the bottom bar keeps only what the header leaves out (jobs and statuses).
+test("the statuses-only bar drops the identity the top header already paints", () => {
+	const data = model({ statuses: ["MCP connected", "Permissions: YOLO"], jobs: [{ id: "job-1", label: "CI for PR 1860", startedAt: 1 }] });
+	const lines = renderShellStatusesOnlyBar(data, plainTheme, 80).map(stripAnsi);
+	assert.equal(lines.length, 1);
+	assert.match(lines[0]!, /⧗ 1 job/);
+	assert.match(lines[0]!, /MCP connected/);
+	assert.match(lines[0]!, /Permissions: YOLO/);
+	assert.doesNotMatch(lines[0]!, /gentle-pi|gpt-5\.5|ctx|\$/);
+	assert.ok(visibleWidth(renderShellStatusesOnlyBar(data, plainTheme, 20)[0]!) <= 20, "overflow truncates instead of wrapping");
+	assert.deepEqual(renderShellStatusesOnlyBar(model({ statuses: [] }), plainTheme, 80), [], "nothing left over paints no row");
 });
 
 test("bottom-only and hidden below-input chrome retain a compact jobs count", (t) => {

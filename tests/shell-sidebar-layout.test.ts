@@ -1360,7 +1360,13 @@ test("a folded rail gives the full width back and reports that it could be shown
 		assert.notEqual((f.root[NODE]() as { type: string }).type, "hstack", "folded: no rail column");
 		assert.equal(state.ownsHost?.(), false);
 		assert.equal(state.railAvailable?.(), true, "unfolding would show the rail here");
+		assert.equal(state.headerOwnsIdentity?.(), false, "no painted top header: the bottom bar keeps the whole row");
+		sidebarHeader(f.tui, { render: () => ["HEADER"], invalidate() {} });
+		f.root[NODE]();
+		assert.equal(state.headerOwnsIdentity?.(), true, "folded wide with a painted top header: the header owns the identity");
 		control.state = false;
+		f.root[NODE]();
+		assert.equal(state.headerOwnsIdentity?.(), false, "an unfolded rail owns the whole Status itself");
 		assert.equal(hstackOf(f).type, "hstack", "unfolding restores the rail on the next layout");
 		f.host.terminal.columns = 139;
 		assert.equal(state.railAvailable?.(), false, "below the breakpoint there is no rail to unfold");

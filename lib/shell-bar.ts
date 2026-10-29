@@ -591,6 +591,18 @@ export function renderShellBottomOnlyBar(model: ShellBarModel, theme: ShellBarTh
 	return statuses.length ? [...rows, truncateToWidth(joinSegments(statuses, theme), Math.max(0, Math.floor(width)), "…")] : rows;
 }
 
+// The bottom bar while the rail is folded at full width and a top header
+// paints: the header already carries path, branch, model, context, cost and
+// usage, so only the jobs count and the extension statuses stay down here.
+// Nothing left over means no row at all.
+export function renderShellStatusesOnlyBar(model: ShellBarModel, theme: ShellBarTheme, width: number): string[] {
+	const segments = [
+		...(model.jobs?.length ? [shellJobsCount(model.jobs.length)] : []),
+		...model.statuses.map(sanitizeStatus).filter((status) => status.length > 0),
+	].map((status) => theme.fg(ROLE.STATUS, status));
+	return segments.length ? [truncateToWidth(joinSegments(segments, theme), Math.max(0, Math.floor(width)), "…")] : [];
+}
+
 // The rule row painted directly under the header bar: one full-width horizontal
 // line in the same theme role as the editor frame (PROMPT_FRAME_ROLE in
 // extensions/gentle-shell.ts), so the status row and the prompt read as one
