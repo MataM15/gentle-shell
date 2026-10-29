@@ -105,6 +105,8 @@ const ROLE = {
 	MODEL: "text",
 	EFFORT: "syntaxFunction",
 	LABEL: "muted",
+	// Row keys sit a step below the values they introduce.
+	KEY: "dim",
 	VALUE: "text",
 	STATUS: "muted",
 	SESSION: "dim",
@@ -252,8 +254,11 @@ function statusRow(status: string): StatusRow {
 // Sidebar groups use structured fields, never positional compact-bar segments
 // or inferred meanings from opaque extension status strings.
 export function renderShellSidebarBar(model: ShellBarModel, theme: ShellBarTheme, width: number, presentation?: Presentation): string[] {
-	const value = (text: string) => theme.fg(ROLE.VALUE, theme.bold(text));
+	// Values read at normal weight; only the two identity facts stay strong.
+	const value = (text: string) => theme.fg(ROLE.VALUE, text);
+	const strong = (text: string) => theme.fg(ROLE.VALUE, theme.bold(text));
 	const label = (text: string) => theme.fg(ROLE.LABEL, text);
+	const dimmed = (text: string) => theme.fg(ROLE.KEY, text);
 	const changes = model.changes;
 	// Rows are fitted to one line before they reach the card: the key column is
 	// shared by every group, so the values line up down the whole card.
@@ -276,23 +281,22 @@ export function renderShellSidebarBar(model: ShellBarModel, theme: ShellBarTheme
 	const row = (key: string, text: string | string[], paint: (text: string) => string = value): Row => ({ key, values: typeof text === "string" ? plain(text) : text, paint });
 	const groups: Array<{ title: string; rows: Row[] }> = [
 		{
+			// Location block: where this session runs and what it changed, in one
+			// block instead of one row group per fact.
 			title: "Project",
 			rows: [
 				row("Path", model.cwd),
-				...(model.branch ? [row("Branch", model.branch)] : []),
+				...(model.branch ? [row("Branch", model.branch, strong)] : []),
 				...(model.sessionName ? [row("Session", model.sessionName)] : []),
-				...(model.profile ? [row("Profile", sanitizeStatus(model.profile))] : []),
+				...(model.profile ? [row("Profile", sanitizeStatus(model.profile), strong)] : []),
+				...(presentation?.visibility.changes === false ? [] : [
+					changes?.files
+						? { key: "Changes", values: [`${changes.files} ${changes.files === 1 ? "file" : "files"} · ${theme.fg("success", `+${changes.added}`)} ${theme.fg("error", `−${changes.deleted}`)}`], paint: (text: string) => text }
+						: row("Changes", "No captured changes", label),
+					row("", "/gentle:changes", label),
+				]),
 			],
 		},
-		...(presentation?.visibility.changes === false ? [] : [{
-			title: "Changes",
-			rows: [
-				changes?.files
-					? { key: "Changes", values: [`${changes.files} ${changes.files === 1 ? "file" : "files"} · ${theme.fg("success", `+${changes.added}`)} ${theme.fg("error", `−${changes.deleted}`)}`], paint: (text: string) => text }
-					: row("Changes", "No captured changes", label),
-				row("", "/gentle:changes", label),
-			],
-		}]),
 		...(model.review && presentation?.visibility.rdd !== false ? [{
 			title: "   RDD",
 			rows: [
@@ -311,7 +315,7 @@ export function renderShellSidebarBar(model: ShellBarModel, theme: ShellBarTheme
 		const fitting = entry.values.find((candidate) => visibleWidth(candidate) <= valueRoom);
 		return fitting !== undefined ? entry.paint(fitting) : entry.paint(truncateToWidth(entry.values[entry.values.length - 1]!, valueRoom, "…"));
 	};
-	const key = (entry: Row) => label(truncateToWidth(entry.key, keyWidth, "…", true)) + " ".repeat(keyWidth > 0 ? STATUS_KEY_GAP : 0);
+	const key = (entry: Row) => dimmed(truncateToWidth(entry.key, keyWidth, "…", true)) + " ".repeat(keyWidth > 0 ? STATUS_KEY_GAP : 0);
 	const body = groups.flatMap((group, index) => [
 		...(index && (!presentation || presentation.density === "comfortable") ? [""] : []),
 		...(presentation?.density === "minimal" ? [] : [label(group.title)]),

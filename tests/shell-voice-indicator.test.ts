@@ -5,21 +5,26 @@ import { renderVoiceIndicator } from '../lib/shell-voice-indicator.ts';
 
 const calls: string[] = [];
 const theme = { fg: (role: string, text: string) => { calls.push(role); return text; }, bold: (text: string) => `\x1b[1m${text}\x1b[22m` };
+const strip = (text: string) => text.replace(/\x1b\[[0-9;]*m/g, '');
 
-test('voice indicator highlights each active state and vanishes on idle', () => {
- for (const [state, role] of [['preparing', 'warning'], ['listening', 'success'], ['transcribing', 'accent']] as const) {
+test('voice badge names each active state in Spanish, colors the dot and vanishes on idle', () => {
+ for (const [state, label, role] of [['preparing', 'Preparando', 'warning'], ['listening', 'Escuchando', 'error'], ['transcribing', 'Transcribiendo', 'warning']] as const) {
   calls.length = 0;
-  const lines = renderVoiceIndicator(state, theme, 32);
+  const lines = renderVoiceIndicator(state, theme, 40);
   assert.equal(lines.length, 1);
-  assert.match(lines[0]!, new RegExp(`Voice · ${state}`));
-  assert.match(lines[0]!, /\x1b\[1m/);
-  assert.deepEqual(calls, [role]);
+  assert.match(strip(lines[0]!), new RegExp(`● ${label} $`));
+  assert.match(lines[0]!, /\x1b\[7m/, 'badge text is an inverted (light) block');
+  assert.match(lines[0]!, /\x1b\[1m/, 'badge text is bold');
+  assert.equal(calls[0], role, 'dot role');
  }
- assert.deepEqual(renderVoiceIndicator(undefined, theme, 32), []);
- assert.deepEqual(renderVoiceIndicator('idle', theme, 32), []);
+ assert.deepEqual(renderVoiceIndicator(undefined, theme, 40), []);
+ assert.deepEqual(renderVoiceIndicator('idle', theme, 40), []);
 });
 
-test('indicator fits narrow widths without adding rows', () => {
+test('voice badge is right-aligned and fits narrow widths without adding rows', () => {
+ const wide = renderVoiceIndicator('listening', theme, 40);
+ assert.equal(visibleWidth(wide[0]!), 40);
+ assert.match(strip(wide[0]!), /^\s+● Escuchando $/);
  for (let width = 0; width <= 32; width++) {
   const lines = renderVoiceIndicator('transcribing', theme, width);
   assert.ok(lines.length <= 1);

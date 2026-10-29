@@ -994,3 +994,48 @@ test("sidebar Integrations carries the dev-binary line only while the override i
 	assert.equal(narrow.length, 1, "the build value never wraps");
 	assert.match(narrow[0]!, /Build +dev · 66bf3e1 · field-test/, "a shorter wording is chosen before anything is cut");
 });
+
+// S4: the Status card reads as two blocks — where this session runs together
+// with what it changed, then the system facts — with dim keys, normal-weight
+// values and the two identity facts (branch, profile) still strong.
+
+const boldTheme: ShellBarTheme = {
+	fg(color: string, value: string) {
+		return `<${color}>${value}</${color}>`;
+	},
+	bold(value: string) {
+		return `<bold>${value}</bold>`;
+	},
+};
+
+test("sidebar Status keeps location and the captured changes in one block, the system facts in the next", () => {
+	const data = model({ profile: "team", changes: { files: 2, added: 7, deleted: 3 }, statuses: ["\u{1F9E0} proyectos", "Permissions: YOLO", "\u{1F680} YOLO ON \u{1F525} — destructive confirmations remain"] });
+	const rows = renderShellSidebarBar(data, plainTheme, 60).map(bodyText);
+	const at = (label: string) => rows.findIndex((row) => row.trimStart().startsWith(`${label} `));
+	assert.equal(at("Branch"), at("Path") + 1);
+	assert.equal(at("Profile"), at("Branch") + 1);
+	assert.equal(at("Changes"), at("Profile") + 1, `captured changes belong to the location block: ${rows.join("|")}`);
+	assert.match(rows[at("Changes") + 1]!, /^\s*\/gentle:changes/, "the hint stays under its row");
+	assert.equal(rows[at("Changes") + 2], "", "one blank row separates the two blocks");
+	assert.equal(rows[at("Changes") + 3]!.trim(), "Integrations", "the system block opens right after the blank row");
+	assert.equal(at("Memory"), at("Changes") + 4);
+	assert.equal(at("Perms"), at("Memory") + 1);
+	assert.equal(at("YOLO"), at("Perms") + 1);
+});
+
+test("sidebar Status dims its keys and keeps only Branch and Profile bold", () => {
+	const data = model({ profile: "team", statuses: ["Permissions: YOLO"] });
+	const tagged = renderShellSidebarBar(data, boldTheme, 200).join("\n");
+	assert.match(tagged, /<dim>Path {3}<\/dim> {2}<text>~\/work\/gentle-pi<\/text>/, "Path is a plain value under a dim key");
+	assert.match(tagged, /<dim>Branch <\/dim> {2}<text><bold>main<\/bold><\/text>/);
+	assert.match(tagged, /<dim>Profile<\/dim> {2}<text><bold>team<\/bold><\/text>/);
+	assert.doesNotMatch(tagged, /<bold>~\.\/work|<bold>YOLO|<bold>No status/, "only the identity rows carry weight");
+});
+
+test("sidebar Status keeps the captured-change colors and its muted placeholder rows", () => {
+	const tagged = renderShellSidebarBar(model({ changes: { files: 2, added: 7, deleted: 3 } }), taggedTheme, 200).join("\n");
+	assert.match(tagged, /2 files · <success>\+7<\/success> <error>−3<\/error>/, "the change counts keep their colors at normal weight");
+	assert.doesNotMatch(tagged, /<bold>2 files/);
+	assert.match(tagged, /<muted>\/gentle:changes<\/muted>/);
+	assert.match(renderShellSidebarBar(model(), taggedTheme, 200).join("\n"), /<muted>No captured changes<\/muted>/);
+});

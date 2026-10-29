@@ -77,7 +77,7 @@ test('a card style change invalidates pinned section cache', t => {
  setCardStyle(initial === CARD_STYLE.NEON ? CARD_STYLE.FLOAT : CARD_STYLE.NEON);
  f.frame(); assert.equal(f.count.wellness,2);
 });
-test('activity counts remain pinned across tabs and update without rendering hidden agents', t => {
+test('the tab header carries no activity counters and count changes never repaint hidden agents', t => {
  const root={render:()=>[],invalidate(){},[NODE]:()=>({type:'vstack',entries:[]})};
  const host={mode:'fullscreen',terminal:{columns:160},layoutRoot:root,requestRender(){}}; const tui=host as unknown as TUI;
  let active=2, attention=1, jobs: number | undefined=1, renders=0;
@@ -88,22 +88,27 @@ test('activity counts remain pinned across tabs and update without rendering hid
  t.after(installSidebar(tui,theme,()=> 'auto',()=> 'top',undefined,undefined,{tabs:true}));
  const frame=()=>renderLayoutFrame(root,160,24,()=>{});
  const find=(box:LayoutBox):Component|undefined=>box.children.length===0 && box.component.render(box.rect.width).some(s=>s.includes('Activity')&&s.includes('Status')) ? box.component : box.children.map(find).find(Boolean);
- let view=frame(); assert.match(view.lines.join('\n'),/Agents 2 active.*1 waiting.*1 command/); assert.equal(renders,1);
- let pinned=find(view.root)!; let rows=pinned.render(50), y=rows.findIndex(s=>s.includes('Activity')), x=rows[y]!.indexOf('Status');
- const click={type:'click',button:'left',x,y,width:50,height:rows.length,screenX:110+x,screenY:y,shift:false,alt:false,ctrl:false} as TuiMouseEvent;
- assert.equal(pinned.handleMouse?.(click)?.handled,true); view=frame(); assert.match(view.lines.join('\n'),/STATUS/);
- active=3; attention=2; jobs=undefined; view=frame();
- assert.match(view.lines.join('\n'),/Agents 3 active.*2 waiting.*Commands \?/); assert.equal(renders,1, 'hidden Agents is not repainted');
- pinned=find(view.root)!; rows=pinned.render(50); assert.match(rows.join('\n'),/Agents 3 active/);
+ let view=frame(); let text=view.lines.join('\n');
+ assert.doesNotMatch(text,/Agents|Commands|Waits/, 'counters belong to the Activity card, never the header');
+ assert.equal(renders,1);
+ const pinned0=find(view.root)!; const lines0=pinned0.render(50), y=lines0.findIndex(s=>s.includes('Activity')), x=lines0[y]!.indexOf('Status');
+ const click={type:'click',button:'left',x,y,width:50,height:lines0.length,screenX:110+x,screenY:y,shift:false,alt:false,ctrl:false} as TuiMouseEvent;
+ assert.equal(pinned0.handleMouse?.(click)?.handled,true); view=frame(); assert.match(view.lines.join('\n'),/STATUS/);
+ active=3; attention=2; jobs=undefined; view=frame(); text=view.lines.join('\n');
+ assert.doesNotMatch(text,/Agents 3 active|Commands \?/); assert.equal(renders,1, 'hidden Agents is not repainted');
+ const rows=find(view.root)!.render(50);
+ assert.match(rows.join('\n'),/Activity/); assert.doesNotMatch(rows.join('\n'),/Agents/);
 });
-test('full activity summary fits the fixed rail without dropping counts', t => {
+test('an oversized activity count never widens or overflows the tab header', t => {
  const root={render:()=>[],invalidate(){},[NODE]:()=>({type:'vstack',entries:[]})};
  const host={mode:'fullscreen',terminal:{columns:160},layoutRoot:root,requestRender(){}}; const tui=host as unknown as TUI;
  sidebarPart(tui,'agents',{digest:()=> 'a',activitySummary:()=>({active:12345,attention:67890}),render:()=>['AGENTS'],invalidate(){}});
  sidebarPart(tui,'activity',{digest:()=> 'b',commandsCount:()=>12345,waitsCount:()=>67890,render:()=>['COMMANDS'],invalidate(){}});
  t.after(installSidebar(tui,theme,()=> 'auto',()=> 'top',undefined,undefined,{tabs:true}));
- const view=renderLayoutFrame(root,160,24,()=>{}); const text=view.lines.join('\n');
- assert.match(text,/Agents 12345 active/); assert.match(text,/67890 waiting/); assert.match(text,/12345 commands/); assert.match(text,/Waits 67890/); assert.doesNotMatch(text,/…/);
+ const text=renderLayoutFrame(root,160,24,()=>{}).lines.join('\n');
+ assert.doesNotMatch(text,/12345|67890/, 'no count reaches the header');
+ assert.doesNotMatch(text,/…/);
+ assert.match(text,/Activity *Sessions *Resources *Status/);
 });
 test('tab hit geometry rejects stale digest and resized terminal', t => {
  const f=fixture(); t.after(f.dispose); const pinned=f.find(f.frame().root)!;

@@ -408,18 +408,24 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 				const tabRow = headerLines.length;
 				let tabLine = "";
 				for (const tab of SIDEBAR_TABS) {
+					const active = tab.id === selectedTab;
+					const label = ` ${tab.label} `;
 					tabLine += " ".repeat(tab.start - visibleWidth(tabLine));
-					tabLine += theme.fg(tab.id === selectedTab ? "accent" : "dim", ` ${tab.label} `);
+					// Inactive labels step back so the active one owns the row. Bold pads
+					// invisible cells, so the published click columns never move.
+					tabLine += theme.fg(active ? "accent" : "dim", active ? theme.bold(label) : label);
 				}
 				headerLines.push(tabLine);
-				// Wrap at summary separators instead of clipping the trailing counts.
-				let summaryLine = " ";
-				for (const part of (summaryKey ?? "").split(" · ")) {
-					const next = summaryLine === " " ? ` ${part}` : `${summaryLine} · ${part}`;
-					if (visibleWidth(next) > RAIL_WIDTH && summaryLine !== " ") { headerLines.push(summaryLine); summaryLine = ` ${part}`; }
-					else summaryLine = next;
-				}
-				headerLines.push(summaryLine);
+				// The indicator is the row under the tabs: the active label's own columns
+				// in accent, the rest of the rail a faint rule, so the row reads as a bar.
+				const activeTab = SIDEBAR_TABS.find((tab) => tab.id === selectedTab);
+				const markerStart = activeTab ? activeTab.start + 1 : 0;
+				const markerEnd = activeTab ? Math.min(RAIL_WIDTH, markerStart + visibleWidth(activeTab.label)) : 0;
+				const rule = "─".repeat(RAIL_WIDTH);
+				headerLines.push(markerStart < markerEnd
+					? theme.fg("dim", rule.slice(0, markerStart)) + theme.fg("accent", rule.slice(markerStart, markerEnd)) + theme.fg("dim", rule.slice(markerEnd))
+					: theme.fg("dim", rule));
+				// The counters live in the Activity card; the header carries navigation only.
 				headerLines.push(...(voice?.lines ?? []).map((line) => ` ${line}`));
 				tabPin = { headerHeight, wellnessStart, wellnessHeight: wellness?.lines.length ?? 0, tabRow };
 			}

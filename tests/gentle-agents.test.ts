@@ -4026,7 +4026,7 @@ test("Sessions tab selection reads bounded synthetic presence through the real a
 		assert.equal(paints,0); entries(); entries(); assert.equal(paints,0,"hidden tab never renders"); assert.equal(publishes,0,"no registry read from frames");
 		assert.equal(pinned.handleMouse?.({type:"click",button:"left",x,y,width:50,height:lines.length,screenX:110+x,screenY:y,shift:false,alt:false,ctrl:false} as TuiMouseEvent)?.handled,true);
 		await tick(); const scroll=entries().find(entry=>entry.component instanceof ScrollView)!.component;
-		assert.match(scroll.render(50).map(stripAnsi).join("\n"),/Peer topic/); assert.match(scroll.render(50).map(stripAnsi).join("\n"),/reachability unknown/i);
+		assert.match(scroll.render(50).map(stripAnsi).join("\n"),/Peer topic/); assert.match(scroll.render(50).map(stripAnsi).join("\n"),/visto hace \d+ s/);
 		assert.equal(publishes,1); const painted=paints; entries(); entries(); assert.equal(paints,painted,"stable session frame stays cached");
 		pi.events.emit(SESSION_REFRESH_EVENT,{sessionId:"foreign"}); await tick(); assert.equal(publishes,1);
 	} finally { stop(); unsub(); await fire("session_shutdown",ctx); }

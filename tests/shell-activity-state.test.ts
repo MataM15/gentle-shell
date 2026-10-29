@@ -4,7 +4,7 @@ import type { TUI } from '@earendil-works/pi-tui';
 import { renderLayoutFrame } from '@earendil-works/pi-tui/dist/layout.js';
 import { installSidebar } from '../lib/shell-sidebar-layout.ts';
 import { sidebarHeader, sidebarPart } from '../lib/shell-sidebar.ts';
-import { activitySummary, acceptedJobs, acceptedWaits, commandRows, safeJobLabel, createWaitsReceiver } from '../lib/shell-activity-state.ts';
+import { activitySummary, activitySummaryRows, acceptedJobs, acceptedWaits, commandRows, safeJobLabel, createWaitsReceiver } from '../lib/shell-activity-state.ts';
 test('session-scoped jobs reject malformed and foreign snapshots', () => {
  const snapshot={jobs:[{id:'j',label:'Build preview',startedAt:1000}]};
  assert.equal(acceptedJobs('mine',{sessionId:'other',snapshot}),undefined);
@@ -43,7 +43,7 @@ test('wait event receiver rejects legacy and foreign payloads, clears, and reset
  receiver.reset(); assert.equal(receiver.current(),undefined); assert.equal(changes,6);
  receiver.dispose();
 });
-test('scoped waits event feeds the tabbed background rows and pinned count', t => {
+test('scoped waits event feeds the tabbed background rows and never the header', t => {
  const listeners=new Map<string,(value:unknown)=>void>(); const events={on:(name:string,fn:(value:unknown)=>void)=>{listeners.set(name,fn);return ()=>listeners.delete(name);},emit:(name:string,value:unknown)=>listeners.get(name)?.(value)};
  let session='one'; const root={render:()=>[],invalidate(){},[Symbol.for('@earendil-works/pi-tui/layout-node')]:()=>({type:'vstack',entries:[]})};
  const tui={mode:'fullscreen',terminal:{columns:160},layoutRoot:root,requestRender(){}} as unknown as TUI;
@@ -54,7 +54,7 @@ test('scoped waits event feeds the tabbed background rows and pinned count', t =
  t.after(installSidebar(tui,{fg:(_c,s)=>s,bold:s=>s},()=> 'auto',()=> 'top',undefined,undefined,{tabs:true})); t.after(()=>receiver.dispose());
  const frame=()=>renderLayoutFrame(root,160,20,()=>{}).lines.join('\n');
  events.emit('background-waits:pending',{waits:[]}); assert.match(frame(),/Waits unavailable/);
- events.emit('background-waits:pending',{sessionId:'one',waits:[{id:'w',label:'CI check',startedAt:1}]}); assert.match(frame(),/Wait · CI check · 2m/); assert.match(frame(),/Waits 1/);
+ events.emit('background-waits:pending',{sessionId:'one',waits:[{id:'w',label:'CI check',startedAt:1}]}); assert.match(frame(),/Wait · CI check · 2m/); assert.doesNotMatch(frame(),/Waits \d/, 'the count stays in the card');
  events.emit('background-waits:pending',{sessionId:'other',waits:[]}); assert.match(frame(),/CI check/);
  events.emit('background-waits:pending',{sessionId:'one',waits:[]}); assert.match(frame(),/No local waits/);
  session='two'; assert.match(frame(),/Waits unavailable/);
@@ -64,12 +64,26 @@ test('default labels never publish the raw command', () => {
  assert.equal(safeJobLabel('build job', 'long command'), 'build job');
  assert.equal(safeJobLabel('job: long command', 'long command'), 'Background command');
 });
-test('summary does not turn unknown agents, commands or waits into zero', () => {
- assert.match(activitySummary(undefined,undefined),/Agents \?/);
- assert.match(activitySummary(undefined,undefined),/Commands \?/);
+test('summary does not turn unknown agents, commands or waits into zero or a question mark', () => {
+ assert.match(activitySummary(undefined,undefined),/Agents —/);
+ assert.match(activitySummary(undefined,undefined),/Commands —/);
+ assert.match(activitySummary(undefined,undefined),/Waits —/);
+ assert.doesNotMatch(activitySummary(undefined,undefined),/\?/);
  assert.match(activitySummary({active:2,attention:1},1),/2 active.*1 waiting.*1 command/);
  assert.match(commandRows(undefined, 1000).join('\n'),/Commands unavailable/);
  assert.match(commandRows([], 1000).join('\n'),/No running commands/);
  assert.match(commandRows([], 1000).join('\n'),/Waits unavailable/);
  assert.match(commandRows([{id:'j',label:'build',startedAt:0}], 120000).join('\n'),/build.*running.*2m/);
+});
+
+test('activity summary rows label each fact and never turn an unknown value into a zero or a question mark', () => {
+ assert.deepEqual(activitySummaryRows(undefined,undefined,undefined),[
+  {label:'Agents',value:'—'},{label:'Commands',value:'—'},{label:'Waits',value:'—'},
+ ]);
+ assert.deepEqual(activitySummaryRows({active:1,attention:0},0,0),[
+  {label:'Agents',value:'1 active · 0 waiting'},{label:'Commands',value:'0 commands'},{label:'Waits',value:'0'},
+ ]);
+ assert.deepEqual(activitySummaryRows({active:2,attention:1},1,1)[1],{label:'Commands',value:'1 command'});
+ assert.equal(activitySummaryRows({active:2,attention:1},undefined,undefined)[0].value,'2 active · 1 waiting','a known fact stays known beside unknown ones');
+ for(const row of activitySummaryRows(undefined,undefined,undefined)) assert.doesNotMatch(row.value,/\?/);
 });

@@ -51,10 +51,21 @@ export function createWaitsReceiver(events: { on(name: string, listener: (value:
   dispose: () => { unsubscribe(); snapshot = undefined; },
  };
 }
+/** Unknown is never zero: a value the rail cannot see reads as a dash. */
+export const ACTIVITY_UNKNOWN = '—';
+export interface ActivitySummaryRow { label: string; value: string }
+/** The rows the Activity card opens with: the summary that used to sit under the tabs. */
+export function activitySummaryRows(agents: AgentSummary | undefined, jobs: number | undefined, waits?: number): ActivitySummaryRow[] {
+ return [
+  { label: 'Agents', value: agents ? `${agents.active} active · ${agents.attention} waiting` : ACTIVITY_UNKNOWN },
+  { label: 'Commands', value: jobs === undefined ? ACTIVITY_UNKNOWN : `${jobs} command${jobs === 1 ? '' : 's'}` },
+  { label: 'Waits', value: waits === undefined ? ACTIVITY_UNKNOWN : `${waits}` },
+ ];
+}
 export function activitySummary(agents: AgentSummary | undefined, jobs: number | undefined, waits?: number): string {
- const agentText = agents ? `Agents ${agents.active} active · ${agents.attention} waiting` : 'Agents ?';
- const jobText = jobs === undefined ? 'Commands ?' : `${jobs} command${jobs === 1 ? '' : 's'}`;
- const waitText = waits === undefined ? 'Waits ?' : `Waits ${waits}`;
+ const agentText = agents ? `Agents ${agents.active} active · ${agents.attention} waiting` : `Agents ${ACTIVITY_UNKNOWN}`;
+ const jobText = jobs === undefined ? `Commands ${ACTIVITY_UNKNOWN}` : `${jobs} command${jobs === 1 ? '' : 's'}`;
+ const waitText = waits === undefined ? `Waits ${ACTIVITY_UNKNOWN}` : `Waits ${waits}`;
  return `${agentText} · ${jobText} · ${waitText}`;
 }
 export function waitRows(waits: readonly WaitDisplay[] | undefined, now: number): string[] {

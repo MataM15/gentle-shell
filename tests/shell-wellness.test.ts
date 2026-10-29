@@ -41,7 +41,7 @@ test("rendering never consumes notices and resets affect only the selected remin
 	assert.deepEqual(model.tick(now + 30 * 60000), ["water"]);
 });
 
-test("Spanish rail and narrow fallback remain bounded with precise reset hit targets", () => {
+test("Spanish rail, clock and date stay bounded and the card paints no reset glyph", () => {
 	const model = new WellnessSession(config, now);
 	for (const width of [48, 44, 35, 20]) {
 		const lines = model.render(now, width, theme);
@@ -49,13 +49,35 @@ test("Spanish rail and narrow fallback remain bounded with precise reset hit tar
 		assert.match(lines.join("\n"), /Breaks/);
 		assert.doesNotMatch(lines[0]!, /✿/, `rail card title has no glyph at ${width}`);
 		assert.match(lines.join("\n"), /Agua/);
-		for (const [y, line] of lines.entries()) {
-			const at = line.indexOf("↻");
-			if (at < 0) continue;
-			const x = visibleWidth(line.slice(0, at));
-			assert.ok(model.resetTargetAt(x, y));
-			assert.equal(model.resetTargetAt(x + 1, y), undefined);
-		}
+		assert.doesNotMatch(lines.join("\n"), /↻/, `no reset glyph survives at ${width}`);
+	}
+});
+
+test("each reset click target spans that row's whole label and stops at the clock", () => {
+	const model = new WellnessSession(config, now);
+	const lines = model.render(now, 48, theme);
+	for (const [target, label] of [["water", "Agua"], ["break", "Descanso"], ["stretch", "Estirar"]] as const) {
+		const y = lines.findIndex((line) => line.includes(label));
+		assert.ok(y >= 0, `${label} is painted`);
+		const from = visibleWidth(lines[y]!.slice(0, lines[y]!.indexOf(label)));
+		for (let x = from; x < from + label.length; x++) assert.equal(model.resetTargetAt(x, y), target, `column ${x} of ${label}`);
+		assert.equal(model.resetTargetAt(from + label.length, y), undefined, "the clock and the time stay inert");
+	}
+	const dinnerRow = lines.findIndex((line) => line.includes("Cena"));
+	assert.equal(model.resetTargetAt(1, dinnerRow), undefined, "dinner has no manual reset");
+});
+
+test("only a due reminder paints Ahora bold in accent, and other values keep the normal weight", () => {
+	// Accent stands in for the theme's accent role; anything else stays untagged.
+	const ansi = { fg: (role: string, text: string) => role === "accent" ? `\x1b[35m${text}\x1b[39m` : text, bold: (text: string) => `\x1b[1m${text}\x1b[22m` };
+	const model = new WellnessSession({ ...config, dinnerTime: "08:00" }, now);
+	for (const width of [48, 40]) {
+		const before = model.render(now, width, ansi).join("\n");
+		assert.doesNotMatch(before, /\x1b\[35m/, `nothing due at ${width} columns paints no accent`);
+		const text = model.render(now + 30 * 60000, width, ansi).join("\n");
+		assert.ok(text.includes("\x1b[35m\x1b[1mAhora\x1b[22m\x1b[39m"), `the due item is bold accent at ${width} columns`);
+		assert.equal(text.match(/Ahora/g)?.length, 1, "only the due reminder is marked");
+		assert.doesNotMatch(text, /\x1b\[35m1h 30m/, "the other values keep the normal weight");
 	}
 });
 
@@ -74,9 +96,9 @@ test("narrow widths render a compact card with the time in the title", () => {
 	assert.equal(model.render(now, 44, theme).length, 6);
 });
 
-test("a due reminder turns the card and its due label to the warning role at every width", () => {
+test("a due reminder takes the accent label and the warning frame at every width", () => {
 	// Zero-width escapes keep wrapping honest; yellow stands in for the warning role.
-	const ansi = { fg: (role: string, text: string) => role === "warning" ? `\x1b[33m${text}\x1b[39m` : text, bold: (text: string) => `\x1b[1m${text}\x1b[22m` };
+	const ansi = { fg: (role: string, text: string) => role === "warning" ? `\x1b[33m${text}\x1b[39m` : role === "accent" ? `\x1b[35m${text}\x1b[39m` : text, bold: (text: string) => `\x1b[1m${text}\x1b[22m` };
 	// Dinner away from the fixture's 21:00 so only water comes due 30 minutes later.
 	const model = new WellnessSession({ ...config, dinnerTime: "08:00" }, now);
 	for (const width of [48, 40]) {
@@ -84,7 +106,7 @@ test("a due reminder turns the card and its due label to the warning role at eve
 		assert.doesNotMatch(before, /\x1b\[33m/, `nothing due at ${width} columns keeps the info tone`);
 		const due = model.render(now + 30 * 60000, width, ansi);
 		const text = due.join("\n");
-		assert.ok(text.includes("\x1b[33m\x1b[1mAhora\x1b[22m\x1b[39m"), `the due label stands out at ${width} columns`);
+		assert.ok(text.includes("\x1b[35m\x1b[1mAhora\x1b[22m\x1b[39m"), `the due label carries the accent at ${width} columns`);
 		assert.ok(due[0]!.includes("\x1b[33m"), `the frame takes the warning tone at ${width} columns`);
 		assert.equal(text.match(/Ahora/g)?.length, 1, "only the due reminder is marked");
 		assert.ok(due.every((line) => visibleWidth(line) <= width), `bounded at ${width} columns`);
@@ -287,9 +309,9 @@ test("a stale reset hit never fires while Wellness is hidden on a phone-sized te
 	const f = await extensionFixture(t);
 	const columns = f.tui.terminal as { columns: number };
 	const rows = f.widget.render(140);
-	const y = rows.findIndex(row => row.includes("↻"));
-	assert.ok(y >= 0, "a reset glyph is painted when wide");
-	const x = visibleWidth(rows[y]!.slice(0, rows[y]!.indexOf("↻")));
+	const y = rows.findIndex(row => row.includes("Agua"));
+	assert.ok(y >= 0, "the reset row is painted when wide");
+	const x = visibleWidth(rows[y]!.slice(0, rows[y]!.indexOf("Agua")));
 	const click = { type: "click", button: "left", x, y, screenX: x, screenY: y, width: 140, height: rows.length, shift: false, alt: false, ctrl: false } as const;
 	const flush = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); };
 	for (const width of [60, 40]) {
@@ -301,9 +323,9 @@ test("a stale reset hit never fires while Wellness is hidden on a phone-sized te
 	}
 	columns.columns = 141;
 	const again = f.widget.render(141);
-	const row = again.findIndex(line => line.includes("↻"));
-	const col = visibleWidth(again[row]!.slice(0, again[row]!.indexOf("↻")));
-	assert.equal(f.widget.handleMouse?.({ ...click, x: col, y: row, screenX: col, screenY: row, width: 141 })?.handled, true, "visible again: the reset glyph works");
+	const row = again.findIndex(line => line.includes("Agua"));
+	const col = visibleWidth(again[row]!.slice(0, again[row]!.indexOf("Agua")));
+	assert.equal(f.widget.handleMouse?.({ ...click, x: col, y: row, screenX: col, screenY: row, width: 141 })?.handled, true, "visible again: the reset label works");
 	await flush();
 	assert.equal(f.resets.length, 1);
 });

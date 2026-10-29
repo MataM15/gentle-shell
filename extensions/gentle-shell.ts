@@ -128,10 +128,11 @@ import { REVIEW_SIDEBAR_EVENT, isReviewSidebarSnapshot, type ReviewSidebarSnapsh
 import { JOBS_SIDEBAR_EVENT, JOBS_STATUS_KEY, jobsCollapseKey, type RunningJobDisplay } from "../lib/jobs-sidebar-state.ts";
 import { JOBS_FINISHED_TTL_MS, jobsCardTone, renderJobsCard } from "../lib/jobs-widget.ts";
 import { NativePointerRegion } from "../lib/native-pointer-region.ts";
-import { acceptedJobs, createWaitsReceiver, waitRows } from "../lib/shell-activity-state.ts";
+import { acceptedJobs, activitySummaryRows, createWaitsReceiver, waitRows } from "../lib/shell-activity-state.ts";
 import { createVoiceReceiver } from "../lib/shell-voice-state.ts";
 import { renderVoiceIndicator } from "../lib/shell-voice-indicator.ts";
-import { acceptedSessionSnapshot, sessionRows, SESSION_REFRESH_EVENT, SESSION_SNAPSHOT_EVENT, type SessionSnapshot } from "../lib/shell-session-state.ts";
+import { reduceVoiceOverlay, renderVoiceOverlay, visibleVoiceOverlay, type VoiceOverlay } from "../lib/shell-voice-overlay.ts";
+import { acceptedSessionSnapshot, sessionRows, SESSION_REFRESH_EVENT, SESSION_SNAPSHOT_EVENT, SESSIONS_CARD_TITLE, type SessionSnapshot } from "../lib/shell-session-state.ts";
 import { installSessionChangeCapture } from "../lib/session-change-capture.ts";
 import { SelectionEngine } from "../lib/selection-engine.ts";
 import { withOverlayRepaint } from "../lib/overlay-repaint.ts";
@@ -2175,7 +2176,16 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 	};
 	const sessionId = () => currentContext?.sessionManager.getSessionId();
 	const waitsReceiver = createWaitsReceiver(pi.events, sessionId, redrawReview);
-	const voiceReceiver = createVoiceReceiver(pi.events, sessionId, redrawReview);
+	// Transient notice for voice transitions (S3): raised on the receiver's
+	// change callback, shown for its ttl, repainted through the digest only.
+	let voiceOverlay: VoiceOverlay | undefined;
+	let voiceStateSeen: "idle" | "preparing" | "listening" | "transcribing" = "idle";
+	const voiceReceiver = createVoiceReceiver(pi.events, sessionId, () => {
+		const state = voiceReceiver.current() ?? "idle";
+		voiceOverlay = reduceVoiceOverlay(voiceOverlay, { state, at: deps.now() }, voiceStateSeen);
+		voiceStateSeen = state;
+		redrawReview();
+	});
 	const sessionData = () => sessionSnapshotOwner && sessionSnapshotOwner === sessionId() ? sessionSnapshot : undefined;
 	const unsubscribeSessions = pi.events.on(SESSION_SNAPSHOT_EVENT, (value) => {
 		const id = sessionId();
@@ -2467,20 +2477,29 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 				digest: () => {
 					const waits = waitsReceiver.current();
 					const now = deps.now();
-					return JSON.stringify([runningJobs, waits, runningJobs?.map((job) => Math.max(0, Math.floor((now - job.startedAt) / 60000))), waits?.map((wait) => Math.max(0, Math.floor((now - wait.startedAt) / 60000)))]);
+					return JSON.stringify([sidebarState(tui).parts.get("agents")?.activitySummary?.(), runningJobs, waits, runningJobs?.map((job) => Math.max(0, Math.floor((now - job.startedAt) / 60000))), waits?.map((wait) => Math.max(0, Math.floor((now - wait.startedAt) / 60000)))]);
 				},
 				// Jobs have their own rail card now; this one keeps the local waits.
-				render: (width) => renderCard({ title: "Background", tone: CARD_TONE.INFO, rail: true, body: waitRows(waitsReceiver.current(), deps.now()) }, theme, width, { expanded: true, panel: true }),
+				// The summary rows moved here from under the tabs (S1): dim labels, "—" for unknowns.
+				render: (width) => renderCard({ title: "Background", tone: CARD_TONE.INFO, rail: true, body: [
+					...activitySummaryRows(sidebarState(tui).parts.get("agents")?.activitySummary?.(), runningJobs?.length, waitsReceiver.current()?.length).map((row) => `${theme.fg("dim", row.label.padEnd(9))}${theme.fg("text", row.value)}`),
+					"",
+					...waitRows(waitsReceiver.current(), deps.now()),
+				] }, theme, width, { expanded: true, panel: true }),
 				invalidate() {},
 			});
 			const voicePart = sidebarPart(tui, "voice", { render: () => [], invalidate() {}, dispose() {} }, {
-				digest: () => voiceReceiver.current() ?? "idle",
-				render: (width) => renderVoiceIndicator(voiceReceiver.current(), theme, width),
+				digest: () => `${voiceReceiver.current() ?? "idle"}|${visibleVoiceOverlay(voiceOverlay, deps.now()) ? voiceOverlay?.at : ""}`,
+				render: (width) => [
+					...renderVoiceIndicator(voiceReceiver.current(), theme, width),
+					...(voiceOverlay && visibleVoiceOverlay(voiceOverlay, deps.now()) ? renderVoiceOverlay(voiceOverlay, width, theme) : []),
+				],
 				invalidate() {},
 			});
 			const sessionsPart = sidebarPart(tui, "sessions", { render: () => [], invalidate() {}, dispose() {} }, {
-				digest: () => JSON.stringify(sessionData()),
-				render: (width) => renderCard({ title: "Sessions", tone: CARD_TONE.INFO, rail: true, body: sessionRows(sessionData()) }, theme, width, { expanded: true, panel: true }),
+				// The minute bucket keeps the "hace N min" ages fresh without a timer.
+				digest: () => `${JSON.stringify(sessionData())}|${Math.floor(deps.now() / 60000)}`,
+				render: (width) => renderCard({ title: SESSIONS_CARD_TITLE, tone: CARD_TONE.INFO, rail: true, body: sessionRows(sessionData(), deps.now()) }, theme, width, { expanded: true, panel: true }),
 				invalidate() {},
 			});
 			const uninstall = installSidebar(tui, theme, () => visualSettings.statusPlacement, () => visualSettings.headerPlacement, () => visualSettings.density, { collapsed: () => railCollapsed, toggle: () => toggleRail(), hint: () => railPanelKey(env) }, {

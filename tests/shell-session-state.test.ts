@@ -21,8 +21,10 @@ test('snapshot validation is bounded, session scoped, and distinguishes no peers
  assert.equal(acceptedSessionSnapshot('two',{sessionId:'one',snapshot:ready}),undefined);
  assert.equal(acceptedSessionSnapshot('one',{sessionId:'one',snapshot:{...ready,rows:Array(9).fill(ready.rows[0])}}),undefined);
  assert.equal(acceptedSessionSnapshot('one',{sessionId:'one',snapshot:{...ready,rows:[{name:'x',freshness:'alive',active:0}]}}),undefined);
- assert.match(sessionRows({kind:'ready',rows:[],incomplete:false,observedAt:1}).join('\n'),/No other sessions/);
- assert.match(sessionRows({kind:'ready',rows:[],incomplete:true,observedAt:1}).join('\n'),/Results incomplete/);
+ assert.deepEqual(acceptedSessionSnapshot('one',{sessionId:'one',snapshot:{...ready,rows:[{...ready.rows[0],lastSeen:2}]}}),{...ready,rows:[{...ready.rows[0],lastSeen:2}]});
+ assert.equal(acceptedSessionSnapshot('one',{sessionId:'one',snapshot:{...ready,rows:[{...ready.rows[0],lastSeen:-1}]}}),undefined);
+ assert.match(sessionRows({kind:'ready',rows:[],incomplete:false,observedAt:1},1).join('\n'),/Sin otras sesiones/);
+ assert.match(sessionRows({kind:'ready',rows:[],incomplete:true,observedAt:1},1).join('\n'),/lista parcial/);
  assert.match(sessionRows(undefined).join('\n'),/unavailable/);
 });
 test('synthetic same-profile publisher projects headers without exposing session ids', (t) => {
@@ -32,7 +34,12 @@ test('synthetic same-profile publisher projects headers without exposing session
  const peer=PresencePublisher.start({profile,sessionId:'other',label:'Peer topic',activity:[]});
  try {
   const result=readSessionSnapshot(profile,'current');
-  assert.equal(result.kind,'ready'); if (result.kind==='ready') assert.deepEqual(result.rows,[{name:'Peer topic',freshness:'recent',active:0}]);
+  assert.equal(result.kind,'ready');
+  if (result.kind==='ready') {
+   assert.equal(result.rows.length,1);
+   assert.equal(result.rows[0]!.name,'Peer topic'); assert.equal(result.rows[0]!.freshness,'recent'); assert.equal(result.rows[0]!.active,0);
+   assert.equal(typeof result.rows[0]!.lastSeen,'number');
+  }
   assert.doesNotMatch(JSON.stringify(result),/current|other/);
  } finally { self.dispose(); peer.dispose(); }
 });
@@ -42,9 +49,8 @@ test('snapshot prioritizes recent records and labels the bounded observation tim
  const result=projectSessionPage(page,'self',Date.UTC(2026,0,2,3,4,5));
  assert.equal(result.kind,'ready'); if(result.kind!=='ready') return;
  assert.equal(result.rows[0]!.name,'recent'); assert.equal(result.rows.length,8); assert.equal(result.incomplete,true);
- const text=sessionRows(result).join('\n');
- assert.match(text,/2026-01-02 03:04:05 UTC/); assert.match(text,/running.*queued.*waiting/);
- assert.match(text,/not verified live/i); assert.match(text,/recent at snapshot/i);
+ assert.deepEqual(sessionRows(result,Date.UTC(2026,0,2,3,4,5)).slice(-1),['visto hace 0 s · lista parcial']);
+ assert.equal(result.rows[1]!.lastSeen,1);
  assert.equal(acceptedSessionSnapshot('one',{sessionId:'one',snapshot:{...result,observedAt:NaN}}),undefined);
 });
 test('asynchronous refresh discards stale successes and failures for old parent sessions', async () => {

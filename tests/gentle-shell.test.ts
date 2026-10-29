@@ -557,11 +557,12 @@ test("Sessions selection requests current-session metadata and renders only vali
 		select("Sessions"); assert.equal(requests.length,1,"reselecting the same tab does not rescan");
 		const ready={kind:"ready",rows:[{name:"Peer topic",freshness:"recent",active:2}],incomplete:false,observedAt:1};
 		pi.events.emit(SESSION_SNAPSHOT_EVENT,{sessionId:"foreign",snapshot:ready}); assert.match(body(),/Sessions unavailable/);
-		pi.events.emit(SESSION_SNAPSHOT_EVENT,{sessionId:session,snapshot:ready}); assert.match(body(),/Peer topic/); assert.match(body(),/reachability unknown/i);
-		assert.match(body(),/1970-01-01 00:00:00 UTC/); assert.match(body(),/not verified live/); assert.match(body(),/running \+ queued \+ waiting/); assert.match(body(),/recent at snapshot/);
+		pi.events.emit(SESSION_SNAPSHOT_EVENT,{sessionId:session,snapshot:ready}); assert.match(body(),/Peer topic/); assert.match(body(),/visto hace \d+ s/, "one human footer replaces the technical disclaimers");
+		// Human-language card (S2): no technical disclaimers, one age line per session.
+		assert.match(body(),/● Peer topic/); assert.match(body(),/hace \d+ (min|h) · 2 agentes/); assert.doesNotMatch(body(),/not verified live|running \+ queued|recent at snapshot/);
 		const count=paints; body(); assert.equal(paints,count,"stable session rows are cached");
 		select("Status"); const hidden=paints; pi.events.emit(SESSION_SNAPSHOT_EVENT,{sessionId:session,snapshot:{kind:"ready",rows:[],incomplete:false,observedAt:1}}); entries(); assert.equal(paints,hidden,"hidden Sessions does not render");
-		select("Sessions"); assert.match(body(),/No other sessions/); assert.equal(requests.length,2);
+		select("Sessions"); assert.match(body(),/Sin otras sesiones/); assert.equal(requests.length,2);
 		session="replacement"; assert.match(body(),/Sessions unavailable/,"old parent snapshot cannot leak to replacement");
 	} finally {off();component.dispose();await fire(handlers,"session_shutdown",ctx);}
 });
@@ -579,7 +580,7 @@ test("scoped voice and waits events reach the actual pinned rail and clear on re
 	const data = { getGitBranch: () => "main", getExtensionStatuses: () => new Map(), getAvailableProviderCount: () => 1, onBranchChange: () => () => {} };
 	const factory = ui.footerFactory as (tui: unknown, theme: ShellBarTheme, data: unknown) => { dispose(): void };
 	const voicePaint: Array<{ role: string; text: string }> = [];
-	const voiceTheme = { ...plainTheme, fg: (role: string, value: string) => { if (value.includes("Voice ·")) voicePaint.push({ role, text: value }); return plainTheme.fg(role, value); } };
+	const voiceTheme = { ...plainTheme, fg: (role: string, value: string) => { if (value === "\x1b[7m●") voicePaint.push({ role, text: value }); return plainTheme.fg(role, value); } };
 	const component = factory(tui, voiceTheme, data);
 	const status = sidebarState(tui as unknown as TUI).parts.get("footer")!; const render = status.render.bind(status); let statusRenders = 0;
 	status.render = (width) => { statusRenders++; return render(width); };
@@ -595,30 +596,33 @@ test("scoped voice and waits events reach the actual pinned rail and clear on re
 	};
 	const voice = createVoiceStatePublisher(pi, ctx);
 	try {
-		assert.match(text().body, /Waits unavailable/); assert.doesNotMatch(text().pinned, /Voice ·/);
+		const badge = /● (Preparando|Escuchando|Transcribiendo) /;
+		assert.match(text().body, /Waits unavailable/); assert.doesNotMatch(text().pinned, badge);
 		pi.events.emit("background-waits:pending", { waits: [{id:"w",label:"old",startedAt:1}] });
 		pi.events.emit("background-waits:pending", { sessionId:"foreign", waits:[{id:"w",label:"foreign",startedAt:1}] });
 		assert.match(text().body,/Waits unavailable/);
 		pi.events.emit("background-waits:pending", { sessionId:session, waits:[{id:"w",label:"CI check",startedAt:1}] });
-		assert.match(text().body,/CI check/); assert.match(text().pinned,/Waits 1/);
-		voice.publish("preparing"); assert.match(text().pinned,/Voice · preparing/); assert.equal(voicePaint.at(-1)?.role, "warning");
-		voice.publish("listening"); assert.match(text().pinned,/Voice · listening/); assert.equal(voicePaint.at(-1)?.role, "success");
+		// The counts live inside the Activity card now (S1), not under the tabs.
+		assert.match(text().body,/CI check/); assert.match(text().body,/Waits\s+1\b/); assert.doesNotMatch(text().pinned,/Waits 1/);
+		voice.publish("preparing"); assert.match(text().pinned,/● Preparando /); assert.equal(voicePaint.at(-1)?.role, "warning");
+		voice.publish("listening"); assert.match(text().pinned,/● Escuchando /); assert.equal(voicePaint.at(-1)?.role, "error");
+		assert.match(text().pinned,/● Escuchando…/); assert.match(text().pinned,/micrófono abierto/);
 		pi.events.emit(VOICE_STATE_EVENT,{schema:VOICE_STATE_SCHEMA,sessionId:"foreign",state:"transcribing"});
 		pi.events.emit(VOICE_STATE_EVENT,{schema:VOICE_STATE_SCHEMA,sessionId:session,state:"recording"});
-		assert.match(text().pinned,/Voice · listening/);
+		assert.match(text().pinned,/● Escuchando /);
 		assert.equal(statusRenders,0,"hidden Status never renders for events");
-		select("Status"); assert.match(text().pinned,/Waits 1/); assert.match(text().pinned,/Voice · listening/); assert.ok(statusRenders>0);
-		voice.publish("transcribing"); assert.match(text().pinned,/Voice · transcribing/); assert.equal(voicePaint.at(-1)?.role, "accent");
-		voice.publish("idle"); assert.doesNotMatch(text().pinned,/Voice ·/);
-		pi.events.emit("background-waits:pending", {sessionId:session,waits:[]}); assert.match(text().pinned,/Waits 0/);
+		select("Status"); assert.match(text().pinned,/● Escuchando /); assert.ok(statusRenders>0);
+		voice.publish("transcribing"); assert.match(text().pinned,/● Transcribiendo /); assert.equal(voicePaint.at(-1)?.role, "warning");
+		voice.publish("idle"); assert.doesNotMatch(text().pinned,badge);
+		select("Activity"); pi.events.emit("background-waits:pending", {sessionId:session,waits:[]}); assert.match(text().body,/Waits\s+0\b/);
 		component.dispose(); session = "replacement"; await fire(handlers,"session_start",ctx);
 		const next = (ui.footerFactory as typeof factory)(tui,plainTheme,data);
 		try {
 			voice.publish("preparing"); pi.events.emit("background-waits:pending",{sessionId:"shell-session",waits:[{id:"w",label:"stale",startedAt:1}]});
-			assert.doesNotMatch(text().pinned,/Voice ·|Waits 1/); assert.match(text().body,/Waits unavailable/);
+			assert.doesNotMatch(text().pinned,badge); assert.doesNotMatch(text().body,/Waits\s+1\b/); assert.match(text().body,/Waits unavailable/);
 			await fire(handlers,"session_shutdown",ctx);
 			pi.events.emit(VOICE_STATE_EVENT,{schema:VOICE_STATE_SCHEMA,sessionId:session,state:"listening"});
-			assert.doesNotMatch(text().pinned,/Voice ·/);
+			assert.doesNotMatch(text().pinned,badge);
 		} finally { next.dispose(); }
 	} finally { voice.close(); component.dispose(); }
 });
@@ -644,12 +648,13 @@ test("tabbed rail keeps job counts and owns the active dev notice only on Status
 		pi.events.emit("gentle-ai:jobs-sidebar", { sessionId: "shell-session", snapshot: { jobs: [{ id: "job-1", label: "CI for PR 1860", startedAt: 1 }] } });
 		for (const tab of ["Activity", "Sessions", "Resources"]) {
 			if (tab !== "Activity") select(tab);
-			const view = text(); assert.match(view.pinned, /1 command\b/); assert.doesNotMatch(view.body, /field-test/);
-			assert.doesNotMatch(below.render(100).map(stripAnsi).join("\n"), /1 job/, "pinned summary owns the count, not the float");
-			if (tab === "Activity") assert.match(view.body, /CI for PR 1860/);
+			// The command count lives in the Activity card (S1); the tab header carries navigation only.
+			const view = text(); assert.doesNotMatch(view.pinned, /1 command\b/); assert.doesNotMatch(view.body, /field-test/);
+			assert.doesNotMatch(below.render(100).map(stripAnsi).join("\n"), /1 job/, "the Activity card owns the count, not the float");
+			if (tab === "Activity") { assert.match(view.body, /Commands\s+1 command\b/); assert.match(view.body, /CI for PR 1860/); }
 			assert.match(view.widget, /dev binary override/, `${tab} needs the startup notice when Status is hidden`);
 		}
-		select("Status"); const status = text(); assert.match(status.pinned, /1 command\b/); assert.match(status.body, /field-test/); assert.doesNotMatch(status.body, /CI for PR 1860/, "jobs keep their own card instead of repeating inside Status"); assert.equal(status.widget, "");
+		select("Status"); const status = text(); assert.doesNotMatch(status.pinned, /1 command\b/); assert.match(status.body, /field-test/); assert.doesNotMatch(status.body, /CI for PR 1860/, "jobs keep their own card instead of repeating inside Status"); assert.equal(status.widget, "");
 		select("Resources"); assert.match(text().widget, /dev binary override/);
 		await fire(handlers, "agent_start", ctx); assert.equal(ui.widgets.has("gentle-shell-dev-binary"), false);
 	} finally { component.dispose(); await fire(handlers, "session_shutdown", ctx); }

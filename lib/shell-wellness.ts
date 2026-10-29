@@ -43,7 +43,7 @@ export class WellnessSession {
 	private revisions = new Map<Reminder, string>();
 	private localRevision = 0;
 	private notified = new Set<Reminder>();
-	private resetHits: Array<{ target: Exclude<Reminder, "dinner">; x: number; y: number }> = [];
+	private resetHits: Array<{ target: Exclude<Reminder, "dinner">; from: number; to: number; y: number }> = [];
 	constructor(config: WellnessConfig, now: number) {
 		this.config = config;
 		this.reset("all", now);
@@ -73,7 +73,7 @@ export class WellnessSession {
 	/** Dinner has no manual reset, so a deadline past its grace window is stale. */
 	dinnerExpired(now: number): boolean { return now >= this.deadlines.get("dinner")! + DINNER_GRACE_MS; }
 	resetTargetAt(x: number, y: number): Exclude<Reminder, "dinner"> | undefined {
-		return this.resetHits.find((hit) => hit.x === x && hit.y === y)?.target;
+		return this.resetHits.find((hit) => hit.y === y && x >= hit.from && x < hit.to)?.target;
 	}
 	tick(now: number): Reminder[] {
 		return REMINDERS.filter((key) => {
@@ -93,19 +93,18 @@ export class WellnessSession {
 			...(offset === undefined ? {} : { timeZone: "UTC" }),
 		});
 		const innerWidth = Math.max(1, width - 4);
-		const reminderWidth = width >= 44 ? Math.max(1, innerWidth - 17) : innerWidth;
 		const reminders = REMINDERS.map((key) => {
 			const minutes = Math.ceil((this.deadlines.get(key)! - now) / 60000);
 			const remaining = minutes <= 0 ? (spanish ? "Ahora" : "Due") : minutes < 60 ? `${minutes}m` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
-			const text = `${(spanish ? WELLNESS_LABELS_ES : WELLNESS_LABELS)[key].padEnd(spanish ? 9 : 8)}${remaining}`;
-			return key === "dinner" || text.length + 2 > reminderWidth ? text : `${text.padEnd(reminderWidth - 2)}↻ `;
+			return `${(spanish ? WELLNESS_LABELS_ES : WELLNESS_LABELS)[key].padEnd(spanish ? 9 : 8)}${remaining}`;
 		});
 		const title = WELLNESS_TITLE;
 		// A due reminder must be noticed from the rail alone: the transcript notice scrolls away.
 		const dueWord = spanish ? "Ahora" : "Due";
 		const tone = REMINDERS.some((key) => this.deadlines.get(key)! <= now) ? "warning" : "info";
-		// Styled after layout, so padding and slicing still measure plain text.
-		const mark = (row: string) => row.replaceAll(dueWord, theme.fg("warning", theme.bold ? theme.bold(dueWord) : dueWord));
+		// Styled after layout, so padding and slicing still measure plain text. Only a
+		// due reminder earns the accent: no reset glyph column, the row label is the hit.
+		const mark = (row: string) => row.replaceAll(dueWord, theme.fg("accent", theme.bold ? theme.bold(dueWord) : dueWord));
 		if (width < 44) {
 			// Narrow terminals (phones) get a compact card: the time moves into the
 			// title and the reminders pack into as few rows as fit, without reset glyphs.
@@ -131,10 +130,10 @@ export class WellnessSession {
 		for (const key of REMINDERS) {
 			if (key === "dinner") continue;
 			const label = (spanish ? WELLNESS_LABELS_ES : WELLNESS_LABELS)[key];
-			const y = output.findIndex((line) => line.includes(label) && line.includes("↻"));
+			const y = output.findIndex((line) => line.includes(label));
 			if (y < 0) continue;
-			const glyph = output[y]!.indexOf("↻");
-			this.resetHits.push({ target: key, x: visibleWidth(output[y]!.slice(0, glyph)), y });
+			const from = visibleWidth(output[y]!.slice(0, output[y]!.indexOf(label)));
+			this.resetHits.push({ target: key, from, to: from + label.length, y });
 		}
 		return output;
 	}
