@@ -1363,7 +1363,7 @@ test("a folded rail gives the full width back and reports that it could be shown
 		assert.equal(state.headerOwnsIdentity?.(), false, "no painted top header: the bottom bar keeps the whole row");
 		sidebarHeader(f.tui, { render: () => ["HEADER"], invalidate() {} });
 		f.root[NODE]();
-		assert.equal(state.headerOwnsIdentity?.(), true, "folded wide with a painted top header: the header owns the identity");
+		assert.equal(state.headerOwnsIdentity?.(), false, "folded wide: the bottom band replaced the top header (folded-band S2a), so it no longer owns the identity");
 		control.state = false;
 		f.root[NODE]();
 		assert.equal(state.headerOwnsIdentity?.(), false, "an unfolded rail owns the whole Status itself");
@@ -1384,5 +1384,57 @@ test("hidden or bottom Status placement never offers the rail", () => {
 		} finally {
 			uninstall();
 		}
+	}
+});
+
+// Folded-rail bottom band (odd/tasks/folded-band.md S1, S2a).
+test("S1: foldedBand is true only while the rail is folded at full width in fullscreen with Status allowing the rail", () => {
+	const cases: Array<{ name: string; mode: string; columns: number; folded: boolean; placement: "auto" | "right" | "bottom" | "hidden"; expected: boolean }> = [
+		{ name: "folded, 140 columns", mode: "fullscreen", columns: 140, folded: true, placement: "auto", expected: true },
+		{ name: "folded, wide, Status right", mode: "fullscreen", columns: 200, folded: true, placement: "right", expected: true },
+		{ name: "rail shown", mode: "fullscreen", columns: 160, folded: false, placement: "auto", expected: false },
+		{ name: "narrow terminal", mode: "fullscreen", columns: 139, folded: true, placement: "auto", expected: false },
+		{ name: "regular mode", mode: "regular", columns: 160, folded: true, placement: "auto", expected: false },
+		{ name: "Status hidden", mode: "fullscreen", columns: 160, folded: true, placement: "hidden", expected: false },
+		{ name: "Status bottom", mode: "fullscreen", columns: 160, folded: true, placement: "bottom", expected: false },
+	];
+	for (const c of cases) {
+		const f = fixture(c.mode, c.columns);
+		const uninstall = installSidebar(f.tui, theme, () => c.placement, () => "top", () => "comfortable", railControl(c.folded));
+		try {
+			f.root[NODE]();
+			assert.equal(sidebarState(f.tui).foldedBand?.(), c.expected, c.name);
+			assert.equal(sidebarState(f.tui).railAvailable?.() === true, c.expected, `${c.name}: same condition as railAvailable`);
+		} finally { uninstall(); }
+	}
+});
+
+test("S2a: the top header does not paint while the band does, and returns once the rail unfolds", () => {
+	const f = fixture("fullscreen", 160);
+	const control = railControl(true);
+	sidebarHeader(f.tui, { render: () => ["HEADER"], invalidate() {} });
+	const uninstall = installSidebar(f.tui, theme, () => "auto", () => "top", () => "comfortable", control);
+	try {
+		const state = sidebarState(f.tui);
+		const folded = f.root[NODE]() as unknown as { type: string; entries: { component: Component }[] };
+		assert.equal(folded.type, "vstack", "the native layout alone");
+		assert.ok(!JSON.stringify(folded.entries.map((entry) => entry.component.render?.(160))).includes("HEADER"), "no header row");
+		assert.equal(state.headerOwnsIdentity?.(), false, "the band, not the header, carries the identity");
+		control.state = false;
+		assert.equal(hstackOf(f).type, "hstack");
+		assert.equal(state.foldedBand?.(), false);
+	} finally { uninstall(); }
+});
+
+test("S2a: narrow and regular layouts keep their top header exactly as before", () => {
+	for (const [mode, columns] of [["fullscreen", 139], ["regular", 160]] as const) {
+		const f = fixture(mode, columns);
+		sidebarHeader(f.tui, { render: () => ["HEADER"], invalidate() {} });
+		const uninstall = installSidebar(f.tui, theme, () => "auto", () => "top", () => "comfortable", railControl(true));
+		try {
+			const node = f.root[NODE]() as unknown as { type: string; entries: { component: Component }[] };
+			if (mode === "fullscreen") assert.equal(node.entries[0]!.component.render(columns)[0], "HEADER", `${columns} columns paints the header`);
+			assert.equal(sidebarState(f.tui).foldedBand?.(), false);
+		} finally { uninstall(); }
 	}
 });

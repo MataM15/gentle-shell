@@ -30,6 +30,13 @@ export interface SidebarState {
 	 * placement that allows it. The editor offers `« panel` only then.
 	 */
 	railAvailable?: () => boolean;
+	/**
+	 * True while the folded rail's bottom band owns the identity chrome: the rail
+	 * is folded at full width (the `railAvailable` condition). The top header, the
+	 * bottom Status bar, the standalone Breaks paint and the separate YOLO line
+	 * all step aside; the band paints Sesión and Breaks together instead.
+	 */
+	foldedBand?: () => boolean;
 	/** True while a painting top header is the only status row of a narrow fullscreen terminal: the bottom Status bar steps aside. */
 	headerOwnsStatus?: () => boolean;
 	/**
@@ -87,7 +94,7 @@ export function sidebarPart<T extends Component & { dispose?(): void }>(tui: TUI
 	const phoneHidden = () => (key === "agents" || key === "todo") && isPhoneWidth(tui);
 	return {
 		...bottom,
-		render: (width: number) => phoneHidden() || (key === "todo" && (state.visibility?.todo === false || state.railAvailable?.() === true)) || (key === "footer" && (state.statusHidden?.() || state.headerOwnsStatus?.())) || (state.active && state.ownsHost?.()) ? [] : bottom.render(width),
+		render: (width: number) => phoneHidden() || (key === "todo" && (state.visibility?.todo === false || state.railAvailable?.() === true)) || (key === "footer" && (state.statusHidden?.() || state.headerOwnsStatus?.())) || ((key === "footer" || key === "wellness") && state.foldedBand?.() === true) || (state.active && state.ownsHost?.()) ? [] : bottom.render(width),
 		...(bottom.handleMouse ? { handleMouse: (event: Parameters<NonNullable<Component["handleMouse"]>>[0]) => phoneHidden() ? undefined : bottom.handleMouse?.(event) } : {}),
 		dispose() {
 			if (state.parts.get(key) === rail) state.parts.delete(key);

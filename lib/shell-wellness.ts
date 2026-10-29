@@ -9,6 +9,7 @@ export const WELLNESS_LABELS_ES: Record<Reminder, string> = { water: "Agua", bre
 export const WELLNESS_NOTICES_ES: Record<Reminder, string> = { water: "Hora de tomar agua.", break: "Hora de descansar.", stretch: "Hora de estirar.", dinner: "Hora de cenar." };
 /** The rail card's title, in both languages: it sits beside Limits and Status, which are English. */
 export const WELLNESS_TITLE = "Breaks";
+const RESET_GLYPH = "↻";
 const DIGITS: Record<string, string[]> = {
 	"0": ["┌─┐", "│ │", "└─┘"], "1": [" ╷ ", " │ ", " ╵ "],
 	"2": ["╶─┐", "┌─┘", "└─╴"], "3": ["╶─┐", " ─┤", "╶─┘"],
@@ -82,7 +83,12 @@ export class WellnessSession {
 			return true;
 		});
 	}
-	render(now: number, width: number, theme: CardTheme): string[] {
+	/**
+	 * `resetGlyphs` is the folded band's format: a ↻ column immediately left of the
+	 * clock for every reminder with a manual reset, and both the glyph and the row
+	 * label reset it. The rail keeps the glyph-free format.
+	 */
+	render(now: number, width: number, theme: CardTheme, options: { resetGlyphs?: boolean } = {}): string[] {
 		const offset = this.config.utcOffsetMinutes;
 		const date = new Date(now + (offset ?? 0) * 60000);
 		const parts = offset === undefined ? [date.getHours(), date.getMinutes()] : [date.getUTCHours(), date.getUTCMinutes()];
@@ -93,10 +99,13 @@ export class WellnessSession {
 			...(offset === undefined ? {} : { timeZone: "UTC" }),
 		});
 		const innerWidth = Math.max(1, width - 4);
+		const glyphs = options.resetGlyphs === true && width >= 44;
+		const reminderWidth = Math.max(1, innerWidth - 17);
 		const reminders = REMINDERS.map((key) => {
 			const minutes = Math.ceil((this.deadlines.get(key)! - now) / 60000);
 			const remaining = minutes <= 0 ? (spanish ? "Ahora" : "Due") : minutes < 60 ? `${minutes}m` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
-			return `${(spanish ? WELLNESS_LABELS_ES : WELLNESS_LABELS)[key].padEnd(spanish ? 9 : 8)}${remaining}`;
+			const text = `${(spanish ? WELLNESS_LABELS_ES : WELLNESS_LABELS)[key].padEnd(spanish ? 9 : 8)}${remaining}`;
+			return !glyphs || key === "dinner" || text.length + 2 > reminderWidth ? text : `${text.padEnd(reminderWidth - 2)}${RESET_GLYPH} `;
 		});
 		const title = WELLNESS_TITLE;
 		// A due reminder must be noticed from the rail alone: the transcript notice scrolls away.
@@ -134,6 +143,11 @@ export class WellnessSession {
 			if (y < 0) continue;
 			const from = visibleWidth(output[y]!.slice(0, output[y]!.indexOf(label)));
 			this.resetHits.push({ target: key, from, to: from + label.length, y });
+			const glyph = output[y]!.indexOf(RESET_GLYPH);
+			if (glyphs && glyph >= 0) {
+				const at = visibleWidth(output[y]!.slice(0, glyph));
+				this.resetHits.push({ target: key, from: at, to: at + 1, y });
+			}
 		}
 		return output;
 	}

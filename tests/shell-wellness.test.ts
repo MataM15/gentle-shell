@@ -329,3 +329,42 @@ test("a stale reset hit never fires while Wellness is hidden on a phone-sized te
 	await flush();
 	assert.equal(f.resets.length, 1);
 });
+
+// S5 (odd/tasks/folded-band.md): the folded band restores the ↻ reset glyph column.
+test("S5: resetGlyphs paints ↻ for Agua, Descanso and Estirar, immediately left of the clock, and never for Cena", () => {
+	const model = new WellnessSession(config, now);
+	const lines = model.render(now, 50, theme, { resetGlyphs: true });
+	assert.equal(lines.length, 6);
+	assert.ok(lines.every((line) => visibleWidth(line) === 50));
+	const glyphRows = [1, 2, 3].map((y) => lines[y]!);
+	const columns = glyphRows.map((line) => visibleWidth(line.slice(0, line.indexOf("↻"))));
+	assert.equal(new Set(columns).size, 1, "one glyph column");
+	assert.ok(lines[4]!.includes("Cena") && !lines[4]!.includes("↻"), "dinner has no glyph");
+	assert.match(lines[1]!, /Agua +\d+m +↻ +[┌│└╶╷ ]/, "the glyph sits between the countdown and the clock");
+});
+
+test("S5: with resetGlyphs both the ↻ glyph and the row label reset that reminder", () => {
+	const model = new WellnessSession(config, now);
+	const lines = model.render(now, 50, theme, { resetGlyphs: true });
+	for (const [target, label, y] of [["water", "Agua", 1], ["break", "Descanso", 2], ["stretch", "Estirar", 3]] as const) {
+		const glyph = visibleWidth(lines[y]!.slice(0, lines[y]!.indexOf("↻")));
+		const from = visibleWidth(lines[y]!.slice(0, lines[y]!.indexOf(label)));
+		assert.equal(model.resetTargetAt(glyph, y), target, `glyph of ${label}`);
+		for (let x = from; x < from + label.length; x++) assert.equal(model.resetTargetAt(x, y), target, `label column ${x}`);
+		assert.equal(model.resetTargetAt(glyph + 2, y), undefined, "the clock stays inert");
+		assert.equal(model.resetTargetAt(glyph, y + 10), undefined, "other rows are inert");
+	}
+	const dinner = lines.findIndex((line) => line.includes("Cena"));
+	for (let x = 0; x < 50; x++) assert.equal(model.resetTargetAt(x, dinner), undefined, "dinner has no reset target");
+});
+
+test("S5: without resetGlyphs the rail format is unchanged, and a later plain render drops the glyph hits", () => {
+	const model = new WellnessSession(config, now);
+	const withGlyphs = model.render(now, 50, theme, { resetGlyphs: true });
+	const glyph = visibleWidth(withGlyphs[1]!.slice(0, withGlyphs[1]!.indexOf("↻")));
+	const rail = model.render(now, 50, theme);
+	assert.doesNotMatch(rail.join("\n"), /↻/);
+	assert.equal(model.resetTargetAt(glyph, 1), undefined, "stale glyph hit is gone after the rail render");
+	assert.deepEqual(rail, model.render(now, 50, theme, { resetGlyphs: false }));
+	assert.doesNotMatch(model.render(now, 40, theme, { resetGlyphs: true }).join("\n"), /↻/, "compact narrow card never paints glyphs");
+});

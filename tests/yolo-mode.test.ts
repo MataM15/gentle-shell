@@ -72,13 +72,36 @@ test("only /gentle:yolo is registered and the ON text carries the rocket and fir
 	assert.equal(YOLO_STATUS_TEXT, ON_TEXT);
 });
 
+// The widget is a component factory since the folded band (odd/tasks/folded-band.md S2c).
+function yoloWidgetRows(widget: unknown, tui: object): string[] | undefined {
+	if (widget === undefined) return undefined;
+	return (widget as (tui: object, theme: object) => { render(width: number): string[] })(tui, {}).render(120);
+}
+
+test("S2c: the YOLO line stays silent while the folded band paints it inside Sesión", async () => {
+	const h = harness();
+	await h.command("enable");
+	const widget = h.widgets.get("gentle:yolo");
+	assert.equal(typeof widget, "function", "a state-gated component, not a static line");
+	const state = { terminal: {}, foldedBand: undefined as (() => boolean) | undefined };
+	const symbol = Symbol.for("gentle-pi.experimental-sidebar.state");
+	const tui = { terminal: { [symbol]: state } };
+	assert.deepEqual(yoloWidgetRows(widget, tui), [ON_TEXT], "no band");
+	state.foldedBand = () => true;
+	assert.deepEqual(yoloWidgetRows(widget, tui), [], "band painting");
+	state.foldedBand = () => false;
+	assert.deepEqual(yoloWidgetRows(widget, tui), [ON_TEXT], "band gone");
+	assert.deepEqual(yoloWidgetRows(widget, {}), [ON_TEXT], "a host without a terminal keeps the line");
+	assert.equal(h.statuses.get("gentle:yolo"), ON_TEXT, "the status itself, which feeds the Sesión card, is untouched");
+});
+
 test("human command enable/disable/status/invalid and status/widget clearing", async () => {
 	const h = harness();
 	assert.equal(h.tools.some((name) => name.includes("yolo")), false);
 	await h.command("status"); assert.match(h.notices.at(-1)!, /OFF/);
 	await h.command("enable");
 	assert.equal(h.statuses.get("gentle:yolo"), ON_TEXT);
-	assert.deepEqual(h.widgets.get("gentle:yolo"), [ON_TEXT]);
+	assert.deepEqual(yoloWidgetRows(h.widgets.get("gentle:yolo"), {}), [ON_TEXT], "outside the folded band the line paints as before");
 	for (const invalid of ["invalid", "on", "off", "toggle"]) {
 		await h.command(invalid);
 		assert.equal(h.notices.at(-1), USAGE);

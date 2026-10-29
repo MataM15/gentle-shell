@@ -235,7 +235,7 @@ interface StatusRow {
 
 const STATUS_KEY_MAX = 8;
 const STATUS_KEY_GAP = 2;
-const STATUS_YOLO = /YOLO ON\b.*destructive confirmations remain/i;
+export const STATUS_YOLO = /YOLO ON\b.*destructive confirmations remain/i;
 const STATUS_PERMISSIONS = /^Permissions:\s*(.+)$/i;
 const STATUS_MEMORY = /^\u{1F9E0}\s*(.+)$/u;
 
@@ -601,6 +601,136 @@ export function renderShellStatusesOnlyBar(model: ShellBarModel, theme: ShellBar
 		...model.statuses.map(sanitizeStatus).filter((status) => status.length > 0),
 	].map((status) => theme.fg(ROLE.STATUS, status));
 	return segments.length ? [truncateToWidth(joinSegments(segments, theme), Math.max(0, Math.floor(width)), "…")] : [];
+}
+
+// The folded rail's bottom band: the Sesión card (this file) beside the Breaks
+// card (lib/shell-wellness.ts), one row of two same-height cards below the
+// editor. Pure: models and lines in, lines out.
+const BAND_TITLE = "Sesión";
+const BAND_MARK = "◇";
+const BAND_USAGE_ICON = RAIL_USAGE_ICON;
+/** The Breaks card keeps the rail's width, anchored to the right edge. */
+export const BAND_RIGHT_WIDTH = 50;
+const BAND_GAP = 2;
+// One column beyond the card frame's own space, on each side of the cells.
+const BAND_PADDING = 1;
+const BAND_FRAME_COLUMNS = 2 + BAND_PADDING;
+const BAND_MIN_LEFT_WIDTH = 30;
+const BAND_MIN_COLUMN_GAP = 2;
+
+/** The usage action's hit, in card-local columns: `[start, end)` on body row `row` (a row of the card, frame included). */
+export interface ShellSessionUsageHit {
+	row: number;
+	start: number;
+	end: number;
+}
+
+export interface ShellSessionCard {
+	rows: string[];
+	usageHit?: ShellSessionUsageHit;
+}
+
+export interface FoldedBand {
+	rows: string[];
+	/** Column where the right card starts; the band width when there is none. */
+	rightX: number;
+	rightWidth: number;
+	usageHit?: ShellSessionUsageHit;
+}
+
+function bandCell(text: string, width: number): string {
+	if (width <= 0) return "";
+	return visibleWidth(text) <= width ? text : truncateToWidth(text, width, "…");
+}
+
+function bandPad(text: string, width: number): string {
+	return text + " ".repeat(Math.max(0, width - visibleWidth(text)));
+}
+
+// Fits three column widths into `available`, shrinking the widest first and
+// keeping a minimum gap between the columns that exist.
+function bandColumnWidths(natural: number[], available: number): number[] {
+	const widths = [...natural];
+	const gaps = (widths.filter((width) => width > 0).length - 1) * BAND_MIN_COLUMN_GAP;
+	let excess = widths.reduce((sum, width) => sum + width, 0) + Math.max(0, gaps) - available;
+	while (excess > 0) {
+		const widest = widths.indexOf(Math.max(...widths));
+		if (widths[widest]! <= 1) break;
+		widths[widest]!--;
+		excess--;
+	}
+	return widths;
+}
+
+/**
+ * The Sesión card: path, branch, model, context, cost, usage and the shell's
+ * statuses in three columns aligned by ◇ (column 1 at the left padding, column
+ * 3 ending at the right padding, column 2 centred between them), plus a full
+ * width fourth row for the YOLO status or the leftover statuses. Every cell is
+ * clipped to its column, never wrapped.
+ */
+export function renderShellSessionCard(model: ShellBarModel, theme: ShellBarTheme, width: number, usageHint?: string, presentation?: Presentation, paint?: GaugePaint): ShellSessionCard {
+	const target = Math.max(0, Math.floor(width));
+	const cells = Math.max(1, target - 4 - BAND_PADDING * 2);
+	const mark = (text: string) => `${theme.fg(ROLE.SEPARATOR, BAND_MARK)} ${text}`;
+	const showModel = presentation?.visibility.modelDetails !== false;
+	const showUsage = presentation?.visibility.usageCost !== false;
+	const statuses = model.statuses.map(sanitizeStatus).filter((status) => status.length > 0);
+	const yolo = statuses.find((status) => STATUS_YOLO.test(status));
+	const rest = statuses.filter((status) => status !== yolo).map((status) => theme.fg(ROLE.STATUS, status));
+	const dirty = model.dirty ? ` ${theme.fg(ROLE.DIRTY, `±${model.dirty}`)}` : "";
+	const location = (model.branch ? `${theme.fg("dim", model.cwd)} ${theme.bold(theme.fg(ROLE.BRANCH, model.branch))}` : theme.fg("dim", model.cwd)) + dirty;
+	const profile = model.profile ? ` ${theme.fg(ROLE.LABEL, "·")} ${theme.fg(ROLE.LABEL, model.profile)}` : "";
+	const usageText = `${BAND_USAGE_ICON} usage${usageHint ? ` ${usageHint}` : ""}`;
+	const grid: string[][] = [
+		[location, showModel ? mark(executionSegment(model.modelId, model.effort, theme) + profile) : "", ""],
+		[showUsage ? contextSegment(model.contextPercent, theme, paint) : "", showUsage ? mark(costSegment(model.costTotal, model.subscription, theme)) : "",
+			showUsage ? mark(theme.fg(RAIL_ACTION_LABEL_ROLE, usageText.slice(0, usageText.indexOf("usage") + 5)) + (usageHint ? theme.fg(RAIL_ACTION_HINT_ROLE, usageText.slice(usageText.indexOf("usage") + 5)) : "")) : ""],
+		[rest[0] ?? "", model.jobs?.length ? mark(theme.fg(ROLE.STATUS, shellJobsCount(model.jobs.length))) : "", rest[1] ? mark(rest[1]) : ""],
+	];
+	const fourth = yolo ? theme.fg(ROLE.STATUS, yolo) : rest.slice(2).join(theme.fg(ROLE.SEPARATOR, " · "));
+	const natural = [0, 1, 2].map((column) => Math.max(...grid.map((row) => visibleWidth(row[column]!))));
+	const [w1, w2, w3] = bandColumnWidths(natural, cells) as [number, number, number];
+	const col3 = w3 > 0 ? cells - w3 : cells;
+	const col2 = w2 > 0 ? w1 + Math.floor((col3 - w1 - w2) / 2) : col3;
+	const body = [...grid.map((row) => {
+		const line = bandPad(bandCell(row[0]!, w1), col2) + bandPad(bandCell(row[1]!, w2), col3 - col2) + bandCell(row[2]!, w3);
+		return " ".repeat(BAND_PADDING) + bandPad(line, cells) + " ".repeat(BAND_PADDING);
+	}), " ".repeat(BAND_PADDING) + bandPad(bandCell(fourth, cells), cells) + " ".repeat(BAND_PADDING)];
+	const rows = renderCard({ title: BAND_TITLE, tone: CARD_TONE.INFO, rail: true, body }, theme, target, { expanded: true });
+	const usageRow = 1 + 1;
+	const usageCell = grid[1]![2]!;
+	if (!showUsage || w3 === 0 || usageCell === "") return { rows };
+	const start = BAND_FRAME_COLUMNS + col3 + visibleWidth(`${BAND_MARK} `);
+	const end = start + Math.min(visibleWidth(usageText), Math.max(0, w3 - visibleWidth(`${BAND_MARK} `)));
+	return { rows, usageHit: { row: usageRow, start, end } };
+}
+
+/** The usage action is interactive only on its own row, within its icon, label and key hint. */
+export function shellSessionUsageHit(card: Pick<ShellSessionCard, "usageHit">, x: number, y: number): boolean {
+	const hit = card.usageHit;
+	return hit !== undefined && y === hit.row && x >= hit.start && x < hit.end;
+}
+
+/**
+ * The band: Sesión on the left taking the remaining width, `breaks` (the Breaks
+ * card's lines) on the right at BAND_RIGHT_WIDTH, two columns apart. The shorter
+ * card is padded so both keep the same height. Without Breaks lines (wellness
+ * off, or no room) Sesión spans the whole width.
+ */
+export function renderFoldedBand(model: ShellBarModel, theme: ShellBarTheme, width: number, breaks: string[] | undefined, usageHint?: string, presentation?: Presentation, paint?: GaugePaint): FoldedBand {
+	const target = Math.max(0, Math.floor(width));
+	const rightWidth = breaks && breaks.length > 0 && target - BAND_RIGHT_WIDTH - BAND_GAP >= BAND_MIN_LEFT_WIDTH ? BAND_RIGHT_WIDTH : 0;
+	const leftWidth = rightWidth > 0 ? target - rightWidth - BAND_GAP : target;
+	const left = renderShellSessionCard(model, theme, leftWidth, usageHint, presentation, paint);
+	if (rightWidth === 0) return { rows: left.rows, rightX: target, rightWidth, usageHit: left.usageHit };
+	const height = Math.max(left.rows.length, breaks!.length);
+	const rows = Array.from({ length: height }, (_, i) => {
+		const leftRow = bandPad(left.rows[i] ?? "", leftWidth);
+		const rightRow = bandPad(bandCell(breaks![i] ?? "", rightWidth), rightWidth);
+		return `${leftRow}${" ".repeat(BAND_GAP)}${rightRow}`;
+	});
+	return { rows, rightX: leftWidth + BAND_GAP, rightWidth, usageHit: left.usageHit };
 }
 
 // The rule row painted directly under the header bar: one full-width horizontal

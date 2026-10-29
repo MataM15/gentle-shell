@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { shellEnabled } from "../lib/shell-bar.ts";
-import { isPhoneWidth, sidebarPart } from "../lib/shell-sidebar.ts";
+import { isPhoneWidth, sidebarPart, sidebarState } from "../lib/shell-sidebar.ts";
 import { invalidateSidebar } from "../lib/shell-sidebar-layout.ts";
 import { parseWellnessConfig, WellnessSession, WELLNESS_LABELS, WELLNESS_LABELS_ES, WELLNESS_NOTICES_ES, type Reminder, type WellnessConfig } from "../lib/shell-wellness.ts";
 import { WellnessStateStore, type WellnessState } from "../lib/wellness-state.ts";
@@ -66,7 +66,9 @@ export default function gentleWellness(
 			let paintEpoch = 0;
 			const repaint = () => { paintEpoch++; invalidateSidebar(tui); tui.requestRender(); };
 			const currentTheme = theme ?? ctx.ui.theme;
-			const paint = (width: number) => isPhoneWidth(tui) ? [] : model.render(Date.now(), width, currentTheme);
+			// The folded band owns the card in its glyph format; the rail keeps the plain one.
+			const resetGlyphs = () => sidebarState(tui).foldedBand?.() === true;
+			const paint = (width: number) => isPhoneWidth(tui) ? [] : model.render(Date.now(), width, currentTheme, { resetGlyphs: resetGlyphs() });
 			// Every Pi render re-lays out the whole transcript, so the poll repaints only when
 			// the last painted card would change (clock minute, countdowns, visibility).
 			let painted: { width: number; text: string } | undefined;
@@ -114,7 +116,8 @@ export default function gentleWellness(
 			timer.unref();
 			const part = sidebarPart(tui, "wellness", {
 				// Polls and explicit visible changes advance the epoch; reads are O(1).
-				digest: () => String(paintEpoch),
+				// The format flag rides it so lines cached for the rail never serve the band, or the reverse.
+				digest: () => `${paintEpoch}|${resetGlyphs()}`,
 				// Hidden only in paint: polling, notices, resets and persistence keep running.
 				render: (width: number) => {
 					const lines = paint(width);

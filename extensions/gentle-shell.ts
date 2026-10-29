@@ -12,7 +12,7 @@ import { profilesFilePath, profileRoleEntries, readProfilesFileResult } from "..
 import { resolveSessionProfile, sessionProfileLabel, sessionProfileModelProfiles } from "../lib/session-profile-freeze.ts";
 import * as os from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { buildShellHeaderModel, devBinaryShortId, renderShellBar, renderShellBelowInputFloat, renderShellBottomOnlyBar, renderShellHeaderChrome, renderShellStatusesOnlyBar, renderShellRailHeader, renderShellSidebarBar, keepNativeWorkingRow, shellEnabled, shellHeaderCommandsHit, shellHeaderUsageHit, shellJobsCount, type ShellBarModel, type ShellBarTheme } from "../lib/shell-bar.ts";
+import { BAND_RIGHT_WIDTH, buildShellHeaderModel, devBinaryShortId, renderFoldedBand, renderShellBar, renderShellBelowInputFloat, renderShellBottomOnlyBar, renderShellHeaderChrome, renderShellStatusesOnlyBar, renderShellRailHeader, renderShellSidebarBar, keepNativeWorkingRow, shellEnabled, shellHeaderCommandsHit, shellHeaderUsageHit, shellJobsCount, shellSessionUsageHit, type FoldedBand, type ShellBarModel, type ShellBarTheme } from "../lib/shell-bar.ts";
 import { CHANGE_STATUS, DIFF_MAX_BYTES, DIFF_MAX_LINES, DIFF_TOO_LARGE, WorktreeChangesTracker, changesDigest, renderChangesWidget, type ChangedFile, type ChangesModel, type FileRevision, type GitRunner, type LineCounter, type WorktreeChanges } from "../lib/shell-changes.ts";
 import { WorktreeChangesView } from "../lib/shell-changes-view.ts";
 import { createNativeFullscreenInteraction } from "../lib/native-fullscreen-interaction.ts";
@@ -122,7 +122,7 @@ import {
 import { accountIdFromToken, ANTHROPIC_PROVIDER, ANTHROPIC_USAGE_URL, CODEX_PROVIDER, CODEX_USAGE_URL, NAN_PROVIDER, NAN_QUOTA_URL, parseAnthropicOauthUsage, parseCodexUsage, parseNanQuota, parseProviderUsage, parseUsageHeaders, limitsFailureNotes, parseUsageSource, renderUsageCard, usageCardDigest, usageScopeProviders, UsageSourceRegistry, UsageStore, USAGE_SOURCE_EVENT, type ProviderUsage, type UsageSource } from "../lib/shell-usage.ts";
 import { UsageView } from "../lib/shell-usage-view.ts";
 import { sidebarHeader, sidebarPart, sidebarState, VISUAL_SETTINGS_CHANGED, type SidebarRail } from "../lib/shell-sidebar.ts";
-import { installSidebar, invalidateSidebar, narrowStatusOwner, SIDEBAR_BREAKPOINT, STATUS_OWNER } from "../lib/shell-sidebar-layout.ts";
+import { installSidebar, invalidateSidebar, narrowStatusOwner, SIDEBAR_BREAKPOINT, STATUS_OWNER, themeSignature } from "../lib/shell-sidebar-layout.ts";
 import { sessionChangeRoots } from "../lib/session-changes.ts";
 import { REVIEW_SIDEBAR_EVENT, isReviewSidebarSnapshot, type ReviewSidebarSnapshot } from "../lib/review-sidebar-state.ts";
 import { JOBS_SIDEBAR_EVENT, JOBS_STATUS_KEY, jobsCollapseKey, type RunningJobDisplay } from "../lib/jobs-sidebar-state.ts";
@@ -1526,6 +1526,7 @@ function renderDoubleEscCancelReport(
 
 const CHANGES_WIDGET_KEY = "gentle-shell-changes";
 const HEADER_WIDGET_KEY = "gentle-shell-below-input-header";
+const BAND_WIDGET_KEY = "gentle-shell-folded-band";
 const CHANGES_COMMAND_NAME = "gentle:changes";
 const CHANGES_SHORTCUT_DEFAULT = "alt+g";
 const CHANGES_POLL_DEFAULT_MS = 2000;
@@ -2318,6 +2319,9 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 				devBinary: () => devNotice,
 			});
 			const footerModel = footerStatus.model;
+			// Folded at full width the Sesión + Breaks band replaces the top header, the
+			// bottom bar and the standalone Breaks and YOLO paints (odd/tasks/folded-band.md).
+			const bandOn = () => Boolean(tui.terminal && sidebarState(tui).foldedBand?.());
 			// At narrow fullscreen widths only one status row paints: a top header
 			// suppresses the bottom bar in the layout, and otherwise the bottom bar
 			// takes over the header's data while the below-input header steps aside.
@@ -2332,12 +2336,12 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 				const state = sidebarState(tui);
 				return Boolean(state.statusHidden?.() || state.headerOwnsStatus?.() || (state.active && state.ownsHost?.()));
 			};
-			groupedChangesOwner = (width) => belowFloat(width, !footerSuppressed()) !== undefined;
+			groupedChangesOwner = (width) => !bandOn() && belowFloat(width, !footerSuppressed()) !== undefined;
 			const bottomBar = {
 				...bottom,
 				// A folded wide rail keeps its top header: the bottom bar then paints only
 				// what that header leaves out instead of repeating the identity row.
-				render: (width: number) => belowFloat(width, true)?.rows ?? (statusOwner() === STATUS_OWNER.BOTTOM ? renderShellBottomOnlyBar(footerModel(), theme, width, usageShortcutKey, visualSettings, undefined, gaugePaint(ctx)) : tui?.terminal && sidebarState(tui).headerOwnsIdentity?.() ? renderShellStatusesOnlyBar(footerModel(), theme, width) : bottom.render(width)),
+				render: (width: number) => bandOn() ? [] : belowFloat(width, true)?.rows ?? (statusOwner() === STATUS_OWNER.BOTTOM ? renderShellBottomOnlyBar(footerModel(), theme, width, usageShortcutKey, visualSettings, undefined, gaugePaint(ctx)) : tui?.terminal && sidebarState(tui).headerOwnsIdentity?.() ? renderShellStatusesOnlyBar(footerModel(), theme, width) : bottom.render(width)),
 				handleMouse(event: Parameters<NonNullable<SidebarRail["handleMouse"]>>[0]) {
 					if (footerSuppressed() || event.type !== "click" || event.button !== "left") return undefined;
 					const chrome = belowFloat(event.width, true);
@@ -2508,20 +2512,57 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 				tabs: true, onTabSelect: (tab) => { const id = sessionId(); if (tab === "sessions" && id) pi.events.emit(SESSION_REFRESH_EVENT, { sessionId: id }); },
 			});
 			// The public widget slot follows the editor even when the rail is absent.
-			const belowHeader = () => visualSettings.headerPlacement === "below-input" && (tui as TUI & { mode?: string }).mode === "fullscreen" && statusOwner() !== STATUS_OWNER.BOTTOM;
+			const belowHeader = () => !bandOn() && visualSettings.headerPlacement === "below-input" && (tui as TUI & { mode?: string }).mode === "fullscreen" && statusOwner() !== STATUS_OWNER.BOTTOM;
 			const widgetChrome = (width: number) => belowFloat(width, false) ?? headerBar(width);
 			ctx.ui.setWidget(HEADER_WIDGET_KEY, () => ({
 				render(width: number) {
+					if (bandOn()) return [];
 					if (belowFloat(width, false)) return footerSuppressed() ? widgetChrome(width).rows : [];
 					return belowHeader() ? headerBar(width).rows : [];
 				},
 				invalidate() {},
 				handleMouse(event) {
+					if (bandOn()) return undefined;
 					const grouped = belowFloat(event.width, false);
 					if ((grouped ? !footerSuppressed() : !belowHeader()) || event.type !== "click" || event.button !== "left") return undefined;
 					if (!shellHeaderUsageHit(widgetChrome(event.width), event.x, event.y)) return undefined;
 					void openUsage(ctx);
 					return { handled: true, render: true };
+				},
+			}), { placement: "belowEditor" });
+			// The band: Sesión (path, branch, model, context, cost, usage, statuses)
+			// beside the registered Breaks lines, below the editor. It repaints only when
+			// its digest changes; clicks are honoured against the geometry last painted.
+			let bandPainted: { key: string; width: number; band: FoldedBand } | undefined;
+			let bandUncached = 0;
+			const breaksPart = () => sidebarState(tui).parts.get("wellness");
+			const bandKey = (width: number) => {
+				const breaks = breaksPart();
+				return JSON.stringify([width, footerStatus.key(), breaks ? (breaks.digest?.() ?? ++bandUncached) : null, themeSignature(theme)]);
+			};
+			ctx.ui.setWidget(BAND_WIDGET_KEY, () => ({
+				render(width: number) {
+					if (!bandOn()) { bandPainted = undefined; return []; }
+					const key = bandKey(width);
+					if (bandPainted?.key === key && bandPainted.width === width) return bandPainted.band.rows;
+					let breaks: string[] | undefined;
+					try { breaks = breaksPart()?.render(BAND_RIGHT_WIDTH); } catch { breaks = undefined; }
+					const band = renderFoldedBand(footerModel(), theme, width, breaks, usageShortcutKey, visualSettings, gaugePaint(ctx));
+					bandPainted = { key, width, band };
+					return band.rows;
+				},
+				invalidate() {},
+				handleMouse(event) {
+					const painted = bandPainted;
+					if (!painted || !bandOn() || event.type !== "click" || event.button !== "left") return undefined;
+					if (event.width !== painted.width || event.y < 0 || event.y >= painted.band.rows.length || bandKey(event.width) !== painted.key) return undefined;
+					if (shellSessionUsageHit(painted.band, event.x, event.y)) {
+						void openUsage(ctx);
+						return { handled: true, render: true };
+					}
+					const { rightX, rightWidth } = painted.band;
+					if (rightWidth === 0 || event.x < rightX || event.x >= rightX + rightWidth) return undefined;
+					return breaksPart()?.handleMouse?.({ ...event, x: event.x - rightX, width: rightWidth, height: painted.band.rows.length });
 				},
 			}), { placement: "belowEditor" });
 			return { ...part,
@@ -2536,7 +2577,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 					return rows.length === 0 && (tui as TUI & { mode?: string }).mode === "fullscreen"
 						&& resolvePromptLayout(width, cardStyle(), theme.bg?.bind(theme)).background ? [""] : rows;
 				},
-				dispose() { clearInterval(jobsTimer); jobsPart.dispose(); ctx.ui.setWidget(HEADER_WIDGET_KEY, undefined); disposeHeader(); limitsPart.dispose?.(); activityPart.dispose?.(); voicePart.dispose?.(); sessionsPart.dispose?.(); uninstall(); part.dispose(); if (sidebarTui === tui) { sidebarTui = undefined; groupedChangesOwner = () => false; } releaseFullscreenProbe(fullscreenProbe); } };
+				dispose() { clearInterval(jobsTimer); jobsPart.dispose(); ctx.ui.setWidget(HEADER_WIDGET_KEY, undefined); ctx.ui.setWidget(BAND_WIDGET_KEY, undefined); disposeHeader(); limitsPart.dispose?.(); activityPart.dispose?.(); voicePart.dispose?.(); sessionsPart.dispose?.(); uninstall(); part.dispose(); if (sidebarTui === tui) { sidebarTui = undefined; groupedChangesOwner = () => false; } releaseFullscreenProbe(fullscreenProbe); } };
 		});
 		void refreshUsage(ctx, true);
 		const ownsPrompt = installPrompt(

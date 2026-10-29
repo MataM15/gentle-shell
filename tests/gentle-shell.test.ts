@@ -7191,3 +7191,161 @@ test("pasted image chips warn instead of sending images a text-only model reject
 	});
 	assert.ok(ui.notices.some((notice) => /1 pasted image was not sent: the current model does not accept images/.test(notice)));
 });
+
+// Folded-rail bottom band (odd/tasks/folded-band.md): wiring of the Sesión + Breaks widget.
+const BAND_KEY = "gentle-shell-folded-band";
+async function bandFixture(t: TestContext, options: { breaks?: boolean; statuses?: Array<[string, string]> } = {}) {
+	const home = scopedDoubleEscCancelConfigHome(t);
+	const { pi, handlers } = fakePi();
+	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home, GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" });
+	const { ctx, ui, overlayReady } = fakeContext();
+	await fire(handlers, "session_start", ctx);
+	const tui = { mode: "fullscreen", terminal: { rows: 40, columns: 160 }, requestRender() {} };
+	const statuses = new Map<string, string>(options.statuses ?? [["mcp", "MCP ready"], ["yolo", "\u{1F680} YOLO ON \u{1F525} — destructive confirmations remain"]]);
+	const footer = (ui.footerFactory as (tui: unknown, theme: ShellBarTheme, data: unknown) => { render(width: number): string[]; dispose(): void })(tui, plainTheme, {
+		getGitBranch: () => "main", getExtensionStatuses: () => statuses, getAvailableProviderCount: () => 1, onBranchChange: () => () => {},
+	});
+	const state = sidebarState(tui as unknown as TUI);
+	const wellness = { renders: 0, digest: "d1", clicks: [] as Array<{ x: number; y: number; width: number }> };
+	if (options.breaks !== false) {
+		state.parts.set("wellness", {
+			digest: () => wellness.digest,
+			render: (width: number) => { wellness.renders++; return Array.from({ length: 6 }, (_, i) => `BREAKS${i}`.padEnd(width, "·")); },
+			invalidate() {},
+			handleMouse: (event) => { wellness.clicks.push({ x: event.x, y: event.y, width: event.width }); return { handled: true, render: true }; },
+		});
+	}
+	state.foldedBand = () => true;
+	const widget = (ui.widgets.get(BAND_KEY) as (tui: unknown, theme: ShellBarTheme) => SidebarRail)(tui, plainTheme);
+	const click = (x: number, y: number, width = 160): TuiMouseEvent => ({ type: "click", button: "left", x, y, screenX: x, screenY: y, width, height: 6, shift: false, alt: false, ctrl: false } as TuiMouseEvent);
+	return { tui, ui, footer, state, widget, wellness, click, statuses, overlayReady, ctx, handlers };
+}
+
+test("S3: the band widget paints Sesión left and the registered Breaks lines at the right edge", async (t) => {
+	const f = await bandFixture(t);
+	try {
+		const rows = f.widget.render(160).map(stripAnsi);
+		assert.equal(rows.length, 6);
+		assert.ok(rows.every((row) => visibleWidth(row) === 160));
+		assert.match(rows[0]!, /Sesión/);
+		assert.match(rows[1]!, /main/);
+		assert.match(rows[4]!, /YOLO ON .* destructive confirmations remain/, "the YOLO status lives in the Sesión card");
+		assert.match(rows[3]!, /MCP ready/);
+		rows.forEach((row, i) => assert.equal(row.slice(110), `BREAKS${i}`.padEnd(50, "·"), `row ${i} Breaks`));
+	} finally { f.footer.dispose(); }
+});
+
+test("S1: outside the folded band the widget paints nothing, and disposing removes it", async (t) => {
+	const f = await bandFixture(t);
+	try {
+		f.state.foldedBand = () => false;
+		assert.deepEqual(f.widget.render(160), []);
+		f.state.foldedBand = undefined;
+		assert.deepEqual(f.widget.render(160), []);
+	} finally { f.footer.dispose(); }
+	assert.equal(f.ui.widgets.has(BAND_KEY), false);
+});
+
+test("S3: without a Breaks part (wellness off) Sesión spans the whole width", async (t) => {
+	const f = await bandFixture(t, { breaks: false });
+	try {
+		const rows = f.widget.render(160).map(stripAnsi);
+		assert.equal(rows.length, 6);
+		assert.ok(rows.every((row) => visibleWidth(row) === 160));
+		assert.match(rows[0]!, /^╭.*╮$/);
+	} finally { f.footer.dispose(); }
+});
+
+test("S2b: the bottom bar paints nothing while the band paints, and the f57d77722 statuses-only row survives without it", async (t) => {
+	const f = await bandFixture(t);
+	try {
+		f.state.headerOwnsIdentity = () => true;
+		f.state.railAvailable = () => true;
+		assert.equal(stripAnsi(f.footer.render(160).join("")).trim(), "", "no status row while the band paints");
+		f.state.foldedBand = () => false;
+		const statusesOnly = stripAnsi(f.footer.render(160).join("\n"));
+		assert.match(statusesOnly, /MCP ready/);
+		assert.doesNotMatch(statusesOnly, /\bmain\b|ctx/, "statuses only, as in f57d77722");
+		f.state.headerOwnsIdentity = () => false;
+		assert.match(stripAnsi(f.footer.render(160).join("\n")), /\bmain\b/, "without the band or the header the bottom bar keeps the whole row");
+	} finally { f.footer.dispose(); }
+});
+
+test("S2: the below-input header widget stays silent while the band paints", async (t) => {
+	const home = scopedDoubleEscCancelConfigHome(t);
+	writeVisualSettings({ ...resolveVisualSettings({ gentlePiConfigHome: home }).settings, headerPlacement: "below-input" }, { gentlePiConfigHome: home });
+	const { pi, handlers } = fakePi();
+	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home, GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" });
+	const { ctx, ui } = fakeContext();
+	await fire(handlers, "session_start", ctx);
+	const tui = { mode: "fullscreen", terminal: { rows: 40, columns: 160 }, requestRender() {} };
+	const footer = (ui.footerFactory as (tui: unknown, theme: ShellBarTheme, data: unknown) => { dispose(): void })(tui, plainTheme, {
+		getGitBranch: () => "main", getExtensionStatuses: () => new Map(), getAvailableProviderCount: () => 1, onBranchChange: () => () => {},
+	});
+	try {
+		const header = (ui.widgets.get("gentle-shell-below-input-header") as (tui: unknown, theme: ShellBarTheme) => { render(width: number): string[] })(tui, plainTheme);
+		const state = sidebarState(tui as unknown as TUI);
+		assert.notDeepEqual(header.render(160), [], "without the band the below-input header paints");
+		state.foldedBand = () => true;
+		assert.deepEqual(header.render(160), []);
+	} finally { footer.dispose(); }
+});
+
+test("S7: the band re-renders only when its inputs change", async (t) => {
+	const f = await bandFixture(t);
+	try {
+		const first = f.widget.render(160);
+		for (let i = 0; i < 5; i++) assert.deepEqual(f.widget.render(160), first);
+		assert.equal(f.wellness.renders, 1, "Breaks rendered once for six identical frames");
+		f.wellness.digest = "d2";
+		f.widget.render(160);
+		assert.equal(f.wellness.renders, 2, "a Breaks digest change repaints");
+		f.widget.render(170);
+		assert.equal(f.wellness.renders, 3, "a resize repaints");
+		f.statuses.set("mcp", "MCP busy");
+		assert.match(stripAnsi(f.widget.render(170).join("\n")), /MCP busy/, "a status change repaints Sesión");
+		assert.equal(f.wellness.renders, 4);
+		f.widget.render(170);
+		assert.equal(f.wellness.renders, 4);
+	} finally { f.footer.dispose(); }
+});
+
+test("S6: a click on `usage` opens the usage overlay; other cells of Sesión are inert", async (t) => {
+	const f = await bandFixture(t);
+	try {
+		const rows = f.widget.render(160).map(stripAnsi);
+		const x = rows[2]!.indexOf("usage");
+		assert.equal(f.widget.handleMouse?.(f.click(x, 1)), undefined, "wrong row");
+		assert.equal(f.widget.handleMouse?.(f.click(2, 2)), undefined, "ctx cell");
+		assert.equal(f.widget.handleMouse?.({ ...f.click(x, 2), button: "right" } as TuiMouseEvent), undefined);
+		assert.equal(f.widget.handleMouse?.(f.click(x, 2))?.handled, true);
+		await f.overlayReady;
+		f.ui.closeOverlay?.();
+	} finally { f.footer.dispose(); }
+});
+
+test("S6: clicks on the right card reach the Breaks part with card-local coordinates", async (t) => {
+	const f = await bandFixture(t);
+	try {
+		f.widget.render(160);
+		assert.equal(f.widget.handleMouse?.(f.click(110 + 36, 2))?.handled, true);
+		assert.deepEqual(f.wellness.clicks, [{ x: 36, y: 2, width: 50 }]);
+		assert.equal(f.widget.handleMouse?.(f.click(108, 2)), undefined, "the gap is inert");
+		assert.equal(f.wellness.clicks.length, 1);
+	} finally { f.footer.dispose(); }
+});
+
+test("S6: hits are honoured only against the geometry last painted", async (t) => {
+	const f = await bandFixture(t);
+	try {
+		const rows = f.widget.render(160).map(stripAnsi);
+		const x = rows[2]!.indexOf("usage");
+		assert.equal(f.widget.handleMouse?.(f.click(150, 2, 150)), undefined, "a different width than the last paint");
+		f.wellness.digest = "d2";
+		assert.equal(f.widget.handleMouse?.(f.click(110 + 36, 2)), undefined, "inputs changed since the last paint");
+		f.widget.render(160);
+		f.state.foldedBand = () => false;
+		assert.equal(f.widget.handleMouse?.(f.click(x, 2)), undefined, "band no longer painting");
+		assert.equal(f.wellness.clicks.length, 0);
+	} finally { f.footer.dispose(); }
+});
