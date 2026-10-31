@@ -84,6 +84,7 @@ function harness(t: test.TestContext, fake: FakeOptions = {}) {
 	const loaded: string[] = [];
 	const engines: Array<{ config: any; calls: any[]; dataDirSeen?: { es: string; phontab: string } }> = [];
 	let exitCode: number | undefined;
+	let terminate: (() => void) | undefined;
 	class OfflineTts {
 		config: any;
 		calls: any[] = [];
@@ -112,9 +113,10 @@ function harness(t: test.TestContext, fake: FakeOptions = {}) {
 			throw new Error(`unexpected module ${file}`);
 		},
 		tmpdir: paths.scratch,
+		onTerminate: (handler: () => void) => { terminate = handler; },
 	});
 	const send = (message: unknown) => input.emit("data", `${typeof message === "string" ? message : JSON.stringify(message)}\n`);
-	return { paths, input, messages, loaded, engines, done, send, types: () => messages.map((message) => message.type), exitCode: () => exitCode };
+	return { paths, input, messages, loaded, engines, done, send, terminate: () => terminate?.(), types: () => messages.map((message) => message.type), exitCode: () => exitCode };
 }
 
 test("speaks each chunk in order as a 16-bit WAV line, with the espeak tree assembled and removed afterwards", async (t) => {
@@ -207,4 +209,14 @@ test("a cancel or a closed stdin stops between chunks and still removes the espe
 		assert.equal(existsSync(worker.engines[0]!.config.model.kokoro.dataDir), false, stop);
 		assert.equal(worker.exitCode(), 0, stop);
 	}
+});
+
+test("a termination signal ends the worker and still removes the espeak tree", async (t) => {
+	let worker!: ReturnType<typeof harness>;
+	worker = harness(t, { beforeGenerate: (index) => { if (index === 1) worker.terminate(); } });
+	worker.send(startRequest(worker.paths, { chunks: ["Uno.", "Dos.", "Tres."] }));
+	await worker.done;
+	assert.ok(!worker.types().includes("done"));
+	assert.equal(existsSync(worker.engines[0]!.config.model.kokoro.dataDir), false);
+	assert.equal(worker.exitCode(), 0);
 });

@@ -178,3 +178,23 @@ test("the fallback engine prefers the natural voice and reads with the Windows v
 	assert.equal(await createFallbackSpeechEngine(aborting, scriptedEngine("windows", "done", log)).speak("cuatro", { signal: controller.signal }), "cancelled");
 	assert.ok(!log.includes("windows:cuatro"), "a cancelled reading is not read again by the fallback");
 });
+
+test("a failure after audio was heard is marked audible; one before any audio is not", async () => {
+	for (const heard of [false, true]) {
+		const h = harness();
+		const spoken = h.engine.speak("Hola. Segunda frase.", { language: "es", signal: new AbortController().signal });
+		await h.until(() => h.procs.length === 2);
+		if (heard) h.worker().proc.say({ type: "audio", index: 0, wav: "UklGRg==" });
+		h.worker().proc.say({ type: "error", code: "generate" });
+		await assert.rejects(spoken, (error: unknown) => (error as { audible?: boolean }).audible === heard);
+	}
+});
+
+test("the fallback never reads a reply again after the natural voice was already heard", async () => {
+	const log: string[] = [];
+	const audibleFailure = Object.assign(new Error("failed mid-reply"), { audible: true });
+	const preferred: SpeechEngine & { available(): Promise<boolean> } = { id: "kokoro", available: async () => true, speak: async () => { log.push("kokoro"); throw audibleFailure; } };
+	const engine = createFallbackSpeechEngine(preferred, scriptedEngine("windows", "done", log));
+	await assert.rejects(engine.speak("hola", { signal: new AbortController().signal }), (error: unknown) => error === audibleFailure);
+	assert.deepEqual(log, ["kokoro"]);
+});

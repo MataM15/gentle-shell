@@ -70,11 +70,15 @@ const MESSAGES: Record<KokoroSpeechErrorCode, string> = {
 
 export class KokoroSpeechError extends Error {
 	readonly code: KokoroSpeechErrorCode;
+	// True once part of the reply was already handed to the player, so a
+	// fallback must not read it again from the start.
+	readonly audible: boolean;
 
-	constructor(code: KokoroSpeechErrorCode) {
+	constructor(code: KokoroSpeechErrorCode, audible = false) {
 		super(MESSAGES[code]);
 		this.name = "KokoroSpeechError";
 		this.code = code;
+		this.audible = audible;
 	}
 }
 
@@ -124,6 +128,7 @@ export function createKokoroSpeechEngine(options: KokoroEngineOptions): SpeechEn
 			return new Promise<SpeechOutcome>((resolve, reject) => {
 				let settled = false;
 				let workerDone = false;
+				let audible = false;
 				const exited = { worker: false, player: false };
 				let timer: ReturnType<typeof setTimeout> | undefined;
 				const stdio: ["pipe", "pipe", "pipe"] = ["pipe", "pipe", "pipe"];
@@ -145,7 +150,7 @@ export function createKokoroSpeechEngine(options: KokoroEngineOptions): SpeechEn
 					if (timer) clearTimeout(timer);
 					signal.removeEventListener("abort", onAbort);
 					if (outcome !== "done") killAll();
-					if (outcome instanceof KokoroSpeechError) reject(outcome);
+					if (outcome instanceof KokoroSpeechError) reject(audible && !outcome.audible ? new KokoroSpeechError(outcome.code, true) : outcome);
 					else resolve(outcome);
 				};
 				const onAbort = () => finish("cancelled");
@@ -181,7 +186,10 @@ export function createKokoroSpeechEngine(options: KokoroEngineOptions): SpeechEn
 							message = undefined;
 						}
 						if (!message || message.schema !== KOKORO_TTS_SCHEMA) return finish(new KokoroSpeechError("failed"));
-						if (message.type === "audio" && typeof message.wav === "string" && /^[A-Za-z0-9+/=]+$/.test(message.wav)) player.stdin?.write(`${message.wav}\n`);
+						if (message.type === "audio" && typeof message.wav === "string" && /^[A-Za-z0-9+/=]+$/.test(message.wav)) {
+							audible = true;
+							player.stdin?.write(`${message.wav}\n`);
+						}
 						else if (message.type === "done") {
 							workerDone = true;
 							player.stdin?.end();

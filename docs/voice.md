@@ -230,7 +230,8 @@ with no setting to change; the Windows voice stays as the fallback.
 | How it plays | `scripts/voice-tts-worker.cjs` runs in its own Node process with a scrubbed environment and synthesizes chunk by chunk: the first sentence alone, then groups of up to 300 characters. Each chunk goes as a 16-bit mono WAV line to one PowerShell process that plays it with `System.Media.SoundPlayer`. PowerShell starts while the first sentence is synthesized. |
 | Speed | On an idle CPU with 4 threads, synthesis ran at about a third of real time; under heavy load it ran slower than real time, which leaves pauses between chunks. |
 | Checks | Before anything native loads, the worker checks that every model and phoneme file is a regular file of the pinned size. Digests are verified at download, and the parent checks the install marker before each reading. The worker's temporary phoneme tree is removed whenever it ends. |
-| Failure | A natural-voice failure falls back to the Windows voice for that reply, silently. Esc and the dictation shortcut stop both processes. |
+| Failure | A natural-voice failure before any audio was played falls back to the Windows voice for that reply, silently. A failure after part of the reply was heard stops there with "The reply could not be read aloud." instead of reading it again from the start. |
+| Stop | Esc and the dictation shortcut kill both processes. The worker handles the termination signal, so its temporary phoneme tree is still removed; a chunk being synthesized at that moment finishes first, so the worker can outlive the stop by a few seconds while the player is already silent. |
 
 Licenses: the Kokoro-82M weights by hexgrad are Apache-2.0, exported for
 sherpa-onnx by csukuangfj. The espeak-ng phoneme data is GPL-3.0-or-later. It

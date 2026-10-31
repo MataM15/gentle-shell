@@ -253,6 +253,9 @@ function runTtsWorker(io) {
 		const onEnd = () => dispatch(() => session.end(undefined));
 		io.input.on("data", onData);
 		io.input.on("end", onEnd);
+		// The parent stops a reading by killing this process; the handler still
+		// removes the temporary phoneme tree before exiting.
+		io.onTerminate?.(() => session.end(undefined));
 	});
 }
 
@@ -264,6 +267,10 @@ if (require.main === module) {
 		write: (line) => process.stdout.write(line),
 		exit: (code) => process.stdout.write("", () => process.exit(code)),
 		loadModule: (file) => require(file),
+		onTerminate: (handler) => {
+			process.once("SIGTERM", handler);
+			process.once("SIGINT", handler);
+		},
 	};
 	process.on("uncaughtException", () => {
 		process.stdout.write(`${JSON.stringify({ schema: SCHEMA, type: "error", code: "internal" })}\n`, () => process.exit(1));
