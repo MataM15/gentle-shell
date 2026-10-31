@@ -55,6 +55,7 @@ export const requiredPaths = [
   "lib/voice-command.ts",
   "lib/voice-install.ts",
   "lib/voice-kokoro.ts",
+  "lib/voice-kokoro-engine.ts",
   "lib/voice-platform.ts",
   "lib/voice-reply-speech.ts",
   "lib/voice-session.ts",
@@ -63,6 +64,8 @@ export const requiredPaths = [
   // The dictation worker is spawned by path, never imported, so nothing else
   // would notice it missing from the packed tarball.
   "scripts/voice-worker.cjs",
+  // The natural-voice worker is spawned by path too.
+  "scripts/voice-tts-worker.cjs",
   "docs/voice.md",
   "extensions/gentle-design.ts",
   "lib/gentle-design.ts",

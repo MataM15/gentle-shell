@@ -1,5 +1,6 @@
-import type { VoiceModelManifest, VoiceNotice } from "./voice-artifacts.ts";
-import { installVoiceModel, readVoiceComponentStatus, resolveVoiceHome, voiceComponentPath, type VoiceFetch, type VoiceInstallProgress } from "./voice-install.ts";
+import { VOICE_TARGETS, voiceRuntimeManifest, type VoiceModelManifest, type VoiceNotice, type VoiceTarget } from "./voice-artifacts.ts";
+import type { KokoroLaunch } from "./voice-kokoro-engine.ts";
+import { installVoiceModel, readVoiceComponentStatus, resolveVoiceHome, voiceComponentPath, type VoiceComponentStatus, type VoiceFetch, type VoiceInstallProgress } from "./voice-install.ts";
 
 // The natural voice for spoken replies (docs/voice.md, "Natural voice with
 // Kokoro"): the Kokoro v1.0 multi-language sherpa-onnx export at a fixed
@@ -133,4 +134,29 @@ export async function installKokoro(options: KokoroInstallOptions = {}): Promise
 		if (options.signal?.aborted) return;
 		await installVoiceModel({ voiceHome: options.voiceHome, env: options.env, signal: options.signal, onProgress: options.onProgress, manifest: manifests[part], fetch: options.fetch });
 	}
+}
+
+// What the speech worker needs for one reading, when Kokoro and the voice
+// runtime for this platform are both installed; undefined otherwise.
+export async function resolveKokoroLaunch(options: {
+	voiceHome?: string;
+	env?: NodeJS.ProcessEnv;
+	manifests?: Record<KokoroPart, VoiceModelManifest>;
+	// Tests only: the runtime status, read from the pinned manifest by default.
+	readRuntime?: (voiceHome: string) => Promise<VoiceComponentStatus>;
+} = {}): Promise<KokoroLaunch | undefined> {
+	const voiceHome = options.voiceHome ?? resolveVoiceHome(options.env);
+	const manifests = options.manifests ?? KOKORO_MANIFESTS;
+	const status = await readKokoroStatus({ voiceHome, manifests });
+	if (status.state !== "installed" || !status.roots) return undefined;
+	const target = `${process.platform}-${process.arch}` as VoiceTarget;
+	const readRuntime = options.readRuntime ?? ((home: string) => (VOICE_TARGETS.includes(target) ? readVoiceComponentStatus({ voiceHome: home, kind: "runtime", manifest: voiceRuntimeManifest(target) }) : Promise.resolve(undefined as unknown as VoiceComponentStatus)));
+	const runtime = await readRuntime(voiceHome);
+	if (runtime?.state !== "installed") return undefined;
+	const files = (part: KokoroPart) => manifests[part].files.map(({ name, size }) => ({ name, size }));
+	return {
+		runtimeRoot: runtime.path,
+		core: { root: status.roots.core, files: files("core") },
+		espeak: (["espeak", "espeakRomance", "espeakGermanic"] as const).map((part) => ({ root: status.roots![part], folder: KOKORO_ESPEAK_LAYOUT[part] as KokoroLaunch["espeak"][number]["folder"], files: files(part) })),
+	};
 }

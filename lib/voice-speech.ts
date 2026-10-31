@@ -249,3 +249,25 @@ export function createWindowsSpeechEngine(options: WindowsSpeechEngineOptions): 
 		},
 	};
 }
+
+// --- the preferred engine with a fallback --------------------------------------------
+
+// Reads with the preferred engine (the natural voice) while it is available and
+// with the fallback (the Windows voice) otherwise, or when the preferred one
+// fails. A reading the user stopped is never read again by the fallback.
+export function createFallbackSpeechEngine(preferred: SpeechEngine & { available(): Promise<boolean> }, fallback: SpeechEngine): SpeechEngine {
+	return {
+		id: `${preferred.id}+${fallback.id}`,
+		async speak(text, options) {
+			if (await preferred.available().catch(() => false)) {
+				try {
+					return await preferred.speak(text, options);
+				} catch {
+					if (options.signal.aborted) return "cancelled";
+				}
+			}
+			if (options.signal.aborted) return "cancelled";
+			return fallback.speak(text, options);
+		},
+	};
+}

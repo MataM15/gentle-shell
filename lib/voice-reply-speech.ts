@@ -1,5 +1,8 @@
 import { release } from "node:os";
+import { createKokoroSpeechEngine } from "./voice-kokoro-engine.ts";
+import { resolveKokoroLaunch } from "./voice-kokoro.ts";
 import {
+	createFallbackSpeechEngine,
 	createWindowsSpeechEngine,
 	guessReplyLanguage,
 	resolvePowerShell,
@@ -56,13 +59,18 @@ export function createReplyReader(options: { engine: () => SpeechEngine | undefi
 	};
 }
 
-// The Windows voice when this system can reach it, resolved once per caller.
+// The natural voice (Kokoro) once it is installed, with the Windows voice as its
+// fallback, when this system can reach Windows audio; resolved once per caller.
+// Whether Kokoro is installed is checked again for every reading, so a download
+// made during the session is used at once.
 export function defaultSpeechEngineResolver(env: NodeJS.ProcessEnv = process.env): () => SpeechEngine | undefined {
 	let resolved: SpeechEngine | null | undefined;
 	return () => {
 		if (resolved === undefined) {
 			const command = windowsSpeechAvailable({ platform: process.platform, kernelRelease: release() }) ? resolvePowerShell(process.platform, env) : undefined;
-			resolved = command ? createWindowsSpeechEngine({ command }) : null;
+			resolved = command
+				? createFallbackSpeechEngine(createKokoroSpeechEngine({ launch: () => resolveKokoroLaunch({ env }), powershell: command, env }), createWindowsSpeechEngine({ command }))
+				: null;
 		}
 		return resolved ?? undefined;
 	};

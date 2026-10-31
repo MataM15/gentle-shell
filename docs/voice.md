@@ -158,8 +158,9 @@ key press in a real terminal has been exercised.
 Turn it on from `/gentle:voice` with **Read replies aloud: turn on**; the same
 entry turns it off. The choice is saved in `voice-speech-settings.json` in the
 Gentle AI config home, next to the push-to-talk file, and applies to every
-session. Nothing is downloaded: it uses the Windows voice (System.Speech), so it
-works on Windows and on WSL only. Elsewhere, turning it on is refused with
+session. Nothing is downloaded: it uses the Windows voice (System.Speech), or the
+natural voice once that is installed (see below), so it works on Windows and on
+WSL only. Elsewhere, turning it on is refused with
 "Spoken replies need the Windows voice (Windows or WSL)."
 
 | Topic | Behavior |
@@ -219,6 +220,17 @@ The installer accepts flat file names only, and that guard is kept. The
 phoneme data comes from nested folders, so it is installed as three flat
 components, one per folder, under `models/` next to Parakeet; the speech worker
 rebuilds the folder tree espeak-ng expects in a private temporary directory.
+
+Once it is installed, every spoken reply uses it, including conversation mode,
+with no setting to change; the Windows voice stays as the fallback.
+
+| Topic | Behavior |
+|-------|----------|
+| Voices | Spanish replies are read by `ef_dora` (speaker 28) with espeak-ng language `es`, English replies by `af_heart` (speaker 3) with `en-us`. |
+| How it plays | `scripts/voice-tts-worker.cjs` runs in its own Node process with a scrubbed environment and synthesizes chunk by chunk: the first sentence alone, then groups of up to 300 characters. Each chunk goes as a 16-bit mono WAV line to one PowerShell process that plays it with `System.Media.SoundPlayer`. PowerShell starts while the first sentence is synthesized. |
+| Speed | On an idle CPU with 4 threads, synthesis ran at about a third of real time; under heavy load it ran slower than real time, which leaves pauses between chunks. |
+| Checks | Before anything native loads, the worker checks that every model and phoneme file is a regular file of the pinned size. Digests are verified at download, and the parent checks the install marker before each reading. The worker's temporary phoneme tree is removed whenever it ends. |
+| Failure | A natural-voice failure falls back to the Windows voice for that reply, silently. Esc and the dictation shortcut stop both processes. |
 
 Licenses: the Kokoro-82M weights by hexgrad are Apache-2.0, exported for
 sherpa-onnx by csukuangfj. The espeak-ng phoneme data is GPL-3.0-or-later. It

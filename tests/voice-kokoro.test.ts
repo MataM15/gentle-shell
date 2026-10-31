@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { join } from "node:path";
 import test, { after } from "node:test";
 import type { VoiceModelManifest } from "../lib/voice-artifacts.ts";
-import { installKokoro, KOKORO_ESPEAK_LAYOUT, KOKORO_MANIFESTS, KOKORO_PARTS, KOKORO_VOICES, kokoroBytes, readKokoroStatus, type KokoroPart } from "../lib/voice-kokoro.ts";
+import { installKokoro, KOKORO_ESPEAK_LAYOUT, KOKORO_MANIFESTS, KOKORO_PARTS, KOKORO_VOICES, kokoroBytes, readKokoroStatus, resolveKokoroLaunch, type KokoroPart } from "../lib/voice-kokoro.ts";
 import { VoiceInstallError, type VoiceFetch } from "../lib/voice-install.ts";
 
 // The pinned Kokoro download (S6): what is fetched, from where, and how the
@@ -103,4 +103,25 @@ test("an aborted install stops before the next part", async () => {
 	await installKokoro({ voiceHome, manifests, fetch, signal: controller.signal });
 	assert.equal(urls.length, 0);
 	assert.equal((await readKokoroStatus({ voiceHome, manifests })).state, "missing");
+});
+
+test("a launch is resolved only when Kokoro and the voice runtime are both installed", async () => {
+	const voiceHome = scratchHome();
+	const { manifests, fetch } = fakeParts();
+	const runtimeInstalled = async () => ({ kind: "runtime" as const, state: "installed" as const, path: "/voice/runtime/r" });
+	const runtimeMissing = async () => ({ kind: "runtime" as const, state: "missing" as const, path: "/voice/runtime/r" });
+	assert.equal(await resolveKokoroLaunch({ voiceHome, manifests, readRuntime: runtimeInstalled }), undefined, "no Kokoro yet");
+	await installKokoro({ voiceHome, manifests, fetch });
+	assert.equal(await resolveKokoroLaunch({ voiceHome, manifests, readRuntime: runtimeMissing }), undefined, "no runtime");
+	const launch = await resolveKokoroLaunch({ voiceHome, manifests, readRuntime: runtimeInstalled });
+	const status = await readKokoroStatus({ voiceHome, manifests });
+	assert.deepEqual(launch, {
+		runtimeRoot: "/voice/runtime/r",
+		core: { root: status.roots!.core, files: manifests.core.files.map(({ name, size }) => ({ name, size })) },
+		espeak: [
+			{ root: status.roots!.espeak, folder: "", files: manifests.espeak.files.map(({ name, size }) => ({ name, size })) },
+			{ root: status.roots!.espeakRomance, folder: "lang/roa", files: manifests.espeakRomance.files.map(({ name, size }) => ({ name, size })) },
+			{ root: status.roots!.espeakGermanic, folder: "lang/gmw", files: manifests.espeakGermanic.files.map(({ name, size }) => ({ name, size })) },
+		],
+	});
 });

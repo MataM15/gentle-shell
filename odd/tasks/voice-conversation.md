@@ -17,8 +17,8 @@ Branch `feat/voice-conversation`, based on the personal branch `feat/aligned-rdd
 - T1 [S1,S5] Speech module: spoken-text cleanup, reply language guess, Windows SAPI engine in its own process, cancellable. Route inline. Commit: dabdc614e. Done: 16 tests, typecheck clean, real reading heard on WSL.
 - T2 [S1,S3] Read replies aloud: persisted on/off, `/gentle:voice` menu entries, speak on settle, Esc and the toggle key cut a reading, docs. Route inline (worker refused: cross-repository delegation needs interactive consent). Commit: 7db577679. Done: 133 voice tests, typecheck clean.
 - T3 [S2,S3] Conversation mode: silence end-of-speech in the worker, transcript sent instead of pasted, listen again after the reply is read, docs. Route inline. Commit: a98864be3. Done: 180 voice tests plus the new session test, typecheck clean; thresholds tested on synthetic audio only.
-- T4a [S6] Kokoro download: pinned per-file manifests (core, espeak data, two language folders) installed by the existing installer after consent, status and `/gentle:voice` entry. Route inline. Commit: pending.
-- T4b [S6] Kokoro engine: TTS worker generating sentence by sentence with sherpa-onnx 1.13.8, one PowerShell player fed WAV chunks, preferred over the Windows voice when installed, cancellable. Route inline. Commit: pending.
+- T4a [S6] Kokoro download: pinned per-file manifests (core, espeak data, two language folders) installed by the existing installer after consent, status and `/gentle:voice` entry. Route inline. Commit: 3c71df17e. Done: 96 tests, typecheck clean. Deviation: lib/voice-kokoro.ts was written before its test.
+- T4b [S6] Kokoro engine: TTS worker generating sentence by sentence with sherpa-onnx 1.13.8, one PowerShell player fed WAV chunks, preferred over the Windows voice when installed, cancellable. Route inline. Commit: see the T4b commit (feat(voice): read replies with the Kokoro natural voice). Done: 113 tests, typecheck clean, real install (12 s, pinned digests and redirects matched) and a real Kokoro reading heard-path verified (outcome done).
 
 ## Log
 
