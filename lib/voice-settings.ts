@@ -48,3 +48,52 @@ export function writeVoicePushToTalk(enabled: boolean, options: VoiceSettingsOpt
 	}
 	return path;
 }
+
+// Spoken replies and conversation mode, in their own file so the push-to-talk
+// file keeps its exact two-key shape. A missing, malformed or foreign file
+// reads as both off.
+
+export const VOICE_SPEECH_SETTINGS_SCHEMA = "gentle-pi.voice-speech-settings/v1";
+export const VOICE_SPEECH_SETTINGS_FILE = "voice-speech-settings.json";
+
+export interface VoiceSpeechSettings {
+	speakReplies: boolean;
+	conversation: boolean;
+}
+
+const SPEECH_OFF: VoiceSpeechSettings = { speakReplies: false, conversation: false };
+
+export function parseVoiceSpeechSettingsFile(raw: string): VoiceSpeechSettings | undefined {
+	try {
+		const value: unknown = JSON.parse(raw);
+		if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+		const keys = Object.keys(value);
+		if (keys.length !== 3 || !("schema" in value) || value.schema !== VOICE_SPEECH_SETTINGS_SCHEMA) return undefined;
+		if (!("speakReplies" in value) || !("conversation" in value)) return undefined;
+		if (typeof value.speakReplies !== "boolean" || typeof value.conversation !== "boolean") return undefined;
+		return { speakReplies: value.speakReplies, conversation: value.conversation };
+	} catch { return undefined; }
+}
+
+export function readVoiceSpeechSettings(options: VoiceSettingsOptions = {}): VoiceSpeechSettings {
+	try {
+		return parseVoiceSpeechSettingsFile(readFileSync(join(homeFor(options), VOICE_SPEECH_SETTINGS_FILE), "utf8")) ?? { ...SPEECH_OFF };
+	} catch {
+		return { ...SPEECH_OFF };
+	}
+}
+
+export function writeVoiceSpeechSettings(settings: VoiceSpeechSettings, options: VoiceSettingsOptions = {}): string {
+	const home = homeFor(options);
+	const path = join(home, VOICE_SPEECH_SETTINGS_FILE);
+	const temporary = `${path}.${randomUUID()}.tmp`;
+	mkdirSync(home, { recursive: true });
+	try {
+		const content = { schema: VOICE_SPEECH_SETTINGS_SCHEMA, speakReplies: settings.speakReplies, conversation: settings.conversation };
+		writeFileSync(temporary, `${JSON.stringify(content)}\n`, { flag: "wx", mode: 0o600 });
+		renameSync(temporary, path);
+	} finally {
+		try { unlinkSync(temporary); } catch { /* Rename consumed the temporary file. */ }
+	}
+	return path;
+}

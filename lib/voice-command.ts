@@ -6,9 +6,11 @@ import { installVoiceModel, installVoiceRuntime, readVoiceStatus, VoiceInstallEr
 import { diagnoseVoicePlatform, readVoicePlatformProbe, type VoicePlatformDiagnosis, type VoicePlatformProbe } from "./voice-platform.ts";
 import { SpaceHoldDetector, type PushToTalkOptions } from "./voice-push-to-talk.ts";
 import { createVoiceSession, VoiceSessionError, type VoiceSessionErrorCode, type VoiceSessionState, type VoiceTranscript } from "./voice-session.ts";
-import { readVoicePushToTalk, writeVoicePushToTalk } from "./voice-settings.ts";
+import { createReplyReader, defaultSpeechEngineResolver, lastAssistantText } from "./voice-reply-speech.ts";
+import { readVoicePushToTalk, readVoiceSpeechSettings, writeVoicePushToTalk, writeVoiceSpeechSettings, type VoiceSpeechSettings } from "./voice-settings.ts";
+import { SpeechEngineError, type SpeechEngine } from "./voice-speech.ts";
 import { createVoiceStatePublisher, voiceDisplayState, type VoiceDisplayState, type VoiceStatePublisher } from "./voice-status-event.ts";
-import { pushToTalkStatus, voiceToggleStatus, VoiceDictationView, VoiceProgressView, type VoiceViewTheme } from "./voice-ui.ts";
+import { pushToTalkStatus, voiceReadingStatus, voiceToggleStatus, VoiceDictationView, VoiceProgressView, type VoiceViewTheme } from "./voice-ui.ts";
 
 // /gentle:voice (S1-S3): the only entry point to optional local dictation. It
 // shows status, downloads the pinned runtime and model after an explicit
@@ -77,6 +79,10 @@ export interface VoiceCommandDeps {
 	// The persisted push-to-talk toggle.
 	settings?: { read(): boolean; write(enabled: boolean): void };
 	pushToTalk?: PushToTalkOptions;
+	// Spoken replies: the engine (undefined where no voice is reachable) and the
+	// persisted on/off switches.
+	speechEngine?: () => SpeechEngine | undefined;
+	speechSettings?: { read(): VoiceSpeechSettings; write(settings: VoiceSpeechSettings): void };
 }
 
 const MB = 1_000_000;
@@ -87,6 +93,10 @@ const STATUS = "Show status and notices";
 const DISABLE_PUSH_TO_TALK = "Disable push-to-talk (hold Space)";
 const ENABLE_PUSH_TO_TALK = "Enable push-to-talk (hold Space)";
 const STATUS_KEY = "gentle-voice";
+const READ_ON = "Read replies aloud: turn on";
+const READ_OFF = "Read replies aloud: turn off";
+const STOP_READING = "Stop reading";
+const SPEECH_UNAVAILABLE = "Spoken replies need the Windows voice (Windows or WSL).";
 
 const INSTALL_MESSAGES: Record<VoiceInstallErrorCode, string> = {
 	aborted: "Voice download was cancelled. Unfinished files were removed; completed components are kept.",
@@ -385,6 +395,96 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	};
 	const captureSlot = (): Promise<void> | undefined => captureClosing;
 
+	// --- spoken replies -----------------------------------------------------------
+
+	const speechEngine = deps.speechEngine ?? defaultSpeechEngineResolver(env);
+	const speechSettings = deps.speechSettings ?? {
+		read: () => readVoiceSpeechSettings({ env }),
+		write: (next: VoiceSpeechSettings) => { writeVoiceSpeechSettings(next, { env }); },
+	};
+	const readSpeech = (): VoiceSpeechSettings => {
+		try {
+			return speechSettings.read();
+		} catch {
+			return { speakReplies: false, conversation: false };
+		}
+	};
+	const replyReader = createReplyReader({ engine: speechEngine });
+	const supportedSession = (ctx: ExtensionContext | undefined): ctx is ExtensionContext => env.GENTLE_PI_AGENTS_CHILD !== "1" && Boolean(ctx?.hasUI) && ctx?.mode === "tui";
+
+	interface Reading {
+		ctx: ExtensionContext;
+		generation: number;
+		controller: AbortController;
+		unsubscribe(): void;
+	}
+	let reading: Reading | undefined;
+	// The reply of the run in progress, read once the run has settled.
+	let pendingReply: string | undefined;
+	// An unreachable voice is reported once per session, not after every reply.
+	let unavailableReported = false;
+
+	// Stops the reading in progress, if any: the engine process is killed, the
+	// Esc listener goes and the footer clears. Safe to call at any time.
+	const stopReading = (): void => {
+		const current = reading;
+		if (!current) return;
+		reading = undefined;
+		current.controller.abort();
+		try {
+			current.unsubscribe();
+		} catch {
+			/* the input listener is already gone */
+		}
+		setVoiceFooter(current.ctx, () => current.generation === generation, undefined);
+	};
+
+	const readAloud = async (ctx: ExtensionContext, markdown: string): Promise<void> => {
+		stopReading();
+		const current: Reading = { ctx, generation, controller: new AbortController(), unsubscribe: () => {} };
+		reading = current;
+		const live = () => reading === current && current.generation === generation;
+		current.unsubscribe = ctx.ui.onTerminalInput((data) => {
+			try {
+				if (reading !== current) return undefined;
+				if (!isKeyRelease(data) && matchesKey(data, "escape")) {
+					stopReading();
+					return { consume: true };
+				}
+				return undefined;
+			} catch {
+				return undefined;
+			}
+		});
+		setVoiceFooter(ctx, live, voiceReadingStatus(toggleShortcut));
+		try {
+			const outcome = await replyReader.read(markdown, current.controller.signal);
+			if (outcome === "unavailable" && live() && !unavailableReported) {
+				unavailableReported = true;
+				ctx.ui.notify(SPEECH_UNAVAILABLE, "warning");
+			}
+		} catch (error) {
+			if (live()) ctx.ui.notify(error instanceof SpeechEngineError ? error.message : "The reply could not be read aloud.", "warning");
+		} finally {
+			if (reading === current) stopReading();
+		}
+	};
+
+	const setSpeakReplies = (ctx: ExtensionContext, enabled: boolean, say: Say): void => {
+		if (enabled && !speechEngine()) {
+			say(SPEECH_UNAVAILABLE, "warning");
+			return;
+		}
+		try {
+			speechSettings.write({ ...readSpeech(), speakReplies: enabled });
+		} catch {
+			say("The spoken-reply setting could not be saved.", "error");
+			return;
+		}
+		if (!enabled) stopReading();
+		say(enabled ? "Replies will be read aloud. Esc stops a reading." : "Replies are no longer read aloud.", "info");
+	};
+
 	const command = async (ctx: ExtensionCommandContext): Promise<void> => {
 		if (env.GENTLE_PI_AGENTS_CHILD === "1") {
 			if (ctx.hasUI) ctx.ui.notify("Voice dictation is not available in delegated sessions.", "warning");
@@ -435,9 +535,12 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		// Enable is offered only once voice is installed; Disable whenever it is on.
 		const pushToTalk = readToggle();
 		const toggle = pushToTalk ? [DISABLE_PUSH_TO_TALK] : ready ? [ENABLE_PUSH_TO_TALK] : [];
-		const choice = await ctx.ui.select(ready ? "Voice dictation · ready" : "Voice dictation · not installed", ready ? [START, ...toggle, STATUS] : [download, ...toggle, STATUS]);
+		const speech = [readSpeech().speakReplies ? READ_OFF : READ_ON, ...(reading ? [STOP_READING] : [])];
+		const choice = await ctx.ui.select(ready ? "Voice dictation · ready" : "Voice dictation · not installed", ready ? [START, ...toggle, ...speech, STATUS] : [download, ...toggle, ...speech, STATUS]);
 		if (!live() || !choice) return;
 		if (choice === STATUS) say(statusReport(target, diagnosis, status, platform.platform), "info");
+		else if (choice === READ_ON || choice === READ_OFF) setSpeakReplies(ctx, choice === READ_ON, say);
+		else if (choice === STOP_READING) stopReading();
 		else if (choice === DISABLE_PUSH_TO_TALK || choice === ENABLE_PUSH_TO_TALK) setPushToTalk(ctx, choice === ENABLE_PUSH_TO_TALK, say);
 		else if (choice === download) await install(ctx, run, { target, diagnosis, status, platform: platform.platform, runtimeMissing, modelMissing }, say);
 		else if (choice === START) await dictate(ctx, run, target, platform.platform, say);
@@ -817,6 +920,8 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 
 	const toggleDictation = async (ctx: ExtensionContext): Promise<void> => {
 		if (env.GENTLE_PI_AGENTS_CHILD === "1" || !ctx?.hasUI || ctx.mode !== "tui") return;
+		// Talking over a reading stops it first, then dictation starts as usual.
+		stopReading();
 		const current = toggling;
 		if (current) {
 			stopToggle(current);
@@ -834,6 +939,9 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	// cancelling; then the footer and the display go idle under that session's own
 	// id, and its publisher closes. The next session starts from a clean display.
 	const endSession = (ctx: ExtensionContext | undefined): void => {
+		stopReading();
+		pendingReply = undefined;
+		unavailableReported = false;
 		generation++;
 		const running = active;
 		active = undefined;
@@ -860,7 +968,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	};
 
 	pi.registerCommand(VOICE_COMMAND_NAME, {
-		description: "Local voice dictation with Parakeet: download it once, then record and insert the transcript into the draft (never sent).",
+		description: "Local voice dictation with Parakeet (download it once, then record and insert the transcript into the draft, never sent) and spoken replies read aloud with the Windows voice.",
 		handler: async (_args, ctx) => command(ctx),
 	});
 	if (toggleShortcut) {
@@ -884,6 +992,24 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		// any footer a replacement left behind is cleared.
 		publishVoiceState(ctx, "idle");
 		if (readToggle()) arm(ctx);
+	});
+	// A new run stops the reading and forgets the previous reply; the reply of the
+	// last run is read once nothing else will run automatically.
+	pi.on("agent_start", () => {
+		stopReading();
+		pendingReply = undefined;
+	});
+	pi.on("agent_end", (event) => {
+		const text = lastAssistantText(Array.isArray(event?.messages) ? event.messages : []);
+		if (text) pendingReply = text;
+	});
+	pi.on("agent_settled", (event, ctx) => {
+		const text = pendingReply;
+		pendingReply = undefined;
+		if (event?.aborted || !text || !supportedSession(ctx)) return;
+		const speech = readSpeech();
+		if (!speech.speakReplies && !speech.conversation) return;
+		void readAloud(ctx, text);
 	});
 	pi.on("session_shutdown", (_event, ctx) => {
 		const previous = sessionCtx;

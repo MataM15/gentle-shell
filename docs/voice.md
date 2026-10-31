@@ -153,6 +153,26 @@ belongs to the user, so Gentle AI neither reads nor changes it.
 The shortcut is covered by tests with a fake terminal and fake session. No real
 key press in a real terminal has been exercised.
 
+## Read replies aloud
+
+Turn it on from `/gentle:voice` with **Read replies aloud: turn on**; the same
+entry turns it off. The choice is saved in `voice-speech-settings.json` in the
+Gentle AI config home, next to the push-to-talk file, and applies to every
+session. Nothing is downloaded: it uses the Windows voice (System.Speech), so it
+works on Windows and on WSL only. Elsewhere, turning it on is refused with
+"Spoken replies need the Windows voice (Windows or WSL)."
+
+| Topic | Behavior |
+|-------|----------|
+| When | Once a run has settled, with no retry, compaction or queued message left. An aborted run, a delegated child session, RPC and print modes read nothing. |
+| What is read | The text of the last assistant message that has any. Thinking, tool calls and tool results are never read. |
+| What is skipped | Code blocks, table rows, link targets, bare URLs and Markdown markers. A path keeps only its last segment, so `lib/voice-speech.ts` is read as `voice-speech.ts`. List items and headings become separate sentences. A reply is cut at a sentence boundary after about 1,200 characters. |
+| Voice | Each reply is checked for Spanish or English and read with an installed voice of that language when there is one (for example Microsoft Sabina for Spanish), otherwise with the Windows default voice. |
+| Stop | Esc stops the reading and is consumed, so it never reaches the editor or the agent. **Stop reading** in `/gentle:voice` does the same. A new run stops it too. |
+| Talk over it | The dictation shortcut (`alt+m`) stops the reading and starts a dictation at once. |
+| Footer | `Reading reply · esc stop · alt+m talk` while it reads. No state is published on the voice-state event. |
+| Process | Each reading runs PowerShell with a fixed script; the reply goes only through its standard input, as base64 JSON, never as an argument. PowerShell takes about 1.5 seconds to start before the voice is heard. Its output is discarded and a failure shows one fixed message. A reading is killed after 30 seconds plus about 0.1 second per character. |
+
 ## What gets downloaded
 
 All versions, sizes and digests are pinned in `lib/voice-artifacts.ts`.

@@ -55,6 +55,7 @@ export const requiredPaths = [
   "lib/voice-command.ts",
   "lib/voice-install.ts",
   "lib/voice-platform.ts",
+  "lib/voice-reply-speech.ts",
   "lib/voice-session.ts",
   "lib/voice-speech.ts",
   "lib/voice-ui.ts",

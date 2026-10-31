@@ -139,6 +139,12 @@ export function voiceToggleStatus(state: VoiceSessionState, shortcut: string): s
 	return TOGGLE_STATUS[state](shortcut);
 }
 
+// The footer status while a reply is read aloud: Esc stops it, and the
+// dictation shortcut, when one is bound, stops it and starts talking.
+export function voiceReadingStatus(shortcut: string | undefined): string {
+	return shortcut ? `Reading reply · esc stop · ${shortcut} talk` : "Reading reply · esc stop";
+}
+
 export class VoiceDictationView extends VoiceView {
 	private state: VoiceSessionState = "starting";
 	private stopping = false;
