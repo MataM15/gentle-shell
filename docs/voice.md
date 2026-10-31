@@ -189,7 +189,7 @@ replies aloud** is off.
 | Start | Press `alt+m` and speak. Recording ends by itself after 1.2 seconds of quiet that follows speech, so no second press is needed. |
 | Send | The transcript is sent as the next prompt, never pasted. While the agent is still busy it is queued as a follow-up instead of interrupting the run. |
 | The loop | When the reply has been read to the end, the microphone reopens the same way. A reply with nothing readable reopens it too. |
-| Pause | Esc while listening cancels the recording and pauses the conversation. Esc while a reply is read stops the reading and leaves the microphone closed. With no speech within 8 seconds, it pauses with "Conversation paused: no speech was heard. Press alt+m to talk." Press `alt+m` to go on. |
+| Pause | Esc while listening cancels the recording and pauses the conversation. Esc while a reply is read stops the reading and leaves the microphone closed. Stopping it with `alt+m` before saying anything also pauses it, with "Conversation paused. Press alt+m to talk." With no speech within 8 seconds, it pauses with "Conversation paused: no speech was heard. Press alt+m to talk." Press `alt+m` to go on. |
 | Send early | `alt+m` while listening stops the recording and sends at once. |
 | Footer | `● Conversation · listening · alt+m send · esc pause` while recording, then transcribing and sending. |
 | Other inputs | Hold-Space push-to-talk and **Start dictation** keep pasting into the draft; only the shortcut takes part in the conversation. |
@@ -227,7 +227,7 @@ with no setting to change; the Windows voice stays as the fallback.
 | Topic | Behavior |
 |-------|----------|
 | Voices | Spanish replies are read by `ef_dora` (speaker 28) with espeak-ng language `es`, English replies by `af_heart` (speaker 3) with `en-us`. |
-| How it plays | `scripts/voice-tts-worker.cjs` runs in its own Node process with a scrubbed environment and synthesizes chunk by chunk: the first sentence alone, then groups of up to 300 characters. Each chunk goes as a 16-bit mono WAV line to one PowerShell process that plays it with `System.Media.SoundPlayer`. PowerShell starts while the first sentence is synthesized. |
+| How it plays | `scripts/voice-tts-worker.cjs` runs in its own Node process with a scrubbed environment and synthesizes chunk by chunk: the first sentence alone, then one sentence per chunk, short ones merged up to 40 characters and none past 160, so each chunk is ready before the previous one ends. It reads 8% faster than the voice's normal pace. Each chunk goes as a 16-bit mono WAV line to one PowerShell process that plays it with `System.Media.SoundPlayer`. PowerShell starts while the first sentence is synthesized. |
 | Speed | On an idle CPU with 4 threads, synthesis ran at about a third of real time; under heavy load it ran slower than real time, which leaves pauses between chunks. |
 | Checks | Before anything native loads, the worker checks that every model and phoneme file is a regular file of the pinned size. Digests are verified at download, and the parent checks the install marker before each reading. The worker's temporary phoneme tree is removed whenever it ends. |
 | Failure | A natural-voice failure before any audio was played falls back to the Windows voice for that reply, silently. A failure after part of the reply was heard stops there with "The reply could not be read aloud." instead of reading it again from the start. |

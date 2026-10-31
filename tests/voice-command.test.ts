@@ -1843,3 +1843,20 @@ test("a failed natural voice download reports the installer's fixed message", as
 	assert.deepEqual(ui.notices.at(-1), { message: "A downloaded file did not match its pinned size or digest and was discarded.", type: "error" });
 	assert.ok(!ui.notices.some((notice) => /detail that must not leak/.test(notice.message)));
 });
+
+test("stopping a hands-free recording with the shortcut before speaking pauses without claiming nothing was heard", async () => {
+	const { engine } = fakeEngine();
+	const h = harness({ installed: true, engine, speech: { conversation: true } });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	const pressed = pi.shortcuts.get("alt+m")!.handler(ui.ctx);
+	await until(() => h.sessions.length === 1);
+	h.sessions[0]!.started.resolve();
+	await until(() => h.sessions[0]!.state === "recording");
+	void pi.shortcuts.get("alt+m")!.handler(ui.ctx);
+	h.sessions[0]!.result.reject(new VoiceSessionError("no-speech"));
+	await pressed;
+	assert.deepEqual(ui.notices.at(-1), { message: "Conversation paused. Press alt+m to talk.", type: "info" });
+	assert.equal(pi.counts.sends, 0);
+});

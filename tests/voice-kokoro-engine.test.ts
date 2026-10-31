@@ -13,7 +13,7 @@ test("kokoroChunks reads the first sentence alone, then groups the rest within a
 	const long = Array.from({ length: 12 }, (_value, index) => `Oración número ${index} con algo de texto.`).join(" ");
 	const chunks = kokoroChunks(long);
 	assert.equal(chunks[0], "Oración número 0 con algo de texto.");
-	assert.ok(chunks.slice(1).every((chunk) => chunk.length <= 300), "later chunks stay within 300 characters");
+	assert.ok(chunks.slice(1).every((chunk) => chunk.length <= 160), "later chunks stay short, so each one is ready before the previous one ends");
 	assert.equal(chunks.join(" "), long, "nothing is lost or reordered");
 	assert.deepEqual(kokoroChunks("   "), []);
 	const single = "x".repeat(2500);
@@ -89,7 +89,7 @@ test("a reading starts the player and the worker, streams each WAV to the player
 	const request = JSON.parse(proc.written.join("").trim());
 	assert.deepEqual(
 		{ ...request, runtime: undefined, core: undefined, espeak: undefined },
-		{ schema: "gentle.voice-tts/v1", type: "start", lang: "es", sid: 28, speed: 1.1, numThreads: 4, chunks: ["Hola.", "Esto se escucha natural."], runtime: undefined, core: undefined, espeak: undefined },
+		{ schema: "gentle.voice-tts/v1", type: "start", lang: "es", sid: 28, speed: 1.18, numThreads: 4, chunks: ["Hola.", "Esto se escucha natural."], runtime: undefined, core: undefined, espeak: undefined },
 	);
 	assert.deepEqual(request.runtime, { root: LAUNCH.runtimeRoot });
 	assert.deepEqual(request.core, LAUNCH.core);
@@ -112,7 +112,7 @@ test("English replies use the English voice and language", async () => {
 	const request = JSON.parse(h.worker().proc.written.join("").trim());
 	assert.equal(request.lang, "en-us");
 	assert.equal(request.sid, 3);
-	assert.equal(request.speed, 1);
+	assert.equal(request.speed, 1.08, "the natural voice reads 8% faster than its normal pace");
 	controller.abort();
 	assert.equal(await spoken, "cancelled");
 });

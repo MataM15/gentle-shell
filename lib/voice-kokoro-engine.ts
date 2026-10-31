@@ -35,23 +35,39 @@ export const KOKORO_PLAYER_SCRIPT = [
 
 const ENCODED_PLAYER = Buffer.from(KOKORO_PLAYER_SCRIPT, "utf16le").toString("base64");
 
-const CHUNK_MAX = 300;
-const WORKER_CHUNK_MAX = 2000;
+// Later chunks stay short: synthesizing one has to finish before the previous
+// one has played, or the voice stops mid-reply. Short sentences are merged up
+// to CHUNK_MIN so the player does not restart for every few words.
+const CHUNK_MIN = 40;
+const CHUNK_MAX = 160;
+// The natural voice reads a little faster than its normal pace.
+const BASE_SPEED = 1.08;
 const MAX_CHUNKS = 64;
 
-// The first sentence alone, then the rest grouped up to CHUNK_MAX characters at
-// sentence boundaries. A sentence longer than the worker limit is cut.
+// The first sentence alone, then one sentence per chunk, merging short ones up
+// to CHUNK_MIN and never past CHUNK_MAX. A sentence longer than CHUNK_MAX is
+// cut at word boundaries.
 export function kokoroChunks(text: string): string[] {
 	const sentences = text.trim().split(/(?<=[.!?…])\s+/).filter(Boolean).flatMap((sentence) => {
 		const pieces: string[] = [];
-		for (let at = 0; at < sentence.length; at += WORKER_CHUNK_MAX) pieces.push(sentence.slice(at, at + WORKER_CHUNK_MAX));
+		let piece = "";
+		for (const word of sentence.split(/\s+/)) {
+			for (let at = 0; at < word.length; at += CHUNK_MAX) {
+				const part = word.slice(at, at + CHUNK_MAX);
+				if (piece && piece.length + 1 + part.length > CHUNK_MAX) {
+					pieces.push(piece);
+					piece = part;
+				} else piece = piece ? `${piece} ${part}` : part;
+			}
+		}
+		if (piece) pieces.push(piece);
 		return pieces;
 	});
 	if (sentences.length === 0) return [];
 	const chunks = [sentences[0]!];
 	let current = "";
 	for (const sentence of sentences.slice(1)) {
-		if (current && current.length + 1 + sentence.length > CHUNK_MAX) {
+		if (current && (current.length >= CHUNK_MIN || current.length + 1 + sentence.length > CHUNK_MAX)) {
 			chunks.push(current);
 			current = sentence;
 		} else current = current ? `${current} ${sentence}` : sentence;
@@ -124,7 +140,7 @@ export function createKokoroSpeechEngine(options: KokoroEngineOptions): SpeechEn
 			const chunks = kokoroChunks(text);
 			if (chunks.length === 0) return "done";
 			const voice = VOICE_BY_LANGUAGE[language ?? "es"];
-			const speed = Math.max(0.5, Math.min(2, 1 + (rate ?? 0) / 20));
+			const speed = Math.round(Math.max(0.5, Math.min(2, BASE_SPEED + (rate ?? 0) / 20)) * 100) / 100;
 			return new Promise<SpeechOutcome>((resolve, reject) => {
 				let settled = false;
 				let workerDone = false;

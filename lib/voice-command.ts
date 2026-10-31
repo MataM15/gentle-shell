@@ -995,7 +995,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			if (current.stopRequested) dictation.stop();
 			const result = await dictation.outcome;
 			if (!live()) return;
-			if (current.send) sendToAgent(ctx, result, found.platform, say);
+			if (current.send) sendToAgent(ctx, result, found.platform, say, current.stopRequested);
 			else deliver(ctx, result, found.platform, "toggle", say);
 		} finally {
 			current.run.abort = () => {};
@@ -1021,7 +1021,9 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 
 	// Conversation mode: the transcript is the next prompt. A busy agent gets it
 	// as a follow-up instead of interrupting its run.
-	const sendToAgent = (ctx: ExtensionContext, result: Outcome, platform: string, say: Say): void => {
+	// A stop the speaker asked for with the shortcut is a pause, even when nothing
+	// was said yet: the microphone reopens by itself after a reply.
+	const sendToAgent = (ctx: ExtensionContext, result: Outcome, platform: string, say: Say, stoppedByKey = false): void => {
 		const paused = `Conversation paused. Press ${toggleKey} to talk.`;
 		const unheard = `Conversation paused: no speech was heard. Press ${toggleKey} to talk.`;
 		if (result.kind === "cancelled") {
@@ -1030,7 +1032,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		}
 		if (result.kind === "error") {
 			const code = result.error instanceof VoiceSessionError ? result.error.code : undefined;
-			if (code === "no-speech" || code === "empty-audio") say(unheard, "info");
+			if (code === "no-speech" || code === "empty-audio") say(stoppedByKey ? paused : unheard, "info");
 			else say(sessionErrorMessage(result.error, platform, "toggle"), "error");
 			return;
 		}
