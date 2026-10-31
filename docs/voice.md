@@ -155,8 +155,8 @@ key press in a real terminal has been exercised.
 
 ## Read replies aloud
 
-Turn it on from `/gentle:voice` with **Read replies aloud: turn on**; the same
-entry turns it off. The choice is saved in `voice-speech-settings.json` in the
+Turn it on from `/gentle:voice` with **Read replies aloud (off): turn on**; the same
+entry turns it off. Each entry names the current state in parentheses, then the action. The choice is saved in `voice-speech-settings.json` in the
 Gentle AI config home, next to the push-to-talk file, and applies to every
 session. Nothing is downloaded: it uses the Windows voice (System.Speech), or the
 natural voice once that is installed (see below), so it works on Windows and on
@@ -178,7 +178,7 @@ WSL only. Elsewhere, turning it on is refused with
 
 Conversation mode turns dictation and spoken replies into a hands-free loop:
 you speak, the transcript is sent, the reply is read aloud, and the microphone
-reopens. Turn it on from `/gentle:voice` with **Conversation mode: turn on**.
+reopens. Turn it on from `/gentle:voice` with **Conversation mode (off): turn on**.
 It needs voice dictation installed and the Windows voice; otherwise it is
 refused with a notice and nothing is saved. It is saved in the same
 `voice-speech-settings.json` file and reads replies aloud even while **Read

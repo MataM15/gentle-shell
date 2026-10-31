@@ -96,12 +96,12 @@ const STATUS = "Show status and notices";
 const DISABLE_PUSH_TO_TALK = "Disable push-to-talk (hold Space)";
 const ENABLE_PUSH_TO_TALK = "Enable push-to-talk (hold Space)";
 const STATUS_KEY = "gentle-voice";
-const READ_ON = "Read replies aloud: turn on";
-const READ_OFF = "Read replies aloud: turn off";
+const READ_ON = "Read replies aloud (off): turn on";
+const READ_OFF = "Read replies aloud (on): turn off";
 const STOP_READING = "Stop reading";
 const SPEECH_UNAVAILABLE = "Spoken replies need the Windows voice (Windows or WSL).";
-const CONVERSATION_ON = "Conversation mode: turn on";
-const CONVERSATION_OFF = "Conversation mode: turn off";
+const CONVERSATION_ON = "Conversation mode (off): turn on";
+const CONVERSATION_OFF = "Conversation mode (on): turn off";
 // Conversation mode records hands-free: 1.2 s of quiet after speech ends a
 // turn, and 8 s without speech pauses the conversation.
 export const CONVERSATION_ENDPOINT: VoiceEndpoint = { endOfSpeechMs: 1_200, noSpeechMs: 8_000 };

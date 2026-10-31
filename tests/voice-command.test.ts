@@ -1546,22 +1546,22 @@ test("the menu turns spoken replies on and off and persists the choice", async (
 	const { engine } = fakeEngine();
 	const h = harness({ engine });
 	const pi = register(h);
-	const ui = fakeContext({ select: pick(/^Read replies aloud: turn on$/) });
+	const ui = fakeContext({ select: pick(/^Read replies aloud \(off\): turn on$/) });
 	await run(pi, ui);
-	assert.ok(ui.selects[0]!.options.includes("Read replies aloud: turn on"));
+	assert.ok(ui.selects[0]!.options.includes("Read replies aloud (off): turn on"));
 	assert.ok(!ui.selects[0]!.options.includes("Stop reading"));
 	assert.deepEqual(h.speech.writes, [{ speakReplies: true, conversation: false }]);
 	assert.match(ui.notices.at(-1)!.message, /read aloud/i);
-	const again = fakeContext({ select: pick(/^Read replies aloud: turn off$/) });
+	const again = fakeContext({ select: pick(/^Read replies aloud \(on\): turn off$/) });
 	await run(pi, again);
-	assert.ok(again.selects[0]!.options.includes("Read replies aloud: turn off"));
+	assert.ok(again.selects[0]!.options.includes("Read replies aloud (on): turn off"));
 	assert.deepEqual(h.speech.writes.at(-1), { speakReplies: false, conversation: false });
 });
 
 test("turning spoken replies on without the Windows voice is refused and nothing is saved", async () => {
 	const h = harness();
 	const pi = register(h);
-	const ui = fakeContext({ select: pick(/^Read replies aloud: turn on$/) });
+	const ui = fakeContext({ select: pick(/^Read replies aloud \(off\): turn on$/) });
 	await run(pi, ui);
 	assert.deepEqual(h.speech.writes, []);
 	assert.deepEqual(ui.notices.at(-1), { message: "Spoken replies need the Windows voice (Windows or WSL).", type: "warning" });
@@ -1755,29 +1755,29 @@ test("the menu turns conversation mode on only with dictation installed and a vo
 	const { engine, readings } = fakeEngine();
 	const missing = harness({ engine });
 	const missingPi = register(missing);
-	const refused = fakeContext({ select: pick(/^Conversation mode: turn on$/) });
+	const refused = fakeContext({ select: pick(/^Conversation mode \(off\): turn on$/) });
 	await run(missingPi, refused);
-	assert.ok(refused.selects[0]!.options.includes("Conversation mode: turn on"));
+	assert.ok(refused.selects[0]!.options.includes("Conversation mode (off): turn on"));
 	assert.deepEqual(missing.speech.writes, []);
 	assert.deepEqual(refused.notices.at(-1), { message: "Conversation mode needs voice dictation. Choose Download voice dictation first.", type: "warning" });
 
 	const noVoice = harness({ installed: true });
 	const noVoicePi = register(noVoice);
-	const silent = fakeContext({ select: pick(/^Conversation mode: turn on$/) });
+	const silent = fakeContext({ select: pick(/^Conversation mode \(off\): turn on$/) });
 	await run(noVoicePi, silent);
 	assert.deepEqual(noVoice.speech.writes, []);
 	assert.deepEqual(silent.notices.at(-1), { message: "Spoken replies need the Windows voice (Windows or WSL).", type: "warning" });
 
 	const h = harness({ installed: true, engine });
 	const pi = register(h);
-	const on = fakeContext({ select: pick(/^Conversation mode: turn on$/) });
+	const on = fakeContext({ select: pick(/^Conversation mode \(off\): turn on$/) });
 	await run(pi, on);
 	assert.deepEqual(h.speech.writes, [{ speakReplies: false, conversation: true }]);
 	assert.deepEqual(on.notices.at(-1), { message: "Conversation mode is on. Press alt+m and speak: the transcript is sent, the reply is read aloud and the microphone reopens. Esc pauses.", type: "info" });
 	await pi.fire("session_start", on.ctx);
 	await settleReply(pi, on.ctx, "Una respuesta.");
 	await until(() => readings.length === 1);
-	const off = fakeContext({ select: pick(/^Conversation mode: turn off$/) });
+	const off = fakeContext({ select: pick(/^Conversation mode \(on\): turn off$/) });
 	await run(pi, off);
 	assert.deepEqual(h.speech.writes.at(-1), { speakReplies: false, conversation: false });
 	assert.equal(readings[0]!.options.signal.aborted, true, "turning it off stops the reading");
