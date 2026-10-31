@@ -537,3 +537,17 @@ test("rejects an endpoint outside its bounds or with unknown fields before loadi
 		assert.deepEqual(worker.loaded, []);
 	}
 });
+
+test("with an endpoint, quiet speech over a low-gain microphone floor still counts as speech", async (t) => {
+	// Levels measured on a WSLg microphone: a floor near 0.002, speech a few times louder.
+	const worker = harness(t, mono8k);
+	worker.send(startRequest(worker.paths, { endpoint: ENDPOINT }));
+	await worker.waitFor(() => worker.types().includes("recording"));
+	const [stream] = worker.streams;
+	for (let i = 0; i < 3; i++) stream!.options.onData(chunk(100, 0.002));
+	for (let i = 0; i < 5; i++) stream!.options.onData(chunk(100, 0.008));
+	for (let i = 0; i < 5; i++) stream!.options.onData(chunk(100, 0.0025));
+	await worker.done;
+	assert.deepEqual(worker.types(), ["recording", "transcribing", "result"]);
+	assert.equal(worker.recognizers[0]!.waves[0]!.samples.length, 2 * 8000 * 1.3, "it ended at the end of speech, not at the no-speech limit");
+});

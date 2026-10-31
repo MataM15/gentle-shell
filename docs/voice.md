@@ -192,7 +192,7 @@ replies aloud** is off.
 | Send early | `alt+m` while listening stops the recording and sends at once. |
 | Footer | `● Conversation · listening · alt+m send · esc pause` while recording, then transcribing and sending. |
 | Other inputs | Hold-Space push-to-talk and **Start dictation** keep pasting into the draft; only the shortcut takes part in the conversation. |
-| End of speech | The worker measures each audio chunk in audio time. The noise floor is the quietest chunk heard so far, and a chunk counts as speech when it is at least three times that floor and above a fixed minimum level. Speech counts once 150 ms of it were heard. The request carries `endpoint: { endOfSpeechMs, noSpeechMs }`, bounded to 300–5000 ms and 1–60 s; without it a recording never ends on silence, exactly as before. |
+| End of speech | The worker measures each audio chunk in audio time. The noise floor is the quietest chunk heard so far, and a chunk counts as speech when it is at least three times that floor and above a fixed minimum of 0.003 RMS, just over the floor measured on a low-gain WSLg microphone (about 0.002). Speech counts once 150 ms of it were heard. The request carries `endpoint: { endOfSpeechMs, noSpeechMs }`, bounded to 300–5000 ms and 1–60 s; without it a recording never ends on silence, exactly as before. |
 
 The thresholds are tested with synthetic audio only. A loud room or a quiet
 microphone may need the shortcut to send; tuning them on real microphones is

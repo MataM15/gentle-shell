@@ -14,9 +14,9 @@ Branch `feat/voice-conversation`, based on the personal branch `feat/aligned-rdd
 
 ## Tasks
 
-- T1 [S1,S5] Speech module: spoken-text cleanup, reply language guess, Windows SAPI engine in its own process, cancellable. Route inline. Commit: pending.
-- T2 [S1,S3] Read replies aloud: persisted on/off, `/gentle:voice` menu entries, speak on settle, Esc and the toggle key cut a reading, docs. Route inline. Commit: pending.
-- T3 [S2,S3] Conversation mode: silence end-of-speech in the worker, transcript sent instead of pasted, listen again after the reply is read, docs. Route inline. Commit: pending.
+- T1 [S1,S5] Speech module: spoken-text cleanup, reply language guess, Windows SAPI engine in its own process, cancellable. Route inline. Commit: dabdc614e. Done: 16 tests, typecheck clean, real reading heard on WSL.
+- T2 [S1,S3] Read replies aloud: persisted on/off, `/gentle:voice` menu entries, speak on settle, Esc and the toggle key cut a reading, docs. Route inline (worker refused: cross-repository delegation needs interactive consent). Commit: 7db577679. Done: 133 voice tests, typecheck clean.
+- T3 [S2,S3] Conversation mode: silence end-of-speech in the worker, transcript sent instead of pasted, listen again after the reply is read, docs. Route inline. Commit: a98864be3. Done: 180 voice tests plus the new session test, typecheck clean; thresholds tested on synthetic audio only.
 - T4 [S6] Kokoro engine with consented, pinned, verified download. Route inline after research. Commit: pending.
 
 ## Log
@@ -24,4 +24,6 @@ Branch `feat/voice-conversation`, based on the personal branch `feat/aligned-rdd
 - L1 (user, original request): "https://anoma.ly/hex/ Se puede usar eso para dictar y que me hable el agente de pi/gentle-shell?" Follow-up: "no hay algo creado ya que sea parecido, pero que haga, digamos, ambas funciones que para que yo pueda hablar ... y que me diga también lo que ... el texto de la gente, digamos, para tener esa interacción".
 - L2 (user): "se podría hacer algo parecido, pero que quizás funcione mejor. Igual me gusta bastante lo que vi. ... ahorrándonos también esto de tener que instalar un repositorio externo ... quizás podemos hacer algo parecido nosotros acá."
 - L3 (user, accepting Sabina first then Kokoro): "ok dale".
+- L5 (evidence): the full suite on this worktree gave 0 failures and 27 cancellations in tests/codegraph-tools.test.ts and tests/voice-session.test.ts; the base commit 9414cfb4e gives the same 27 cancellations, so they predate this branch. Its provider-contract and runtime-harness stages fail here only because pnpm refuses to reinstall over the node_modules symlink; never run the full suite through that symlink again.
+- L6 (evidence): tests/voice-session.test.ts hangs in "cancel discards the transcript, ignores late results and leaves no worker" on this machine, also at the base commit, and Node then cancels every later test in the file. Tests before it pass, including the new endpoint test. Pre-existing, outside this feature.
 - L4 (evidence): PowerShell from WSL selected "Microsoft Sabina Desktop" for es-*, base64 UTF-8 text through stdin kept the accents, and killing the WSL-side process stopped the Windows speech. The user heard it: "Esuche un \"hola soy el gentle man\" puede ser?"

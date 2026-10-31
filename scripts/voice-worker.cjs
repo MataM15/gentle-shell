@@ -222,7 +222,9 @@ class MonoRecorder {
 // counts once 150 ms of it were heard; after that, endOfSpeechMs of quiet ends
 // the recording. With no speech within noSpeechMs it ends as well, and the
 // blank transcript is reported as no speech.
-const MIN_SPEECH_LEVEL = 0.01;
+// Just above the floor measured on a low-gain WSLg microphone (about 0.002 RMS),
+// so quiet speech still counts; the floor ratio does the real work.
+const MIN_SPEECH_LEVEL = 0.003;
 const SPEECH_FLOOR_RATIO = 3;
 const MIN_SPEECH_SECONDS = 0.15;
 
