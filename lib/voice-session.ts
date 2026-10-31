@@ -89,6 +89,11 @@ export class VoiceSessionError extends Error {
 
 export type VoiceSessionState = "idle" | "starting" | "recording" | "transcribing" | "finished";
 
+export interface VoiceEndpoint {
+	endOfSpeechMs: number;
+	noSpeechMs: number;
+}
+
 export interface VoiceTranscript {
 	text: string;
 	// True when the recording limit ended capture before stop() was called.
@@ -118,6 +123,9 @@ export interface VoiceSessionOptions {
 	voiceHome?: string;
 	env?: NodeJS.ProcessEnv;
 	maxRecordingMs?: number;
+	// Hands-free recording (conversation mode): the worker stops by itself after
+	// endOfSpeechMs of quiet that follows speech, or after noSpeechMs with none.
+	endpoint?: VoiceEndpoint;
 	startTimeoutMs?: number;
 	transcribeTimeoutMs?: number;
 	exitGraceMs?: number;
@@ -316,6 +324,7 @@ export class VoiceSession {
 			target,
 			maxRecordingMs: this.options.maxRecordingMs ?? VOICE_SESSION_DEFAULTS.maxRecordingMs,
 			numThreads: VOICE_SESSION_DEFAULTS.numThreads,
+			...(this.options.endpoint ? { endpoint: { endOfSpeechMs: this.options.endpoint.endOfSpeechMs, noSpeechMs: this.options.endpoint.noSpeechMs } } : {}),
 			runtime: { root, files: runtime.packages.flatMap((pkg) => pkg.requiredFiles.map((file) => `node_modules/${pkg.name}/${file}`)) },
 			model: {
 				root: voiceComponentPath(voiceHome, "model", model),

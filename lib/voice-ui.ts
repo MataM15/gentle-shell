@@ -139,6 +139,20 @@ export function voiceToggleStatus(state: VoiceSessionState, shortcut: string): s
 	return TOGGLE_STATUS[state](shortcut);
 }
 
+const CONVERSATION_STATUS: Record<VoiceSessionState, (shortcut: string) => string> = {
+	idle: () => "Conversation · preparing · esc pause",
+	starting: () => "Conversation · preparing · esc pause",
+	recording: (shortcut) => `● Conversation · listening · ${shortcut} send · esc pause`,
+	transcribing: () => "Conversation · transcribing · esc pause",
+	finished: () => "Conversation · sending",
+};
+
+// The footer status of a conversation-mode recording: it ends on its own when
+// the speaker stops, the shortcut sends at once and Esc pauses the conversation.
+export function voiceConversationStatus(state: VoiceSessionState, shortcut: string): string {
+	return CONVERSATION_STATUS[state](shortcut);
+}
+
 // The footer status while a reply is read aloud: Esc stops it, and the
 // dictation shortcut, when one is bound, stops it and starts talking.
 export function voiceReadingStatus(shortcut: string | undefined): string {

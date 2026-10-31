@@ -244,6 +244,20 @@ test("records, stops and returns the transcript from a fixed, scrubbed worker la
 	assert.deepEqual(run.states, ["starting", "recording", "transcribing", "finished"]);
 });
 
+test("a hands-free endpoint is forwarded to the worker only when it is asked for", async (t) => {
+	const fixture = await installFixture(t, "linux-x64");
+	const plain = scripted(fixture);
+	void plain.session.start().catch(() => {});
+	await plain.until(() => plain.workers.length === 1 && plain.worker().received.length === 1);
+	assert.equal("endpoint" in (plain.worker().received[0] as Record<string, unknown>), false);
+	await plain.session.cancel();
+	const handsFree = scripted(fixture, { endpoint: { endOfSpeechMs: 1200, noSpeechMs: 8000 } });
+	void handsFree.session.start().catch(() => {});
+	await handsFree.until(() => handsFree.workers.length === 1 && handsFree.worker().received.length === 1);
+	assert.deepEqual((handsFree.worker().received[0] as Record<string, unknown>).endpoint, { endOfSpeechMs: 1200, noSpeechMs: 8000 });
+	await handsFree.session.cancel();
+});
+
 test("cancel discards the transcript, ignores late results and leaves no worker", async (t) => {
 	const fixture = await installFixture(t, "linux-x64");
 

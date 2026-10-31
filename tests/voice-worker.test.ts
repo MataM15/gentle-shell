@@ -474,3 +474,66 @@ test("the recording limit during verification transcribes once the model is veri
 	await worker.done;
 	assert.deepEqual(worker.messages.at(-1), { schema: SCHEMA, type: "result", text: "hello world", truncated: true });
 });
+
+// --- end of speech (conversation mode, S2) ------------------------------------------
+
+const ENDPOINT = { endOfSpeechMs: 500, noSpeechMs: 2000 };
+const mono8k = { defaults: { sampleRate: 8000, channels: 1, sampleFormat: "f32" }, formats: ["f32"] };
+const chunk = (ms: number, level: number) => new Float32Array((8000 * ms) / 1000).fill(level);
+
+test("with an endpoint, silence after speech ends the recording and transcribes on its own", async (t) => {
+	const worker = harness(t, mono8k);
+	worker.send(startRequest(worker.paths, { endpoint: ENDPOINT }));
+	await worker.waitFor(() => worker.types().includes("recording"));
+	const [stream] = worker.streams;
+	for (let i = 0; i < 2; i++) stream!.options.onData(chunk(100, 0));
+	for (let i = 0; i < 5; i++) stream!.options.onData(chunk(100, 0.3));
+	for (let i = 0; i < 4; i++) stream!.options.onData(chunk(100, 0.001));
+	await settle();
+	assert.deepEqual(worker.types(), ["recording"], "a pause shorter than the endpoint keeps recording");
+	stream!.options.onData(chunk(100, 0.3));
+	for (let i = 0; i < 5; i++) stream!.options.onData(chunk(100, 0));
+	await worker.done;
+	assert.deepEqual(worker.types(), ["recording", "transcribing", "result"]);
+	assert.equal(worker.messages.at(-1)!.truncated, false);
+	assert.equal(stream!.closes, 1);
+	// Everything up to the end of speech is transcribed, upsampled to 16 kHz.
+	assert.equal(worker.recognizers[0]!.waves[0]!.samples.length, 2 * 8000 * 1.7);
+});
+
+test("with an endpoint, a steady noise floor is not speech and ends as no speech", async (t) => {
+	const worker = harness(t, mono8k);
+	worker.send(startRequest(worker.paths, { endpoint: ENDPOINT }));
+	await worker.waitFor(() => worker.types().includes("recording"));
+	const [stream] = worker.streams;
+	for (let i = 0; i < 19; i++) stream!.options.onData(chunk(100, 0.02));
+	await settle();
+	assert.deepEqual(worker.types(), ["recording"]);
+	stream!.options.onData(chunk(100, 0.02));
+	await worker.done;
+	assert.deepEqual(worker.types(), ["recording", "transcribing", "result"]);
+});
+
+test("without an endpoint, silence never ends the recording", async (t) => {
+	const worker = harness(t, mono8k);
+	worker.send(startRequest(worker.paths));
+	await worker.waitFor(() => worker.types().includes("recording"));
+	const [stream] = worker.streams;
+	stream!.options.onData(chunk(500, 0.3));
+	for (let i = 0; i < 30; i++) stream!.options.onData(chunk(100, 0));
+	await settle();
+	assert.deepEqual(worker.types(), ["recording"]);
+	worker.send({ schema: SCHEMA, type: "stop" });
+	await worker.done;
+	assert.deepEqual(worker.types(), ["recording", "transcribing", "result"]);
+});
+
+test("rejects an endpoint outside its bounds or with unknown fields before loading anything", async (t) => {
+	for (const endpoint of [{ endOfSpeechMs: 100, noSpeechMs: 2000 }, { endOfSpeechMs: 500, noSpeechMs: 120_000 }, { endOfSpeechMs: 500 }, { ...ENDPOINT, extra: 1 }, "500"]) {
+		const worker = harness(t, mono8k);
+		worker.send(startRequest(worker.paths, { endpoint }));
+		await worker.done;
+		assert.deepEqual(worker.messages, [{ schema: SCHEMA, type: "error", code: "invalid-request" }], JSON.stringify(endpoint));
+		assert.deepEqual(worker.loaded, []);
+	}
+});

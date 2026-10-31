@@ -173,6 +173,31 @@ works on Windows and on WSL only. Elsewhere, turning it on is refused with
 | Footer | `Reading reply · esc stop · alt+m talk` while it reads. No state is published on the voice-state event. |
 | Process | Each reading runs PowerShell with a fixed script; the reply goes only through its standard input, as base64 JSON, never as an argument. PowerShell takes about 1.5 seconds to start before the voice is heard. Its output is discarded and a failure shows one fixed message. A reading is killed after 30 seconds plus about 0.1 second per character. |
 
+## Conversation mode
+
+Conversation mode turns dictation and spoken replies into a hands-free loop:
+you speak, the transcript is sent, the reply is read aloud, and the microphone
+reopens. Turn it on from `/gentle:voice` with **Conversation mode: turn on**.
+It needs voice dictation installed and the Windows voice; otherwise it is
+refused with a notice and nothing is saved. It is saved in the same
+`voice-speech-settings.json` file and reads replies aloud even while **Read
+replies aloud** is off.
+
+| Topic | Behavior |
+|-------|----------|
+| Start | Press `alt+m` and speak. Recording ends by itself after 1.2 seconds of quiet that follows speech, so no second press is needed. |
+| Send | The transcript is sent as the next prompt, never pasted. While the agent is still busy it is queued as a follow-up instead of interrupting the run. |
+| The loop | When the reply has been read to the end, the microphone reopens the same way. A reply with nothing readable reopens it too. |
+| Pause | Esc while listening cancels the recording and pauses the conversation. Esc while a reply is read stops the reading and leaves the microphone closed. With no speech within 8 seconds, it pauses with "Conversation paused: no speech was heard. Press alt+m to talk." Press `alt+m` to go on. |
+| Send early | `alt+m` while listening stops the recording and sends at once. |
+| Footer | `● Conversation · listening · alt+m send · esc pause` while recording, then transcribing and sending. |
+| Other inputs | Hold-Space push-to-talk and **Start dictation** keep pasting into the draft; only the shortcut takes part in the conversation. |
+| End of speech | The worker measures each audio chunk in audio time. The noise floor is the quietest chunk heard so far, and a chunk counts as speech when it is at least three times that floor and above a fixed minimum level. Speech counts once 150 ms of it were heard. The request carries `endpoint: { endOfSpeechMs, noSpeechMs }`, bounded to 300–5000 ms and 1–60 s; without it a recording never ends on silence, exactly as before. |
+
+The thresholds are tested with synthetic audio only. A loud room or a quiet
+microphone may need the shortcut to send; tuning them on real microphones is
+still open.
+
 ## What gets downloaded
 
 All versions, sizes and digests are pinned in `lib/voice-artifacts.ts`.

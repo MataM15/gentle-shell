@@ -5,12 +5,12 @@ import { PARAKEET_MODEL_MANIFEST, VOICE_NOTICES, voiceRuntimeManifest, type Voic
 import { installVoiceModel, installVoiceRuntime, readVoiceStatus, VoiceInstallError, type VoiceComponentStatus, type VoiceInstallErrorCode, type VoiceInstallProgress, type VoiceInstallResult } from "./voice-install.ts";
 import { diagnoseVoicePlatform, readVoicePlatformProbe, type VoicePlatformDiagnosis, type VoicePlatformProbe } from "./voice-platform.ts";
 import { SpaceHoldDetector, type PushToTalkOptions } from "./voice-push-to-talk.ts";
-import { createVoiceSession, VoiceSessionError, type VoiceSessionErrorCode, type VoiceSessionState, type VoiceTranscript } from "./voice-session.ts";
+import { createVoiceSession, VoiceSessionError, type VoiceEndpoint, type VoiceSessionErrorCode, type VoiceSessionState, type VoiceTranscript } from "./voice-session.ts";
 import { createReplyReader, defaultSpeechEngineResolver, lastAssistantText } from "./voice-reply-speech.ts";
 import { readVoicePushToTalk, readVoiceSpeechSettings, writeVoicePushToTalk, writeVoiceSpeechSettings, type VoiceSpeechSettings } from "./voice-settings.ts";
 import { SpeechEngineError, type SpeechEngine } from "./voice-speech.ts";
 import { createVoiceStatePublisher, voiceDisplayState, type VoiceDisplayState, type VoiceStatePublisher } from "./voice-status-event.ts";
-import { pushToTalkStatus, voiceReadingStatus, voiceToggleStatus, VoiceDictationView, VoiceProgressView, type VoiceViewTheme } from "./voice-ui.ts";
+import { pushToTalkStatus, voiceConversationStatus, voiceReadingStatus, voiceToggleStatus, VoiceDictationView, VoiceProgressView, type VoiceViewTheme } from "./voice-ui.ts";
 
 // /gentle:voice (S1-S3): the only entry point to optional local dictation. It
 // shows status, downloads the pinned runtime and model after an explicit
@@ -75,7 +75,7 @@ export interface VoiceCommandDeps {
 	readStatus?: (target: VoiceTarget) => Promise<VoiceStatusSnapshot>;
 	installRuntime?: (options: VoiceInstallRequest & { target: VoiceTarget }) => Promise<VoiceInstallResult>;
 	installModel?: (options: VoiceInstallRequest) => Promise<VoiceInstallResult>;
-	createSession?: (options: { target: VoiceTarget; onStateChange(state: VoiceSessionState): void }) => VoiceDictation;
+	createSession?: (options: { target: VoiceTarget; onStateChange(state: VoiceSessionState): void; endpoint?: VoiceEndpoint }) => VoiceDictation;
 	// The persisted push-to-talk toggle.
 	settings?: { read(): boolean; write(enabled: boolean): void };
 	pushToTalk?: PushToTalkOptions;
@@ -97,6 +97,11 @@ const READ_ON = "Read replies aloud: turn on";
 const READ_OFF = "Read replies aloud: turn off";
 const STOP_READING = "Stop reading";
 const SPEECH_UNAVAILABLE = "Spoken replies need the Windows voice (Windows or WSL).";
+const CONVERSATION_ON = "Conversation mode: turn on";
+const CONVERSATION_OFF = "Conversation mode: turn off";
+// Conversation mode records hands-free: 1.2 s of quiet after speech ends a
+// turn, and 8 s without speech pauses the conversation.
+export const CONVERSATION_ENDPOINT: VoiceEndpoint = { endOfSpeechMs: 1_200, noSpeechMs: 8_000 };
 
 const INSTALL_MESSAGES: Record<VoiceInstallErrorCode, string> = {
 	aborted: "Voice download was cancelled. Unfinished files were removed; completed components are kept.",
@@ -179,7 +184,7 @@ function deliver(ctx: ExtensionContext, result: Outcome, platform: string, start
 // The microphone is claimed at start(), not at creation: creation is inert, and
 // start() first waits for the capture that is still closing, so two workers can
 // never be alive at once, however long the platform takes to release the device.
-function runDictation(createSession: NonNullable<VoiceCommandDeps["createSession"]>, target: VoiceTarget, onState: (state: VoiceSessionState) => void, admission?: () => Promise<void> | undefined) {
+function runDictation(createSession: NonNullable<VoiceCommandDeps["createSession"]>, target: VoiceTarget, onState: (state: VoiceSessionState) => void, admission?: () => Promise<void> | undefined, endpoint?: VoiceEndpoint) {
 	let settled = false;
 	let stopping = false;
 	let cancelled = false;
@@ -221,7 +226,7 @@ function runDictation(createSession: NonNullable<VoiceCommandDeps["createSession
 			/* the observer is advisory */
 		}
 	};
-	const session = createSession({ target, onStateChange });
+	const session = createSession({ target, onStateChange, endpoint });
 	const begin = () => {
 		// A run cancelled, stopped or settled while it waited never starts.
 		if (cancelled || settled) return;
@@ -327,7 +332,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	// fetch override is ever passed from here.
 	const installRuntime = deps.installRuntime ?? (({ target, signal, onProgress }) => installVoiceRuntime({ env, target, signal, onProgress }));
 	const installModel = deps.installModel ?? (({ signal, onProgress }) => installVoiceModel({ env, signal, onProgress }));
-	const createSession = deps.createSession ?? (({ target, onStateChange }) => createVoiceSession({ env, target, onStateChange }));
+	const createSession = deps.createSession ?? (({ target, onStateChange, endpoint }) => createVoiceSession({ env, target, onStateChange, endpoint }));
 	const settings = deps.settings ?? { read: () => readVoicePushToTalk({ env }), write: (enabled: boolean) => { writeVoicePushToTalk(enabled, { env }); } };
 	// The toggle shortcut is fixed for the session: Pi binds shortcuts once.
 	const toggleShortcut = voiceToggleKey(env);
@@ -439,7 +444,8 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		setVoiceFooter(current.ctx, () => current.generation === generation, undefined);
 	};
 
-	const readAloud = async (ctx: ExtensionContext, markdown: string): Promise<void> => {
+	type ReadingOutcome = "done" | "cancelled" | "empty" | "unavailable" | "error";
+	const readAloud = async (ctx: ExtensionContext, markdown: string): Promise<ReadingOutcome> => {
 		stopReading();
 		const current: Reading = { ctx, generation, controller: new AbortController(), unsubscribe: () => {} };
 		reading = current;
@@ -463,8 +469,10 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 				unavailableReported = true;
 				ctx.ui.notify(SPEECH_UNAVAILABLE, "warning");
 			}
+			return outcome;
 		} catch (error) {
 			if (live()) ctx.ui.notify(error instanceof SpeechEngineError ? error.message : "The reply could not be read aloud.", "warning");
+			return "error";
 		} finally {
 			if (reading === current) stopReading();
 		}
@@ -483,6 +491,30 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		}
 		if (!enabled) stopReading();
 		say(enabled ? "Replies will be read aloud. Esc stops a reading." : "Replies are no longer read aloud.", "info");
+	};
+
+	const setConversation = (enabled: boolean, ready: boolean, say: Say): void => {
+		if (enabled && !ready) {
+			say("Conversation mode needs voice dictation. Choose Download voice dictation first.", "warning");
+			return;
+		}
+		if (enabled && !speechEngine()) {
+			say(SPEECH_UNAVAILABLE, "warning");
+			return;
+		}
+		try {
+			speechSettings.write({ ...readSpeech(), conversation: enabled });
+		} catch {
+			say("The conversation setting could not be saved.", "error");
+			return;
+		}
+		if (!enabled) {
+			stopReading();
+			say("Conversation mode is off.", "info");
+			return;
+		}
+		const start = toggleShortcut ? `Press ${toggleShortcut} and speak` : "Speak after the next reply";
+		say(`Conversation mode is on. ${start}: the transcript is sent, the reply is read aloud and the microphone reopens. Esc pauses.`, "info");
 	};
 
 	const command = async (ctx: ExtensionCommandContext): Promise<void> => {
@@ -535,12 +567,14 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		// Enable is offered only once voice is installed; Disable whenever it is on.
 		const pushToTalk = readToggle();
 		const toggle = pushToTalk ? [DISABLE_PUSH_TO_TALK] : ready ? [ENABLE_PUSH_TO_TALK] : [];
-		const speech = [readSpeech().speakReplies ? READ_OFF : READ_ON, ...(reading ? [STOP_READING] : [])];
+		const speechNow = readSpeech();
+		const speech = [speechNow.speakReplies ? READ_OFF : READ_ON, speechNow.conversation ? CONVERSATION_OFF : CONVERSATION_ON, ...(reading ? [STOP_READING] : [])];
 		const choice = await ctx.ui.select(ready ? "Voice dictation · ready" : "Voice dictation · not installed", ready ? [START, ...toggle, ...speech, STATUS] : [download, ...toggle, ...speech, STATUS]);
 		if (!live() || !choice) return;
 		if (choice === STATUS) say(statusReport(target, diagnosis, status, platform.platform), "info");
 		else if (choice === READ_ON || choice === READ_OFF) setSpeakReplies(ctx, choice === READ_ON, say);
 		else if (choice === STOP_READING) stopReading();
+		else if (choice === CONVERSATION_ON || choice === CONVERSATION_OFF) setConversation(choice === CONVERSATION_ON, ready, say);
 		else if (choice === DISABLE_PUSH_TO_TALK || choice === ENABLE_PUSH_TO_TALK) setPushToTalk(ctx, choice === ENABLE_PUSH_TO_TALK, say);
 		else if (choice === download) await install(ctx, run, { target, diagnosis, status, platform: platform.platform, runtimeMissing, modelMissing }, say);
 		else if (choice === START) await dictate(ctx, run, target, platform.platform, say);
@@ -821,6 +855,8 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		dictation?: ReturnType<typeof runDictation>;
 		// A press while preparing stops as soon as recording can be stopped.
 		stopRequested: boolean;
+		// Conversation mode: hands-free recording, and the transcript is sent.
+		send: boolean;
 		cancelled: boolean;
 		unsubscribe(): void;
 	}
@@ -832,7 +868,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		const live = () => current.run.generation === generation && toggling === current;
 		return (state: VoiceSessionState) => {
 			if (!live()) return;
-			setVoiceFooter(current.ctx, live, voiceToggleStatus(state, toggleKey));
+			setVoiceFooter(current.ctx, live, current.send ? voiceConversationStatus(state, toggleKey) : voiceToggleStatus(state, toggleKey));
 			publishVoiceState(current.ctx, voiceDisplayState(state), live);
 		};
 	};
@@ -869,8 +905,8 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		current.dictation.cancel();
 	};
 
-	const openToggle = (ctx: ExtensionContext): ToggleRun => {
-		const current: ToggleRun = { ctx, run: { generation, abort: () => {} }, stopRequested: false, cancelled: false, unsubscribe: () => {} };
+	const openToggle = (ctx: ExtensionContext, send: boolean): ToggleRun => {
+		const current: ToggleRun = { ctx, run: { generation, abort: () => {} }, stopRequested: false, send, cancelled: false, unsubscribe: () => {} };
 		toggling = current;
 		active = current.run;
 		// Esc has to cancel without reaching the editor's own interrupt.
@@ -903,7 +939,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 				say("Voice dictation is not installed. Run /gentle:voice to download it.", "warning");
 				return;
 			}
-			const dictation = runDictation(createSession, found.target, (state) => display(state), captureSlot);
+			const dictation = runDictation(createSession, found.target, (state) => display(state), captureSlot, current.send ? CONVERSATION_ENDPOINT : undefined);
 			current.dictation = dictation;
 			current.run.abort = dictation.cancel;
 			display("starting");
@@ -911,7 +947,8 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			if (current.stopRequested) dictation.stop();
 			const result = await dictation.outcome;
 			if (!live()) return;
-			deliver(ctx, result, found.platform, "toggle", say);
+			if (current.send) sendToAgent(ctx, result, found.platform, say);
+			else deliver(ctx, result, found.platform, "toggle", say);
 		} finally {
 			current.run.abort = () => {};
 			closeToggle(current);
@@ -931,7 +968,39 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			ctx.ui.notify("Voice dictation is already running. Finish or cancel it first.", "warning");
 			return;
 		}
-		await runToggle(openToggle(ctx));
+		await runToggle(openToggle(ctx, readSpeech().conversation));
+	};
+
+	// Conversation mode: the transcript is the next prompt. A busy agent gets it
+	// as a follow-up instead of interrupting its run.
+	const sendToAgent = (ctx: ExtensionContext, result: Outcome, platform: string, say: Say): void => {
+		const paused = `Conversation paused. Press ${toggleKey} to talk.`;
+		const unheard = `Conversation paused: no speech was heard. Press ${toggleKey} to talk.`;
+		if (result.kind === "cancelled") {
+			say(paused, "info");
+			return;
+		}
+		if (result.kind === "error") {
+			const code = result.error instanceof VoiceSessionError ? result.error.code : undefined;
+			if (code === "no-speech" || code === "empty-audio") say(unheard, "info");
+			else say(sessionErrorMessage(result.error, platform, "toggle"), "error");
+			return;
+		}
+		const text = result.transcript.text.trim();
+		if (!text) {
+			say(unheard, "info");
+			return;
+		}
+		const idle = typeof ctx.isIdle === "function" ? ctx.isIdle() : true;
+		if (idle) pi.sendUserMessage(text);
+		else pi.sendUserMessage(text, { deliverAs: "followUp" });
+	};
+
+	// Reopens the microphone after a reply in conversation mode, unless voice is
+	// already busy with another capture.
+	const listenForReply = (ctx: ExtensionContext): void => {
+		if (toggling || active || !supportedSession(ctx)) return;
+		void runToggle(openToggle(ctx, true));
 	};
 
 	// Ends every voice activity one session owned. The generation moves first, so
@@ -1009,7 +1078,12 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		if (event?.aborted || !text || !supportedSession(ctx)) return;
 		const speech = readSpeech();
 		if (!speech.speakReplies && !speech.conversation) return;
-		void readAloud(ctx, text);
+		const owner = generation;
+		void readAloud(ctx, text).then((outcome) => {
+			// A reading the user stopped, or one that failed, leaves the microphone closed.
+			const finished = outcome === "done" || outcome === "empty" || outcome === "unavailable";
+			if (finished && owner === generation && readSpeech().conversation) listenForReply(ctx);
+		});
 	});
 	pi.on("session_shutdown", (_event, ctx) => {
 		const previous = sessionCtx;

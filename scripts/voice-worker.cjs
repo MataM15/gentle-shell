@@ -73,8 +73,16 @@ const hasExactKeys = (value, keys) => isRecord(value) && Object.keys(value).leng
 const isSafeRelative = (value) => typeof value === "string" && value.split("/").every((segment) => segment !== "." && segment !== ".." && SAFE_SEGMENT.test(segment));
 const isInteger = (value, min, max) => Number.isSafeInteger(value) && value >= min && value <= max;
 
+const START_KEYS = ["schema", "type", "target", "maxRecordingMs", "numThreads", "runtime", "model"];
+
 function parseStart(message) {
-	if (!hasExactKeys(message, ["schema", "type", "target", "maxRecordingMs", "numThreads", "runtime", "model"])) fail("invalid-request");
+	const withEndpoint = isRecord(message) && Object.hasOwn(message, "endpoint");
+	if (!hasExactKeys(message, withEndpoint ? [...START_KEYS, "endpoint"] : START_KEYS)) fail("invalid-request");
+	if (withEndpoint) {
+		const { endpoint } = message;
+		if (!hasExactKeys(endpoint, ["endOfSpeechMs", "noSpeechMs"])) fail("invalid-request");
+		if (!isInteger(endpoint.endOfSpeechMs, 300, 5000) || !isInteger(endpoint.noSpeechMs, 1000, 60000)) fail("invalid-request");
+	}
 	if (message.schema !== SCHEMA || message.type !== "start" || !TARGETS.includes(message.target)) fail("invalid-request");
 	if (!isInteger(message.maxRecordingMs, 1000, 600000) || !isInteger(message.numThreads, 1, 8)) fail("invalid-request");
 	const { runtime, model } = message;
@@ -180,14 +188,19 @@ class MonoRecorder {
 		const { offset, scale } = this.format;
 		const frames = Math.min(Math.floor(data.length / channels), this.maxSamples - this.length);
 		const mono = new Float32Array(frames);
+		let energy = 0;
 		for (let frame = 0; frame < frames; frame++) {
 			let sum = 0;
 			for (let channel = 0; channel < channels; channel++) sum += (Number(data[frame * channels + channel]) - offset) / scale;
 			const value = sum / channels;
 			mono[frame] = Number.isFinite(value) ? Math.max(-1, Math.min(1, value)) : 0;
+			energy += mono[frame] * mono[frame];
 		}
 		this.chunks.push(mono);
 		this.length += frames;
+		// The level of this chunk, for end-of-speech detection.
+		this.lastFrames = frames;
+		this.lastLevel = frames > 0 ? Math.sqrt(energy / frames) : 0;
 		return this.length < this.maxSamples;
 	}
 
@@ -200,6 +213,44 @@ class MonoRecorder {
 		}
 		this.chunks = [];
 		return all;
+	}
+}
+
+// Decides when a hands-free recording is over, in audio time, never wall time.
+// The noise floor is the quietest chunk heard so far; a chunk is speech when it
+// is at least three times that floor and above a fixed minimum level. Speech
+// counts once 150 ms of it were heard; after that, endOfSpeechMs of quiet ends
+// the recording. With no speech within noSpeechMs it ends as well, and the
+// blank transcript is reported as no speech.
+const MIN_SPEECH_LEVEL = 0.01;
+const SPEECH_FLOOR_RATIO = 3;
+const MIN_SPEECH_SECONDS = 0.15;
+
+class Endpointer {
+	constructor(sampleRate, endpoint) {
+		this.endOfSpeech = (sampleRate * endpoint.endOfSpeechMs) / 1000;
+		this.noSpeech = (sampleRate * endpoint.noSpeechMs) / 1000;
+		this.minSpeech = sampleRate * MIN_SPEECH_SECONDS;
+		this.floor = Infinity;
+		this.heard = 0;
+		this.speech = 0;
+		this.quiet = 0;
+	}
+
+	// Returns true once the recording should end.
+	push(level, frames) {
+		if (frames <= 0) return false;
+		this.floor = Math.min(this.floor, level);
+		this.heard += frames;
+		const loud = level >= Math.max(MIN_SPEECH_LEVEL, this.floor * SPEECH_FLOOR_RATIO);
+		if (loud) {
+			this.speech += frames;
+			this.quiet = 0;
+		} else {
+			this.quiet += frames;
+		}
+		if (this.speech >= this.minSpeech) return this.quiet >= this.endOfSpeech;
+		return this.heard >= this.noSpeech;
 	}
 }
 
@@ -353,6 +404,7 @@ class WorkerSession {
 			throw error instanceof WorkerFailure ? error : new WorkerFailure("unsupported-input");
 		}
 		this.recorder = new MonoRecorder(config, Math.ceil((config.sampleRate * maxRecordingMs) / 1000));
+		this.endpointer = this.request?.endpoint ? new Endpointer(config.sampleRate, this.request.endpoint) : undefined;
 		try {
 			// The native layer holds the stream weakly; this session keeps it alive.
 			this.stream = await convenience.createInputStream({
@@ -377,7 +429,9 @@ class WorkerSession {
 		if (!this.recorder.append(data)) {
 			this.truncated = true;
 			void this.transcribe().catch((error) => this.fail(error));
+			return;
 		}
+		if (this.endpointer?.push(this.recorder.lastLevel, this.recorder.lastFrames)) void this.transcribe().catch((error) => this.fail(error));
 	}
 
 	async transcribe() {
