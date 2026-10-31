@@ -199,10 +199,11 @@ interface Harness {
 	installs: Array<{ kind: string; options: Record<string, unknown> }>;
 	settings: { enabled: boolean; reads: number; writes: boolean[] };
 	speech: { current: VoiceSpeechSettings; writes: VoiceSpeechSettings[] };
+	kokoro: { state: "installed" | "missing"; installs: Array<{ signal: AbortSignal }> };
 	clock: ReturnType<typeof manualClock>;
 }
 
-function harness(overrides: { platform?: string; arch?: string; installed?: boolean; install?: (kind: "runtime" | "model", options: { signal: AbortSignal; onProgress(progress: VoiceInstallProgress): void }) => Promise<VoiceInstallResult>; env?: NodeJS.ProcessEnv; pushToTalk?: boolean; speech?: Partial<VoiceSpeechSettings>; engine?: SpeechEngine } = {}): Harness {
+function harness(overrides: { platform?: string; arch?: string; installed?: boolean; install?: (kind: "runtime" | "model", options: { signal: AbortSignal; onProgress(progress: VoiceInstallProgress): void }) => Promise<VoiceInstallResult>; env?: NodeJS.ProcessEnv; pushToTalk?: boolean; speech?: Partial<VoiceSpeechSettings>; engine?: SpeechEngine; kokoro?: "installed" | "missing"; kokoroInstall?: () => Promise<void> } = {}): Harness {
 	const calls: string[] = [];
 	const sessions: FakeSession[] = [];
 	const endpoints: Harness["endpoints"] = [];
@@ -211,6 +212,7 @@ function harness(overrides: { platform?: string; arch?: string; installed?: bool
 	const settings = { enabled: overrides.pushToTalk ?? false, reads: 0, writes: [] as boolean[] };
 	// Spoken replies are faked too: no test reaches PowerShell or the config home.
 	const speech = { current: { speakReplies: false, conversation: false, ...overrides.speech }, writes: [] as VoiceSpeechSettings[] };
+	const kokoro: Harness["kokoro"] = { state: overrides.kokoro ?? "missing", installs: [] };
 	const clock = manualClock();
 	const state = overrides.installed ? "installed" : "missing";
 	const install = overrides.install ?? (async (kind) => ({ kind, path: `${VOICE_HOME}/${kind}`, alreadyInstalled: false }));
@@ -236,12 +238,20 @@ function harness(overrides: { platform?: string; arch?: string; installed?: bool
 		},
 		pushToTalk: { timers: clock.timers },
 		speechEngine: () => overrides.engine,
+		kokoro: {
+			readStatus: async () => ({ state: kokoro.state, voiceHome: VOICE_HOME }),
+			install: async (options) => {
+				kokoro.installs.push(options);
+				await (overrides.kokoroInstall ?? (async () => {}))();
+				kokoro.state = "installed";
+			},
+		},
 		speechSettings: {
 			read: () => ({ ...speech.current }),
 			write: (next) => { speech.writes.push({ ...next }); speech.current = { ...next }; },
 		},
 	};
-	return { deps, calls, sessions, endpoints, installs, settings, speech, clock };
+	return { deps, calls, sessions, endpoints, installs, settings, speech, kokoro, clock };
 }
 
 const pick = (pattern: RegExp) => (_title: string, options: string[]) => options.find((option) => pattern.test(option));
@@ -1774,4 +1784,62 @@ test("the menu turns conversation mode on only with dictation installed and a vo
 	assert.deepEqual(off.notices.at(-1), { message: "Conversation mode is off.", type: "info" });
 	await tick();
 	assert.equal(h.sessions.length, 0, "and the microphone does not reopen");
+});
+
+// --- the natural voice download (S6) ----------------------------------------------------
+
+const NATURAL = /^Download natural voice \(Kokoro, about \d+ MB\)$/;
+
+test("the natural voice is offered once the voice runtime is installed and Kokoro is not", async () => {
+	for (const scenario of [
+		{ name: "runtime and no Kokoro", installed: true, kokoro: "missing" as const, offered: true },
+		{ name: "Kokoro installed", installed: true, kokoro: "installed" as const, offered: false },
+		{ name: "no runtime yet", installed: false, kokoro: "missing" as const, offered: false },
+	]) {
+		const h = harness({ installed: scenario.installed, kokoro: scenario.kokoro });
+		const pi = register(h);
+		const ui = fakeContext();
+		await run(pi, ui);
+		assert.equal(ui.selects[0]!.options.some((option) => NATURAL.test(option)), scenario.offered, scenario.name);
+	}
+	const h = harness({ installed: true });
+	const pi = register(h);
+	const ui = fakeContext();
+	await run(pi, ui);
+	assert.ok(ui.selects[0]!.options.includes("Download natural voice (Kokoro, about 355 MB)"));
+});
+
+test("downloading the natural voice asks first, names sizes and licenses, and declining fetches nothing", async () => {
+	const h = harness({ installed: true });
+	const pi = register(h);
+	const ui = fakeContext({ select: pick(NATURAL), confirm: () => false });
+	await run(pi, ui);
+	assert.equal(ui.confirms.length, 1);
+	assert.equal(ui.confirms[0]!.title, "Download the natural voice?");
+	for (const expected of [/model\.onnx/, /espeak-ng-data/, /Apache-2\.0/, /GPL-3\.0-or-later/, /355 MB/, /Spanish and English/]) {
+		assert.match(ui.confirms[0]!.message, expected);
+	}
+	assert.deepEqual(h.kokoro.installs, []);
+	assert.deepEqual(ui.notices.at(-1), { message: "Natural voice download skipped; nothing was downloaded.", type: "info" });
+});
+
+test("an accepted natural voice download installs it with a cancel signal and reports success", async () => {
+	const h = harness({ installed: true });
+	const pi = register(h);
+	const ui = fakeContext({ select: pick(NATURAL), confirm: () => true });
+	await run(pi, ui);
+	assert.equal(h.kokoro.installs.length, 1);
+	assert.ok(h.kokoro.installs[0]!.signal instanceof AbortSignal);
+	assert.equal(h.kokoro.state, "installed");
+	assert.deepEqual(ui.notices.at(-1), { message: "The natural voice is installed. Spoken replies now use Kokoro.", type: "info" });
+	assert.equal(ui.open(), false, "the progress overlay is closed");
+});
+
+test("a failed natural voice download reports the installer's fixed message", async () => {
+	const h = harness({ installed: true, kokoroInstall: async () => { throw new VoiceInstallError("integrity", "detail that must not leak"); } });
+	const pi = register(h);
+	const ui = fakeContext({ select: pick(NATURAL), confirm: () => true });
+	await run(pi, ui);
+	assert.deepEqual(ui.notices.at(-1), { message: "A downloaded file did not match its pinned size or digest and was discarded.", type: "error" });
+	assert.ok(!ui.notices.some((notice) => /detail that must not leak/.test(notice.message)));
 });

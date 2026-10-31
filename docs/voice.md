@@ -198,6 +198,33 @@ The thresholds are tested with synthetic audio only. A loud room or a quiet
 microphone may need the shortcut to send; tuning them on real microphones is
 still open.
 
+## Natural voice with Kokoro
+
+The Windows voice works with no download but sounds robotic. Once the voice
+runtime is installed, `/gentle:voice` offers **Download natural voice (Kokoro,
+about 355 MB)**. The confirmation lists the files, the destination, the sizes
+and the licenses; nothing is fetched before you accept, and Esc cancels.
+
+| Component | Source | Size | Verified by |
+|-----------|--------|------|-------------|
+| `model.onnx`, `voices.bin`, `tokens.txt`, `LICENSE` | Hugging Face `csukuangfj/kokoro-multi-lang-v1_0`, commit `f7b96bb6bef5` | about 354 MB | per-file size and SHA-256 |
+| espeak-ng phoneme data: `phontab`, `phonindex`, `phondata`, `intonations`, `es_dict`, `en_dict`, `lang/roa/es`, `lang/roa/es-419`, `lang/gmw/en`, `lang/gmw/en-US` | same commit | under 1 MB | per-file size and SHA-256 |
+
+Only Spanish and English phoneme data is downloaded, not the 355 files
+upstream ships. Every size and digest was checked against the upstream
+`kokoro-multi-lang-v1_0.tar.bz2` release asset, whose files are identical. The
+pins live in `lib/voice-kokoro.ts`.
+
+The installer accepts flat file names only, and that guard is kept. The
+phoneme data comes from nested folders, so it is installed as three flat
+components, one per folder, under `models/` next to Parakeet; the speech worker
+rebuilds the folder tree espeak-ng expects in a private temporary directory.
+
+Licenses: the Kokoro-82M weights by hexgrad are Apache-2.0, exported for
+sherpa-onnx by csukuangfj. The espeak-ng phoneme data is GPL-3.0-or-later. It
+runs on the pinned sherpa-onnx 1.13.8 runtime; sherpa-onnx 2.x drops espeak-ng,
+so that pin must not move without replacing the phonemizer.
+
 ## What gets downloaded
 
 All versions, sizes and digests are pinned in `lib/voice-artifacts.ts`.

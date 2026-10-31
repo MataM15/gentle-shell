@@ -6,6 +6,7 @@ import { installVoiceModel, installVoiceRuntime, readVoiceStatus, VoiceInstallEr
 import { diagnoseVoicePlatform, readVoicePlatformProbe, type VoicePlatformDiagnosis, type VoicePlatformProbe } from "./voice-platform.ts";
 import { SpaceHoldDetector, type PushToTalkOptions } from "./voice-push-to-talk.ts";
 import { createVoiceSession, VoiceSessionError, type VoiceEndpoint, type VoiceSessionErrorCode, type VoiceSessionState, type VoiceTranscript } from "./voice-session.ts";
+import { installKokoro, KOKORO_MANIFESTS, KOKORO_NOTICES, kokoroBytes, readKokoroStatus, type KokoroStatus } from "./voice-kokoro.ts";
 import { createReplyReader, defaultSpeechEngineResolver, lastAssistantText } from "./voice-reply-speech.ts";
 import { readVoicePushToTalk, readVoiceSpeechSettings, writeVoicePushToTalk, writeVoiceSpeechSettings, type VoiceSpeechSettings } from "./voice-settings.ts";
 import { SpeechEngineError, type SpeechEngine } from "./voice-speech.ts";
@@ -83,6 +84,8 @@ export interface VoiceCommandDeps {
 	// persisted on/off switches.
 	speechEngine?: () => SpeechEngine | undefined;
 	speechSettings?: { read(): VoiceSpeechSettings; write(settings: VoiceSpeechSettings): void };
+	// The natural voice (Kokoro): its install status and its consented download.
+	kokoro?: { readStatus(): Promise<KokoroStatus>; install(options: VoiceInstallRequest): Promise<void> };
 }
 
 const MB = 1_000_000;
@@ -415,6 +418,10 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		}
 	};
 	const replyReader = createReplyReader({ engine: speechEngine });
+	const kokoro = deps.kokoro ?? {
+		readStatus: () => readKokoroStatus({ env }),
+		install: ({ signal, onProgress }: VoiceInstallRequest) => installKokoro({ env, signal, onProgress }),
+	};
 	const supportedSession = (ctx: ExtensionContext | undefined): ctx is ExtensionContext => env.GENTLE_PI_AGENTS_CHILD !== "1" && Boolean(ctx?.hasUI) && ctx?.mode === "tui";
 
 	interface Reading {
@@ -567,17 +574,58 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		// Enable is offered only once voice is installed; Disable whenever it is on.
 		const pushToTalk = readToggle();
 		const toggle = pushToTalk ? [DISABLE_PUSH_TO_TALK] : ready ? [ENABLE_PUSH_TO_TALK] : [];
+		// The natural voice runs on the dictation runtime, so it is offered once that is installed.
+		const kokoroStatus = runtimeMissing ? undefined : await kokoro.readStatus().catch(() => undefined);
+		if (!live()) return;
+		const naturalDownload = `Download natural voice (Kokoro, about ${megabytes(kokoroBytes())})`;
+		const natural = kokoroStatus && kokoroStatus.state !== "installed" ? [naturalDownload] : [];
 		const speechNow = readSpeech();
 		const speech = [speechNow.speakReplies ? READ_OFF : READ_ON, speechNow.conversation ? CONVERSATION_OFF : CONVERSATION_ON, ...(reading ? [STOP_READING] : [])];
-		const choice = await ctx.ui.select(ready ? "Voice dictation · ready" : "Voice dictation · not installed", ready ? [START, ...toggle, ...speech, STATUS] : [download, ...toggle, ...speech, STATUS]);
+		const choice = await ctx.ui.select(ready ? "Voice dictation · ready" : "Voice dictation · not installed", ready ? [START, ...toggle, ...speech, ...natural, STATUS] : [download, ...toggle, ...speech, ...natural, STATUS]);
 		if (!live() || !choice) return;
 		if (choice === STATUS) say(statusReport(target, diagnosis, status, platform.platform), "info");
 		else if (choice === READ_ON || choice === READ_OFF) setSpeakReplies(ctx, choice === READ_ON, say);
 		else if (choice === STOP_READING) stopReading();
 		else if (choice === CONVERSATION_ON || choice === CONVERSATION_OFF) setConversation(choice === CONVERSATION_ON, ready, say);
+		else if (choice === naturalDownload) await installNatural(ctx, run, status.voiceHome, say);
 		else if (choice === DISABLE_PUSH_TO_TALK || choice === ENABLE_PUSH_TO_TALK) setPushToTalk(ctx, choice === ENABLE_PUSH_TO_TALK, say);
 		else if (choice === download) await install(ctx, run, { target, diagnosis, status, platform: platform.platform, runtimeMissing, modelMissing }, say);
 		else if (choice === START) await dictate(ctx, run, target, platform.platform, say);
+	};
+
+	const installNatural = async (ctx: ExtensionCommandContext, run: Run, voiceHome: string, say: Say): Promise<void> => {
+		const { core, espeak, espeakRomance, espeakGermanic } = KOKORO_MANIFESTS;
+		const bytes = (files: readonly { size: number }[]) => files.reduce((sum, file) => sum + file.size, 0);
+		const phonemes = bytes(espeak.files) + bytes(espeakRomance.files) + bytes(espeakGermanic.files);
+		const message = [
+			`Downloads into ${voiceHome}:`,
+			`- Kokoro v1.0 multi-language model from Hugging Face (${core.files.map((file) => file.name).join(", ")}): ${megabytes(bytes(core.files))}`,
+			`- espeak-ng-data phoneme files for Spanish and English: ${megabytes(phonemes)}`,
+			`About ${megabytes(kokoroBytes())} in total. It runs on the voice runtime dictation already installed.`,
+			"Every file is checked against its pinned size and digest. Nothing downloaded is loaded or run during the download.",
+			"Licenses and attribution:",
+			...KOKORO_NOTICES.map((notice) => `- ${notice.attribution ?? `${notice.component}: ${notice.license}.`} Source: ${notice.source}`),
+		].join("\n");
+		if (!(await ctx.ui.confirm("Download the natural voice?", message))) {
+			say("Natural voice download skipped; nothing was downloaded.", "info");
+			return;
+		}
+		if (run.generation !== generation) return;
+		const controller = new AbortController();
+		run.abort = () => controller.abort();
+		const overlay = openOverlay(ctx, (theme, requestRender) => new VoiceProgressView({ theme, requestRender, onCancel: () => controller.abort() }));
+		let failure: unknown;
+		try {
+			await kokoro.install({ signal: controller.signal, onProgress: (progress) => overlay.view()?.update(progress) });
+		} catch (error) {
+			failure = error;
+		} finally {
+			run.abort = () => {};
+			await overlay.close();
+		}
+		if (controller.signal.aborted) say("Natural voice download was cancelled. Unfinished files were removed; completed parts are kept.", "info");
+		else if (failure !== undefined) say(failure instanceof VoiceInstallError ? INSTALL_MESSAGES[failure.code] : "Natural voice download failed.", "error");
+		else say("The natural voice is installed. Spoken replies now use Kokoro.", "info");
 	};
 
 	const install = async (
