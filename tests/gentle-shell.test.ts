@@ -5849,7 +5849,8 @@ test("gentleShell files header usage under the provider that served the response
 	const opened = commands.get("gentle:usage")!.handler("", ctx);
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	const plain = ui.overlayView!.render(90).map(stripAnsi).join("\n");
-	assert.match(plain, /✿ claude-bridge ·/);
+	// The personal overlay names the provider without the decorative flower glyph.
+	assert.match(plain, /active claude-bridge ·/);
 	assert.doesNotMatch(plain, /no subscription usage for this provider/);
 	ui.closeOverlay?.();
 	await opened;
