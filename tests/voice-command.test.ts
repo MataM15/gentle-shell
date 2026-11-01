@@ -201,6 +201,7 @@ interface Harness {
 	focus: { focused: boolean; asks: number };
 	turn: { held: boolean; waiting: Array<() => void>; acquired: number; released: number };
 	warmReleases: number;
+	cues: string[];
 	kokoro: { state: "installed" | "missing"; installs: Array<{ signal: AbortSignal }> };
 	miro: { state: "installed" | "missing"; installs: Array<{ signal: AbortSignal }> };
 	clock: ReturnType<typeof manualClock>;
@@ -217,7 +218,7 @@ function harness(overrides: { platform?: string; arch?: string; installed?: bool
 	const voice: Harness["voice"] = { sessions: overrides.voice ? ["session-alpha"] : [], writes: [] };
 	const focus: Harness["focus"] = { focused: overrides.focused ?? true, asks: 0 };
 	const turn: Harness["turn"] = { held: overrides.turnHeld ?? false, waiting: [], acquired: 0, released: 0 };
-	const harnessRef = { warmReleases: 0 };
+	const harnessRef = { warmReleases: 0, cues: [] as string[] };
 	const kokoro: Harness["kokoro"] = { state: overrides.kokoro ?? "missing", installs: [] };
 	const miro: Harness["miro"] = { state: overrides.miro ?? "missing", installs: [] };
 	const clock = manualClock();
@@ -263,6 +264,7 @@ function harness(overrides: { platform?: string; arch?: string; installed?: bool
 		},
 		paneFocused: async () => { focus.asks++; return focus.focused; },
 		releaseWarm: async () => { harnessRef.warmReleases++; },
+		cues: { play: (name) => { harnessRef.cues.push(name); }, warm: () => { harnessRef.cues.push("warm"); }, dispose: () => { harnessRef.cues.push("dispose"); } },
 		// The shared reading turn, faked: free unless a test holds it.
 		readingTurn: (signal) => new Promise((resolve) => {
 			const take = () => { turn.acquired++; resolve(() => { turn.released++; }); };
@@ -2068,4 +2070,74 @@ test("a hands-free turn that hears nothing keeps the draft unsent", async () => 
 	await pressed;
 	assert.equal(pi.counts.sends, 0);
 	assert.equal(ui.editor(), "/tmp/pi-clipboard-1234.png");
+});
+
+// --- microphone cues ----------------------------------------------------------------
+
+test("a rising cue plays when the microphone really starts recording and a falling one when it stops", async () => {
+	const { engine } = fakeEngine();
+	const h = harness({ installed: true, engine, voice: true });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	assert.deepEqual(h.cues, ["warm"], "a voice session wakes the player at start");
+	const pressed = pi.shortcuts.get("alt+m")!.handler(ui.ctx);
+	await until(() => h.sessions.length === 1);
+	assert.deepEqual(h.cues, ["warm"], "nothing plays while the microphone is still opening");
+	h.sessions[0]!.started.resolve();
+	await until(() => h.sessions[0]!.state === "recording");
+	assert.deepEqual(h.cues, ["warm", "open"]);
+	h.sessions[0]!.emit("transcribing");
+	assert.deepEqual(h.cues, ["warm", "open", "close"]);
+	h.sessions[0]!.emit("finished");
+	h.sessions[0]!.result.resolve({ text: "hola", truncated: false });
+	await pressed;
+	assert.deepEqual(h.cues, ["warm", "open", "close"], "the close cue plays once");
+});
+
+test("Esc while recording plays the falling cue, and a capture that never recorded plays none", async () => {
+	const { engine } = fakeEngine();
+	const h = harness({ installed: true, engine, voice: true });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	const pressed = pi.shortcuts.get("alt+m")!.handler(ui.ctx);
+	await until(() => h.sessions.length === 1);
+	h.sessions[0]!.started.resolve();
+	await until(() => h.sessions[0]!.state === "recording");
+	ui.type(ESC);
+	await pressed;
+	assert.deepEqual(h.cues, ["warm", "open", "close"]);
+	const second = pi.shortcuts.get("alt+m")!.handler(ui.ctx);
+	await until(() => h.sessions.length === 2);
+	ui.type(ESC);
+	await second;
+	assert.deepEqual(h.cues, ["warm", "open", "close"], "cancelled before recording: no cue");
+});
+
+test("dictation that pastes plays the cues too, a session without voice does not wake the player early, and the player is released with the session", async () => {
+	const h = harness({ installed: true });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	assert.deepEqual(h.cues, []);
+	const pressed = pi.shortcuts.get("alt+m")!.handler(ui.ctx);
+	await until(() => h.sessions.length === 1);
+	h.sessions[0]!.started.resolve();
+	await until(() => h.sessions[0]!.state === "recording");
+	void pi.shortcuts.get("alt+m")!.handler(ui.ctx);
+	h.sessions[0]!.result.resolve({ text: "pegado", truncated: false });
+	await pressed;
+	assert.deepEqual(h.cues, ["open", "close"]);
+	await pi.fire("session_shutdown", ui.ctx);
+	assert.equal(h.cues.at(-1), "dispose");
+});
+
+test("turning voice on wakes the cue player", async () => {
+	const { engine } = fakeEngine();
+	const h = harness({ engine, installed: true });
+	const pi = register(h);
+	const ui = fakeContext({ select: pick(/^Voice in this session \(off\): turn on$/) });
+	await run(pi, ui);
+	assert.ok(h.cues.includes("warm"));
 });

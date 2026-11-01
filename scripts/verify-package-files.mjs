@@ -53,6 +53,7 @@ export const requiredPaths = [
   "extensions/gentle-voice.ts",
   "lib/voice-artifacts.ts",
   "lib/voice-command.ts",
+  "lib/voice-cues.ts",
   "lib/voice-install.ts",
   "lib/voice-kokoro.ts",
   "lib/voice-kokoro-engine.ts",

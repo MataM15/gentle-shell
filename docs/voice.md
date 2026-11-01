@@ -215,6 +215,22 @@ The thresholds are tested with synthetic audio only. A loud room or a quiet
 microphone may need the shortcut to send; tuning them on real microphones is
 still open.
 
+### Microphone cues
+
+A short rising tone plays when the microphone really starts recording, after
+the worker reports it, and a falling tone when recording stops: at the end of
+speech, on the dictation shortcut, or on Esc. A capture cancelled before it
+recorded plays neither. Both shortcut dictation and hands-free turns play them.
+
+The tones are generated in `lib/voice-cues.ts`, written once into a private
+temporary directory, and played through the native PulseAudio player the
+notifications use: about 20 ms from the request to sound once its worker is
+awake. A voice session wakes it at session start and when voice is turned on,
+so the first cue is on time. Where PulseAudio is not available, including
+native Windows, the cues stay silent, because the Windows players start
+PowerShell and would arrive about a second late. The player and its files are
+released when the Pi session ends.
+
 ### Faster transcription
 
 A dictation worker started for one recording verifies the 670 MB model digests

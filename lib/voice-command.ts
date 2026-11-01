@@ -9,6 +9,7 @@ import { createVoiceSession, VoiceSessionError, type VoiceEndpoint, type VoiceSe
 import { installKokoro, installMiro, KOKORO_MANIFESTS, KOKORO_NOTICES, kokoroBytes, MIRO_MANIFEST, MIRO_NOTICE, miroBytes, readKokoroStatus, readMiroStatus, type KokoroStatus } from "./voice-kokoro.ts";
 import { createReplyReader, defaultSpeechEngineResolver, lastAssistantText } from "./voice-reply-speech.ts";
 import { acquireReadingTurn, paneFocused as herdrPaneFocused } from "./voice-presence.ts";
+import { createCuePlayer, type CuePlayer } from "./voice-cues.ts";
 import { createWarmVoiceWorker, type WarmVoiceWorker } from "./voice-warm.ts";
 import { readVoicePushToTalk, readVoiceSessions, writeVoicePushToTalk, writeVoiceSessions } from "./voice-settings.ts";
 import { SpeechEngineError, type SpeechEngine } from "./voice-speech.ts";
@@ -91,6 +92,8 @@ export interface VoiceCommandDeps {
 	readingTurn?: (signal: AbortSignal) => Promise<(() => void) | undefined>;
 	// Releases the dictation worker kept alive for hands-free recordings.
 	releaseWarm?: () => Promise<void>;
+	// The microphone cues; one player per process, created on first use.
+	cues?: CuePlayer;
 	// The natural voice (Kokoro): its install status and its consented download.
 	kokoro?: { readStatus(): Promise<KokoroStatus>; install(options: VoiceInstallRequest): Promise<void> };
 	// The Miro voice (Piper), chosen by the owner for Spanish replies.
@@ -354,6 +357,12 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		return warm.worker;
 	};
 	const createSession = deps.createSession ?? (({ target, onStateChange, endpoint }) => (endpoint ? warmFor(target).session({ onStateChange, endpoint }) : createVoiceSession({ env, target, onStateChange, endpoint })));
+	let cuePlayer = deps.cues;
+	let cuesUsed = false;
+	const cues = (): CuePlayer => {
+		cuesUsed = true;
+		return (cuePlayer ??= createCuePlayer({ env }));
+	};
 	const releaseWarm = deps.releaseWarm ?? (async () => {
 		const current = warm;
 		warm = undefined;
@@ -561,6 +570,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			say("Voice is off in this session.", "info");
 			return;
 		}
+		cues().warm();
 		const start = toggleShortcut ? `${toggleShortcut} starts a hands-free conversation` : "the reply starts a hands-free conversation";
 		say(`Voice is on in this session: replies are read aloud, and ${start}. Esc pauses.`, "info");
 	};
@@ -980,6 +990,8 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		stopRequested: boolean;
 		// Conversation mode: hands-free recording, and the transcript is sent.
 		send: boolean;
+		// The microphone cue already played for this capture.
+		cue: "none" | "open" | "closed";
 		cancelled: boolean;
 		unsubscribe(): void;
 	}
@@ -991,6 +1003,14 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		const live = () => current.run.generation === generation && toggling === current;
 		return (state: VoiceSessionState) => {
 			if (!live()) return;
+			// Rising when the microphone really records, falling when it stops.
+			if (state === "recording" && current.cue === "none") {
+				current.cue = "open";
+				cues().play("open");
+			} else if (state !== "recording" && current.cue === "open") {
+				current.cue = "closed";
+				cues().play("close");
+			}
 			setVoiceFooter(current.ctx, live, current.send ? voiceConversationStatus(state, toggleKey) : voiceToggleStatus(state, toggleKey));
 			publishVoiceState(current.ctx, voiceDisplayState(state), live);
 		};
@@ -998,6 +1018,11 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 
 	const closeToggle = (current: ToggleRun) => {
 		if (toggling !== current) return;
+		// A capture cancelled while recording reports no more states.
+		if (current.cue === "open") {
+			current.cue = "closed";
+			cues().play("close");
+		}
 		toggling = undefined;
 		if (active === current.run) active = undefined;
 		try {
@@ -1029,7 +1054,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	};
 
 	const openToggle = (ctx: ExtensionContext, send: boolean): ToggleRun => {
-		const current: ToggleRun = { ctx, run: { generation, abort: () => {} }, stopRequested: false, send, cancelled: false, unsubscribe: () => {} };
+		const current: ToggleRun = { ctx, run: { generation, abort: () => {} }, stopRequested: false, send, cue: "none", cancelled: false, unsubscribe: () => {} };
 		toggling = current;
 		active = current.run;
 		// Esc has to cancel without reaching the editor's own interrupt.
@@ -1153,6 +1178,11 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	const endSession = (ctx: ExtensionContext | undefined): void => {
 		stopReading();
 		void releaseWarm().catch(() => {});
+		if (cuesUsed) {
+			cuesUsed = false;
+			cuePlayer?.dispose();
+			cuePlayer = deps.cues;
+		}
 		pendingReply = undefined;
 		unavailableReported = false;
 		spokenTurnPending = false;
@@ -1206,6 +1236,8 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		// any footer a replacement left behind is cleared.
 		publishVoiceState(ctx, "idle");
 		if (readToggle()) arm(ctx);
+		// A voice session wakes the cue player now, so the first cue is on time.
+		if (voiceOn(ctx)) cues().warm();
 	});
 	// A new run stops the reading and forgets the previous reply; the reply of the
 	// last run is read once nothing else will run automatically.
