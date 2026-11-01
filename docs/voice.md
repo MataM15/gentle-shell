@@ -287,6 +287,20 @@ sherpa-onnx by csukuangfj. The espeak-ng phoneme data is GPL-3.0-or-later. It
 runs on the pinned sherpa-onnx 1.13.8 runtime; sherpa-onnx 2.x drops espeak-ng,
 so that pin must not move without replacing the phonemizer.
 
+## Raúl robot voice
+
+Spanish replies are read by the owner's pick: the Windows OneCore voice
+**Microsoft Raul** (Spanish, Mexico), with a metallic robot effect and a
+leveler. Everything runs on this machine; no text leaves it. It needs no
+download: Raúl ships with Windows' Spanish (Mexico) speech pack.
+
+| Topic | Behavior |
+|-------|----------|
+| How it plays | One PowerShell process synthesizes the reply sentence by sentence through the WinRT speech API (`lib/voice-onecore.ts`) and writes each sentence as a base64 WAV line; the reply reaches it only through its standard input, as base64 JSON lines. Each sentence is processed in code and handed to a second PowerShell process that plays them in order. |
+| Effect | `lib/voice-robot.ts` reproduces ffmpeg's `afftfilt=real='hypot(re,im)*sin(0)':imag='hypot(re,im)*cos(0)':win_size=512:overlap=0.75,volume=1.6` step by step from `af_afftfilt.c` (ffmpeg 6.1): on a real reply it matches ffmpeg's output within 0.00002, less than one 16-bit step, and processes 20 seconds of audio in about 0.3 seconds. ffmpeg is not needed. |
+| Level | The effect leaves speech low and uneven, so a leveler brings every 50 ms of speech toward a steady level (at most 6 times louder, never quieter), keeps pauses as they are, and rounds off peaks instead of clipping. |
+| Fallback | English replies, and any Raúl failure before audio (for example a missing voice), go to Miro, then Kokoro, then the Windows SAPI voice. A failure after part of the reply was heard stops there. |
+
 ## Miro voice (Piper)
 
 Miro is a Spanish (Spain) Piper VITS voice, the owner's pick for Spanish
@@ -298,7 +312,7 @@ the destination and the license; nothing is fetched before you accept.
 |-------|----------|
 | Source | `es_ES-miro-high.onnx`, `tokens.txt` and its `README.md` license text from Hugging Face `csukuangfj/vits-piper-es_ES-miro-high`, commit `0e1f77356142`, checked against the sherpa-onnx release tarball. Pins live in `lib/voice-kokoro.ts`. |
 | Phoneme data | Reuses the Spanish and English espeak-ng parts the natural voice uses; installing Miro fetches them only when missing. |
-| Which voice reads | Spanish replies use Miro when it is installed. English replies, and any Miro failure before audio, fall back to Kokoro, then to the Windows voice. |
+| Which voice reads | Spanish replies use Raúl first; Miro reads them when Raúl fails before audio. English replies, and any Miro failure before audio, fall back to Kokoro, then to the Windows voice. |
 | License | CC BY-NC-SA 4.0: non-commercial use only. It reads replies to the owner inside this personal tool; it is not shipped in any product. |
 
 ## What gets downloaded
