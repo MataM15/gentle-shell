@@ -1521,7 +1521,7 @@ test("the dictation shortcut while reading stops the reading, then starts a hand
 	assert.equal(ui.editor(), "", "nothing is pasted");
 });
 
-test("a new agent run stops the reading", async () => {
+test("a background run lets the reading finish; a typed message stops it", async () => {
 	const { engine, readings } = fakeEngine();
 	const h = harness({ voice: true, engine });
 	const pi = register(h);
@@ -1530,10 +1530,12 @@ test("a new agent run stops the reading", async () => {
 	await settleReply(pi, ui.ctx, "Primera respuesta.");
 	await until(() => readings.length === 1);
 	await pi.fire("agent_start", ui.ctx);
-	assert.equal(readings[0]!.options.signal.aborted, true);
+	assert.equal(readings[0]!.options.signal.aborted, false, "a background notice does not cut the reading");
+	await pi.fire("input", ui.ctx, { type: "input", text: "esto lo escribí", source: "interactive" });
+	assert.equal(readings[0]!.options.signal.aborted, true, "the user's own message does");
 });
 
-test("a second settled reply replaces the reading in progress", async () => {
+test("a second settled reply waits for the reading in progress, and only the newest waits", async () => {
 	const { engine, readings } = fakeEngine();
 	const h = harness({ voice: true, engine });
 	const pi = register(h);
@@ -1541,12 +1543,34 @@ test("a second settled reply replaces the reading in progress", async () => {
 	await pi.fire("session_start", ui.ctx);
 	await settleReply(pi, ui.ctx, "Primera respuesta.");
 	await until(() => readings.length === 1);
-	await pi.fire("agent_end", ui.ctx, reply("Segunda respuesta."));
-	await pi.fire("agent_settled", ui.ctx, { aborted: false });
+	await settleReply(pi, ui.ctx, "Segunda respuesta.");
+	await settleReply(pi, ui.ctx, "Tercera respuesta.");
+	await tick();
+	assert.equal(readings.length, 1, "nothing interrupts the first reading");
+	assert.equal(readings[0]!.options.signal.aborted, false);
+	readings[0]!.finish("done");
 	await until(() => readings.length === 2);
-	assert.equal(readings[0]!.options.signal.aborted, true);
-	assert.equal(readings[1]!.text, "Segunda respuesta.");
-	assert.equal(ui.terminal.subscribes - ui.terminal.unsubscribes, 1, "one Esc listener at a time");
+	assert.equal(readings[1]!.text, "Tercera respuesta.", "the newest reply is read next");
+	readings[1]!.finish("done");
+	await until(() => ui.statuses.at(-1) === undefined);
+	await tick();
+	assert.equal(readings.length, 2);
+	assert.equal(ui.terminal.subscribes - ui.terminal.unsubscribes, 0);
+});
+
+test("Esc on a reading also drops the reply waiting behind it", async () => {
+	const { engine, readings } = fakeEngine();
+	const h = harness({ voice: true, engine });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	await settleReply(pi, ui.ctx, "Primera respuesta.");
+	await until(() => readings.length === 1);
+	await settleReply(pi, ui.ctx, "Segunda respuesta.");
+	ui.type(ESC);
+	await until(() => ui.statuses.at(-1) === undefined);
+	await tick();
+	assert.equal(readings.length, 1);
 });
 
 test("an engine failure is reported once with its fixed message", async () => {
@@ -2142,7 +2166,7 @@ test("turning voice on wakes the cue player", async () => {
 	assert.ok(h.cues.includes("warm"));
 });
 
-test("a background run that cuts the reading keeps the spoken turn, so the next reply still reopens the microphone", async () => {
+test("after a spoken turn, a background reply waits its turn, and the microphone reopens once both were read", async () => {
 	const { engine, readings } = fakeEngine();
 	const h = harness({ installed: true, engine, voice: true });
 	const pi = register(h);
@@ -2151,11 +2175,13 @@ test("a background run that cuts the reading keeps the spoken turn, so the next 
 	await talk(pi, h, ui.ctx, "bajá las voces");
 	await settleReply(pi, ui.ctx, "Las estoy bajando.");
 	await until(() => readings.length === 1);
-	// A background job finishing wakes the agent: a new run cuts the reading.
+	// A background job finishing wakes the agent while the first reply is read.
 	await settleReply(pi, ui.ctx, "Ya bajaron, te las hago sonar.");
+	await tick();
+	assert.equal(readings[0]!.options.signal.aborted, false);
+	readings[0]!.finish("done");
 	await until(() => readings.length === 2);
-	assert.equal(readings[0]!.options.signal.aborted, true);
-	assert.equal(h.sessions.length, 1, "no microphone while the second reply is read");
+	assert.equal(h.sessions.length, 1, "no microphone between the two readings");
 	readings[1]!.finish("done");
 	await until(() => h.sessions.length === 2);
 	assert.deepEqual(h.endpoints.at(-1), HANDS_FREE);

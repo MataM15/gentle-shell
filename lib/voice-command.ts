@@ -505,6 +505,19 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		setVoiceFooter(current.ctx, () => current.generation === generation, undefined);
 	};
 
+	// A reply that settles while another is read waits here; only the newest
+	// waits, so a burst of background replies cannot pile up.
+	let queuedReply: { ctx: ExtensionContext; text: string } | undefined;
+	// Stops the reading and drops the reply waiting behind it: for the user's
+	// own Esc, message, shortcut, Stop reading, voice off and session end.
+	const cutReadings = (): void => {
+		queuedReply = undefined;
+		stopReading();
+	};
+	// Set while this extension sends a spoken transcript, so its input event is
+	// recognized as the user's own turn.
+	let voiceSendPending = false;
+
 	type ReadingOutcome = "done" | "cancelled" | "empty" | "unavailable" | "error";
 	const readAloud = async (ctx: ExtensionContext, markdown: string): Promise<ReadingOutcome> => {
 		stopReading();
@@ -517,7 +530,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 				if (!isKeyRelease(data) && matchesKey(data, "escape")) {
 					// Stopping a reading pauses the conversation.
 					spokenTurnPending = false;
-					stopReading();
+					cutReadings();
 					return { consume: true };
 				}
 				return undefined;
@@ -566,7 +579,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			return;
 		}
 		if (!enabled) {
-			stopReading();
+			cutReadings();
 			spokenTurnPending = false;
 			void releaseWarm().catch(() => {});
 			say("Voice is off in this session.", "info");
@@ -643,7 +656,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		else if (choice === VOICE_ON || choice === VOICE_OFF) setVoice(ctx, choice === VOICE_ON, say);
 		else if (choice === STOP_READING) {
 			spokenTurnPending = false;
-			stopReading();
+			cutReadings();
 		}
 		else if (choice === naturalDownload) await installNatural(ctx, run, status.voiceHome, say);
 		else if (choice === miroDownload) await installMiroVoice(ctx, run, status.voiceHome, say);
@@ -1111,7 +1124,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	const toggleDictation = async (ctx: ExtensionContext): Promise<void> => {
 		if (env.GENTLE_PI_AGENTS_CHILD === "1" || !ctx?.hasUI || ctx.mode !== "tui") return;
 		// Talking over a reading stops it first, then dictation starts as usual.
-		stopReading();
+		cutReadings();
 		const current = toggling;
 		if (current) {
 			stopToggle(current);
@@ -1158,6 +1171,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		const message = draft ? `${draft}\n\n${text}` : text;
 		spokenTurnPending = true;
 		const idle = typeof ctx.isIdle === "function" ? ctx.isIdle() : true;
+		voiceSendPending = true;
 		if (idle) pi.sendUserMessage(message);
 		else pi.sendUserMessage(message, { deliverAs: "followUp" });
 		if (draft) {
@@ -1181,7 +1195,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	// cancelling; then the footer and the display go idle under that session's own
 	// id, and its publisher closes. The next session starts from a clean display.
 	const endSession = (ctx: ExtensionContext | undefined): void => {
-		stopReading();
+		cutReadings();
 		void releaseWarm().catch(() => {});
 		if (cuesUsed) {
 			cuesUsed = false;
@@ -1248,38 +1262,59 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	// last run is read once nothing else will run automatically.
 	// A typed message ends the spoken turn; messages sent by extensions,
 	// including this one, leave it as it is.
+	// The user's own message, typed or spoken, stops the reading: they moved
+	// on. A typed one also ends the spoken turn. Runs that background notices or
+	// other extensions start leave the reading alone, and their reply waits.
 	pi.on("input", (event) => {
-		if (event?.source === "interactive") spokenTurnPending = false;
+		const typed = event?.source === "interactive";
+		const spokenSend = voiceSendPending;
+		voiceSendPending = false;
+		if (typed) spokenTurnPending = false;
+		if (typed || spokenSend) cutReadings();
 	});
 	pi.on("agent_start", () => {
-		stopReading();
 		pendingReply = undefined;
 	});
 	pi.on("agent_end", (event) => {
 		const text = lastAssistantText(Array.isArray(event?.messages) ? event.messages : []);
 		if (text) pendingReply = text;
 	});
-	pi.on("agent_settled", (event, ctx) => {
-		const text = pendingReply;
-		pendingReply = undefined;
-		// The spoken turn stays pending until the microphone reopens: a run that a
-		// background notice starts can cut this reading, and the next reply still
-		// reopens it. Typing, Esc and a failed reading end it.
-		const spoken = spokenTurnPending;
-		if (event?.aborted || !text || !supportedSession(ctx) || !voiceOn(ctx)) return;
+	// Reads one reply, then the one that waited behind it; once nothing is left
+	// to read, a pending spoken turn reopens the microphone.
+	const readReply = (ctx: ExtensionContext, text: string): void => {
 		const owner = generation;
 		void readAloud(ctx, text).then(async (outcome) => {
+			if (owner !== generation) return;
 			// A reading the user stopped, or one that failed, leaves the microphone
 			// closed, and only a reply to a spoken turn reopens it.
 			const finished = outcome === "done" || outcome === "empty" || outcome === "unavailable";
 			if (outcome === "error") spokenTurnPending = false;
-			if (!finished || !spoken || !spokenTurnPending || owner !== generation || !voiceOn(ctx)) return;
+			if (!finished) {
+				queuedReply = undefined;
+				return;
+			}
+			const next = queuedReply;
+			queuedReply = undefined;
+			if (next && voiceOn(next.ctx)) return readReply(next.ctx, next.text);
+			if (!spokenTurnPending || !voiceOn(ctx)) return;
 			spokenTurnPending = false;
 			const focused = await paneFocused().catch(() => false);
 			if (owner !== generation) return;
 			if (focused) listenForReply(ctx);
 			else ctx.ui.notify(`Conversation paused in this pane. Press ${toggleKey} to talk.`, "info");
 		});
+	};
+	pi.on("agent_settled", (event, ctx) => {
+		const text = pendingReply;
+		pendingReply = undefined;
+		// The spoken turn stays pending until the microphone reopens. Typing, Esc
+		// and a failed reading end it.
+		if (event?.aborted || !text || !supportedSession(ctx) || !voiceOn(ctx)) return;
+		if (reading) {
+			queuedReply = { ctx, text };
+			return;
+		}
+		readReply(ctx, text);
 	});
 	pi.on("session_shutdown", (_event, ctx) => {
 		const previous = sessionCtx;
