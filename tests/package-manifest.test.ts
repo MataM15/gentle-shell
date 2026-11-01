@@ -21,7 +21,7 @@ import { resolveGentlePiAgentHome } from "../lib/agent-home.ts";
 import { getPackageAssetOwner, installPackageAssets, type PackageAssetOwner } from "../lib/agent-assets.ts";
 import { discoverAgents } from "../lib/agents-config.ts";
 import { AUDITED_PI_EDITOR_VERSIONS } from "../lib/vim-editor-adapter.ts";
-import { resolveProjectPiSdkVersion } from "../scripts/test-packed-runner.mjs";
+import { resolveProjectPiSdkVersion, runNpmWithEnv } from "../scripts/test-packed-runner.mjs";
 // Package installation is owned by lib/agent-assets.ts, not the retired SDD preflight.
 
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));

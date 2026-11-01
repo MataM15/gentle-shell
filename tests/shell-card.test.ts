@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import {
-	CARD_STYLE, CARD_TONE, cardAwaitingResult, cardRunningLine, cardStyle, cardTopRows, markCardResult, panelExtraRows, panelHeaderRow, renderCard, setCardStyle,
+	CARD_STYLE, CARD_TONE, cardAwaitingResult, cardRunningLine, cardStyle, cardTopRows, headingFits, markCardResult, panelExtraRows, panelHeaderRow, renderCard, setCardStyle,
 	type Card, type CardStyle, type CardTone,
 } from "../lib/shell-card.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
@@ -536,4 +536,16 @@ test("rail cards drop the glyph and paint an info title rose and bold; other car
 	const suffix = renderCard({ title: "Todos", titleSuffix: "▾ Collapse", subtitle: "1 of 3", body: ["x"], tone: CARD_TONE.INFO, rail: true }, theme, 40, { expanded: true });
 	assert.match(stripAnsi(suffix[0]!), /^╭─ Todos ▾ Collapse · 1 of 3 ─+╮$/);
 	assert.equal(visibleWidth(suffix[0]!), 40);
+});
+
+test("headingFits says whether a composed subtitle still leaves room for the key hint", () => {
+	const card: Card = { title: "Agent status", subtitle: "explore", body: [], tone: CARD_TONE.INFO, glyph: "◎" };
+	const hint = "expand";
+	// cardTop needs title + glyph, the separator and subtitle, the frame columns and the hinted tail.
+	const needed = visibleWidth("◎ Agent status") + 3 + visibleWidth("explore") + 5 + visibleWidth(hint) + 2;
+	assert.equal(headingFits(card, hint, needed), true, "exactly enough columns still shows the hint");
+	assert.equal(headingFits(card, hint, needed - 1), false, "one column short is a no");
+	assert.equal(headingFits(card, undefined, needed - (visibleWidth(hint) + 2)), true, "without a hint exactly the head columns are enough");
+	assert.equal(headingFits(card, undefined, needed - (visibleWidth(hint) + 3)), false, "and one column less is still a no");
+	assert.equal(headingFits({ ...card, subtitle: undefined }, hint, needed - 9), true, "no subtitle frees its separator and columns");
 });
