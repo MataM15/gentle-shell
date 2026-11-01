@@ -29,7 +29,7 @@ export const VOICE_SESSION_DEFAULTS = {
 	numThreads: 2,
 } as const;
 
-const MAX_LINE = 64 * 1024;
+export const MAX_LINE = 64 * 1024;
 const MAX_LINES = 16;
 const MAX_TEXT = 16 * 1024;
 const RECORDING_MARGIN_MS = 10_000;
@@ -138,12 +138,12 @@ export interface VoiceSessionOptions {
 	nodeVersion?: string;
 }
 
-type WorkerMessage = { type: "recording" } | { type: "transcribing" } | { type: "result"; text: string; truncated: boolean } | { type: "error"; code: WorkerErrorCode };
+export type WorkerMessage = { type: "recording" } | { type: "transcribing" } | { type: "result"; text: string; truncated: boolean } | { type: "error"; code: WorkerErrorCode };
 
 const hasExactKeys = (value: Record<string, unknown>, keys: string[]) => Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
 
 // Accepts only the four known messages with exactly their fields.
-function parseWorkerLine(line: string): WorkerMessage | undefined {
+export function parseWorkerLine(line: string): WorkerMessage | undefined {
 	let value: unknown;
 	try {
 		value = JSON.parse(line);
@@ -173,7 +173,7 @@ function parseWorkerLine(line: string): WorkerMessage | undefined {
 // overrides and PATH are dropped.
 const CHILD_ENV_KEYS = ["HOME", "USERPROFILE", "SystemRoot", "SYSTEMROOT", "windir", "TEMP", "TMP", "TMPDIR", "XDG_RUNTIME_DIR", "PULSE_SERVER", "PULSE_COOKIE", "LANG", "LC_ALL", "LC_CTYPE"];
 
-function childEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+export function childEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 	const env: NodeJS.ProcessEnv = {};
 	for (const key of CHILD_ENV_KEYS) if (source[key] !== undefined) env[key] = source[key];
 	env.NODE_NO_WARNINGS = "1";
@@ -181,7 +181,7 @@ function childEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 	return env;
 }
 
-function defaultSpawn(executable: string, args: string[], options: VoiceWorkerSpawnOptions): VoiceWorkerChild {
+export function defaultSpawn(executable: string, args: string[], options: VoiceWorkerSpawnOptions): VoiceWorkerChild {
 	// SAFETY: ChildProcess provides stdin/stdout/stderr/kill/once compatible with the narrower VoiceWorkerChild; the cast only bridges that narrowing.
 	return spawn(executable, args, { ...options, stdio: ["pipe", "pipe", "pipe"] }) as unknown as VoiceWorkerChild;
 }
@@ -299,39 +299,8 @@ export class VoiceSession {
 		return this.outcome && "error" in this.outcome ? this.outcome.error : fail("worker-exited");
 	}
 
-	private async prepare(): Promise<{ root: string; request: Record<string, unknown> }> {
-		const { target } = this.options;
-		if (!VOICE_TARGETS.includes(target)) throw fail("unsupported");
-		if (Number((this.options.nodeVersion ?? process.versions.node).split(".")[0]) < 22) throw fail("node-version");
-		const model = this.options.manifests?.model ?? PARAKEET_MODEL_MANIFEST;
-		const runtime = this.options.manifests?.runtime ?? voiceRuntimeManifest(target);
-		if (runtime.target !== target) throw fail("unsupported");
-		const voiceHome = this.options.voiceHome ?? resolveVoiceHome(this.options.env);
-		const statuses = await Promise.all([
-			readVoiceComponentStatus({ voiceHome, kind: "runtime", manifest: runtime }),
-			readVoiceComponentStatus({ voiceHome, kind: "model", manifest: model }),
-		]);
-		if (statuses.some((status) => status.state !== "installed")) throw fail("not-installed");
-		const pick = (prefix: string) => {
-			const file = model.files.find((candidate) => candidate.name.startsWith(prefix));
-			if (!file) throw fail("model-invalid");
-			return { name: file.name, size: file.size, sha256: file.sha256 };
-		};
-		const root = voiceComponentPath(voiceHome, "runtime", runtime);
-		const request = {
-			schema: VOICE_WORKER_SCHEMA,
-			type: "start",
-			target,
-			maxRecordingMs: this.options.maxRecordingMs ?? VOICE_SESSION_DEFAULTS.maxRecordingMs,
-			numThreads: VOICE_SESSION_DEFAULTS.numThreads,
-			...(this.options.endpoint ? { endpoint: { endOfSpeechMs: this.options.endpoint.endOfSpeechMs, noSpeechMs: this.options.endpoint.noSpeechMs } } : {}),
-			runtime: { root, files: runtime.packages.flatMap((pkg) => pkg.requiredFiles.map((file) => `node_modules/${pkg.name}/${file}`)) },
-			model: {
-				root: voiceComponentPath(voiceHome, "model", model),
-				files: { encoder: pick("encoder."), decoder: pick("decoder."), joiner: pick("joiner."), tokens: pick("tokens.") },
-			},
-		};
-		return { root, request };
+	private prepare(): Promise<{ root: string; request: Record<string, unknown> }> {
+		return prepareVoiceWorkerLaunch(this.options);
 	}
 
 	private launch(root: string, request: Record<string, unknown>): void {
@@ -462,6 +431,43 @@ export class VoiceSession {
 			// A worker that cannot be written to is gone; close settles the session.
 		}
 	}
+}
+
+// Checks the install and builds the worker launch: its directory and start
+// request. Shared by single-use sessions and the warm worker.
+export async function prepareVoiceWorkerLaunch(options: VoiceSessionOptions): Promise<{ root: string; request: Record<string, unknown> }> {
+	const { target } = options;
+	if (!VOICE_TARGETS.includes(target)) throw fail("unsupported");
+	if (Number((options.nodeVersion ?? process.versions.node).split(".")[0]) < 22) throw fail("node-version");
+	const model = options.manifests?.model ?? PARAKEET_MODEL_MANIFEST;
+	const runtime = options.manifests?.runtime ?? voiceRuntimeManifest(target);
+	if (runtime.target !== target) throw fail("unsupported");
+	const voiceHome = options.voiceHome ?? resolveVoiceHome(options.env);
+	const statuses = await Promise.all([
+		readVoiceComponentStatus({ voiceHome, kind: "runtime", manifest: runtime }),
+		readVoiceComponentStatus({ voiceHome, kind: "model", manifest: model }),
+	]);
+	if (statuses.some((status) => status.state !== "installed")) throw fail("not-installed");
+	const pick = (prefix: string) => {
+		const file = model.files.find((candidate) => candidate.name.startsWith(prefix));
+		if (!file) throw fail("model-invalid");
+		return { name: file.name, size: file.size, sha256: file.sha256 };
+	};
+	const root = voiceComponentPath(voiceHome, "runtime", runtime);
+	const request = {
+		schema: VOICE_WORKER_SCHEMA,
+		type: "start",
+		target,
+		maxRecordingMs: options.maxRecordingMs ?? VOICE_SESSION_DEFAULTS.maxRecordingMs,
+		numThreads: VOICE_SESSION_DEFAULTS.numThreads,
+		...(options.endpoint ? { endpoint: { endOfSpeechMs: options.endpoint.endOfSpeechMs, noSpeechMs: options.endpoint.noSpeechMs } } : {}),
+		runtime: { root, files: runtime.packages.flatMap((pkg) => pkg.requiredFiles.map((file) => `node_modules/${pkg.name}/${file}`)) },
+		model: {
+			root: voiceComponentPath(voiceHome, "model", model),
+			files: { encoder: pick("encoder."), decoder: pick("decoder."), joiner: pick("joiner."), tokens: pick("tokens.") },
+		},
+	};
+	return { root, request };
 }
 
 export function createVoiceSession(options: VoiceSessionOptions): VoiceSession {

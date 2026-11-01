@@ -77,7 +77,11 @@ const START_KEYS = ["schema", "type", "target", "maxRecordingMs", "numThreads", 
 
 function parseStart(message) {
 	const withEndpoint = isRecord(message) && Object.hasOwn(message, "endpoint");
-	if (!hasExactKeys(message, withEndpoint ? [...START_KEYS, "endpoint"] : START_KEYS)) fail("invalid-request");
+	const withKeepAlive = isRecord(message) && Object.hasOwn(message, "keepAlive");
+	const keys = [...START_KEYS, ...(withEndpoint ? ["endpoint"] : []), ...(withKeepAlive ? ["keepAlive"] : [])];
+	if (!hasExactKeys(message, keys)) fail("invalid-request");
+	// A warm worker stays alive after each result for the next recording.
+	if (withKeepAlive && message.keepAlive !== true) fail("invalid-request");
 	if (withEndpoint) {
 		const { endpoint } = message;
 		if (!hasExactKeys(endpoint, ["endOfSpeechMs", "noSpeechMs"])) fail("invalid-request");
@@ -239,6 +243,11 @@ class Endpointer {
 		this.quiet = 0;
 	}
 
+	// True once enough speech was heard to count as someone talking.
+	get heardSpeech() {
+		return this.speech >= this.minSpeech;
+	}
+
 	// Returns true once the recording should end.
 	push(level, frames) {
 		if (frames <= 0) return false;
@@ -290,6 +299,10 @@ class WorkerSession {
 		this.request = undefined;
 		// Settles once every model digest matched; rejects with model-invalid.
 		this.modelVerified = undefined;
+		// A warm worker keeps the verified model and its loaded recognizer for
+		// later recordings with the same runtime and model.
+		this.verifiedKey = undefined;
+		this.recognizer = undefined;
 		this.verification = new AbortController();
 		this.truncated = false;
 	}
@@ -315,7 +328,11 @@ class WorkerSession {
 	}
 
 	async handle(message) {
-		if (this.state === "waiting") return this.begin(parseStart(message));
+		if (this.state === "waiting") {
+			// Only an idle worker may be closed; it leaves without a message.
+			if (hasExactKeys(message, ["schema", "type"]) && message.schema === SCHEMA && message.type === "close") return this.end(undefined);
+			return this.begin(parseStart(message));
+		}
 		if (!hasExactKeys(message, ["schema", "type"]) || message.schema !== SCHEMA) fail("invalid-request");
 		if (message.type === "cancel") return this.end(undefined);
 		if (message.type === "stop") {
@@ -352,6 +369,10 @@ class WorkerSession {
 	// Starts in the same step that enters recording, so no stop can see a
 	// session without a pending verification.
 	verifyModel() {
+		const key = JSON.stringify([this.request.runtime, this.request.model]);
+		if (this.request.keepAlive && this.verifiedKey === key && this.modelVerified) return;
+		this.verifiedKey = this.request.keepAlive ? key : undefined;
+		this.recognizer = undefined;
 		this.modelVerified = validateModel(this.request.model, this.io.uid, this.io.openRead ?? createReadStream, this.verification.signal);
 		// While recording, a failed verification ends the session at once: the
 		// audio could never be transcribed. Later, transcribe() reports it.
@@ -446,10 +467,14 @@ class WorkerSession {
 		await this.modelVerified;
 		if (this.state !== "transcribing") return;
 		const { sampleRate } = this.recorder.config;
+		// Hands-free: with no speech heard the model is not asked at all, because
+		// it can turn noise into a word such as "Yeah." that would be sent.
+		if (this.endpointer && !this.endpointer.heardSpeech) return this.finishResult("");
 		const captured = this.recorder.samples();
 		if (captured.length < sampleRate * MIN_SECONDS) fail("empty-audio");
 		const samples = resample(captured, sampleRate);
-		const recognizer = this.loadRecognizer();
+		const recognizer = this.recognizer ?? this.loadRecognizer();
+		if (this.request.keepAlive) this.recognizer = recognizer;
 		let text;
 		try {
 			const stream = recognizer.createStream();
@@ -460,7 +485,18 @@ class WorkerSession {
 			fail("decode");
 		}
 		if (typeof text !== "string") fail("decode");
-		await this.end({ type: "result", text: text.trim().slice(0, MAX_TEXT), truncated: this.truncated });
+		return this.finishResult(text);
+	}
+
+	async finishResult(text) {
+		const result = { type: "result", text: text.trim().slice(0, MAX_TEXT), truncated: this.truncated };
+		if (!this.request.keepAlive) return this.end(result);
+		// Warm: the microphone was already released; wait for the next start.
+		this.send(result);
+		this.state = "waiting";
+		this.recorder = undefined;
+		this.endpointer = undefined;
+		this.truncated = false;
 	}
 
 	fail(error) {

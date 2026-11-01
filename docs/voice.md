@@ -215,6 +215,23 @@ The thresholds are tested with synthetic audio only. A loud room or a quiet
 microphone may need the shortcut to send; tuning them on real microphones is
 still open.
 
+### Faster transcription
+
+A dictation worker started for one recording verifies the 670 MB model digests
+and loads the recognizer every time: on the owner's machine about 3 seconds
+for the digests and 3.3 seconds for the load, before a 0.4-second decode of 3
+seconds of audio. Hands-free recordings therefore share one worker that stays
+alive between recordings (`keepAlive: true` in its start request):
+
+| Topic | Behavior |
+|-------|----------|
+| First recording | Verifies and loads the model as before: about 4.6 seconds from the end of speech to the transcript, measured. |
+| Next recordings | Reuse the verified model and the loaded recognizer, with 4 decoding threads: 0.3 to 0.6 seconds, measured. The install is still checked before each one. |
+| Microphone | Opened only while recording and released after each one; the worker keeps only the model. |
+| Memory | The loaded model, about 1 GB, stays in that one worker process, on the CPU only. |
+| Release | The worker closes after 10 idle minutes, when voice is turned off in the session and when the Pi session ends. A cancel or any error ends it, and the next recording starts a fresh one. Dictation that pastes keeps its single-use worker. |
+| Noise | With no speech heard by the end-of-speech detector, the recognizer is not asked at all and the transcript is blank, because Parakeet can turn noise into a word such as "Yeah." that would otherwise be sent. |
+
 ## Natural voice with Kokoro
 
 The Windows voice works with no download but sounds robotic. Once the voice

@@ -9,6 +9,7 @@ import { createVoiceSession, VoiceSessionError, type VoiceEndpoint, type VoiceSe
 import { installKokoro, KOKORO_MANIFESTS, KOKORO_NOTICES, kokoroBytes, readKokoroStatus, type KokoroStatus } from "./voice-kokoro.ts";
 import { createReplyReader, defaultSpeechEngineResolver, lastAssistantText } from "./voice-reply-speech.ts";
 import { acquireReadingTurn, paneFocused as herdrPaneFocused } from "./voice-presence.ts";
+import { createWarmVoiceWorker, type WarmVoiceWorker } from "./voice-warm.ts";
 import { readVoicePushToTalk, readVoiceSessions, writeVoicePushToTalk, writeVoiceSessions } from "./voice-settings.ts";
 import { SpeechEngineError, type SpeechEngine } from "./voice-speech.ts";
 import { createVoiceStatePublisher, voiceDisplayState, type VoiceDisplayState, type VoiceStatePublisher } from "./voice-status-event.ts";
@@ -88,6 +89,8 @@ export interface VoiceCommandDeps {
 	voiceSessions?: { read(): string[]; write(sessions: string[]): void };
 	paneFocused?: () => Promise<boolean>;
 	readingTurn?: (signal: AbortSignal) => Promise<(() => void) | undefined>;
+	// Releases the dictation worker kept alive for hands-free recordings.
+	releaseWarm?: () => Promise<void>;
 	// The natural voice (Kokoro): its install status and its consented download.
 	kokoro?: { readStatus(): Promise<KokoroStatus>; install(options: VoiceInstallRequest): Promise<void> };
 }
@@ -337,7 +340,23 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	// fetch override is ever passed from here.
 	const installRuntime = deps.installRuntime ?? (({ target, signal, onProgress }) => installVoiceRuntime({ env, target, signal, onProgress }));
 	const installModel = deps.installModel ?? (({ signal, onProgress }) => installVoiceModel({ env, signal, onProgress }));
-	const createSession = deps.createSession ?? (({ target, onStateChange, endpoint }) => createVoiceSession({ env, target, onStateChange, endpoint }));
+	// Hands-free recordings (they carry an endpoint) reuse one kept-alive worker,
+	// so the model is verified and loaded once; dictation that pastes keeps its
+	// single-use worker.
+	let warm: { target: VoiceTarget; worker: WarmVoiceWorker } | undefined;
+	const warmFor = (target: VoiceTarget): WarmVoiceWorker => {
+		if (warm?.target !== target) {
+			void warm?.worker.close();
+			warm = { target, worker: createWarmVoiceWorker({ target, env }) };
+		}
+		return warm.worker;
+	};
+	const createSession = deps.createSession ?? (({ target, onStateChange, endpoint }) => (endpoint ? warmFor(target).session({ onStateChange, endpoint }) : createVoiceSession({ env, target, onStateChange, endpoint })));
+	const releaseWarm = deps.releaseWarm ?? (async () => {
+		const current = warm;
+		warm = undefined;
+		await current?.worker.close();
+	});
 	const settings = deps.settings ?? { read: () => readVoicePushToTalk({ env }), write: (enabled: boolean) => { writeVoicePushToTalk(enabled, { env }); } };
 	// The toggle shortcut is fixed for the session: Pi binds shortcuts once.
 	const toggleShortcut = voiceToggleKey(env);
@@ -531,6 +550,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		if (!enabled) {
 			stopReading();
 			spokenTurnPending = false;
+			void releaseWarm().catch(() => {});
 			say("Voice is off in this session.", "info");
 			return;
 		}
@@ -1072,6 +1092,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	// id, and its publisher closes. The next session starts from a clean display.
 	const endSession = (ctx: ExtensionContext | undefined): void => {
 		stopReading();
+		void releaseWarm().catch(() => {});
 		pendingReply = undefined;
 		unavailableReported = false;
 		spokenTurnPending = false;

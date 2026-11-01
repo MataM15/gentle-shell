@@ -200,6 +200,7 @@ interface Harness {
 	voice: { sessions: string[]; writes: string[][] };
 	focus: { focused: boolean; asks: number };
 	turn: { held: boolean; waiting: Array<() => void>; acquired: number; released: number };
+	warmReleases: number;
 	kokoro: { state: "installed" | "missing"; installs: Array<{ signal: AbortSignal }> };
 	clock: ReturnType<typeof manualClock>;
 }
@@ -215,6 +216,7 @@ function harness(overrides: { platform?: string; arch?: string; installed?: bool
 	const voice: Harness["voice"] = { sessions: overrides.voice ? ["session-alpha"] : [], writes: [] };
 	const focus: Harness["focus"] = { focused: overrides.focused ?? true, asks: 0 };
 	const turn: Harness["turn"] = { held: overrides.turnHeld ?? false, waiting: [], acquired: 0, released: 0 };
+	const harnessRef = { warmReleases: 0 };
 	const kokoro: Harness["kokoro"] = { state: overrides.kokoro ?? "missing", installs: [] };
 	const clock = manualClock();
 	const state = overrides.installed ? "installed" : "missing";
@@ -254,6 +256,7 @@ function harness(overrides: { platform?: string; arch?: string; installed?: bool
 			write: (next) => { voice.writes.push([...next]); voice.sessions = [...next]; },
 		},
 		paneFocused: async () => { focus.asks++; return focus.focused; },
+		releaseWarm: async () => { harnessRef.warmReleases++; },
 		// The shared reading turn, faked: free unless a test holds it.
 		readingTurn: (signal) => new Promise((resolve) => {
 			const take = () => { turn.acquired++; resolve(() => { turn.released++; }); };
@@ -263,7 +266,7 @@ function harness(overrides: { platform?: string; arch?: string; installed?: bool
 			signal.addEventListener("abort", () => resolve(undefined), { once: true });
 		}),
 	};
-	return { deps, calls, sessions, endpoints, installs, settings, voice, focus, turn, kokoro, clock };
+	return Object.assign(harnessRef, { deps, calls, sessions, endpoints, installs, settings, voice, focus, turn, kokoro, clock });
 }
 
 const pick = (pattern: RegExp) => (_title: string, options: string[]) => options.find((option) => pattern.test(option));
@@ -1948,4 +1951,17 @@ test("the default reading turn takes and releases the shared turn file in the vo
 	} finally {
 		rmSync(home, { recursive: true, force: true });
 	}
+});
+
+test("the kept-alive dictation worker is released when voice is turned off and when the session ends", async () => {
+	const { engine } = fakeEngine();
+	const h = harness({ engine, installed: true, voice: true });
+	const pi = register(h);
+	const ui = fakeContext({ select: pick(/^Voice in this session \(on\): turn off$/) });
+	await pi.fire("session_start", ui.ctx);
+	const atStart = h.warmReleases;
+	await run(pi, ui);
+	assert.equal(h.warmReleases, atStart + 1, "turning voice off releases it");
+	await pi.fire("session_shutdown", ui.ctx);
+	assert.equal(h.warmReleases, atStart + 2, "ending the session releases it");
 });

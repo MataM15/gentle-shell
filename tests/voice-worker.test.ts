@@ -512,6 +512,21 @@ test("with an endpoint, a steady noise floor is not speech and ends as no speech
 	stream!.options.onData(chunk(100, 0.02));
 	await worker.done;
 	assert.deepEqual(worker.types(), ["recording", "transcribing", "result"]);
+	// The model can hallucinate a word from noise ("Yeah."): with no speech
+	// heard, nothing is decoded and the transcript is blank.
+	assert.equal(worker.messages.at(-1)!.text, "");
+	assert.deepEqual(worker.recognizers, [], "the recognizer is never loaded for noise");
+});
+
+test("with an endpoint, a recording stopped by the shortcut before any speech is blank too", async (t) => {
+	const worker = harness(t, mono8k);
+	worker.send(startRequest(worker.paths, { endpoint: ENDPOINT }));
+	await worker.waitFor(() => worker.types().includes("recording"));
+	for (let i = 0; i < 5; i++) worker.streams[0]!.options.onData(chunk(100, 0.002));
+	worker.send({ schema: SCHEMA, type: "stop" });
+	await worker.done;
+	assert.equal(worker.messages.at(-1)!.text, "");
+	assert.deepEqual(worker.recognizers, []);
 });
 
 test("without an endpoint, silence never ends the recording", async (t) => {
@@ -550,4 +565,69 @@ test("with an endpoint, quiet speech over a low-gain microphone floor still coun
 	await worker.done;
 	assert.deepEqual(worker.types(), ["recording", "transcribing", "result"]);
 	assert.equal(worker.recognizers[0]!.waves[0]!.samples.length, 2 * 8000 * 1.3, "it ended at the end of speech, not at the no-speech limit");
+});
+
+// --- warm worker (S11) ----------------------------------------------------------------
+
+test("a warm worker answers several recordings, verifying and loading the model only once", async (t) => {
+	const reads = gatedReads();
+	reads.release();
+	const worker = harness(t, mono8k, { openRead: reads.openRead });
+	const record = async (index: number) => {
+		await worker.waitFor(() => worker.streams.length === index + 1, `stream ${index}`);
+		await worker.waitFor(() => worker.types().filter((type) => type === "recording").length === index + 1, `recording ${index}`);
+		worker.streams[index]!.options.onData(chunk(500, 0.3));
+		worker.send({ schema: SCHEMA, type: "stop" });
+		await worker.waitFor(() => worker.types().filter((type) => type === "result").length === index + 1, `result ${index}`);
+	};
+	worker.send(startRequest(worker.paths, { keepAlive: true }));
+	await record(0);
+	assert.equal(worker.exitCode(), undefined, "the worker stays alive after a result");
+	assert.equal(worker.streams[0]!.closes, 1, "the microphone is released between recordings");
+	const firstReads = reads.opened.length;
+	worker.send(startRequest(worker.paths, { keepAlive: true }));
+	await record(1);
+	assert.equal(reads.opened.length, firstReads, "the model digests are not checked again");
+	assert.equal(worker.recognizers.length, 1, "the recognizer is loaded once");
+	assert.equal(worker.recognizers[0]!.decodes, 2);
+	assert.equal(worker.loaded.filter(isSherpa).length, 1, "sherpa-onnx is loaded once");
+	worker.send({ schema: SCHEMA, type: "close" });
+	await worker.done;
+	assert.equal(worker.exitCode(), 0);
+	assert.deepEqual(worker.types(), ["recording", "transcribing", "result", "recording", "transcribing", "result"]);
+});
+
+test("a warm worker refuses close while recording", async (t) => {
+	const reads = gatedReads();
+	reads.release();
+	const worker = harness(t, mono8k, { openRead: reads.openRead });
+	worker.send(startRequest(worker.paths, { keepAlive: true }));
+	await worker.waitFor(() => worker.types().includes("recording"));
+	worker.send({ schema: SCHEMA, type: "close" });
+	await worker.done;
+	assert.deepEqual(worker.messages.at(-1), { schema: SCHEMA, type: "error", code: "invalid-request" });
+});
+
+test("without keepAlive a worker still exits after its result, and close before any start ends it quietly", async (t) => {
+	const worker = harness(t, mono8k);
+	worker.send(startRequest(worker.paths));
+	await worker.waitFor(() => worker.types().includes("recording"));
+	worker.streams[0]!.options.onData(chunk(500, 0.3));
+	worker.send({ schema: SCHEMA, type: "stop" });
+	await worker.done;
+	assert.equal(worker.exitCode(), 0);
+	const idle = harness(t, mono8k);
+	idle.send({ schema: SCHEMA, type: "close" });
+	await idle.done;
+	assert.deepEqual(idle.messages, []);
+	assert.equal(idle.exitCode(), 0);
+});
+
+test("keepAlive must be exactly true when present", async (t) => {
+	for (const keepAlive of [false, "true", 1]) {
+		const worker = harness(t, mono8k);
+		worker.send(startRequest(worker.paths, { keepAlive }));
+		await worker.done;
+		assert.deepEqual(worker.messages, [{ schema: SCHEMA, type: "error", code: "invalid-request" }], String(keepAlive));
+	}
 });

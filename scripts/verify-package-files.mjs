@@ -62,6 +62,7 @@ export const requiredPaths = [
   "lib/voice-session.ts",
   "lib/voice-speech.ts",
   "lib/voice-ui.ts",
+  "lib/voice-warm.ts",
   // The dictation worker is spawned by path, never imported, so nothing else
   // would notice it missing from the packed tarball.
   "scripts/voice-worker.cjs",
