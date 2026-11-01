@@ -6,7 +6,7 @@ import { installVoiceModel, installVoiceRuntime, readVoiceStatus, resolveVoiceHo
 import { diagnoseVoicePlatform, readVoicePlatformProbe, type VoicePlatformDiagnosis, type VoicePlatformProbe } from "./voice-platform.ts";
 import { SpaceHoldDetector, type PushToTalkOptions } from "./voice-push-to-talk.ts";
 import { createVoiceSession, VoiceSessionError, type VoiceEndpoint, type VoiceSessionErrorCode, type VoiceSessionState, type VoiceTranscript } from "./voice-session.ts";
-import { installKokoro, KOKORO_MANIFESTS, KOKORO_NOTICES, kokoroBytes, readKokoroStatus, type KokoroStatus } from "./voice-kokoro.ts";
+import { installKokoro, installMiro, KOKORO_MANIFESTS, KOKORO_NOTICES, kokoroBytes, MIRO_MANIFEST, MIRO_NOTICE, miroBytes, readKokoroStatus, readMiroStatus, type KokoroStatus } from "./voice-kokoro.ts";
 import { createReplyReader, defaultSpeechEngineResolver, lastAssistantText } from "./voice-reply-speech.ts";
 import { acquireReadingTurn, paneFocused as herdrPaneFocused } from "./voice-presence.ts";
 import { createWarmVoiceWorker, type WarmVoiceWorker } from "./voice-warm.ts";
@@ -93,6 +93,8 @@ export interface VoiceCommandDeps {
 	releaseWarm?: () => Promise<void>;
 	// The natural voice (Kokoro): its install status and its consented download.
 	kokoro?: { readStatus(): Promise<KokoroStatus>; install(options: VoiceInstallRequest): Promise<void> };
+	// The Miro voice (Piper), chosen by the owner for Spanish replies.
+	miro?: { readStatus(): Promise<{ state: string; voiceHome: string }>; install(options: VoiceInstallRequest): Promise<void> };
 }
 
 const MB = 1_000_000;
@@ -457,6 +459,10 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	// the microphone, and no other reply does.
 	let spokenTurnPending = false;
 	const replyReader = createReplyReader({ engine: speechEngine });
+	const miro = deps.miro ?? {
+		readStatus: () => readMiroStatus({ env }),
+		install: ({ signal, onProgress }: VoiceInstallRequest) => installMiro({ env, signal, onProgress }),
+	};
 	const kokoro = deps.kokoro ?? {
 		readStatus: () => readKokoroStatus({ env }),
 		install: ({ signal, onProgress }: VoiceInstallRequest) => installKokoro({ env, signal, onProgress }),
@@ -614,6 +620,10 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		if (!live()) return;
 		const naturalDownload = `Download natural voice (Kokoro, about ${megabytes(kokoroBytes())})`;
 		const natural = kokoroStatus && kokoroStatus.state !== "installed" ? [naturalDownload] : [];
+		const miroStatus = runtimeMissing ? undefined : await miro.readStatus().catch(() => undefined);
+		if (!live()) return;
+		const miroDownload = `Download Miro voice (Piper, about ${megabytes(miroBytes())})`;
+		if (miroStatus && miroStatus.state !== "installed") natural.unshift(miroDownload);
 		const speech = [voiceOn(ctx) ? VOICE_OFF : VOICE_ON, ...(reading ? [STOP_READING] : [])];
 		const choice = await ctx.ui.select(ready ? "Voice dictation · ready" : "Voice dictation · not installed", ready ? [START, ...toggle, ...speech, ...natural, STATUS] : [download, ...toggle, ...speech, ...natural, STATUS]);
 		if (!live() || !choice) return;
@@ -621,9 +631,41 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		else if (choice === VOICE_ON || choice === VOICE_OFF) setVoice(ctx, choice === VOICE_ON, say);
 		else if (choice === STOP_READING) stopReading();
 		else if (choice === naturalDownload) await installNatural(ctx, run, status.voiceHome, say);
+		else if (choice === miroDownload) await installMiroVoice(ctx, run, status.voiceHome, say);
 		else if (choice === DISABLE_PUSH_TO_TALK || choice === ENABLE_PUSH_TO_TALK) setPushToTalk(ctx, choice === ENABLE_PUSH_TO_TALK, say);
 		else if (choice === download) await install(ctx, run, { target, diagnosis, status, platform: platform.platform, runtimeMissing, modelMissing }, say);
 		else if (choice === START) await dictate(ctx, run, target, platform.platform, say);
+	};
+
+	const installMiroVoice = async (ctx: ExtensionCommandContext, run: Run, voiceHome: string, say: Say): Promise<void> => {
+		const message = [
+			`Downloads into ${voiceHome}:`,
+			`- Piper voice Miro, Spanish from Spain (${MIRO_MANIFEST.files.map((file) => file.name).join(", ")}), and the Spanish and English phoneme data when missing: about ${megabytes(miroBytes())}`,
+			"Every file is checked against its pinned size and digest. Nothing downloaded is loaded or run during the download.",
+			"License:",
+			`- ${MIRO_NOTICE.attribution} Source: ${MIRO_NOTICE.source}`,
+			"- The phoneme data is espeak-ng-data, licensed under GPL-3.0-or-later.",
+		].join("\n");
+		if (!(await ctx.ui.confirm("Download the Miro voice?", message))) {
+			say("Miro voice download skipped; nothing was downloaded.", "info");
+			return;
+		}
+		if (run.generation !== generation) return;
+		const controller = new AbortController();
+		run.abort = () => controller.abort();
+		const overlay = openOverlay(ctx, (theme, requestRender) => new VoiceProgressView({ theme, requestRender, onCancel: () => controller.abort() }));
+		let failure: unknown;
+		try {
+			await miro.install({ signal: controller.signal, onProgress: (progress) => overlay.view()?.update(progress) });
+		} catch (error) {
+			failure = error;
+		} finally {
+			run.abort = () => {};
+			await overlay.close();
+		}
+		if (controller.signal.aborted) say("Miro voice download was cancelled. Unfinished files were removed; completed parts are kept.", "info");
+		else if (failure !== undefined) say(failure instanceof VoiceInstallError ? INSTALL_MESSAGES[failure.code] : "Miro voice download failed.", "error");
+		else say("The Miro voice is installed. Spanish replies now use it.", "info");
 	};
 
 	const installNatural = async (ctx: ExtensionCommandContext, run: Run, voiceHome: string, say: Say): Promise<void> => {

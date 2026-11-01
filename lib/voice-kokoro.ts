@@ -160,3 +160,87 @@ export async function resolveKokoroLaunch(options: {
 		espeak: (["espeak", "espeakRomance", "espeakGermanic"] as const).map((part) => ({ root: status.roots![part], folder: KOKORO_ESPEAK_LAYOUT[part] as KokoroLaunch["espeak"][number]["folder"], files: files(part) })),
 	};
 }
+
+// --- the Miro voice (Piper) ------------------------------------------------------------
+
+// Miro, a Spanish (Spain) Piper VITS voice chosen by the owner, at a fixed Hugging
+// Face commit. Sizes and digests were checked against the sherpa-onnx release
+// tarball vits-piper-es_ES-miro-high.tar.bz2, whose files are identical. It
+// reuses the Spanish and English phoneme data Kokoro installs, so installing it
+// fetches those small parts too when they are missing.
+const MIRO_REPO = "csukuangfj/vits-piper-es_ES-miro-high";
+const MIRO_REVISION = "0e1f773561429a9e50fa23d868a40eb341ad83c4";
+
+export const MIRO_MANIFEST: VoiceModelManifest = {
+	// Install ids are lowercase by the installer's path guard.
+	id: `vits-piper-es-es-miro-high-${MIRO_REVISION.slice(0, 12)}`,
+	revision: MIRO_REVISION,
+	baseUrl: `https://huggingface.co/${MIRO_REPO}/resolve/${MIRO_REVISION}`,
+	files: [
+		{ name: "es_ES-miro-high.onnx", size: 63153775, sha256: "e18073d75c92a5441e0d2770b241f877e984b123e3186ab70a5346c0df999fc5" },
+		{ name: "tokens.txt", size: 954, sha256: "620e1aecf1a68fea3ba5850d137b0138fa2037c9b372dad13b95a2a215d0849a" },
+		// The license text travels with the model.
+		{ name: "README.md", size: 856, sha256: "d759b76d463c7fd92bb382e2575bafe9d8d82c5adeef6a7d7ba0b048a21cc57e" },
+	],
+	redirects: [
+		{ origin: "https://huggingface.co", pathPrefix: `/api/resolve-cache/models/${MIRO_REPO}/${MIRO_REVISION}/` },
+		{ origin: "https://us.aws.cdn.hf.co", pathPrefix: "/xet-bridge-us/" },
+	],
+};
+
+export const MIRO_NOTICE: VoiceNotice = {
+	component: "es_ES-miro-high (Piper)",
+	license: "CC-BY-NC-SA-4.0",
+	source: `https://huggingface.co/${MIRO_REPO}`,
+	attribution: "Piper voice es_ES miro (high), licensed under CC BY-NC-SA 4.0: non-commercial use only.",
+};
+
+const ESPEAK_PARTS = ["espeak", "espeakRomance", "espeakGermanic"] as const;
+
+export const miroBytes = (manifests: Record<KokoroPart, VoiceModelManifest> = KOKORO_MANIFESTS, miro: VoiceModelManifest = MIRO_MANIFEST): number =>
+	[miro, ...ESPEAK_PARTS.map((part) => manifests[part])].reduce((sum, manifest) => sum + manifest.files.reduce((total, file) => total + file.size, 0), 0);
+
+interface MiroOptions {
+	voiceHome?: string;
+	env?: NodeJS.ProcessEnv;
+	// Tests only: other manifests.
+	miro?: VoiceModelManifest;
+	manifests?: Record<KokoroPart, VoiceModelManifest>;
+}
+
+export async function readMiroStatus(options: MiroOptions = {}): Promise<{ state: KokoroState; voiceHome: string }> {
+	const voiceHome = options.voiceHome ?? resolveVoiceHome(options.env);
+	const manifests = options.manifests ?? KOKORO_MANIFESTS;
+	const all = [options.miro ?? MIRO_MANIFEST, ...ESPEAK_PARTS.map((part) => manifests[part])];
+	const states = await Promise.all(all.map((manifest) => readVoiceComponentStatus({ voiceHome, kind: "model", manifest }).then((status) => status.state)));
+	if (states.every((state) => state === "installed")) return { state: "installed", voiceHome };
+	if (states.some((state) => state === "invalid")) return { state: "invalid", voiceHome };
+	return { state: states.some((state) => state === "installed") ? "partial" : "missing", voiceHome };
+}
+
+// Installs the shared phoneme data, then Miro, through the pinned-model installer.
+export async function installMiro(options: MiroOptions & { signal?: AbortSignal; onProgress?: (progress: VoiceInstallProgress) => void; fetch?: VoiceFetch } = {}): Promise<void> {
+	const manifests = options.manifests ?? KOKORO_MANIFESTS;
+	for (const manifest of [...ESPEAK_PARTS.map((part) => manifests[part]), options.miro ?? MIRO_MANIFEST]) {
+		if (options.signal?.aborted) return;
+		await installVoiceModel({ voiceHome: options.voiceHome, env: options.env, signal: options.signal, onProgress: options.onProgress, manifest, fetch: options.fetch });
+	}
+}
+
+export async function resolveMiroLaunch(options: MiroOptions & { readRuntime?: (voiceHome: string) => Promise<VoiceComponentStatus> } = {}): Promise<KokoroLaunch | undefined> {
+	const voiceHome = options.voiceHome ?? resolveVoiceHome(options.env);
+	const manifests = options.manifests ?? KOKORO_MANIFESTS;
+	const miro = options.miro ?? MIRO_MANIFEST;
+	if ((await readMiroStatus({ ...options, voiceHome })).state !== "installed") return undefined;
+	const target = `${process.platform}-${process.arch}` as VoiceTarget;
+	const readRuntime = options.readRuntime ?? ((home: string) => (VOICE_TARGETS.includes(target) ? readVoiceComponentStatus({ voiceHome: home, kind: "runtime", manifest: voiceRuntimeManifest(target) }) : Promise.resolve(undefined as unknown as VoiceComponentStatus)));
+	const runtime = await readRuntime(voiceHome);
+	if (runtime?.state !== "installed") return undefined;
+	const sized = (manifest: VoiceModelManifest, keep: (name: string) => boolean = () => true) => manifest.files.filter((file) => keep(file.name)).map(({ name, size }) => ({ name, size }));
+	return {
+		kind: "piper",
+		runtimeRoot: runtime.path,
+		core: { root: voiceComponentPath(voiceHome, "model", miro), files: sized(miro, (name) => name !== "README.md") },
+		espeak: ESPEAK_PARTS.map((part) => ({ root: voiceComponentPath(voiceHome, "model", manifests[part]), folder: KOKORO_ESPEAK_LAYOUT[part] as KokoroLaunch["espeak"][number]["folder"], files: sized(manifests[part]) })),
+	};
+}

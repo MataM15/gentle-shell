@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { join } from "node:path";
 import test, { after } from "node:test";
 import type { VoiceModelManifest } from "../lib/voice-artifacts.ts";
-import { installKokoro, KOKORO_ESPEAK_LAYOUT, KOKORO_MANIFESTS, KOKORO_PARTS, KOKORO_VOICES, kokoroBytes, readKokoroStatus, resolveKokoroLaunch, type KokoroPart } from "../lib/voice-kokoro.ts";
+import { installKokoro, installMiro, KOKORO_ESPEAK_LAYOUT, KOKORO_MANIFESTS, KOKORO_PARTS, KOKORO_VOICES, kokoroBytes, MIRO_MANIFEST, miroBytes, readKokoroStatus, readMiroStatus, resolveKokoroLaunch, resolveMiroLaunch, type KokoroPart } from "../lib/voice-kokoro.ts";
 import { VoiceInstallError, type VoiceFetch } from "../lib/voice-install.ts";
 
 // The pinned Kokoro download (S6): what is fetched, from where, and how the
@@ -124,4 +124,59 @@ test("a launch is resolved only when Kokoro and the voice runtime are both insta
 			{ root: status.roots!.espeakGermanic, folder: "lang/gmw", files: manifests.espeakGermanic.files.map(({ name, size }) => ({ name, size })) },
 		],
 	});
+});
+
+// --- the Miro voice (Piper) ---------------------------------------------------------
+
+test("the Miro voice is pinned to one Hugging Face commit with flat names and the observed redirects", () => {
+	assert.equal(MIRO_MANIFEST.baseUrl, "https://huggingface.co/csukuangfj/vits-piper-es_ES-miro-high/resolve/0e1f773561429a9e50fa23d868a40eb341ad83c4");
+	assert.equal(MIRO_MANIFEST.id, "vits-piper-es-es-miro-high-0e1f77356142");
+	assert.deepEqual(MIRO_MANIFEST.files, [
+		{ name: "es_ES-miro-high.onnx", size: 63153775, sha256: "e18073d75c92a5441e0d2770b241f877e984b123e3186ab70a5346c0df999fc5" },
+		{ name: "tokens.txt", size: 954, sha256: "620e1aecf1a68fea3ba5850d137b0138fa2037c9b372dad13b95a2a215d0849a" },
+		{ name: "README.md", size: 856, sha256: "d759b76d463c7fd92bb382e2575bafe9d8d82c5adeef6a7d7ba0b048a21cc57e" },
+	]);
+	assert.deepEqual(MIRO_MANIFEST.redirects.map((rule) => rule.origin), ["https://huggingface.co", "https://us.aws.cdn.hf.co"]);
+	assert.equal(miroBytes(KOKORO_MANIFESTS), 63_155_585 + kokoroBytes(KOKORO_MANIFESTS) - KOKORO_MANIFESTS.core.files.reduce((sum, file) => sum + file.size, 0), "Miro plus the shared phoneme data");
+});
+
+function fakeMiro() {
+	const kokoro = fakeParts();
+	const data = Buffer.from("fake miro model");
+	const tokens = Buffer.from("fake miro tokens");
+	const readme = Buffer.from("license");
+	const digest = (buffer: Buffer) => createHash("sha256").update(buffer).digest("hex");
+	const miro: VoiceModelManifest = {
+		...MIRO_MANIFEST,
+		id: `test-${MIRO_MANIFEST.id}`,
+		files: [
+			{ name: "es_ES-miro-high.onnx", size: data.length, sha256: digest(data) },
+			{ name: "tokens.txt", size: tokens.length, sha256: digest(tokens) },
+			{ name: "README.md", size: readme.length, sha256: digest(readme) },
+		],
+	};
+	const bodies = new Map([[`${MIRO_MANIFEST.baseUrl}/es_ES-miro-high.onnx`, data], [`${MIRO_MANIFEST.baseUrl}/tokens.txt`, tokens], [`${MIRO_MANIFEST.baseUrl}/README.md`, readme]]);
+	const urls: string[] = [];
+	const fetch: VoiceFetch = async (url, init) => {
+		urls.push(url);
+		const body = bodies.get(url);
+		return body ? new Response(new Uint8Array(body), { status: 200, headers: { "content-length": String(body.length) } }) : kokoro.fetch(url, init);
+	};
+	return { miro, manifests: kokoro.manifests, fetch, urls };
+}
+
+test("installing Miro also installs the shared phoneme data, and a launch needs it all plus the runtime", async () => {
+	const voiceHome = scratchHome();
+	const { miro, manifests, fetch, urls } = fakeMiro();
+	const runtime = async () => ({ kind: "runtime" as const, state: "installed" as const, path: "/voice/runtime/r" });
+	assert.equal((await readMiroStatus({ voiceHome, miro, manifests })).state, "missing");
+	assert.equal(await resolveMiroLaunch({ voiceHome, miro, manifests, readRuntime: runtime }), undefined);
+	await installMiro({ voiceHome, miro, manifests, fetch });
+	assert.ok(!urls.some((url) => url.endsWith("/model.onnx") || url.endsWith("/voices.bin")), "the Kokoro model itself is not downloaded");
+	assert.equal((await readMiroStatus({ voiceHome, miro, manifests })).state, "installed");
+	const launch = await resolveMiroLaunch({ voiceHome, miro, manifests, readRuntime: runtime });
+	assert.equal(launch!.kind, "piper");
+	assert.deepEqual(launch!.core.files, [{ name: "es_ES-miro-high.onnx", size: 15 }, { name: "tokens.txt", size: 16 }], "the license file is not handed to the worker");
+	assert.deepEqual(launch!.espeak.map((part) => part.folder), ["", "lang/roa", "lang/gmw"]);
+	assert.equal(await resolveMiroLaunch({ voiceHome, miro, manifests, readRuntime: async () => ({ kind: "runtime" as const, state: "missing" as const, path: "/r" }) }), undefined);
 });

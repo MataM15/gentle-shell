@@ -23,6 +23,8 @@ const path = require("node:path");
 const SCHEMA = "gentle.voice-tts/v1";
 const TTS_ENTRY = "node_modules/sherpa-onnx-node/non-streaming-tts.js";
 const CORE_FILES = ["model.onnx", "voices.bin", "tokens.txt"];
+// Piper voices are single-speaker VITS models: one .onnx file and its tokens.
+const KINDS = ["kokoro", "piper"];
 const ESPEAK_FOLDERS = ["", "lang/roa", "lang/gmw"];
 const LANGS = ["es", "es-419", "en-us"];
 const MAX_INPUT_LINE = 256 * 1024;
@@ -55,12 +57,16 @@ function parseFiles(value) {
 }
 
 function parseStart(message) {
-	const keys = ["schema", "type", "runtime", "core", "espeak", "lang", "sid", "speed", "numThreads", "chunks"];
+	const baseKeys = ["schema", "type", "runtime", "core", "espeak", "lang", "sid", "speed", "numThreads", "chunks"];
+	const keys = isRecord(message) && Object.hasOwn(message, "kind") ? [...baseKeys, "kind"] : baseKeys;
 	if (!hasExactKeys(message, keys) || message.schema !== SCHEMA || message.type !== "start") fail("invalid-request");
+	const kind = message.kind ?? "kokoro";
+	if (!KINDS.includes(kind)) fail("invalid-request");
 	if (!hasExactKeys(message.runtime, ["root"]) || !isRoot(message.runtime.root)) fail("invalid-request");
 	if (!hasExactKeys(message.core, ["root", "files"]) || !isRoot(message.core.root)) fail("invalid-request");
 	const coreFiles = parseFiles(message.core.files);
-	if (!CORE_FILES.every((name) => coreFiles.some((file) => file.name === name))) fail("invalid-request");
+	if (kind === "kokoro" && !CORE_FILES.every((name) => coreFiles.some((file) => file.name === name))) fail("invalid-request");
+	if (kind === "piper" && (coreFiles.filter((file) => file.name.endsWith(".onnx")).length !== 1 || !coreFiles.some((file) => file.name === "tokens.txt"))) fail("invalid-request");
 	if (!Array.isArray(message.espeak) || message.espeak.length !== ESPEAK_FOLDERS.length) fail("invalid-request");
 	const folders = new Set();
 	for (const part of message.espeak) {
@@ -68,12 +74,12 @@ function parseStart(message) {
 		folders.add(part.folder);
 		parseFiles(part.files);
 	}
-	if (!LANGS.includes(message.lang) || !isInteger(message.sid, 0, 53) || !isInteger(message.numThreads, 1, 8)) fail("invalid-request");
+	if (!LANGS.includes(message.lang) || !isInteger(message.sid, 0, kind === "piper" ? 0 : 53) || !isInteger(message.numThreads, 1, 8)) fail("invalid-request");
 	if (typeof message.speed !== "number" || !Number.isFinite(message.speed) || message.speed < 0.5 || message.speed > 2) fail("invalid-request");
 	const { chunks } = message;
 	if (!Array.isArray(chunks) || chunks.length === 0 || chunks.length > MAX_CHUNKS) fail("invalid-request");
 	if (!chunks.every((chunk) => typeof chunk === "string" && chunk.trim().length > 0 && chunk.length <= MAX_CHUNK)) fail("invalid-request");
-	return message;
+	return { ...message, kind };
 }
 
 // A regular file of exactly the expected size, not a link or anything else.
@@ -163,8 +169,7 @@ class TtsSession {
 
 	async speak(request) {
 		this.state = "speaking";
-		const sizeOf = (name) => request.core.files.find((file) => file.name === name).size;
-		for (const name of CORE_FILES) checkFile(request.core.root, name, sizeOf(name), "model-invalid");
+		for (const file of request.core.files) checkFile(request.core.root, file.name, file.size, "model-invalid");
 		for (const part of request.espeak) for (const file of part.files) checkFile(part.root, file.name, file.size, "model-invalid");
 		checkFile(request.runtime.root, TTS_ENTRY, undefined, "runtime-invalid");
 		let dataDir;
@@ -176,15 +181,14 @@ class TtsSession {
 		let tts;
 		try {
 			const { OfflineTts } = this.io.loadModule(path.join(request.runtime.root, ...TTS_ENTRY.split("/")));
+			const fromCore = (name) => path.join(request.core.root, name);
+			const voice =
+				request.kind === "piper"
+					? { vits: { model: fromCore(request.core.files.find((file) => file.name.endsWith(".onnx")).name), tokens: fromCore("tokens.txt"), dataDir } }
+					: { kokoro: { model: fromCore("model.onnx"), voices: fromCore("voices.bin"), tokens: fromCore("tokens.txt"), dataDir, lang: request.lang } };
 			tts = new OfflineTts({
 				model: {
-					kokoro: {
-						model: path.join(request.core.root, "model.onnx"),
-						voices: path.join(request.core.root, "voices.bin"),
-						tokens: path.join(request.core.root, "tokens.txt"),
-						dataDir,
-						lang: request.lang,
-					},
+					...voice,
 					numThreads: request.numThreads,
 					provider: "cpu",
 					debug: false,

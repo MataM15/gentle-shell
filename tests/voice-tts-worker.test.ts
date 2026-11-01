@@ -18,6 +18,7 @@ const TTS_ENTRY = "node_modules/sherpa-onnx-node/non-streaming-tts.js";
 interface Install {
 	runtimeRoot: string;
 	core: string;
+	piper: string;
 	espeak: string;
 	romance: string;
 	germanic: string;
@@ -41,6 +42,7 @@ function install(t: test.TestContext): Install {
 	return {
 		runtimeRoot: make(join(dir, "runtime"), { [TTS_ENTRY]: "// fake" }),
 		core: make(join(dir, "core"), { "model.onnx": "model", "voices.bin": "voices", "tokens.txt": "tokens" }),
+		piper: make(join(dir, "piper"), { "es_ES-miro-high.onnx": "piper model", "tokens.txt": "piper tokens" }),
 		espeak: make(join(dir, "espeak"), { phontab: "pt", phonindex: "pi", phondata: "pd", intonations: "in", es_dict: "es", en_dict: "en" }),
 		romance: make(join(dir, "roa"), { es: "lang es", "es-419": "lang es-419" }),
 		germanic: make(join(dir, "gmw"), { en: "lang en", "en-US": "lang en-US" }),
@@ -91,7 +93,7 @@ function harness(t: test.TestContext, fake: FakeOptions = {}) {
 		sampleRate = 24000;
 		constructor(config: any) {
 			this.config = config;
-			const dataDir = config.model.kokoro.dataDir;
+			const dataDir = (config.model.kokoro ?? config.model.vits).dataDir;
 			engines.push(this as any);
 			(this as any).dataDirSeen = { es: readFileSync(join(dataDir, "lang/roa/es"), "utf8"), phontab: readFileSync(join(dataDir, "phontab"), "utf8") };
 		}
@@ -219,4 +221,47 @@ test("a termination signal ends the worker and still removes the espeak tree", a
 	assert.ok(!worker.types().includes("done"));
 	assert.equal(existsSync(worker.engines[0]!.config.model.kokoro.dataDir), false);
 	assert.equal(worker.exitCode(), 0);
+});
+
+// --- Piper voices --------------------------------------------------------------------
+
+function piperRequest(paths: Install, overrides: Record<string, unknown> = {}) {
+	return startRequest(paths, {
+		kind: "piper",
+		core: { root: paths.piper, files: sized(paths.piper, ["es_ES-miro-high.onnx", "tokens.txt"]) },
+		sid: 0,
+		...overrides,
+	});
+}
+
+test("a Piper request loads its VITS model with the assembled phoneme tree and speaks each chunk", async (t) => {
+	const worker = harness(t);
+	worker.send(piperRequest(worker.paths));
+	await worker.done;
+	assert.deepEqual(worker.types(), ["audio", "audio", "done"]);
+	const [engine] = worker.engines;
+	assert.equal(engine!.config.model.kokoro, undefined);
+	const { vits } = engine!.config.model;
+	assert.equal(vits.model, join(worker.paths.piper, "es_ES-miro-high.onnx"));
+	assert.equal(vits.tokens, join(worker.paths.piper, "tokens.txt"));
+	assert.deepEqual(engine!.dataDirSeen, { es: "lang es", phontab: "pt" });
+	assert.equal(existsSync(vits.dataDir), false, "the tree is removed afterwards");
+	assert.deepEqual(engine!.calls.map((call) => [call.text, call.sid, call.speed]), [["Hola.", 0, 1], ["¿Cómo andás?", 0, 1]]);
+});
+
+test("a Piper request needs exactly one model and its tokens, speaker 0, and a known kind", async (t) => {
+	const paths = install(t);
+	const cases: Array<[string, Record<string, unknown>]> = [
+		["no tokens", { core: { root: paths.piper, files: sized(paths.piper, ["es_ES-miro-high.onnx"]) } }],
+		["no model", { core: { root: paths.piper, files: sized(paths.piper, ["tokens.txt"]) } }],
+		["another speaker", { sid: 1 }],
+		["unknown kind", { kind: "festival" }],
+	];
+	for (const [name, overrides] of cases) {
+		const worker = harness(t);
+		worker.send(piperRequest(worker.paths, overrides));
+		await worker.done;
+		assert.deepEqual(worker.messages, [{ schema: SCHEMA, type: "error", code: "invalid-request" }], name);
+		assert.deepEqual(worker.loaded, [], name);
+	}
 });

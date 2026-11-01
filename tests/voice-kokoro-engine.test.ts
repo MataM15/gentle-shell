@@ -47,7 +47,7 @@ const LAUNCH: KokoroLaunch = {
 	],
 };
 
-function harness(launch: KokoroLaunch | null = LAUNCH, timeoutMs?: (text: string) => number) {
+function harness(launch: KokoroLaunch | null = LAUNCH, timeoutMs?: (text: string) => number, voices?: Parameters<typeof createKokoroSpeechEngine>[0]["voices"]) {
 	const procs: Array<{ command: string; args: readonly string[]; options: Record<string, unknown>; proc: FakeProc }> = [];
 	const spawn = (command: string, args: readonly string[], options: Record<string, unknown>) => {
 		const proc = new FakeProc();
@@ -62,6 +62,7 @@ function harness(launch: KokoroLaunch | null = LAUNCH, timeoutMs?: (text: string
 		workerPath: "/fixed/voice-tts-worker.cjs",
 		env: { HOME: "/home/someone", SECRET_TOKEN: "abc", NODE_OPTIONS: "--require /evil.js" },
 		timeoutMs,
+		voices,
 	});
 	const worker = () => procs.find((entry) => entry.command === "/usr/bin/node")!;
 	const player = () => procs.find((entry) => entry.command === "/mnt/c/Windows/powershell.exe")!;
@@ -197,4 +198,20 @@ test("the fallback never reads a reply again after the natural voice was already
 	const engine = createFallbackSpeechEngine(preferred, scriptedEngine("windows", "done", log));
 	await assert.rejects(engine.speak("hola", { signal: new AbortController().signal }), (error: unknown) => error === audibleFailure);
 	assert.deepEqual(log, ["kokoro"]);
+});
+
+test("a Piper voice reads Spanish with its single speaker and refuses other languages without starting anything", async () => {
+	const h = harness({ ...LAUNCH, kind: "piper" }, undefined, { es: { lang: "es", sid: 0 } });
+	const controller = new AbortController();
+	const spoken = h.engine.speak("Hola. Soy Miro.", { language: "es", signal: controller.signal });
+	await h.until(() => h.procs.length === 2);
+	const request = JSON.parse(h.worker().proc.written.join("").trim());
+	assert.equal(request.kind, "piper");
+	assert.equal(request.sid, 0);
+	assert.equal(request.lang, "es");
+	controller.abort();
+	assert.equal(await spoken, "cancelled");
+	const english = harness({ ...LAUNCH, kind: "piper" }, undefined, { es: { lang: "es", sid: 0 } });
+	await assert.rejects(english.engine.speak("Hello there.", { language: "en", signal: new AbortController().signal }), (error: unknown) => (error as { audible?: boolean }).audible === false);
+	assert.equal(english.procs.length, 0);
 });

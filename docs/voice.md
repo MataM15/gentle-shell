@@ -271,6 +271,20 @@ sherpa-onnx by csukuangfj. The espeak-ng phoneme data is GPL-3.0-or-later. It
 runs on the pinned sherpa-onnx 1.13.8 runtime; sherpa-onnx 2.x drops espeak-ng,
 so that pin must not move without replacing the phonemizer.
 
+## Miro voice (Piper)
+
+Miro is a Spanish (Spain) Piper VITS voice, the owner's pick for Spanish
+replies. Once the voice runtime is installed, `/gentle:voice` offers
+**Download Miro voice (Piper, about 64 MB)**. The confirmation names the files,
+the destination and the license; nothing is fetched before you accept.
+
+| Topic | Behavior |
+|-------|----------|
+| Source | `es_ES-miro-high.onnx`, `tokens.txt` and its `README.md` license text from Hugging Face `csukuangfj/vits-piper-es_ES-miro-high`, commit `0e1f77356142`, checked against the sherpa-onnx release tarball. Pins live in `lib/voice-kokoro.ts`. |
+| Phoneme data | Reuses the Spanish and English espeak-ng parts the natural voice uses; installing Miro fetches them only when missing. |
+| Which voice reads | Spanish replies use Miro when it is installed. English replies, and any Miro failure before audio, fall back to Kokoro, then to the Windows voice. |
+| License | CC BY-NC-SA 4.0: non-commercial use only. It reads replies to the owner inside this personal tool; it is not shipped in any product. |
+
 ## What gets downloaded
 
 All versions, sizes and digests are pinned in `lib/voice-artifacts.ts`.

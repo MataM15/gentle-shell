@@ -1,6 +1,6 @@
 import { release } from "node:os";
 import { createKokoroSpeechEngine } from "./voice-kokoro-engine.ts";
-import { resolveKokoroLaunch } from "./voice-kokoro.ts";
+import { resolveKokoroLaunch, resolveMiroLaunch } from "./voice-kokoro.ts";
 import {
 	createFallbackSpeechEngine,
 	createWindowsSpeechEngine,
@@ -69,7 +69,12 @@ export function defaultSpeechEngineResolver(env: NodeJS.ProcessEnv = process.env
 		if (resolved === undefined) {
 			const command = windowsSpeechAvailable({ platform: process.platform, kernelRelease: release() }) ? resolvePowerShell(process.platform, env) : undefined;
 			resolved = command
-				? createFallbackSpeechEngine(createKokoroSpeechEngine({ launch: () => resolveKokoroLaunch({ env }), powershell: command, env }), createWindowsSpeechEngine({ command }))
+				? createFallbackSpeechEngine(
+						// Miro reads Spanish replies once installed; Kokoro and then the
+						// Windows voice read everything else and take over on a failure.
+						createKokoroSpeechEngine({ launch: () => resolveMiroLaunch({ env }), powershell: command, env, voices: { es: { lang: "es", sid: 0 } } }),
+						createFallbackSpeechEngine(createKokoroSpeechEngine({ launch: () => resolveKokoroLaunch({ env }), powershell: command, env }), createWindowsSpeechEngine({ command })),
+					)
 				: null;
 		}
 		return resolved ?? undefined;

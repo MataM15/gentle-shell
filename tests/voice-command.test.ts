@@ -202,10 +202,11 @@ interface Harness {
 	turn: { held: boolean; waiting: Array<() => void>; acquired: number; released: number };
 	warmReleases: number;
 	kokoro: { state: "installed" | "missing"; installs: Array<{ signal: AbortSignal }> };
+	miro: { state: "installed" | "missing"; installs: Array<{ signal: AbortSignal }> };
 	clock: ReturnType<typeof manualClock>;
 }
 
-function harness(overrides: { platform?: string; arch?: string; installed?: boolean; install?: (kind: "runtime" | "model", options: { signal: AbortSignal; onProgress(progress: VoiceInstallProgress): void }) => Promise<VoiceInstallResult>; env?: NodeJS.ProcessEnv; pushToTalk?: boolean; voice?: boolean; focused?: boolean; turnHeld?: boolean; engine?: SpeechEngine; kokoro?: "installed" | "missing"; kokoroInstall?: () => Promise<void> } = {}): Harness {
+function harness(overrides: { platform?: string; arch?: string; installed?: boolean; install?: (kind: "runtime" | "model", options: { signal: AbortSignal; onProgress(progress: VoiceInstallProgress): void }) => Promise<VoiceInstallResult>; env?: NodeJS.ProcessEnv; pushToTalk?: boolean; voice?: boolean; focused?: boolean; turnHeld?: boolean; engine?: SpeechEngine; kokoro?: "installed" | "missing"; kokoroInstall?: () => Promise<void>; miro?: "installed" | "missing" } = {}): Harness {
 	const calls: string[] = [];
 	const sessions: FakeSession[] = [];
 	const endpoints: Harness["endpoints"] = [];
@@ -218,6 +219,7 @@ function harness(overrides: { platform?: string; arch?: string; installed?: bool
 	const turn: Harness["turn"] = { held: overrides.turnHeld ?? false, waiting: [], acquired: 0, released: 0 };
 	const harnessRef = { warmReleases: 0 };
 	const kokoro: Harness["kokoro"] = { state: overrides.kokoro ?? "missing", installs: [] };
+	const miro: Harness["miro"] = { state: overrides.miro ?? "missing", installs: [] };
 	const clock = manualClock();
 	const state = overrides.installed ? "installed" : "missing";
 	const install = overrides.install ?? (async (kind) => ({ kind, path: `${VOICE_HOME}/${kind}`, alreadyInstalled: false }));
@@ -243,6 +245,10 @@ function harness(overrides: { platform?: string; arch?: string; installed?: bool
 		},
 		pushToTalk: { timers: clock.timers },
 		speechEngine: () => overrides.engine,
+		miro: {
+			readStatus: async () => ({ state: miro.state, voiceHome: VOICE_HOME }),
+			install: async (options) => { miro.installs.push(options); miro.state = "installed"; },
+		},
 		kokoro: {
 			readStatus: async () => ({ state: kokoro.state, voiceHome: VOICE_HOME }),
 			install: async (options) => {
@@ -266,7 +272,7 @@ function harness(overrides: { platform?: string; arch?: string; installed?: bool
 			signal.addEventListener("abort", () => resolve(undefined), { once: true });
 		}),
 	};
-	return Object.assign(harnessRef, { deps, calls, sessions, endpoints, installs, settings, voice, focus, turn, kokoro, clock });
+	return Object.assign(harnessRef, { deps, calls, sessions, endpoints, installs, settings, voice, focus, turn, kokoro, miro, clock });
 }
 
 const pick = (pattern: RegExp) => (_title: string, options: string[]) => options.find((option) => pattern.test(option));
@@ -1980,4 +1986,40 @@ test("a reply waiting for its turn is not read once voice was turned off in the 
 	await until(() => h.turn.released === 1);
 	assert.equal(readings.length, 0, "nothing is read after consent was withdrawn");
 	assert.equal(ui.statuses.at(-1), undefined);
+});
+
+// --- the Miro voice download (Piper) --------------------------------------------------
+
+const MIRO = /^Download Miro voice \(Piper, about \d+ MB\)$/;
+
+test("the Miro voice is offered once the voice runtime is installed and Miro is not", async () => {
+	for (const scenario of [
+		{ name: "runtime and no Miro", installed: true, miro: "missing" as const, offered: true },
+		{ name: "Miro installed", installed: true, miro: "installed" as const, offered: false },
+		{ name: "no runtime yet", installed: false, miro: "missing" as const, offered: false },
+	]) {
+		const h = harness({ installed: scenario.installed, miro: scenario.miro });
+		const pi = register(h);
+		const ui = fakeContext();
+		await run(pi, ui);
+		assert.equal(ui.selects[0]!.options.some((option) => MIRO.test(option)), scenario.offered, scenario.name);
+	}
+});
+
+test("downloading Miro asks first with its non-commercial license, and an accepted download installs it", async () => {
+	const declined = harness({ installed: true });
+	const declinedPi = register(declined);
+	const no = fakeContext({ select: pick(MIRO), confirm: () => false });
+	await run(declinedPi, no);
+	assert.equal(no.confirms[0]!.title, "Download the Miro voice?");
+	for (const expected of [/es_ES-miro-high\.onnx/, /CC BY-NC-SA 4\.0/, /non-commercial/, /\d+ MB/]) assert.match(no.confirms[0]!.message, expected);
+	assert.deepEqual(declined.miro.installs, []);
+	assert.deepEqual(no.notices.at(-1), { message: "Miro voice download skipped; nothing was downloaded.", type: "info" });
+	const h = harness({ installed: true });
+	const pi = register(h);
+	const yes = fakeContext({ select: pick(MIRO), confirm: () => true });
+	await run(pi, yes);
+	assert.equal(h.miro.installs.length, 1);
+	assert.ok(h.miro.installs[0]!.signal instanceof AbortSignal);
+	assert.deepEqual(yes.notices.at(-1), { message: "The Miro voice is installed. Spanish replies now use it.", type: "info" });
 });

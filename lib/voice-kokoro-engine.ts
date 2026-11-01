@@ -15,6 +15,8 @@ export const KOKORO_TTS_SCHEMA = "gentle.voice-tts/v1";
 export const KOKORO_TTS_WORKER_URL = new URL("../scripts/voice-tts-worker.cjs", import.meta.url);
 
 export interface KokoroLaunch {
+	// A Piper VITS voice, or Kokoro when absent.
+	kind?: "kokoro" | "piper";
 	runtimeRoot: string;
 	core: { root: string; files: Array<{ name: string; size: number }> };
 	espeak: Array<{ root: string; folder: "" | "lang/roa" | "lang/gmw"; files: Array<{ name: string; size: number }> }>;
@@ -117,6 +119,9 @@ export interface KokoroEngineOptions {
 	env?: NodeJS.ProcessEnv;
 	numThreads?: number;
 	timeoutMs?: (text: string) => number;
+	// The voice per reply language; a language without one is refused so the
+	// fallback reads it. Kokoro's Spanish and English voices by default.
+	voices?: Partial<Record<"es" | "en", { lang: "es" | "es-419" | "en-us"; sid: number }>>;
 }
 
 const VOICE_BY_LANGUAGE = { es: { lang: "es", sid: 28 }, en: { lang: "en-us", sid: 3 } } as const;
@@ -134,12 +139,13 @@ export function createKokoroSpeechEngine(options: KokoroEngineOptions): SpeechEn
 		available: async () => (await options.launch().catch(() => undefined)) !== undefined,
 		async speak(text, { language, rate, signal }) {
 			if (signal.aborted) return "cancelled";
+			const voice = (options.voices ?? VOICE_BY_LANGUAGE)[language ?? "es"];
+			if (!voice) throw new KokoroSpeechError("unavailable");
 			const launch = await options.launch().catch(() => undefined);
 			if (!launch) throw new KokoroSpeechError("unavailable");
 			if (signal.aborted) return "cancelled";
 			const chunks = kokoroChunks(text);
 			if (chunks.length === 0) return "done";
-			const voice = VOICE_BY_LANGUAGE[language ?? "es"];
 			const speed = Math.round(Math.max(0.5, Math.min(2, BASE_SPEED + (rate ?? 0) / 20)) * 100) / 100;
 			return new Promise<SpeechOutcome>((resolve, reject) => {
 				let settled = false;
@@ -224,7 +230,7 @@ export function createKokoroSpeechEngine(options: KokoroEngineOptions): SpeechEn
 				});
 				signal.addEventListener("abort", onAbort, { once: true });
 				timer = setTimeout(() => finish(new KokoroSpeechError("timeout")), timeoutFor(text));
-				worker.stdin?.write(`${JSON.stringify({ schema: KOKORO_TTS_SCHEMA, type: "start", runtime: { root: launch.runtimeRoot }, core: launch.core, espeak: launch.espeak, lang: voice.lang, sid: voice.sid, speed, numThreads: options.numThreads ?? 4, chunks })}\n`);
+				worker.stdin?.write(`${JSON.stringify({ schema: KOKORO_TTS_SCHEMA, type: "start", ...(launch.kind === "piper" ? { kind: "piper" } : {}), runtime: { root: launch.runtimeRoot }, core: launch.core, espeak: launch.espeak, lang: voice.lang, sid: voice.sid, speed, numThreads: options.numThreads ?? 4, chunks })}\n`);
 			});
 		},
 	};
