@@ -1116,10 +1116,27 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			say(unheard, "info");
 			return;
 		}
+		// Whatever is in the draft goes with the transcript: a pasted image is a
+		// file path in the draft, so it travels exactly as a typed submit would
+		// send it. The draft is cleared only once it was sent.
+		let draft = "";
+		try {
+			draft = ctx.ui.getEditorText().trim();
+		} catch {
+			/* no readable draft: send the transcript alone */
+		}
+		const message = draft ? `${draft}\n\n${text}` : text;
 		spokenTurnPending = true;
 		const idle = typeof ctx.isIdle === "function" ? ctx.isIdle() : true;
-		if (idle) pi.sendUserMessage(text);
-		else pi.sendUserMessage(text, { deliverAs: "followUp" });
+		if (idle) pi.sendUserMessage(message);
+		else pi.sendUserMessage(message, { deliverAs: "followUp" });
+		if (draft) {
+			try {
+				ctx.ui.setEditorText("");
+			} catch {
+				/* the message was sent; a stale draft is harmless */
+			}
+		}
 	};
 
 	// Reopens the microphone after a reply in conversation mode, unless voice is

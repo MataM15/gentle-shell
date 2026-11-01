@@ -1506,6 +1506,7 @@ test("the dictation shortcut while reading stops the reading, then starts a hand
 	const pi = register(h);
 	const ui = fakeContext();
 	await pi.fire("session_start", ui.ctx);
+	(ui.ctx.ui as unknown as { setEditorText(text: string): void }).setEditorText("");
 	await settleReply(pi, ui.ctx, "Te estoy leyendo esto.");
 	await until(() => readings.length === 1);
 	const pressed = pi.shortcuts.get("alt+m")!.handler(ui.ctx);
@@ -1515,7 +1516,7 @@ test("the dictation shortcut while reading stops the reading, then starts a hand
 	await speak(h, 0, "hola");
 	await pressed;
 	assert.deepEqual(pi.sent, [{ content: "hola", options: undefined }]);
-	assert.equal(ui.editor(), "draft: ", "nothing is pasted");
+	assert.equal(ui.editor(), "", "nothing is pasted");
 });
 
 test("a new agent run stops the reading", async () => {
@@ -1709,6 +1710,7 @@ test("in conversation mode the toggle records hands-free and sends the transcrip
 	const pi = register(h);
 	const ui = fakeContext();
 	await pi.fire("session_start", ui.ctx);
+	(ui.ctx.ui as unknown as { setEditorText(text: string): void }).setEditorText("");
 	const pressed = pi.shortcuts.get("alt+m")!.handler(ui.ctx);
 	await until(() => h.sessions.length === 1);
 	assert.deepEqual(h.endpoints, [HANDS_FREE]);
@@ -1720,7 +1722,7 @@ test("in conversation mode the toggle records hands-free and sends the transcrip
 	h.sessions[0]!.result.resolve({ text: "hola agente", truncated: false });
 	await pressed;
 	assert.deepEqual(pi.sent, [{ content: "hola agente", options: undefined }]);
-	assert.equal(ui.editor(), "draft: ", "nothing is pasted");
+	assert.equal(ui.editor(), "", "nothing is pasted");
 	assert.equal(ui.statuses.at(-1), undefined);
 });
 
@@ -1730,6 +1732,7 @@ test("in conversation mode the toggle key sends at once, and a busy agent gets i
 	const pi = register(h);
 	const ui = fakeContext({}, "tui", true, "session-alpha", () => false);
 	await pi.fire("session_start", ui.ctx);
+	(ui.ctx.ui as unknown as { setEditorText(text: string): void }).setEditorText("");
 	const pressed = pi.shortcuts.get("alt+m")!.handler(ui.ctx);
 	await until(() => h.sessions.length === 1);
 	h.sessions[0]!.started.resolve();
@@ -2022,4 +2025,47 @@ test("downloading Miro asks first with its non-commercial license, and an accept
 	assert.equal(h.miro.installs.length, 1);
 	assert.ok(h.miro.installs[0]!.signal instanceof AbortSignal);
 	assert.deepEqual(yes.notices.at(-1), { message: "The Miro voice is installed. Spanish replies now use it.", type: "info" });
+});
+
+test("a hands-free turn sends whatever is in the draft, such as a pasted image path, together with the transcript, then clears the draft", async () => {
+	const { engine } = fakeEngine();
+	const h = harness({ installed: true, engine, voice: true });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	(ui.ctx.ui as unknown as { setEditorText(text: string): void }).setEditorText("  /tmp/pi-clipboard-1234.png\nmirá esta captura  ");
+	await talk(pi, h, ui.ctx, "¿qué ves acá?");
+	assert.deepEqual(pi.sent, [{ content: "/tmp/pi-clipboard-1234.png\nmirá esta captura\n\n¿qué ves acá?", options: undefined }]);
+	assert.equal(ui.editor(), "", "the draft is cleared once it was sent");
+});
+
+test("a hands-free turn with a blank draft sends only the transcript and leaves the draft alone", async () => {
+	const { engine } = fakeEngine();
+	const h = harness({ installed: true, engine, voice: true });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	(ui.ctx.ui as unknown as { setEditorText(text: string): void }).setEditorText("   ");
+	await talk(pi, h, ui.ctx, "hola");
+	assert.deepEqual(pi.sent, [{ content: "hola", options: undefined }]);
+	assert.equal(ui.editor(), "   ");
+});
+
+test("a hands-free turn that hears nothing keeps the draft unsent", async () => {
+	const { engine } = fakeEngine();
+	const h = harness({ installed: true, engine, voice: true });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	(ui.ctx.ui as unknown as { setEditorText(text: string): void }).setEditorText("/tmp/pi-clipboard-1234.png");
+	const pressed = pi.shortcuts.get("alt+m")!.handler(ui.ctx);
+	await until(() => h.sessions.length === 1);
+	h.sessions[0]!.started.resolve();
+	await until(() => h.sessions[0]!.state === "recording");
+	h.sessions[0]!.emit("transcribing");
+	h.sessions[0]!.emit("finished");
+	h.sessions[0]!.result.reject(new VoiceSessionError("no-speech"));
+	await pressed;
+	assert.equal(pi.counts.sends, 0);
+	assert.equal(ui.editor(), "/tmp/pi-clipboard-1234.png");
 });
