@@ -202,6 +202,7 @@ interface Harness {
 	turn: { held: boolean; waiting: Array<() => void>; acquired: number; released: number };
 	warmReleases: number;
 	cues: string[];
+	events: Array<{ event: string } & Record<string, unknown>>;
 	kokoro: { state: "installed" | "missing"; installs: Array<{ signal: AbortSignal }> };
 	miro: { state: "installed" | "missing"; installs: Array<{ signal: AbortSignal }> };
 	clock: ReturnType<typeof manualClock>;
@@ -218,7 +219,7 @@ function harness(overrides: { platform?: string; arch?: string; installed?: bool
 	const voice: Harness["voice"] = { sessions: overrides.voice ? ["session-alpha"] : [], writes: [] };
 	const focus: Harness["focus"] = { focused: overrides.focused ?? true, asks: 0 };
 	const turn: Harness["turn"] = { held: overrides.turnHeld ?? false, waiting: [], acquired: 0, released: 0 };
-	const harnessRef = { warmReleases: 0, cues: [] as string[] };
+	const harnessRef = { warmReleases: 0, cues: [] as string[], events: [] as Array<{ event: string } & Record<string, unknown>> };
 	const kokoro: Harness["kokoro"] = { state: overrides.kokoro ?? "missing", installs: [] };
 	const miro: Harness["miro"] = { state: overrides.miro ?? "missing", installs: [] };
 	const clock = manualClock();
@@ -264,6 +265,7 @@ function harness(overrides: { platform?: string; arch?: string; installed?: bool
 		},
 		paneFocused: async () => { focus.asks++; return focus.focused; },
 		releaseWarm: async () => { harnessRef.warmReleases++; },
+		log: (event, fields) => { harnessRef.events.push({ event, ...fields }); },
 		cues: { play: (name) => { harnessRef.cues.push(name); }, warm: () => { harnessRef.cues.push("warm"); }, dispose: () => { harnessRef.cues.push("dispose"); } },
 		// The shared reading turn, faked: free unless a test holds it.
 		readingTurn: (signal) => new Promise((resolve) => {
@@ -2201,4 +2203,28 @@ test("typing a message ends the spoken turn, so its reply does not reopen the mi
 	await until(() => ui.statuses.at(-1) === undefined);
 	await tick();
 	assert.equal(h.sessions.length, 1);
+});
+
+// --- diagnostics ----------------------------------------------------------------------
+
+test("each reading and every microphone reopen decision is logged with its reason", async () => {
+	const { engine, readings } = fakeEngine();
+	const h = harness({ installed: true, engine, voice: true });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	await talk(pi, h, ui.ctx, "hola");
+	h.focus.focused = false;
+	await settleReply(pi, ui.ctx, "Respuesta.");
+	await until(() => readings.length === 1);
+	readings[0]!.finish("done");
+	await until(() => h.events.some((entry) => entry.event === "mic.reopen"));
+	const names = h.events.map((entry) => entry.event);
+	for (const expected of ["turn.sent", "reply.settled", "reading.start", "reading.end"]) assert.ok(names.includes(expected), expected);
+	assert.deepEqual(h.events.find((entry) => entry.event === "reading.end")!.outcome, "done");
+	const reopen = h.events.find((entry) => entry.event === "mic.reopen")!;
+	assert.equal(reopen.result, "skipped");
+	assert.equal(reopen.reason, "not-focused");
+	assert.equal(reopen.session, "session-alpha");
+	assert.ok(!JSON.stringify(h.events).includes("Respuesta."), "no reply text is logged");
 });

@@ -315,6 +315,17 @@ the destination and the license; nothing is fetched before you accept.
 | Which voice reads | Spanish replies use Raúl first; Miro reads them when Raúl fails before audio. English replies, and any Miro failure before audio, fall back to Kokoro, then to the Windows voice. |
 | License | CC BY-NC-SA 4.0: non-commercial use only. It reads replies to the owner inside this personal tool; it is not shipped in any product. |
 
+## Diagnostics
+
+Every voice session appends one JSON line per voice event to
+`voice-events.log` in the voice directory (`~/.pi/gentle-ai/voice/`): typed or
+spoken input, a spoken turn sent, a reply settled, a reading started and how it
+ended, and each microphone reopen decision with its reason (`opened`, or
+skipped for `not-focused`, `no-spoken-turn`, `voice-off`, `reading-cancelled`,
+`reading-error`, `dictation-running`, `voice-busy`). Lines carry the time, the
+process id and the session id, and sizes instead of text: no reply or
+transcript text is written. Past 512 KB the log moves to `voice-events.log.1`.
+
 ## What gets downloaded
 
 All versions, sizes and digests are pinned in `lib/voice-artifacts.ts`.

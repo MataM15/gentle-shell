@@ -54,6 +54,7 @@ export const requiredPaths = [
   "lib/voice-artifacts.ts",
   "lib/voice-command.ts",
   "lib/voice-cues.ts",
+  "lib/voice-diagnostics.ts",
   "lib/voice-install.ts",
   "lib/voice-kokoro.ts",
   "lib/voice-kokoro-engine.ts",

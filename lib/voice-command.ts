@@ -10,6 +10,7 @@ import { installKokoro, installMiro, KOKORO_MANIFESTS, KOKORO_NOTICES, kokoroByt
 import { createReplyReader, defaultSpeechEngineResolver, lastAssistantText } from "./voice-reply-speech.ts";
 import { acquireReadingTurn, paneFocused as herdrPaneFocused } from "./voice-presence.ts";
 import { createCuePlayer, type CuePlayer } from "./voice-cues.ts";
+import { createVoiceLog, type VoiceLog } from "./voice-diagnostics.ts";
 import { createWarmVoiceWorker, type WarmVoiceWorker } from "./voice-warm.ts";
 import { readVoicePushToTalk, readVoiceSessions, writeVoicePushToTalk, writeVoiceSessions } from "./voice-settings.ts";
 import { SpeechEngineError, type SpeechEngine } from "./voice-speech.ts";
@@ -94,6 +95,8 @@ export interface VoiceCommandDeps {
 	releaseWarm?: () => Promise<void>;
 	// The microphone cues; one player per process, created on first use.
 	cues?: CuePlayer;
+	// The voice event log, for diagnosing cut readings and closed microphones.
+	log?: VoiceLog;
 	// The natural voice (Kokoro): its install status and its consented download.
 	kokoro?: { readStatus(): Promise<KokoroStatus>; install(options: VoiceInstallRequest): Promise<void> };
 	// The Miro voice (Piper), chosen by the owner for Spanish replies.
@@ -357,6 +360,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		return warm.worker;
 	};
 	const createSession = deps.createSession ?? (({ target, onStateChange, endpoint }) => (endpoint ? warmFor(target).session({ onStateChange, endpoint }) : createVoiceSession({ env, target, onStateChange, endpoint })));
+	const voiceLog: VoiceLog = deps.log ?? createVoiceLog({ dir: resolveVoiceHome(env) });
 	let cuePlayer = deps.cues;
 	let cuesUsed = false;
 	const cues = (): CuePlayer => {
@@ -546,13 +550,16 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			// Voice may have been turned off, in any Pi process, while this waited.
 			if (!release || !live() || !voiceOn(ctx)) return "cancelled";
 			setVoiceFooter(ctx, live, voiceReadingStatus(toggleShortcut));
+			voiceLog("reading.start", { session: sessionIdOf(ctx), chars: markdown.length });
 			const outcome = await replyReader.read(markdown, current.controller.signal);
+			voiceLog("reading.end", { session: sessionIdOf(ctx), outcome });
 			if (outcome === "unavailable" && live() && !unavailableReported) {
 				unavailableReported = true;
 				ctx.ui.notify(SPEECH_UNAVAILABLE, "warning");
 			}
 			return outcome;
 		} catch (error) {
+			voiceLog("reading.end", { session: sessionIdOf(ctx), outcome: "error", error: error instanceof Error ? error.name : "unknown" });
 			if (live()) ctx.ui.notify(error instanceof SpeechEngineError ? error.message : "The reply could not be read aloud.", "warning");
 			return "error";
 		} finally {
@@ -1172,6 +1179,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		spokenTurnPending = true;
 		const idle = typeof ctx.isIdle === "function" ? ctx.isIdle() : true;
 		voiceSendPending = true;
+		voiceLog("turn.sent", { session: sessionIdOf(ctx), chars: message.length, idle, draft: draft.length > 0 });
 		if (idle) pi.sendUserMessage(message);
 		else pi.sendUserMessage(message, { deliverAs: "followUp" });
 		if (draft) {
@@ -1186,7 +1194,9 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	// Reopens the microphone after a reply in conversation mode, unless voice is
 	// already busy with another capture.
 	const listenForReply = (ctx: ExtensionContext): void => {
-		if (toggling || active || !supportedSession(ctx)) return;
+		const busy = toggling ? "dictation-running" : active ? "voice-busy" : !supportedSession(ctx) ? "unsupported-session" : undefined;
+		voiceLog("mic.reopen", { session: sessionIdOf(ctx), result: busy ? "skipped" : "opened", reason: busy });
+		if (busy) return;
 		void runToggle(openToggle(ctx, true));
 	};
 
@@ -1268,6 +1278,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	pi.on("input", (event) => {
 		const typed = event?.source === "interactive";
 		const spokenSend = voiceSendPending;
+		voiceLog("input", { source: event?.source, spokenSend, reading: Boolean(reading) });
 		voiceSendPending = false;
 		if (typed) spokenTurnPending = false;
 		if (typed || spokenSend) cutReadings();
@@ -1290,18 +1301,23 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			const finished = outcome === "done" || outcome === "empty" || outcome === "unavailable";
 			if (outcome === "error") spokenTurnPending = false;
 			if (!finished) {
+				voiceLog("mic.reopen", { session: sessionIdOf(ctx), result: "skipped", reason: `reading-${outcome}`, spokenTurnPending });
 				queuedReply = undefined;
 				return;
 			}
 			const next = queuedReply;
 			queuedReply = undefined;
 			if (next && voiceOn(next.ctx)) return readReply(next.ctx, next.text);
-			if (!spokenTurnPending || !voiceOn(ctx)) return;
+			if (!spokenTurnPending || !voiceOn(ctx)) {
+				voiceLog("mic.reopen", { session: sessionIdOf(ctx), result: "skipped", reason: spokenTurnPending ? "voice-off" : "no-spoken-turn" });
+				return;
+			}
 			spokenTurnPending = false;
 			const focused = await paneFocused().catch(() => false);
 			if (owner !== generation) return;
 			if (focused) listenForReply(ctx);
-			else ctx.ui.notify(`Conversation paused in this pane. Press ${toggleKey} to talk.`, "info");
+			else voiceLog("mic.reopen", { session: sessionIdOf(ctx), result: "skipped", reason: "not-focused" });
+			if (!focused) ctx.ui.notify(`Conversation paused in this pane. Press ${toggleKey} to talk.`, "info");
 		});
 	};
 	pi.on("agent_settled", (event, ctx) => {
@@ -1309,6 +1325,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		pendingReply = undefined;
 		// The spoken turn stays pending until the microphone reopens. Typing, Esc
 		// and a failed reading end it.
+		voiceLog("reply.settled", { session: sessionIdOf(ctx), aborted: Boolean(event?.aborted), chars: text?.length ?? 0, voice: voiceOn(ctx), reading: Boolean(reading), spokenTurnPending });
 		if (event?.aborted || !text || !supportedSession(ctx) || !voiceOn(ctx)) return;
 		if (reading) {
 			queuedReply = { ctx, text };
