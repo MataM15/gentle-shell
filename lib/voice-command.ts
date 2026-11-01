@@ -513,7 +513,8 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		try {
 			// One reading at a time across every Pi process: wait for the turn.
 			release = await readingTurn(current.controller.signal);
-			if (!release || !live()) return "cancelled";
+			// Voice may have been turned off, in any Pi process, while this waited.
+			if (!release || !live() || !voiceOn(ctx)) return "cancelled";
 			setVoiceFooter(ctx, live, voiceReadingStatus(toggleShortcut));
 			const outcome = await replyReader.read(markdown, current.controller.signal);
 			if (outcome === "unavailable" && live() && !unavailableReported) {

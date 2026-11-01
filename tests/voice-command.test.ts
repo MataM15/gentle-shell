@@ -1965,3 +1965,19 @@ test("the kept-alive dictation worker is released when voice is turned off and w
 	await pi.fire("session_shutdown", ui.ctx);
 	assert.equal(h.warmReleases, atStart + 2, "ending the session releases it");
 });
+
+test("a reply waiting for its turn is not read once voice was turned off in the meantime", async () => {
+	const { engine, readings } = fakeEngine();
+	const h = harness({ engine, voice: true, turnHeld: true });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	await settleReply(pi, ui.ctx, "Esto no se tiene que leer.");
+	await until(() => h.turn.waiting.length === 1);
+	// Another Pi process turns voice off for this session while the reply waits.
+	h.voice.sessions = [];
+	h.turn.waiting.shift()!();
+	await until(() => h.turn.released === 1);
+	assert.equal(readings.length, 0, "nothing is read after consent was withdrawn");
+	assert.equal(ui.statuses.at(-1), undefined);
+});
