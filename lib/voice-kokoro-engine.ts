@@ -44,7 +44,7 @@ const CHUNK_MIN = 40;
 const CHUNK_MAX = 160;
 // The natural voice reads a little faster than its normal pace.
 const BASE_SPEED = 1.08;
-const MAX_CHUNKS = 64;
+const MAX_CHUNKS = 256;
 
 // The first sentence alone, then one sentence per chunk, merging short ones up
 // to CHUNK_MIN and never past CHUNK_MAX. A sentence longer than CHUNK_MAX is

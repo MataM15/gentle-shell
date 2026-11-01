@@ -50,7 +50,9 @@ export class SpeechEngineError extends Error {
 
 // --- what is read aloud --------------------------------------------------------
 
-export const SPOKEN_TEXT_LIMIT = 1_200;
+// Readings stream sentence by sentence, so a long reply is read whole; the
+// limit only guards against a runaway reply.
+export const SPOKEN_TEXT_LIMIT = 8_000;
 
 const SENTENCE_END = /[.!?:;,]$/;
 

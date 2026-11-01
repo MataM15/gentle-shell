@@ -180,3 +180,10 @@ test("a reading that runs past its bound is killed and rejects as timeout", asyn
 	await assert.rejects(spoken, (error: unknown) => error instanceof SpeechEngineError && error.code === "timeout");
 	assert.deepEqual(calls[0].child.signals, ["SIGTERM"]);
 });
+
+test("spokenText reads a long reply whole: a 3,000-character reply is not cut", () => {
+	const sentence = "Esta es una oración de prueba con algo de texto para leer.";
+	const reply = Array.from({ length: 52 }, () => sentence).join(" ");
+	assert.ok(reply.length > 3000);
+	assert.equal(spokenText(reply), reply);
+});

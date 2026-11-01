@@ -158,7 +158,7 @@ test("rejects malformed requests before loading anything", async (t) => {
 		["speed out of range", { speed: 3 }],
 		["unsupported lang", { lang: "fr" }],
 		["no chunks", { chunks: [] }],
-		["too many chunks", { chunks: Array.from({ length: 65 }, () => "x") }],
+		["too many chunks", { chunks: Array.from({ length: 257 }, () => "x") }],
 		["chunk too long", { chunks: ["x".repeat(2001)] }],
 		["unsafe core name", { core: { ...base.core, files: [{ name: "../model.onnx", size: 5 }, ...base.core.files.slice(1)] } }],
 		["unknown espeak folder", { espeak: [{ ...base.espeak[0], folder: "../escape" }, ...base.espeak.slice(1)] }],

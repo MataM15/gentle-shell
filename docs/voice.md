@@ -187,7 +187,7 @@ In a voice session:
 |-------|----------|
 | When | Once a run has settled, with no retry, compaction or queued message left. An aborted run, a delegated child session, RPC and print modes read nothing. |
 | What is read | The text of the last assistant message that has any. Thinking, tool calls and tool results are never read. |
-| What is skipped | Code blocks, table rows, link targets, bare URLs and Markdown markers. A path keeps only its last segment, so `lib/voice-speech.ts` is read as `voice-speech.ts`. List items and headings become separate sentences. A reply is cut at a sentence boundary after about 1,200 characters. |
+| What is skipped | Code blocks, table rows, link targets, bare URLs and Markdown markers. A path keeps only its last segment, so `lib/voice-speech.ts` is read as `voice-speech.ts`. List items and headings become separate sentences. A reply is read whole: it streams sentence by sentence, and only a runaway reply is cut, at a sentence boundary after about 8,000 characters. |
 | Voice | Each reply is checked for Spanish or English and read with an installed voice of that language when there is one (for example Microsoft Sabina for Spanish), otherwise with the Windows default voice. |
 | Stop | Esc stops the reading and is consumed, so it never reaches the editor or the agent. **Stop reading** in `/gentle:voice` does the same. A new run stops it too. |
 | Talk over it | The dictation shortcut (`alt+m`) stops the reading and starts a dictation at once. |

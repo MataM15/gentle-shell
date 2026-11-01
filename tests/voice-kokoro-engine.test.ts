@@ -215,3 +215,8 @@ test("a Piper voice reads Spanish with its single speaker and refuses other lang
 	await assert.rejects(english.engine.speak("Hello there.", { language: "en", signal: new AbortController().signal }), (error: unknown) => (error as { audible?: boolean }).audible === false);
 	assert.equal(english.procs.length, 0);
 });
+
+test("kokoroChunks keeps every sentence of a long reply made of short sentences", () => {
+	const text = Array.from({ length: 300 }, (_value, index) => `Frase corta número ${index}.`).join(" ");
+	assert.equal(kokoroChunks(text).join(" "), text);
+});
