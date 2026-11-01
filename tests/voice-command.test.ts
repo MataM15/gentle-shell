@@ -2141,3 +2141,38 @@ test("turning voice on wakes the cue player", async () => {
 	await run(pi, ui);
 	assert.ok(h.cues.includes("warm"));
 });
+
+test("a background run that cuts the reading keeps the spoken turn, so the next reply still reopens the microphone", async () => {
+	const { engine, readings } = fakeEngine();
+	const h = harness({ installed: true, engine, voice: true });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	await talk(pi, h, ui.ctx, "bajá las voces");
+	await settleReply(pi, ui.ctx, "Las estoy bajando.");
+	await until(() => readings.length === 1);
+	// A background job finishing wakes the agent: a new run cuts the reading.
+	await settleReply(pi, ui.ctx, "Ya bajaron, te las hago sonar.");
+	await until(() => readings.length === 2);
+	assert.equal(readings[0]!.options.signal.aborted, true);
+	assert.equal(h.sessions.length, 1, "no microphone while the second reply is read");
+	readings[1]!.finish("done");
+	await until(() => h.sessions.length === 2);
+	assert.deepEqual(h.endpoints.at(-1), HANDS_FREE);
+});
+
+test("typing a message ends the spoken turn, so its reply does not reopen the microphone", async () => {
+	const { engine, readings } = fakeEngine();
+	const h = harness({ installed: true, engine, voice: true });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	await talk(pi, h, ui.ctx, "hola");
+	await pi.fire("input", ui.ctx, { type: "input", text: "esto lo escribí", source: "interactive" });
+	await settleReply(pi, ui.ctx, "Respuesta a lo escrito.");
+	await until(() => readings.length === 1);
+	readings[0]!.finish("done");
+	await until(() => ui.statuses.at(-1) === undefined);
+	await tick();
+	assert.equal(h.sessions.length, 1);
+});

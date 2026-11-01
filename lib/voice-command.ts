@@ -515,6 +515,8 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			try {
 				if (reading !== current) return undefined;
 				if (!isKeyRelease(data) && matchesKey(data, "escape")) {
+					// Stopping a reading pauses the conversation.
+					spokenTurnPending = false;
 					stopReading();
 					return { consume: true };
 				}
@@ -639,7 +641,10 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		if (!live() || !choice) return;
 		if (choice === STATUS) say(statusReport(target, diagnosis, status, platform.platform), "info");
 		else if (choice === VOICE_ON || choice === VOICE_OFF) setVoice(ctx, choice === VOICE_ON, say);
-		else if (choice === STOP_READING) stopReading();
+		else if (choice === STOP_READING) {
+			spokenTurnPending = false;
+			stopReading();
+		}
 		else if (choice === naturalDownload) await installNatural(ctx, run, status.voiceHome, say);
 		else if (choice === miroDownload) await installMiroVoice(ctx, run, status.voiceHome, say);
 		else if (choice === DISABLE_PUSH_TO_TALK || choice === ENABLE_PUSH_TO_TALK) setPushToTalk(ctx, choice === ENABLE_PUSH_TO_TALK, say);
@@ -1241,6 +1246,11 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	});
 	// A new run stops the reading and forgets the previous reply; the reply of the
 	// last run is read once nothing else will run automatically.
+	// A typed message ends the spoken turn; messages sent by extensions,
+	// including this one, leave it as it is.
+	pi.on("input", (event) => {
+		if (event?.source === "interactive") spokenTurnPending = false;
+	});
 	pi.on("agent_start", () => {
 		stopReading();
 		pendingReply = undefined;
@@ -1252,15 +1262,19 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	pi.on("agent_settled", (event, ctx) => {
 		const text = pendingReply;
 		pendingReply = undefined;
+		// The spoken turn stays pending until the microphone reopens: a run that a
+		// background notice starts can cut this reading, and the next reply still
+		// reopens it. Typing, Esc and a failed reading end it.
 		const spoken = spokenTurnPending;
-		spokenTurnPending = false;
 		if (event?.aborted || !text || !supportedSession(ctx) || !voiceOn(ctx)) return;
 		const owner = generation;
 		void readAloud(ctx, text).then(async (outcome) => {
 			// A reading the user stopped, or one that failed, leaves the microphone
 			// closed, and only a reply to a spoken turn reopens it.
 			const finished = outcome === "done" || outcome === "empty" || outcome === "unavailable";
-			if (!finished || !spoken || owner !== generation || !voiceOn(ctx)) return;
+			if (outcome === "error") spokenTurnPending = false;
+			if (!finished || !spoken || !spokenTurnPending || owner !== generation || !voiceOn(ctx)) return;
+			spokenTurnPending = false;
 			const focused = await paneFocused().catch(() => false);
 			if (owner !== generation) return;
 			if (focused) listenForReply(ctx);
