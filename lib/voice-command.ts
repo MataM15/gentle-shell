@@ -2,13 +2,14 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@e
 import { isKeyRelease, matchesKey, type Component, type TUI } from "@earendil-works/pi-tui";
 import { withOverlayRepaint } from "./overlay-repaint.ts";
 import { PARAKEET_MODEL_MANIFEST, VOICE_NOTICES, voiceRuntimeManifest, type VoiceTarget } from "./voice-artifacts.ts";
-import { installVoiceModel, installVoiceRuntime, readVoiceStatus, VoiceInstallError, type VoiceComponentStatus, type VoiceInstallErrorCode, type VoiceInstallProgress, type VoiceInstallResult } from "./voice-install.ts";
+import { installVoiceModel, installVoiceRuntime, readVoiceStatus, resolveVoiceHome, VoiceInstallError, type VoiceComponentStatus, type VoiceInstallErrorCode, type VoiceInstallProgress, type VoiceInstallResult } from "./voice-install.ts";
 import { diagnoseVoicePlatform, readVoicePlatformProbe, type VoicePlatformDiagnosis, type VoicePlatformProbe } from "./voice-platform.ts";
 import { SpaceHoldDetector, type PushToTalkOptions } from "./voice-push-to-talk.ts";
 import { createVoiceSession, VoiceSessionError, type VoiceEndpoint, type VoiceSessionErrorCode, type VoiceSessionState, type VoiceTranscript } from "./voice-session.ts";
 import { installKokoro, KOKORO_MANIFESTS, KOKORO_NOTICES, kokoroBytes, readKokoroStatus, type KokoroStatus } from "./voice-kokoro.ts";
 import { createReplyReader, defaultSpeechEngineResolver, lastAssistantText } from "./voice-reply-speech.ts";
-import { readVoicePushToTalk, readVoiceSpeechSettings, writeVoicePushToTalk, writeVoiceSpeechSettings, type VoiceSpeechSettings } from "./voice-settings.ts";
+import { acquireReadingTurn, paneFocused as herdrPaneFocused } from "./voice-presence.ts";
+import { readVoicePushToTalk, readVoiceSessions, writeVoicePushToTalk, writeVoiceSessions } from "./voice-settings.ts";
 import { SpeechEngineError, type SpeechEngine } from "./voice-speech.ts";
 import { createVoiceStatePublisher, voiceDisplayState, type VoiceDisplayState, type VoiceStatePublisher } from "./voice-status-event.ts";
 import { pushToTalkStatus, voiceConversationStatus, voiceReadingStatus, voiceToggleStatus, VoiceDictationView, VoiceProgressView, type VoiceViewTheme } from "./voice-ui.ts";
@@ -80,10 +81,13 @@ export interface VoiceCommandDeps {
 	// The persisted push-to-talk toggle.
 	settings?: { read(): boolean; write(enabled: boolean): void };
 	pushToTalk?: PushToTalkOptions;
-	// Spoken replies: the engine (undefined where no voice is reachable) and the
-	// persisted on/off switches.
+	// Spoken replies: the engine (undefined where no voice is reachable), the
+	// sessions where voice is on, whether this pane is the focused one, and the
+	// reading turn shared by every Pi process (resolves undefined when skipped).
 	speechEngine?: () => SpeechEngine | undefined;
-	speechSettings?: { read(): VoiceSpeechSettings; write(settings: VoiceSpeechSettings): void };
+	voiceSessions?: { read(): string[]; write(sessions: string[]): void };
+	paneFocused?: () => Promise<boolean>;
+	readingTurn?: (signal: AbortSignal) => Promise<(() => void) | undefined>;
 	// The natural voice (Kokoro): its install status and its consented download.
 	kokoro?: { readStatus(): Promise<KokoroStatus>; install(options: VoiceInstallRequest): Promise<void> };
 }
@@ -96,12 +100,10 @@ const STATUS = "Show status and notices";
 const DISABLE_PUSH_TO_TALK = "Disable push-to-talk (hold Space)";
 const ENABLE_PUSH_TO_TALK = "Enable push-to-talk (hold Space)";
 const STATUS_KEY = "gentle-voice";
-const READ_ON = "Read replies aloud (off): turn on";
-const READ_OFF = "Read replies aloud (on): turn off";
+const VOICE_ON = "Voice in this session (off): turn on";
+const VOICE_OFF = "Voice in this session (on): turn off";
 const STOP_READING = "Stop reading";
 const SPEECH_UNAVAILABLE = "Spoken replies need the Windows voice (Windows or WSL).";
-const CONVERSATION_ON = "Conversation mode (off): turn on";
-const CONVERSATION_OFF = "Conversation mode (on): turn off";
 // Conversation mode records hands-free: 1.2 s of quiet after speech ends a
 // turn, and 8 s without speech pauses the conversation.
 export const CONVERSATION_ENDPOINT: VoiceEndpoint = { endOfSpeechMs: 1_200, noSpeechMs: 8_000 };
@@ -406,17 +408,35 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	// --- spoken replies -----------------------------------------------------------
 
 	const speechEngine = deps.speechEngine ?? defaultSpeechEngineResolver(env);
-	const speechSettings = deps.speechSettings ?? {
-		read: () => readVoiceSpeechSettings({ env }),
-		write: (next: VoiceSpeechSettings) => { writeVoiceSpeechSettings(next, { env }); },
+	const voiceSessions = deps.voiceSessions ?? {
+		read: () => readVoiceSessions({ env }),
+		write: (next: string[]) => { writeVoiceSessions(next, { env }); },
 	};
-	const readSpeech = (): VoiceSpeechSettings => {
+	const paneFocused = deps.paneFocused ?? (() => herdrPaneFocused({ env }));
+	const readingTurn = deps.readingTurn ?? ((signal: AbortSignal) => acquireReadingTurn({ dir: resolveVoiceHome(env), signal }));
+	const sessionIdOf = (ctx: ExtensionContext | undefined): string | undefined => {
 		try {
-			return speechSettings.read();
+			const id = ctx?.sessionManager?.getSessionId?.();
+			return typeof id === "string" && id.trim() ? id : undefined;
 		} catch {
-			return { speakReplies: false, conversation: false };
+			return undefined;
 		}
 	};
+	// Voice is on per Pi session: replies are read there and the shortcut starts
+	// a hands-free conversation. Read fresh each time, so a change made in
+	// another process applies at once.
+	const voiceOn = (ctx: ExtensionContext | undefined): boolean => {
+		const id = sessionIdOf(ctx);
+		if (!id) return false;
+		try {
+			return voiceSessions.read().includes(id);
+		} catch {
+			return false;
+		}
+	};
+	// Set when a transcript is sent by voice; the reply to that turn may reopen
+	// the microphone, and no other reply does.
+	let spokenTurnPending = false;
 	const replyReader = createReplyReader({ engine: speechEngine });
 	const kokoro = deps.kokoro ?? {
 		readStatus: () => readKokoroStatus({ env }),
@@ -469,8 +489,13 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 				return undefined;
 			}
 		});
-		setVoiceFooter(ctx, live, voiceReadingStatus(toggleShortcut));
+		setVoiceFooter(ctx, live, "Waiting to read · esc skip");
+		let release: (() => void) | undefined;
 		try {
+			// One reading at a time across every Pi process: wait for the turn.
+			release = await readingTurn(current.controller.signal);
+			if (!release || !live()) return "cancelled";
+			setVoiceFooter(ctx, live, voiceReadingStatus(toggleShortcut));
 			const outcome = await replyReader.read(markdown, current.controller.signal);
 			if (outcome === "unavailable" && live() && !unavailableReported) {
 				unavailableReported = true;
@@ -481,28 +506,15 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			if (live()) ctx.ui.notify(error instanceof SpeechEngineError ? error.message : "The reply could not be read aloud.", "warning");
 			return "error";
 		} finally {
+			release?.();
 			if (reading === current) stopReading();
 		}
 	};
 
-	const setSpeakReplies = (ctx: ExtensionContext, enabled: boolean, say: Say): void => {
-		if (enabled && !speechEngine()) {
-			say(SPEECH_UNAVAILABLE, "warning");
-			return;
-		}
-		try {
-			speechSettings.write({ ...readSpeech(), speakReplies: enabled });
-		} catch {
-			say("The spoken-reply setting could not be saved.", "error");
-			return;
-		}
-		if (!enabled) stopReading();
-		say(enabled ? "Replies will be read aloud. Esc stops a reading." : "Replies are no longer read aloud.", "info");
-	};
-
-	const setConversation = (enabled: boolean, ready: boolean, say: Say): void => {
-		if (enabled && !ready) {
-			say("Conversation mode needs voice dictation. Choose Download voice dictation first.", "warning");
+	const setVoice = (ctx: ExtensionContext, enabled: boolean, say: Say): void => {
+		const id = sessionIdOf(ctx);
+		if (!id) {
+			say("Voice needs a saved session; this one has no id.", "warning");
 			return;
 		}
 		if (enabled && !speechEngine()) {
@@ -510,18 +522,20 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			return;
 		}
 		try {
-			speechSettings.write({ ...readSpeech(), conversation: enabled });
+			const others = voiceSessions.read().filter((session) => session !== id);
+			voiceSessions.write(enabled ? [...others, id] : others);
 		} catch {
-			say("The conversation setting could not be saved.", "error");
+			say("The voice setting could not be saved.", "error");
 			return;
 		}
 		if (!enabled) {
 			stopReading();
-			say("Conversation mode is off.", "info");
+			spokenTurnPending = false;
+			say("Voice is off in this session.", "info");
 			return;
 		}
-		const start = toggleShortcut ? `Press ${toggleShortcut} and speak` : "Speak after the next reply";
-		say(`Conversation mode is on. ${start}: the transcript is sent, the reply is read aloud and the microphone reopens. Esc pauses.`, "info");
+		const start = toggleShortcut ? `${toggleShortcut} starts a hands-free conversation` : "the reply starts a hands-free conversation";
+		say(`Voice is on in this session: replies are read aloud, and ${start}. Esc pauses.`, "info");
 	};
 
 	const command = async (ctx: ExtensionCommandContext): Promise<void> => {
@@ -579,14 +593,12 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		if (!live()) return;
 		const naturalDownload = `Download natural voice (Kokoro, about ${megabytes(kokoroBytes())})`;
 		const natural = kokoroStatus && kokoroStatus.state !== "installed" ? [naturalDownload] : [];
-		const speechNow = readSpeech();
-		const speech = [speechNow.speakReplies ? READ_OFF : READ_ON, speechNow.conversation ? CONVERSATION_OFF : CONVERSATION_ON, ...(reading ? [STOP_READING] : [])];
+		const speech = [voiceOn(ctx) ? VOICE_OFF : VOICE_ON, ...(reading ? [STOP_READING] : [])];
 		const choice = await ctx.ui.select(ready ? "Voice dictation · ready" : "Voice dictation · not installed", ready ? [START, ...toggle, ...speech, ...natural, STATUS] : [download, ...toggle, ...speech, ...natural, STATUS]);
 		if (!live() || !choice) return;
 		if (choice === STATUS) say(statusReport(target, diagnosis, status, platform.platform), "info");
-		else if (choice === READ_ON || choice === READ_OFF) setSpeakReplies(ctx, choice === READ_ON, say);
+		else if (choice === VOICE_ON || choice === VOICE_OFF) setVoice(ctx, choice === VOICE_ON, say);
 		else if (choice === STOP_READING) stopReading();
-		else if (choice === CONVERSATION_ON || choice === CONVERSATION_OFF) setConversation(choice === CONVERSATION_ON, ready, say);
 		else if (choice === naturalDownload) await installNatural(ctx, run, status.voiceHome, say);
 		else if (choice === DISABLE_PUSH_TO_TALK || choice === ENABLE_PUSH_TO_TALK) setPushToTalk(ctx, choice === ENABLE_PUSH_TO_TALK, say);
 		else if (choice === download) await install(ctx, run, { target, diagnosis, status, platform: platform.platform, runtimeMissing, modelMissing }, say);
@@ -1016,7 +1028,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			ctx.ui.notify("Voice dictation is already running. Finish or cancel it first.", "warning");
 			return;
 		}
-		await runToggle(openToggle(ctx, readSpeech().conversation));
+		await runToggle(openToggle(ctx, voiceOn(ctx)));
 	};
 
 	// Conversation mode: the transcript is the next prompt. A busy agent gets it
@@ -1041,6 +1053,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			say(unheard, "info");
 			return;
 		}
+		spokenTurnPending = true;
 		const idle = typeof ctx.isIdle === "function" ? ctx.isIdle() : true;
 		if (idle) pi.sendUserMessage(text);
 		else pi.sendUserMessage(text, { deliverAs: "followUp" });
@@ -1061,6 +1074,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		stopReading();
 		pendingReply = undefined;
 		unavailableReported = false;
+		spokenTurnPending = false;
 		generation++;
 		const running = active;
 		active = undefined;
@@ -1125,14 +1139,19 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	pi.on("agent_settled", (event, ctx) => {
 		const text = pendingReply;
 		pendingReply = undefined;
-		if (event?.aborted || !text || !supportedSession(ctx)) return;
-		const speech = readSpeech();
-		if (!speech.speakReplies && !speech.conversation) return;
+		const spoken = spokenTurnPending;
+		spokenTurnPending = false;
+		if (event?.aborted || !text || !supportedSession(ctx) || !voiceOn(ctx)) return;
 		const owner = generation;
-		void readAloud(ctx, text).then((outcome) => {
-			// A reading the user stopped, or one that failed, leaves the microphone closed.
+		void readAloud(ctx, text).then(async (outcome) => {
+			// A reading the user stopped, or one that failed, leaves the microphone
+			// closed, and only a reply to a spoken turn reopens it.
 			const finished = outcome === "done" || outcome === "empty" || outcome === "unavailable";
-			if (finished && owner === generation && readSpeech().conversation) listenForReply(ctx);
+			if (!finished || !spoken || owner !== generation || !voiceOn(ctx)) return;
+			const focused = await paneFocused().catch(() => false);
+			if (owner !== generation) return;
+			if (focused) listenForReply(ctx);
+			else ctx.ui.notify(`Conversation paused in this pane. Press ${toggleKey} to talk.`, "info");
 		});
 	});
 	pi.on("session_shutdown", (_event, ctx) => {

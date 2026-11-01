@@ -153,15 +153,35 @@ belongs to the user, so Gentle AI neither reads nor changes it.
 The shortcut is covered by tests with a fake terminal and fake session. No real
 key press in a real terminal has been exercised.
 
-## Read replies aloud
+## Voice in a session
 
-Turn it on from `/gentle:voice` with **Read replies aloud (off): turn on**; the same
-entry turns it off. Each entry names the current state in parentheses, then the action. The choice is saved in `voice-speech-settings.json` in the
-Gentle AI config home, next to the push-to-talk file, and applies to every
-session. Nothing is downloaded: it uses the Windows voice (System.Speech), or the
-natural voice once that is installed (see below), so it works on Windows and on
-WSL only. Elsewhere, turning it on is refused with
-"Spoken replies need the Windows voice (Windows or WSL)."
+Voice is turned on per Pi session, so only the sessions you care about talk
+and listen, for example a coordinating session and the one you work in. Open
+`/gentle:voice` in that session and choose **Voice in this session (off): turn
+on**; the same entry, then reading **(on): turn off**, turns it off. Every
+entry names the current state in parentheses, then the action. The choice is
+saved by session id in `voice-sessions.json` in the Gentle AI config home
+(the newest 64 sessions), so it survives `/reload` and applies at once in every
+Pi process. Delegated child sessions never speak or listen.
+
+Voice needs the Windows voice (System.Speech), or the natural voice once that
+is installed (see below), so it works on Windows and on WSL only. Elsewhere,
+turning it on is refused with "Spoken replies need the Windows voice (Windows
+or WSL)." A session without an id is refused too.
+
+In a voice session:
+
+- Every settled reply is read aloud, also while you look at another pane, so a
+  coordinating session can report while you work elsewhere.
+- Readings from all Pi processes take turns through `reading-turn.json` in the
+  voice directory: one reads, the others wait with the footer `Waiting to read
+  · esc skip`. A turn left by a process that is gone is taken over, and a
+  reading waits at most three minutes.
+- The dictation shortcut starts a hands-free conversation instead of pasting
+  (see Conversation below). In a session without voice it keeps dictating into
+  the draft exactly as before.
+
+### Reading replies
 
 | Topic | Behavior |
 |-------|----------|
@@ -174,21 +194,17 @@ WSL only. Elsewhere, turning it on is refused with
 | Footer | `Reading reply · esc stop · alt+m talk` while it reads. No state is published on the voice-state event. |
 | Process | Each reading runs PowerShell with a fixed script; the reply goes only through its standard input, as base64 JSON, never as an argument. PowerShell takes about 1.5 seconds to start before the voice is heard. Its output is discarded and a failure shows one fixed message. A reading is killed after 30 seconds plus about 0.1 second per character. |
 
-## Conversation mode
+### Conversation
 
-Conversation mode turns dictation and spoken replies into a hands-free loop:
-you speak, the transcript is sent, the reply is read aloud, and the microphone
-reopens. Turn it on from `/gentle:voice` with **Conversation mode (off): turn on**.
-It needs voice dictation installed and the Windows voice; otherwise it is
-refused with a notice and nothing is saved. It is saved in the same
-`voice-speech-settings.json` file and reads replies aloud even while **Read
-replies aloud** is off.
+In a voice session the dictation shortcut turns dictation and spoken replies
+into a hands-free loop: you speak, the transcript is sent, the reply is read
+aloud, and the microphone reopens. It needs voice dictation installed.
 
 | Topic | Behavior |
 |-------|----------|
 | Start | Press `alt+m` and speak. Recording ends by itself after 1.2 seconds of quiet that follows speech, so no second press is needed. |
 | Send | The transcript is sent as the next prompt, never pasted. While the agent is still busy it is queued as a follow-up instead of interrupting the run. |
-| The loop | When the reply has been read to the end, the microphone reopens the same way. A reply with nothing readable reopens it too. |
+| The loop | When the reply to something you said has been read to the end, the microphone reopens the same way, but only in the pane herdr reports focused (`herdr pane get`, from `HERDR_PANE_ID`); outside herdr the pane counts as focused. In another pane it stays closed with "Conversation paused in this pane. Press alt+m to talk." A reply with nothing readable reopens it too. A reply to a typed message or a background notice is read but never reopens the microphone. A failed herdr lookup keeps it closed. |
 | Pause | Esc while listening cancels the recording and pauses the conversation. Esc while a reply is read stops the reading and leaves the microphone closed. Stopping it with `alt+m` before saying anything also pauses it, with "Conversation paused. Press alt+m to talk." With no speech within 8 seconds, it pauses with "Conversation paused: no speech was heard. Press alt+m to talk." Press `alt+m` to go on. |
 | Send early | `alt+m` while listening stops the recording and sends at once. |
 | Footer | `● Conversation · listening · alt+m send · esc pause` while recording, then transcribing and sending. |

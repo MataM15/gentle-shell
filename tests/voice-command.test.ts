@@ -6,7 +6,6 @@ import { VoiceInstallError, type VoiceInstallProgress, type VoiceInstallResult }
 import { VoiceSessionError, type VoiceSessionState, type VoiceTranscript } from "../lib/voice-session.ts";
 import { VOICE_COMMAND_NAME, type VoiceCommandDeps, type VoiceDictation } from "../lib/voice-command.ts";
 import type { PushToTalkTimers } from "../lib/voice-push-to-talk.ts";
-import type { VoiceSpeechSettings } from "../lib/voice-settings.ts";
 import { SpeechEngineError, type SpeechEngine, type SpeechOptions, type SpeechOutcome } from "../lib/voice-speech.ts";
 
 // /gentle:voice through its registered command, with fake UI, acquisition and
@@ -198,12 +197,14 @@ interface Harness {
 	endpoints: Array<{ endOfSpeechMs: number; noSpeechMs: number } | undefined>;
 	installs: Array<{ kind: string; options: Record<string, unknown> }>;
 	settings: { enabled: boolean; reads: number; writes: boolean[] };
-	speech: { current: VoiceSpeechSettings; writes: VoiceSpeechSettings[] };
+	voice: { sessions: string[]; writes: string[][] };
+	focus: { focused: boolean; asks: number };
+	turn: { held: boolean; waiting: Array<() => void>; acquired: number; released: number };
 	kokoro: { state: "installed" | "missing"; installs: Array<{ signal: AbortSignal }> };
 	clock: ReturnType<typeof manualClock>;
 }
 
-function harness(overrides: { platform?: string; arch?: string; installed?: boolean; install?: (kind: "runtime" | "model", options: { signal: AbortSignal; onProgress(progress: VoiceInstallProgress): void }) => Promise<VoiceInstallResult>; env?: NodeJS.ProcessEnv; pushToTalk?: boolean; speech?: Partial<VoiceSpeechSettings>; engine?: SpeechEngine; kokoro?: "installed" | "missing"; kokoroInstall?: () => Promise<void> } = {}): Harness {
+function harness(overrides: { platform?: string; arch?: string; installed?: boolean; install?: (kind: "runtime" | "model", options: { signal: AbortSignal; onProgress(progress: VoiceInstallProgress): void }) => Promise<VoiceInstallResult>; env?: NodeJS.ProcessEnv; pushToTalk?: boolean; voice?: boolean; focused?: boolean; turnHeld?: boolean; engine?: SpeechEngine; kokoro?: "installed" | "missing"; kokoroInstall?: () => Promise<void> } = {}): Harness {
 	const calls: string[] = [];
 	const sessions: FakeSession[] = [];
 	const endpoints: Harness["endpoints"] = [];
@@ -211,7 +212,9 @@ function harness(overrides: { platform?: string; arch?: string; installed?: bool
 	// The toggle store is always faked: no test reads or writes the real config home.
 	const settings = { enabled: overrides.pushToTalk ?? false, reads: 0, writes: [] as boolean[] };
 	// Spoken replies are faked too: no test reaches PowerShell or the config home.
-	const speech = { current: { speakReplies: false, conversation: false, ...overrides.speech }, writes: [] as VoiceSpeechSettings[] };
+	const voice: Harness["voice"] = { sessions: overrides.voice ? ["session-alpha"] : [], writes: [] };
+	const focus: Harness["focus"] = { focused: overrides.focused ?? true, asks: 0 };
+	const turn: Harness["turn"] = { held: overrides.turnHeld ?? false, waiting: [], acquired: 0, released: 0 };
 	const kokoro: Harness["kokoro"] = { state: overrides.kokoro ?? "missing", installs: [] };
 	const clock = manualClock();
 	const state = overrides.installed ? "installed" : "missing";
@@ -246,12 +249,21 @@ function harness(overrides: { platform?: string; arch?: string; installed?: bool
 				kokoro.state = "installed";
 			},
 		},
-		speechSettings: {
-			read: () => ({ ...speech.current }),
-			write: (next) => { speech.writes.push({ ...next }); speech.current = { ...next }; },
+		voiceSessions: {
+			read: () => [...voice.sessions],
+			write: (next) => { voice.writes.push([...next]); voice.sessions = [...next]; },
 		},
+		paneFocused: async () => { focus.asks++; return focus.focused; },
+		// The shared reading turn, faked: free unless a test holds it.
+		readingTurn: (signal) => new Promise((resolve) => {
+			const take = () => { turn.acquired++; resolve(() => { turn.released++; }); };
+			if (!turn.held) return take();
+			const wait = () => { turn.held = false; take(); };
+			turn.waiting.push(wait);
+			signal.addEventListener("abort", () => resolve(undefined), { once: true });
+		}),
 	};
-	return { deps, calls, sessions, endpoints, installs, settings, speech, kokoro, clock };
+	return { deps, calls, sessions, endpoints, installs, settings, voice, focus, turn, kokoro, clock };
 }
 
 const pick = (pattern: RegExp) => (_title: string, options: string[]) => options.find((option) => pattern.test(option));
@@ -1413,7 +1425,7 @@ async function settleReply(pi: ReturnType<typeof fakePi>, ctx: unknown, text: st
 
 test("a settled reply is read aloud in its language while spoken replies are on, then the footer clears", async () => {
 	const { engine, readings } = fakeEngine();
-	const h = harness({ speech: { speakReplies: true }, engine });
+	const h = harness({ voice: true, engine });
 	const pi = register(h);
 	const ui = fakeContext();
 	await pi.fire("session_start", ui.ctx);
@@ -1431,13 +1443,13 @@ test("a settled reply is read aloud in its language while spoken replies are on,
 
 test("nothing is read when spoken replies are off, the run was aborted, or the session is not a TUI parent", async () => {
 	for (const scenario of [
-		{ name: "off", speech: { speakReplies: false }, env: {}, mode: "tui", aborted: false },
-		{ name: "aborted", speech: { speakReplies: true }, env: {}, mode: "tui", aborted: true },
-		{ name: "child", speech: { speakReplies: true }, env: { GENTLE_PI_AGENTS_CHILD: "1" }, mode: "tui", aborted: false },
-		{ name: "rpc", speech: { speakReplies: true }, env: {}, mode: "rpc", aborted: false },
+		{ name: "off", voice: false, env: {}, mode: "tui", aborted: false },
+		{ name: "aborted", voice: true, env: {}, mode: "tui", aborted: true },
+		{ name: "child", voice: true, env: { GENTLE_PI_AGENTS_CHILD: "1" }, mode: "tui", aborted: false },
+		{ name: "rpc", voice: true, env: {}, mode: "rpc", aborted: false },
 	]) {
 		const { engine, readings } = fakeEngine();
-		const h = harness({ speech: scenario.speech, engine, env: scenario.env });
+		const h = harness({ voice: scenario.voice, engine, env: scenario.env });
 		const pi = register(h);
 		const ui = fakeContext({}, scenario.mode);
 		await pi.fire("session_start", ui.ctx);
@@ -1450,7 +1462,7 @@ test("nothing is read when spoken replies are off, the run was aborted, or the s
 
 test("a run that ends with no reply text reads nothing, and an older reply is never read late", async () => {
 	const { engine, readings } = fakeEngine();
-	const h = harness({ speech: { speakReplies: true }, engine });
+	const h = harness({ voice: true, engine });
 	const pi = register(h);
 	const ui = fakeContext();
 	await pi.fire("session_start", ui.ctx);
@@ -1465,7 +1477,7 @@ test("a run that ends with no reply text reads nothing, and an older reply is ne
 
 test("Esc stops a reading and is consumed before the editor or the agent sees it", async () => {
 	const { engine, readings } = fakeEngine();
-	const h = harness({ speech: { speakReplies: true }, engine });
+	const h = harness({ voice: true, engine });
 	const pi = register(h);
 	const ui = fakeContext();
 	await pi.fire("session_start", ui.ctx);
@@ -1479,9 +1491,9 @@ test("Esc stops a reading and is consumed before the editor or the agent sees it
 	assert.equal(ui.editor(), "draft: \x1b", "after the reading, Esc passes through again");
 });
 
-test("the dictation shortcut while reading stops the reading, then starts dictation", async () => {
+test("the dictation shortcut while reading stops the reading, then starts a hands-free turn that is sent", async () => {
 	const { engine, readings } = fakeEngine();
-	const h = harness({ speech: { speakReplies: true }, engine, installed: true });
+	const h = harness({ voice: true, engine, installed: true });
 	const pi = register(h);
 	const ui = fakeContext();
 	await pi.fire("session_start", ui.ctx);
@@ -1490,19 +1502,16 @@ test("the dictation shortcut while reading stops the reading, then starts dictat
 	const pressed = pi.shortcuts.get("alt+m")!.handler(ui.ctx);
 	assert.equal(readings[0]!.options.signal.aborted, true, "the reading stops at once");
 	await until(() => h.sessions.length === 1);
-	assert.deepEqual(h.sessions[0]!.calls, ["start"]);
-	h.sessions[0]!.started.resolve();
-	await until(() => h.sessions[0]!.state === "recording");
-	void pi.shortcuts.get("alt+m")!.handler(ui.ctx);
-	h.sessions[0]!.result.resolve({ text: "hola", truncated: false });
+	assert.deepEqual(h.endpoints, [HANDS_FREE]);
+	await speak(h, 0, "hola");
 	await pressed;
-	assert.equal(ui.editor(), "draft: hola", "dictation still pastes when conversation mode is off");
-	assert.equal(pi.counts.sends, 0);
+	assert.deepEqual(pi.sent, [{ content: "hola", options: undefined }]);
+	assert.equal(ui.editor(), "draft: ", "nothing is pasted");
 });
 
 test("a new agent run stops the reading", async () => {
 	const { engine, readings } = fakeEngine();
-	const h = harness({ speech: { speakReplies: true }, engine });
+	const h = harness({ voice: true, engine });
 	const pi = register(h);
 	const ui = fakeContext();
 	await pi.fire("session_start", ui.ctx);
@@ -1514,7 +1523,7 @@ test("a new agent run stops the reading", async () => {
 
 test("a second settled reply replaces the reading in progress", async () => {
 	const { engine, readings } = fakeEngine();
-	const h = harness({ speech: { speakReplies: true }, engine });
+	const h = harness({ voice: true, engine });
 	const pi = register(h);
 	const ui = fakeContext();
 	await pi.fire("session_start", ui.ctx);
@@ -1530,7 +1539,7 @@ test("a second settled reply replaces the reading in progress", async () => {
 
 test("an engine failure is reported once with its fixed message", async () => {
 	const { engine, readings } = fakeEngine();
-	const h = harness({ speech: { speakReplies: true }, engine });
+	const h = harness({ voice: true, engine });
 	const pi = register(h);
 	const ui = fakeContext();
 	await pi.fire("session_start", ui.ctx);
@@ -1542,34 +1551,81 @@ test("an engine failure is reported once with its fixed message", async () => {
 	await until(() => ui.statuses.at(-1) === undefined);
 });
 
-test("the menu turns spoken replies on and off and persists the choice", async () => {
-	const { engine } = fakeEngine();
-	const h = harness({ engine });
+test("the menu turns voice on and off for this session only and persists the choice", async () => {
+	const { engine, readings } = fakeEngine();
+	const h = harness({ engine, installed: true });
+	h.voice.sessions = ["session-other"];
 	const pi = register(h);
-	const ui = fakeContext({ select: pick(/^Read replies aloud \(off\): turn on$/) });
+	const ui = fakeContext({ select: pick(/^Voice in this session \(off\): turn on$/) });
 	await run(pi, ui);
-	assert.ok(ui.selects[0]!.options.includes("Read replies aloud (off): turn on"));
-	assert.ok(!ui.selects[0]!.options.includes("Stop reading"));
-	assert.deepEqual(h.speech.writes, [{ speakReplies: true, conversation: false }]);
-	assert.match(ui.notices.at(-1)!.message, /read aloud/i);
-	const again = fakeContext({ select: pick(/^Read replies aloud \(on\): turn off$/) });
+	assert.ok(ui.selects[0]!.options.includes("Voice in this session (off): turn on"));
+	assert.ok(!ui.selects[0]!.options.some((option) => /Read replies aloud|Conversation mode/.test(option)), "the old global switches are gone");
+	assert.deepEqual(h.voice.writes, [["session-other", "session-alpha"]]);
+	assert.deepEqual(ui.notices.at(-1), { message: "Voice is on in this session: replies are read aloud, and alt+m starts a hands-free conversation. Esc pauses.", type: "info" });
+	await pi.fire("session_start", ui.ctx);
+	await settleReply(pi, ui.ctx, "Una respuesta.");
+	await until(() => readings.length === 1);
+	const again = fakeContext({ select: pick(/^Voice in this session \(on\): turn off$/) });
 	await run(pi, again);
-	assert.ok(again.selects[0]!.options.includes("Read replies aloud (on): turn off"));
-	assert.deepEqual(h.speech.writes.at(-1), { speakReplies: false, conversation: false });
+	assert.deepEqual(h.voice.writes.at(-1), ["session-other"], "other sessions keep their voice");
+	assert.equal(readings[0]!.options.signal.aborted, true, "turning it off stops the reading");
+	assert.deepEqual(again.notices.at(-1), { message: "Voice is off in this session.", type: "info" });
 });
 
-test("turning spoken replies on without the Windows voice is refused and nothing is saved", async () => {
-	const h = harness();
+test("turning voice on without the Windows voice, or without a session id, is refused and nothing is saved", async () => {
+	const h = harness({ installed: true });
 	const pi = register(h);
-	const ui = fakeContext({ select: pick(/^Read replies aloud \(off\): turn on$/) });
+	const ui = fakeContext({ select: pick(/^Voice in this session \(off\): turn on$/) });
 	await run(pi, ui);
-	assert.deepEqual(h.speech.writes, []);
+	assert.deepEqual(h.voice.writes, []);
 	assert.deepEqual(ui.notices.at(-1), { message: "Spoken replies need the Windows voice (Windows or WSL).", type: "warning" });
+	const { engine } = fakeEngine();
+	const anonymous = harness({ installed: true, engine });
+	const anonymousPi = register(anonymous);
+	const noId = fakeContext({ select: pick(/^Voice in this session \(off\): turn on$/) }, "tui", true, "");
+	await run(anonymousPi, noId);
+	assert.deepEqual(anonymous.voice.writes, []);
+	assert.deepEqual(noId.notices.at(-1), { message: "Voice needs a saved session; this one has no id.", type: "warning" });
+});
+
+test("a session whose voice is off reads nothing, even when other sessions have voice on", async () => {
+	const { engine, readings } = fakeEngine();
+	const h = harness({ engine });
+	h.voice.sessions = ["session-other"];
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	await settleReply(pi, ui.ctx, "Esto no se lee acá.");
+	await tick();
+	assert.equal(readings.length, 0);
+});
+
+test("a reading waits for the shared turn, then reads; Esc while waiting skips it", async () => {
+	const { engine, readings } = fakeEngine();
+	const h = harness({ engine, voice: true, turnHeld: true });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	await settleReply(pi, ui.ctx, "Primera.");
+	await until(() => h.turn.waiting.length === 1);
+	assert.equal(readings.length, 0, "nothing is read while another session reads");
+	assert.equal(ui.statuses.at(-1), "Waiting to read · esc skip");
+	h.turn.waiting.shift()!();
+	await until(() => readings.length === 1);
+	readings[0]!.finish("done");
+	await until(() => h.turn.released === 1);
+	h.turn.held = true;
+	await settleReply(pi, ui.ctx, "Segunda.");
+	await until(() => h.turn.waiting.length === 1);
+	ui.type(ESC);
+	await until(() => ui.statuses.at(-1) === undefined);
+	assert.equal(readings.length, 1, "the skipped reply is never read");
+	assert.equal(h.turn.acquired, 1);
 });
 
 test("Stop reading is offered only while a reply is being read, and stops it", async () => {
 	const { engine, readings } = fakeEngine();
-	const h = harness({ speech: { speakReplies: true }, engine });
+	const h = harness({ voice: true, engine });
 	const pi = register(h);
 	const ui = fakeContext({ select: pick(/^Stop reading$/) });
 	await pi.fire("session_start", ui.ctx);
@@ -1582,7 +1638,7 @@ test("Stop reading is offered only while a reply is being read, and stops it", a
 
 test("session shutdown cancels the reading, and a late failure paints nothing", async () => {
 	const { engine, readings } = fakeEngine();
-	const h = harness({ speech: { speakReplies: true }, engine });
+	const h = harness({ voice: true, engine });
 	const pi = register(h);
 	const ui = fakeContext();
 	await pi.fire("session_start", ui.ctx);
@@ -1600,6 +1656,15 @@ test("session shutdown cancels the reading, and a late failure paints nothing", 
 // --- conversation mode (S2, S3) -------------------------------------------------------
 
 const HANDS_FREE = { endOfSpeechMs: 1200, noSpeechMs: 8000 };
+
+// One spoken turn in a voice session: alt+m, speech, end of speech, sent.
+async function talk(pi: ReturnType<typeof fakePi>, h: Harness, ctx: unknown, text: string) {
+	const index = h.sessions.length;
+	const pressed = pi.shortcuts.get("alt+m")!.handler(ctx);
+	await until(() => h.sessions.length === index + 1);
+	await speak(h, index, text);
+	await pressed;
+}
 
 // A hands-free recording ends on its own: the worker reports transcribing, then
 // the session finishes, and the transcript is collected without a key press.
@@ -1631,7 +1696,7 @@ test("without conversation mode the toggle records with no endpoint and pastes",
 
 test("in conversation mode the toggle records hands-free and sends the transcript instead of pasting it", async () => {
 	const { engine } = fakeEngine();
-	const h = harness({ installed: true, engine, speech: { conversation: true } });
+	const h = harness({ installed: true, engine, voice: true });
 	const pi = register(h);
 	const ui = fakeContext();
 	await pi.fire("session_start", ui.ctx);
@@ -1652,7 +1717,7 @@ test("in conversation mode the toggle records hands-free and sends the transcrip
 
 test("in conversation mode the toggle key sends at once, and a busy agent gets it as a follow-up", async () => {
 	const { engine } = fakeEngine();
-	const h = harness({ installed: true, engine, speech: { conversation: true } });
+	const h = harness({ installed: true, engine, voice: true });
 	const pi = register(h);
 	const ui = fakeContext({}, "tui", true, "session-alpha", () => false);
 	await pi.fire("session_start", ui.ctx);
@@ -1667,76 +1732,112 @@ test("in conversation mode the toggle key sends at once, and a busy agent gets i
 	assert.deepEqual(pi.sent, [{ content: "otra cosa", options: { deliverAs: "followUp" } }]);
 });
 
-test("after a reply is read in conversation mode the microphone reopens hands-free, and the next answer is sent", async () => {
+test("after a reply to a spoken turn is read, the microphone reopens hands-free in the focused pane, and the next answer is sent", async () => {
 	const { engine, readings } = fakeEngine();
-	const h = harness({ installed: true, engine, speech: { conversation: true } });
+	const h = harness({ installed: true, engine, voice: true });
 	const pi = register(h);
 	const ui = fakeContext();
 	await pi.fire("session_start", ui.ctx);
+	await talk(pi, h, ui.ctx, "¿seguís?");
 	await settleReply(pi, ui.ctx, "¿Querés que siga?");
 	await until(() => readings.length === 1);
-	assert.equal(h.sessions.length, 0, "the microphone stays closed while the reply is read");
+	assert.equal(h.sessions.length, 1, "the microphone stays closed while the reply is read");
 	readings[0]!.finish("done");
-	await until(() => h.sessions.length === 1);
-	assert.deepEqual(h.endpoints, [HANDS_FREE]);
-	await speak(h, 0, "sí, seguí");
-	await until(() => pi.sent.length === 1);
-	assert.deepEqual(pi.sent, [{ content: "sí, seguí", options: undefined }]);
+	await until(() => h.sessions.length === 2);
+	assert.deepEqual(h.endpoints, [HANDS_FREE, HANDS_FREE]);
+	await speak(h, 1, "sí, seguí");
+	await until(() => pi.sent.length === 2);
+	assert.deepEqual(pi.sent.at(-1), { content: "sí, seguí", options: undefined });
 });
 
-test("a reply with nothing readable still reopens the microphone in conversation mode", async () => {
+test("a reply to a typed message is read but does not reopen the microphone", async () => {
 	const { engine, readings } = fakeEngine();
-	const h = harness({ installed: true, engine, speech: { conversation: true } });
+	const h = harness({ installed: true, engine, voice: true });
 	const pi = register(h);
 	const ui = fakeContext();
 	await pi.fire("session_start", ui.ctx);
+	await settleReply(pi, ui.ctx, "Respuesta a algo escrito.");
+	await until(() => readings.length === 1);
+	readings[0]!.finish("done");
+	await until(() => ui.statuses.at(-1) === undefined);
+	await tick();
+	assert.equal(h.sessions.length, 0);
+	assert.equal(h.focus.asks, 0, "herdr is not even asked");
+});
+
+test("in a pane that is not focused the reply is read but the microphone stays closed", async () => {
+	const { engine, readings } = fakeEngine();
+	const h = harness({ installed: true, engine, voice: true });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	await talk(pi, h, ui.ctx, "hola");
+	h.focus.focused = false;
+	await settleReply(pi, ui.ctx, "Te respondo aunque estés en otro panel.");
+	await until(() => readings.length === 1);
+	readings[0]!.finish("done");
+	await until(() => h.focus.asks === 1);
+	await tick();
+	assert.equal(h.sessions.length, 1, "no second recording");
+	assert.deepEqual(ui.notices.at(-1), { message: "Conversation paused in this pane. Press alt+m to talk.", type: "info" });
+});
+
+test("a reply with nothing readable still reopens the microphone after a spoken turn", async () => {
+	const { engine, readings } = fakeEngine();
+	const h = harness({ installed: true, engine, voice: true });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	await talk(pi, h, ui.ctx, "mostrame el código");
 	await settleReply(pi, ui.ctx, "```\nsolo código\n```");
-	await until(() => h.sessions.length === 1);
+	await until(() => h.sessions.length === 2);
 	assert.equal(readings.length, 0);
 });
 
 test("a reading stopped with Esc, or an engine failure, does not reopen the microphone", async () => {
 	for (const end of ["esc", "fail"] as const) {
 		const { engine, readings } = fakeEngine();
-		const h = harness({ installed: true, engine, speech: { conversation: true } });
+		const h = harness({ installed: true, engine, voice: true });
 		const pi = register(h);
 		const ui = fakeContext();
 		await pi.fire("session_start", ui.ctx);
+		await talk(pi, h, ui.ctx, "hola");
 		await settleReply(pi, ui.ctx, "Respuesta.");
 		await until(() => readings.length === 1);
 		if (end === "esc") ui.type(ESC);
 		else readings[0]!.fail(new SpeechEngineError("failed"));
 		await until(() => ui.statuses.at(-1) === undefined);
 		await tick();
-		assert.equal(h.sessions.length, 0, end);
+		assert.equal(h.sessions.length, 1, end);
 	}
 });
 
 test("hearing no speech pauses the conversation with one notice and does not reopen", async () => {
 	const { engine, readings } = fakeEngine();
-	const h = harness({ installed: true, engine, speech: { conversation: true } });
+	const h = harness({ installed: true, engine, voice: true });
 	const pi = register(h);
 	const ui = fakeContext();
 	await pi.fire("session_start", ui.ctx);
+	await talk(pi, h, ui.ctx, "hola");
 	await settleReply(pi, ui.ctx, "Respuesta.");
 	await until(() => readings.length === 1);
 	readings[0]!.finish("done");
-	await until(() => h.sessions.length === 1);
-	h.sessions[0]!.started.resolve();
-	await until(() => h.sessions[0]!.state === "recording");
-	h.sessions[0]!.emit("transcribing");
-	h.sessions[0]!.emit("finished");
-	h.sessions[0]!.result.reject(new VoiceSessionError("no-speech"));
+	await until(() => h.sessions.length === 2);
+	h.sessions[1]!.started.resolve();
+	await until(() => h.sessions[1]!.state === "recording");
+	h.sessions[1]!.emit("transcribing");
+	h.sessions[1]!.emit("finished");
+	h.sessions[1]!.result.reject(new VoiceSessionError("no-speech"));
 	await until(() => ui.notices.length === 1);
 	assert.deepEqual(ui.notices, [{ message: "Conversation paused: no speech was heard. Press alt+m to talk.", type: "info" }]);
 	await tick();
-	assert.equal(h.sessions.length, 1);
-	assert.equal(pi.counts.sends, 0);
+	assert.equal(h.sessions.length, 2);
+	assert.equal(pi.sent.length, 1);
 });
 
 test("Esc while listening in conversation mode pauses it without sending", async () => {
 	const { engine } = fakeEngine();
-	const h = harness({ installed: true, engine, speech: { conversation: true } });
+	const h = harness({ installed: true, engine, voice: true });
 	const pi = register(h);
 	const ui = fakeContext();
 	await pi.fire("session_start", ui.ctx);
@@ -1749,41 +1850,6 @@ test("Esc while listening in conversation mode pauses it without sending", async
 	assert.ok(h.sessions[0]!.calls.includes("cancel"));
 	assert.equal(pi.counts.sends, 0);
 	assert.deepEqual(ui.notices.at(-1), { message: "Conversation paused. Press alt+m to talk.", type: "info" });
-});
-
-test("the menu turns conversation mode on only with dictation installed and a voice, and off again", async () => {
-	const { engine, readings } = fakeEngine();
-	const missing = harness({ engine });
-	const missingPi = register(missing);
-	const refused = fakeContext({ select: pick(/^Conversation mode \(off\): turn on$/) });
-	await run(missingPi, refused);
-	assert.ok(refused.selects[0]!.options.includes("Conversation mode (off): turn on"));
-	assert.deepEqual(missing.speech.writes, []);
-	assert.deepEqual(refused.notices.at(-1), { message: "Conversation mode needs voice dictation. Choose Download voice dictation first.", type: "warning" });
-
-	const noVoice = harness({ installed: true });
-	const noVoicePi = register(noVoice);
-	const silent = fakeContext({ select: pick(/^Conversation mode \(off\): turn on$/) });
-	await run(noVoicePi, silent);
-	assert.deepEqual(noVoice.speech.writes, []);
-	assert.deepEqual(silent.notices.at(-1), { message: "Spoken replies need the Windows voice (Windows or WSL).", type: "warning" });
-
-	const h = harness({ installed: true, engine });
-	const pi = register(h);
-	const on = fakeContext({ select: pick(/^Conversation mode \(off\): turn on$/) });
-	await run(pi, on);
-	assert.deepEqual(h.speech.writes, [{ speakReplies: false, conversation: true }]);
-	assert.deepEqual(on.notices.at(-1), { message: "Conversation mode is on. Press alt+m and speak: the transcript is sent, the reply is read aloud and the microphone reopens. Esc pauses.", type: "info" });
-	await pi.fire("session_start", on.ctx);
-	await settleReply(pi, on.ctx, "Una respuesta.");
-	await until(() => readings.length === 1);
-	const off = fakeContext({ select: pick(/^Conversation mode \(on\): turn off$/) });
-	await run(pi, off);
-	assert.deepEqual(h.speech.writes.at(-1), { speakReplies: false, conversation: false });
-	assert.equal(readings[0]!.options.signal.aborted, true, "turning it off stops the reading");
-	assert.deepEqual(off.notices.at(-1), { message: "Conversation mode is off.", type: "info" });
-	await tick();
-	assert.equal(h.sessions.length, 0, "and the microphone does not reopen");
 });
 
 // --- the natural voice download (S6) ----------------------------------------------------
@@ -1846,7 +1912,7 @@ test("a failed natural voice download reports the installer's fixed message", as
 
 test("stopping a hands-free recording with the shortcut before speaking pauses without claiming nothing was heard", async () => {
 	const { engine } = fakeEngine();
-	const h = harness({ installed: true, engine, speech: { conversation: true } });
+	const h = harness({ installed: true, engine, voice: true });
 	const pi = register(h);
 	const ui = fakeContext();
 	await pi.fire("session_start", ui.ctx);
@@ -1859,4 +1925,27 @@ test("stopping a hands-free recording with the shortcut before speaking pauses w
 	await pressed;
 	assert.deepEqual(ui.notices.at(-1), { message: "Conversation paused. Press alt+m to talk.", type: "info" });
 	assert.equal(pi.counts.sends, 0);
+});
+
+test("the default reading turn takes and releases the shared turn file in the voice home", async () => {
+	const { mkdtempSync, existsSync, rmSync, mkdirSync } = await import("node:fs");
+	const { join } = await import("node:path");
+	const scratchRoot = join(import.meta.dirname, "..", "tmp");
+	mkdirSync(scratchRoot, { recursive: true });
+	const home = mkdtempSync(join(scratchRoot, "voice-command-turn-"));
+	try {
+		const { engine, readings } = fakeEngine();
+		const h = harness({ voice: true, engine, env: { GENTLE_PI_CONFIG_HOME: home } });
+		delete h.deps.readingTurn;
+		const pi = register(h);
+		const ui = fakeContext();
+		await pi.fire("session_start", ui.ctx);
+		await settleReply(pi, ui.ctx, "Con el turno real.");
+		await until(() => readings.length === 1);
+		assert.equal(existsSync(join(home, "voice", "reading-turn.json")), true, "the turn is held while reading");
+		readings[0]!.finish("done");
+		await until(() => !existsSync(join(home, "voice", "reading-turn.json")));
+	} finally {
+		rmSync(home, { recursive: true, force: true });
+	}
 });

@@ -5,13 +5,14 @@ import { after } from "node:test";
 import test from "node:test";
 import {
 	readVoicePushToTalk,
-	readVoiceSpeechSettings,
+	readVoiceSessions,
+	VOICE_SESSIONS_FILE,
+	VOICE_SESSIONS_LIMIT,
+	VOICE_SESSIONS_SCHEMA,
 	VOICE_SETTINGS_FILE,
 	VOICE_SETTINGS_SCHEMA,
-	VOICE_SPEECH_SETTINGS_FILE,
-	VOICE_SPEECH_SETTINGS_SCHEMA,
 	writeVoicePushToTalk,
-	writeVoiceSpeechSettings,
+	writeVoiceSessions,
 } from "../lib/voice-settings.ts";
 
 // The persisted push-to-talk toggle, in a scratch config home inside the
@@ -57,37 +58,38 @@ test("the config home follows the environment when no home is given", () => {
 	assert.equal(readVoicePushToTalk({ env: { GENTLE_PI_CONFIG_HOME: home } }), true);
 });
 
-// Spoken replies and conversation mode live in their own file, so the
-// push-to-talk file and its strict parser stay exactly as they were.
+// Voice sessions live in their own file, so the push-to-talk file and its
+// strict parser stay exactly as they were.
 
-test("spoken-reply settings are off until written, round-trip, and leave push-to-talk alone", () => {
+test("voice sessions are empty until written, round-trip, and leave push-to-talk alone", () => {
 	const home = scratchHome();
 	const options = { gentlePiConfigHome: home };
-	assert.deepEqual(readVoiceSpeechSettings(options), { speakReplies: false, conversation: false });
+	assert.deepEqual(readVoiceSessions(options), []);
 	writeVoicePushToTalk(true, options);
-	const path = writeVoiceSpeechSettings({ speakReplies: true, conversation: false }, options);
-	assert.equal(path, join(home, VOICE_SPEECH_SETTINGS_FILE));
-	assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), { schema: VOICE_SPEECH_SETTINGS_SCHEMA, speakReplies: true, conversation: false });
-	assert.deepEqual(readVoiceSpeechSettings(options), { speakReplies: true, conversation: false });
-	writeVoiceSpeechSettings({ speakReplies: false, conversation: true }, options);
-	assert.deepEqual(readVoiceSpeechSettings(options), { speakReplies: false, conversation: true });
+	const path = writeVoiceSessions(["session-a", "session-b"], options);
+	assert.equal(path, join(home, VOICE_SESSIONS_FILE));
+	assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), { schema: VOICE_SESSIONS_SCHEMA, sessions: ["session-a", "session-b"] });
+	assert.deepEqual(readVoiceSessions(options), ["session-a", "session-b"]);
+	writeVoiceSessions(["session-b"], options);
+	assert.deepEqual(readVoiceSessions(options), ["session-b"]);
 	assert.equal(readVoicePushToTalk(options), true, "push-to-talk is untouched");
-	assert.deepEqual(JSON.parse(readFileSync(join(home, VOICE_SETTINGS_FILE), "utf8")), { schema: VOICE_SETTINGS_SCHEMA, pushToTalk: true });
 });
 
-test("a malformed or foreign spoken-reply settings file reads as off", () => {
+test("only the most recent voice sessions are kept, without duplicates or blanks", () => {
 	const home = scratchHome();
-	const path = join(home, VOICE_SPEECH_SETTINGS_FILE);
-	const schema = VOICE_SPEECH_SETTINGS_SCHEMA;
-	for (const raw of [
-		"not json",
-		"[]",
-		`{"schema":"${schema}","speakReplies":"yes","conversation":false}`,
-		`{"schema":"other","speakReplies":true,"conversation":true}`,
-		`{"schema":"${schema}","speakReplies":true}`,
-		`{"schema":"${schema}","speakReplies":true,"conversation":true,"extra":1}`,
-	]) {
+	const many = Array.from({ length: 80 }, (_value, index) => `session-${index}`);
+	writeVoiceSessions([...many, "session-79", "", "  "], { gentlePiConfigHome: home });
+	const kept = readVoiceSessions({ gentlePiConfigHome: home });
+	assert.equal(kept.length, VOICE_SESSIONS_LIMIT);
+	assert.deepEqual(kept, many.slice(-VOICE_SESSIONS_LIMIT));
+});
+
+test("a malformed or foreign voice sessions file reads as empty", () => {
+	const home = scratchHome();
+	const path = join(home, VOICE_SESSIONS_FILE);
+	const schema = VOICE_SESSIONS_SCHEMA;
+	for (const raw of ["not json", "[]", `{"schema":"other","sessions":["a"]}`, `{"schema":"${schema}","sessions":"a"}`, `{"schema":"${schema}","sessions":["a",3]}`, `{"schema":"${schema}","sessions":["a"],"extra":1}`]) {
 		writeFileSync(path, raw);
-		assert.deepEqual(readVoiceSpeechSettings({ gentlePiConfigHome: home }), { speakReplies: false, conversation: false }, raw);
+		assert.deepEqual(readVoiceSessions({ gentlePiConfigHome: home }), [], raw);
 	}
 });

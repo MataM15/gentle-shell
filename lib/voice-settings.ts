@@ -49,48 +49,49 @@ export function writeVoicePushToTalk(enabled: boolean, options: VoiceSettingsOpt
 	return path;
 }
 
-// Spoken replies and conversation mode, in their own file so the push-to-talk
-// file keeps its exact two-key shape. A missing, malformed or foreign file
-// reads as both off.
+// The sessions where voice is on (docs/voice.md, "Voice in a session"): replies
+// are read aloud there and the dictation shortcut starts a hands-free
+// conversation. One shared file lists Pi session ids, newest last, so a
+// session keeps its choice across reloads and every Pi process can read it. A
+// missing, malformed or foreign file reads as no session.
 
-export const VOICE_SPEECH_SETTINGS_SCHEMA = "gentle-pi.voice-speech-settings/v1";
-export const VOICE_SPEECH_SETTINGS_FILE = "voice-speech-settings.json";
+export const VOICE_SESSIONS_SCHEMA = "gentle-pi.voice-sessions/v1";
+export const VOICE_SESSIONS_FILE = "voice-sessions.json";
+export const VOICE_SESSIONS_LIMIT = 64;
 
-export interface VoiceSpeechSettings {
-	speakReplies: boolean;
-	conversation: boolean;
-}
-
-const SPEECH_OFF: VoiceSpeechSettings = { speakReplies: false, conversation: false };
-
-export function parseVoiceSpeechSettingsFile(raw: string): VoiceSpeechSettings | undefined {
+export function parseVoiceSessionsFile(raw: string): string[] | undefined {
 	try {
 		const value: unknown = JSON.parse(raw);
 		if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
-		const keys = Object.keys(value);
-		if (keys.length !== 3 || !("schema" in value) || value.schema !== VOICE_SPEECH_SETTINGS_SCHEMA) return undefined;
-		if (!("speakReplies" in value) || !("conversation" in value)) return undefined;
-		if (typeof value.speakReplies !== "boolean" || typeof value.conversation !== "boolean") return undefined;
-		return { speakReplies: value.speakReplies, conversation: value.conversation };
+		if (Object.keys(value).length !== 2 || !("schema" in value) || value.schema !== VOICE_SESSIONS_SCHEMA || !("sessions" in value)) return undefined;
+		const { sessions } = value;
+		return Array.isArray(sessions) && sessions.every((id) => typeof id === "string") ? sessions : undefined;
 	} catch { return undefined; }
 }
 
-export function readVoiceSpeechSettings(options: VoiceSettingsOptions = {}): VoiceSpeechSettings {
+export function readVoiceSessions(options: VoiceSettingsOptions = {}): string[] {
 	try {
-		return parseVoiceSpeechSettingsFile(readFileSync(join(homeFor(options), VOICE_SPEECH_SETTINGS_FILE), "utf8")) ?? { ...SPEECH_OFF };
+		return parseVoiceSessionsFile(readFileSync(join(homeFor(options), VOICE_SESSIONS_FILE), "utf8")) ?? [];
 	} catch {
-		return { ...SPEECH_OFF };
+		return [];
 	}
 }
 
-export function writeVoiceSpeechSettings(settings: VoiceSpeechSettings, options: VoiceSettingsOptions = {}): string {
+// Keeps the most recent VOICE_SESSIONS_LIMIT distinct, non-blank ids.
+export function writeVoiceSessions(sessions: readonly string[], options: VoiceSettingsOptions = {}): string {
+	const kept: string[] = [];
+	for (const id of [...sessions].reverse()) {
+		const trimmed = id.trim();
+		if (trimmed && !kept.includes(trimmed)) kept.push(trimmed);
+		if (kept.length === VOICE_SESSIONS_LIMIT) break;
+	}
+	kept.reverse();
 	const home = homeFor(options);
-	const path = join(home, VOICE_SPEECH_SETTINGS_FILE);
+	const path = join(home, VOICE_SESSIONS_FILE);
 	const temporary = `${path}.${randomUUID()}.tmp`;
 	mkdirSync(home, { recursive: true });
 	try {
-		const content = { schema: VOICE_SPEECH_SETTINGS_SCHEMA, speakReplies: settings.speakReplies, conversation: settings.conversation };
-		writeFileSync(temporary, `${JSON.stringify(content)}\n`, { flag: "wx", mode: 0o600 });
+		writeFileSync(temporary, `${JSON.stringify({ schema: VOICE_SESSIONS_SCHEMA, sessions: kept })}\n`, { flag: "wx", mode: 0o600 });
 		renameSync(temporary, path);
 	} finally {
 		try { unlinkSync(temporary); } catch { /* Rename consumed the temporary file. */ }
