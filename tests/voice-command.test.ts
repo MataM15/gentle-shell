@@ -1599,7 +1599,7 @@ test("the menu turns voice on and off for this session only and persists the cho
 	assert.ok(ui.selects[0]!.options.includes("Voice in this session (off): turn on"));
 	assert.ok(!ui.selects[0]!.options.some((option) => /Read replies aloud|Conversation mode/.test(option)), "the old global switches are gone");
 	assert.deepEqual(h.voice.writes, [["session-other", "session-alpha"]]);
-	assert.deepEqual(ui.notices.at(-1), { message: "Voice is on in this session: replies are read aloud, and alt+m starts a hands-free conversation. Esc pauses.", type: "info" });
+	assert.deepEqual(ui.notices.at(-1), { message: "Voice is on in this session: replies are read aloud, and alt+m starts a hands-free conversation. Esc skips a reading.", type: "info" });
 	await pi.fire("session_start", ui.ctx);
 	await settleReply(pi, ui.ctx, "Una respuesta.");
 	await until(() => readings.length === 1);
@@ -1693,7 +1693,7 @@ test("session shutdown cancels the reading, and a late failure paints nothing", 
 
 // --- conversation mode (S2, S3) -------------------------------------------------------
 
-const HANDS_FREE = { endOfSpeechMs: 1200, noSpeechMs: 8000 };
+const HANDS_FREE = { endOfSpeechMs: 2500, noSpeechMs: 8000 };
 
 // One spoken turn in a voice session: alt+m, speech, end of speech, sent.
 async function talk(pi: ReturnType<typeof fakePi>, h: Harness, ctx: unknown, text: string) {
@@ -1834,22 +1834,48 @@ test("a reply with nothing readable still reopens the microphone after a spoken 
 	assert.equal(readings.length, 0);
 });
 
-test("a reading stopped with Esc, or an engine failure, does not reopen the microphone", async () => {
-	for (const end of ["esc", "fail"] as const) {
-		const { engine, readings } = fakeEngine();
-		const h = harness({ installed: true, engine, voice: true });
-		const pi = register(h);
-		const ui = fakeContext();
-		await pi.fire("session_start", ui.ctx);
-		await talk(pi, h, ui.ctx, "hola");
-		await settleReply(pi, ui.ctx, "Respuesta.");
-		await until(() => readings.length === 1);
-		if (end === "esc") ui.type(ESC);
-		else readings[0]!.fail(new SpeechEngineError("failed"));
-		await until(() => ui.statuses.at(-1) === undefined);
-		await tick();
-		assert.equal(h.sessions.length, 1, end);
-	}
+test("Esc skips the reading of a spoken turn and reopens the microphone, so the user can correct what they heard", async () => {
+	const { engine, readings } = fakeEngine();
+	const h = harness({ installed: true, engine, voice: true });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	await talk(pi, h, ui.ctx, "hola");
+	await settleReply(pi, ui.ctx, "Una respuesta larga que no hace falta escuchar entera.");
+	await until(() => readings.length === 1);
+	ui.type(ESC);
+	assert.equal(readings[0]!.options.signal.aborted, true, "the reading stops at once");
+	await until(() => h.sessions.length === 2);
+	assert.equal(ui.editor(), "", "Esc never reaches the editor");
+});
+
+test("Esc on the reading of a typed turn stops it and leaves the microphone closed", async () => {
+	const { engine, readings } = fakeEngine();
+	const h = harness({ installed: true, engine, voice: true });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	await settleReply(pi, ui.ctx, "Respuesta.");
+	await until(() => readings.length === 1);
+	ui.type(ESC);
+	await until(() => ui.statuses.at(-1) === undefined);
+	await tick();
+	assert.equal(h.sessions.length, 0);
+});
+
+test("a reading that fails does not reopen the microphone", async () => {
+	const { engine, readings } = fakeEngine();
+	const h = harness({ installed: true, engine, voice: true });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	await talk(pi, h, ui.ctx, "hola");
+	await settleReply(pi, ui.ctx, "Respuesta.");
+	await until(() => readings.length === 1);
+	readings[0]!.fail(new SpeechEngineError("failed"));
+	await until(() => ui.statuses.at(-1) === undefined);
+	await tick();
+	assert.equal(h.sessions.length, 1);
 });
 
 test("hearing no speech pauses the conversation with one notice and does not reopen", async () => {

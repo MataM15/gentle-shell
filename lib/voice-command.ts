@@ -115,9 +115,10 @@ const VOICE_ON = "Voice in this session (off): turn on";
 const VOICE_OFF = "Voice in this session (on): turn off";
 const STOP_READING = "Stop reading";
 const SPEECH_UNAVAILABLE = "Spoken replies need the Windows voice (Windows or WSL).";
-// Conversation mode records hands-free: 1.2 s of quiet after speech ends a
-// turn, and 8 s without speech pauses the conversation.
-export const CONVERSATION_ENDPOINT: VoiceEndpoint = { endOfSpeechMs: 1_200, noSpeechMs: 8_000 };
+// Conversation mode records hands-free: 2.5 s of quiet after speech ends a
+// turn, room to think between sentences, and 8 s without speech pauses the
+// conversation.
+export const CONVERSATION_ENDPOINT: VoiceEndpoint = { endOfSpeechMs: 2_500, noSpeechMs: 8_000 };
 
 const INSTALL_MESSAGES: Record<VoiceInstallErrorCode, string> = {
 	aborted: "Voice download was cancelled. Unfinished files were removed; completed components are kept.",
@@ -522,18 +523,23 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	// recognized as the user's own turn.
 	let voiceSendPending = false;
 
-	type ReadingOutcome = "done" | "cancelled" | "empty" | "unavailable" | "error";
+	// "skipped" is the user's Esc: the reading stops, and a spoken turn goes on
+	// to the microphone as if it had been heard to the end.
+	type ReadingOutcome = "done" | "skipped" | "cancelled" | "empty" | "unavailable" | "error";
 	const readAloud = async (ctx: ExtensionContext, markdown: string): Promise<ReadingOutcome> => {
 		stopReading();
 		const current: Reading = { ctx, generation, controller: new AbortController(), unsubscribe: () => {} };
 		reading = current;
+		let skipped = false;
 		const live = () => reading === current && current.generation === generation;
 		current.unsubscribe = ctx.ui.onTerminalInput((data) => {
 			try {
 				if (reading !== current) return undefined;
 				if (!isKeyRelease(data) && matchesKey(data, "escape")) {
-					// Stopping a reading pauses the conversation.
-					spokenTurnPending = false;
+					// Skipping a reading keeps the spoken turn: the microphone reopens so
+					// the user can answer what they already heard. alt+m is the way to
+					// close it.
+					skipped = true;
 					cutReadings();
 					return { consume: true };
 				}
@@ -548,10 +554,11 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			// One reading at a time across every Pi process: wait for the turn.
 			release = await readingTurn(current.controller.signal);
 			// Voice may have been turned off, in any Pi process, while this waited.
-			if (!release || !live() || !voiceOn(ctx)) return "cancelled";
+			if (!release || !live() || !voiceOn(ctx)) return skipped ? "skipped" : "cancelled";
 			setVoiceFooter(ctx, live, voiceReadingStatus(toggleShortcut));
 			voiceLog("reading.start", { session: sessionIdOf(ctx), chars: markdown.length });
-			const outcome = await replyReader.read(markdown, current.controller.signal);
+			const read = await replyReader.read(markdown, current.controller.signal);
+			const outcome: ReadingOutcome = read === "cancelled" && skipped ? "skipped" : read;
 			voiceLog("reading.end", { session: sessionIdOf(ctx), outcome });
 			if (outcome === "unavailable" && live() && !unavailableReported) {
 				unavailableReported = true;
@@ -594,7 +601,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		}
 		cues().warm();
 		const start = toggleShortcut ? `${toggleShortcut} starts a hands-free conversation` : "the reply starts a hands-free conversation";
-		say(`Voice is on in this session: replies are read aloud, and ${start}. Esc pauses.`, "info");
+		say(`Voice is on in this session: replies are read aloud, and ${start}. Esc skips a reading.`, "info");
 	};
 
 	const command = async (ctx: ExtensionCommandContext): Promise<void> => {
@@ -1296,9 +1303,10 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		const owner = generation;
 		void readAloud(ctx, text).then(async (outcome) => {
 			if (owner !== generation) return;
-			// A reading the user stopped, or one that failed, leaves the microphone
-			// closed, and only a reply to a spoken turn reopens it.
-			const finished = outcome === "done" || outcome === "empty" || outcome === "unavailable";
+			// A reading heard to the end or skipped with Esc goes on to the
+			// microphone; one that failed, or was cut by a new message or voice off,
+			// leaves it closed. Only a reply to a spoken turn reopens it.
+			const finished = outcome === "done" || outcome === "skipped" || outcome === "empty" || outcome === "unavailable";
 			if (outcome === "error") spokenTurnPending = false;
 			if (!finished) {
 				voiceLog("mic.reopen", { session: sessionIdOf(ctx), result: "skipped", reason: `reading-${outcome}`, spokenTurnPending });
