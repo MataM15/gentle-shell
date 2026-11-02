@@ -567,6 +567,53 @@ test("with an endpoint, quiet speech over a low-gain microphone floor still coun
 	assert.equal(worker.recognizers[0]!.waves[0]!.samples.length, 2 * 8000 * 1.3, "it ended at the end of speech, not at the no-speech limit");
 });
 
+test("with an endpoint, brief ambient spikes in 10 ms chunks do not keep the recording open", async (t) => {
+	// Levels measured on the RDP microphone in WSLg on 2026-11-02 while nobody
+	// spoke: 10 ms chunks between 0.001 and 0.002 RMS, with one chunk reaching
+	// 0.004 about every half second. Speech measured 0.016 to 0.059.
+	const worker = harness(t, mono8k);
+	worker.send(startRequest(worker.paths, { endpoint: { endOfSpeechMs: 1200, noSpeechMs: 8000 } }));
+	await worker.waitFor(() => worker.types().includes("recording"));
+	const [stream] = worker.streams;
+	const ambient = (ms: number) => {
+		for (let i = 0; i < ms / 10; i++) stream!.options.onData(chunk(10, i % 50 === 25 ? 0.004 : i % 2 ? 0.0012 : 0.0019));
+	};
+	ambient(200);
+	for (let i = 0; i < 50; i++) stream!.options.onData(chunk(10, 0.05));
+	ambient(1200);
+	await worker.done;
+	assert.deepEqual(worker.types(), ["recording", "transcribing", "result"]);
+	assert.equal(worker.recognizers[0]!.waves[0]!.samples.length, 2 * 8000 * 1.9, "it ended 1.2 s after the speech, spikes notwithstanding");
+});
+
+test("with an endpoint, one isolated loud window during the pause is forgiven, the speech tail is not", async (t) => {
+	const worker = harness(t, mono8k);
+	worker.send(startRequest(worker.paths, { endpoint: { endOfSpeechMs: 1200, noSpeechMs: 8000 } }));
+	await worker.waitFor(() => worker.types().includes("recording"));
+	const [stream] = worker.streams;
+	for (let i = 0; i < 2; i++) stream!.options.onData(chunk(100, 0));
+	for (let i = 0; i < 5; i++) stream!.options.onData(chunk(100, 0.3));
+	for (let i = 0; i < 4; i++) stream!.options.onData(chunk(100, 0));
+	stream!.options.onData(chunk(100, 0.3));
+	for (let i = 0; i < 7; i++) stream!.options.onData(chunk(100, 0));
+	await worker.done;
+	assert.deepEqual(worker.types(), ["recording", "transcribing", "result"]);
+	// 1.2 s of quiet counted from the last speech window, the 100 ms click in
+	// the middle forgiven; without the forgiveness it would run to 2.4 s.
+	assert.equal(worker.recognizers[0]!.waves[0]!.samples.length, 2 * 8000 * 1.9);
+});
+
+test("with an endpoint, ambient spikes alone never count as speech", async (t) => {
+	const worker = harness(t, mono8k);
+	worker.send(startRequest(worker.paths, { endpoint: { endOfSpeechMs: 1200, noSpeechMs: 2000 } }));
+	await worker.waitFor(() => worker.types().includes("recording"));
+	const [stream] = worker.streams;
+	for (let i = 0; i < 200; i++) stream!.options.onData(chunk(10, i % 50 === 25 ? 0.004 : i % 2 ? 0.0012 : 0.0019));
+	await worker.done;
+	assert.equal(worker.messages.at(-1)!.text, "", "no speech was heard, so nothing is decoded");
+	assert.deepEqual(worker.recognizers, []);
+});
+
 // --- warm worker (S11) ----------------------------------------------------------------
 
 test("a warm worker answers several recordings, verifying and loading the model only once", async (t) => {

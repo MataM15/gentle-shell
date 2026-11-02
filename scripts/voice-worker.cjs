@@ -221,47 +221,87 @@ class MonoRecorder {
 }
 
 // Decides when a hands-free recording is over, in audio time, never wall time.
-// The noise floor is the quietest chunk heard so far; a chunk is speech when it
-// is at least three times that floor and above a fixed minimum level. Speech
-// counts once 150 ms of it were heard; after that, endOfSpeechMs of quiet ends
-// the recording. With no speech within noSpeechMs it ends as well, and the
+// Levels are judged per 100 ms window, never per device chunk: a WSLg
+// microphone delivers 10 ms chunks whose levels scatter two to four times
+// around the floor, so a single chunk is not evidence of anything. The noise
+// floor is the quietest window heard so far; a window is speech when it is at
+// least three times that floor and above a fixed minimum level. Speech counts
+// once 150 ms of it were heard; after that, endOfSpeechMs of quiet ends the
+// recording, forgiving one isolated loud window in every eight (an ambient
+// spike, a click: a loud window between quiet ones), as long as the latest
+// window is quiet. The tail of the speech itself is never forgiven.
+// With no speech within noSpeechMs it ends as well, and the
 // blank transcript is reported as no speech.
-// Just above the floor measured on a low-gain WSLg microphone (about 0.002 RMS),
-// so quiet speech still counts; the floor ratio does the real work.
-const MIN_SPEECH_LEVEL = 0.003;
+// Above the loudest ambient window measured on a low-gain WSLg microphone
+// (0.0031 RMS; speech there starts at 0.016). It matters because the stream
+// opens with a few windows of digital silence that pull the floor near zero,
+// where the floor ratio cannot do its work.
+const MIN_SPEECH_LEVEL = 0.005;
 const SPEECH_FLOOR_RATIO = 3;
 const MIN_SPEECH_SECONDS = 0.15;
+const WINDOW_SECONDS = 0.1;
+const FORGIVEN_WINDOWS_PER = 8;
+const QUIET = 0;
+const SPEECH = 1;
+const SPIKE = 2;
 
 class Endpointer {
 	constructor(sampleRate, endpoint) {
-		this.endOfSpeech = (sampleRate * endpoint.endOfSpeechMs) / 1000;
-		this.noSpeech = (sampleRate * endpoint.noSpeechMs) / 1000;
-		this.minSpeech = sampleRate * MIN_SPEECH_SECONDS;
+		this.windowFrames = Math.round(sampleRate * WINDOW_SECONDS);
+		this.endWindows = Math.max(1, Math.round(endpoint.endOfSpeechMs / 1000 / WINDOW_SECONDS));
+		this.noSpeechWindows = Math.max(1, Math.round(endpoint.noSpeechMs / 1000 / WINDOW_SECONDS));
+		this.minSpeechWindows = Math.max(1, Math.ceil(MIN_SPEECH_SECONDS / WINDOW_SECONDS));
+		this.forgiven = Math.floor(this.endWindows / FORGIVEN_WINDOWS_PER);
 		this.floor = Infinity;
-		this.heard = 0;
-		this.speech = 0;
-		this.quiet = 0;
+		this.windows = 0;
+		this.speechWindows = 0;
+		// The latest endWindows windows, oldest first: QUIET, SPEECH or SPIKE.
+		this.recent = [];
+		// The window being filled from device chunks.
+		this.energy = 0;
+		this.frames = 0;
 	}
 
 	// True once enough speech was heard to count as someone talking.
 	get heardSpeech() {
-		return this.speech >= this.minSpeech;
+		return this.speechWindows >= this.minSpeechWindows;
 	}
 
 	// Returns true once the recording should end.
 	push(level, frames) {
 		if (frames <= 0) return false;
-		this.floor = Math.min(this.floor, level);
-		this.heard += frames;
-		const loud = level >= Math.max(MIN_SPEECH_LEVEL, this.floor * SPEECH_FLOOR_RATIO);
-		if (loud) {
-			this.speech += frames;
-			this.quiet = 0;
-		} else {
-			this.quiet += frames;
+		this.energy += level * level * frames;
+		this.frames += frames;
+		if (this.frames < this.windowFrames) return false;
+		// A chunk longer than a window stands for as many windows as it spans.
+		const rms = Math.sqrt(this.energy / this.frames);
+		const count = Math.max(1, Math.round(this.frames / this.windowFrames));
+		this.energy = 0;
+		this.frames = 0;
+		let end = false;
+		for (let i = 0; i < count; i++) end = this.pushWindow(rms) || end;
+		return end;
+	}
+
+	pushWindow(rms) {
+		this.floor = Math.min(this.floor, rms);
+		this.windows += 1;
+		const loud = rms >= Math.max(MIN_SPEECH_LEVEL, this.floor * SPEECH_FLOOR_RATIO);
+		if (loud) this.speechWindows += 1;
+		const previous = this.recent.at(-1);
+		// A loud window after a quiet one is a spike until another loud window
+		// follows it; then both are speech.
+		if (loud && previous === SPIKE) this.recent[this.recent.length - 1] = SPEECH;
+		this.recent.push(loud ? (previous === QUIET ? SPIKE : SPEECH) : QUIET);
+		if (this.recent.length > this.endWindows) this.recent.shift();
+		if (!this.heardSpeech) return this.windows >= this.noSpeechWindows;
+		if (loud || this.recent.length < this.endWindows) return false;
+		let spikes = 0;
+		for (const kind of this.recent) {
+			if (kind === SPEECH) return false;
+			if (kind === SPIKE) spikes += 1;
 		}
-		if (this.speech >= this.minSpeech) return this.quiet >= this.endOfSpeech;
-		return this.heard >= this.noSpeech;
+		return spikes <= this.forgiven;
 	}
 }
 
@@ -559,7 +599,7 @@ function runVoiceWorker(io) {
 	});
 }
 
-module.exports = { runVoiceWorker };
+module.exports = { runVoiceWorker, Endpointer };
 
 if (require.main === module) {
 	const io = {
