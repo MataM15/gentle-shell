@@ -9,7 +9,7 @@ import { createVoiceSession, VoiceSessionError, type VoiceEndpoint, type VoiceSe
 import { installKokoro, installMiro, KOKORO_MANIFESTS, KOKORO_NOTICES, kokoroBytes, MIRO_MANIFEST, MIRO_NOTICE, miroBytes, readKokoroStatus, readMiroStatus, type KokoroStatus } from "./voice-kokoro.ts";
 import { createReplyReader, defaultSpeechEngineResolver, lastAssistantText } from "./voice-reply-speech.ts";
 import { acquireReadingTurn, paneFocused as herdrPaneFocused } from "./voice-presence.ts";
-import { createCuePlayer, type CuePlayer } from "./voice-cues.ts";
+import { createCuePlayer, type CueName, type CuePlayer, type CueResult } from "./voice-cues.ts";
 import { createVoiceLog, type VoiceLog } from "./voice-diagnostics.ts";
 import { createWarmVoiceWorker, type WarmVoiceWorker } from "./voice-warm.ts";
 import { readVoicePushToTalk, readVoiceSessions, writeVoicePushToTalk, writeVoiceSessions } from "./voice-settings.ts";
@@ -456,6 +456,24 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		} catch {
 			return undefined;
 		}
+	};
+	// Plays one microphone cue and records what became of it: a cue the Pulse
+	// player never confirmed used to disappear without a trace. The cue stays
+	// advisory, so a player that throws or answers with nothing never breaks the
+	// microphone state that asked for it.
+	const cue = (ctx: ExtensionContext | undefined, name: CueName): void => {
+		let playing: Promise<CueResult | undefined>;
+		try {
+			playing = Promise.resolve(cues().play(name));
+		} catch {
+			return;
+		}
+		void playing
+			.then((result) => {
+				if (!result) return;
+				voiceLog("cue", { session: sessionIdOf(ctx), name: result.name, outcome: result.outcome, ms: result.ms });
+			})
+			.catch(() => {});
 	};
 	// Voice is on per Pi session: replies are read there and the shortcut starts
 	// a hands-free conversation. Read fresh each time, so a change made in
@@ -1038,10 +1056,10 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			// Rising when the microphone really records, falling when it stops.
 			if (state === "recording" && current.cue === "none") {
 				current.cue = "open";
-				cues().play("open");
+				cue(current.ctx, "open");
 			} else if (state !== "recording" && current.cue === "open") {
 				current.cue = "closed";
-				cues().play("close");
+				cue(current.ctx, "close");
 			}
 			setVoiceFooter(current.ctx, live, current.send ? voiceConversationStatus(state, toggleKey) : voiceToggleStatus(state, toggleKey));
 			publishVoiceState(current.ctx, voiceDisplayState(state), live);
@@ -1053,7 +1071,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		// A capture cancelled while recording reports no more states.
 		if (current.cue === "open") {
 			current.cue = "closed";
-			cues().play("close");
+			cue(current.ctx, "close");
 		}
 		toggling = undefined;
 		if (active === current.run) active = undefined;

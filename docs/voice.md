@@ -231,6 +231,24 @@ native Windows, the cues stay silent, because the Windows players start
 PowerShell and would arrive about a second late. The player and its files are
 released when the Pi session ends.
 
+A cue stays advisory: it never blocks the microphone, and a player that throws
+or answers with nothing never breaks the capture it announced. Each cue does
+report what became of it, as a `cue` event in `voice-events.log` with its
+`name`, its `outcome` and how many milliseconds the player took:
+
+| Outcome | Meaning |
+|---------|---------|
+| `done` | The Pulse player drained the tone into the sink. Whether it reached the ears is then up to Windows and the audio path; the log cannot tell. |
+| `failed` | The player was asked and did not confirm the tone. |
+| `unavailable` | No PulseAudio player is reachable, so nothing was played. |
+
+A cue that comes back `failed` is played once more after about 150 ms: the
+Pulse worker retires after a minute idle, so the first cue after a long reading
+can reach a worker that is already on its way out. A cue that played is never
+played twice. On a cold player the first cue also pays the worker's start-up:
+measured here, 527 ms end to end, and the monitor capture of the same run shows
+the tone reaching the RDP sink.
+
 ### Faster transcription
 
 A dictation worker started for one recording verifies the 670 MB model digests
@@ -322,9 +340,11 @@ Every voice session appends one JSON line per voice event to
 spoken input, a spoken turn sent, a reply settled, a reading started and how it
 ended, and each microphone reopen decision with its reason (`opened`, or
 skipped for `not-focused`, `no-spoken-turn`, `voice-off`, `reading-cancelled`,
-`reading-error`, `dictation-running`, `voice-busy`). Lines carry the time, the
-process id and the session id, and sizes instead of text: no reply or
-transcript text is written. Past 512 KB the log moves to `voice-events.log.1`.
+`reading-error`, `dictation-running`, `voice-busy`), and each microphone cue
+with its `name`, `outcome` (`done`, `failed`, `unavailable`) and latency. Lines
+carry the time, the process id and the session id, and sizes instead of text:
+no reply or transcript text is written. Past 512 KB the log moves to
+`voice-events.log.1`.
 
 ## What gets downloaded
 

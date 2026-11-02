@@ -5,6 +5,7 @@ import gentleVoice from "../extensions/gentle-voice.ts";
 import { VoiceInstallError, type VoiceInstallProgress, type VoiceInstallResult } from "../lib/voice-install.ts";
 import { VoiceSessionError, type VoiceSessionState, type VoiceTranscript } from "../lib/voice-session.ts";
 import { VOICE_COMMAND_NAME, type VoiceCommandDeps, type VoiceDictation } from "../lib/voice-command.ts";
+import type { CuePlayer } from "../lib/voice-cues.ts";
 import type { PushToTalkTimers } from "../lib/voice-push-to-talk.ts";
 import { SpeechEngineError, type SpeechEngine, type SpeechOptions, type SpeechOutcome } from "../lib/voice-speech.ts";
 
@@ -208,7 +209,7 @@ interface Harness {
 	clock: ReturnType<typeof manualClock>;
 }
 
-function harness(overrides: { platform?: string; arch?: string; installed?: boolean; install?: (kind: "runtime" | "model", options: { signal: AbortSignal; onProgress(progress: VoiceInstallProgress): void }) => Promise<VoiceInstallResult>; env?: NodeJS.ProcessEnv; pushToTalk?: boolean; voice?: boolean; focused?: boolean; turnHeld?: boolean; engine?: SpeechEngine; kokoro?: "installed" | "missing"; kokoroInstall?: () => Promise<void>; miro?: "installed" | "missing" } = {}): Harness {
+function harness(overrides: { platform?: string; arch?: string; installed?: boolean; install?: (kind: "runtime" | "model", options: { signal: AbortSignal; onProgress(progress: VoiceInstallProgress): void }) => Promise<VoiceInstallResult>; env?: NodeJS.ProcessEnv; pushToTalk?: boolean; voice?: boolean; focused?: boolean; turnHeld?: boolean; engine?: SpeechEngine; kokoro?: "installed" | "missing"; kokoroInstall?: () => Promise<void>; miro?: "installed" | "missing"; cues?: CuePlayer } = {}): Harness {
 	const calls: string[] = [];
 	const sessions: FakeSession[] = [];
 	const endpoints: Harness["endpoints"] = [];
@@ -266,7 +267,7 @@ function harness(overrides: { platform?: string; arch?: string; installed?: bool
 		paneFocused: async () => { focus.asks++; return focus.focused; },
 		releaseWarm: async () => { harnessRef.warmReleases++; },
 		log: (event, fields) => { harnessRef.events.push({ event, ...fields }); },
-		cues: { play: (name) => { harnessRef.cues.push(name); }, warm: () => { harnessRef.cues.push("warm"); }, dispose: () => { harnessRef.cues.push("dispose"); } },
+		cues: overrides.cues ?? { play: (name) => { harnessRef.cues.push(name); return Promise.resolve({ name, outcome: "done" as const, ms: 12 }); }, warm: () => { harnessRef.cues.push("warm"); }, dispose: () => { harnessRef.cues.push("dispose"); } },
 		// The shared reading turn, faked: free unless a test holds it.
 		readingTurn: (signal) => new Promise((resolve) => {
 			const take = () => { turn.acquired++; resolve(() => { turn.released++; }); };
@@ -2232,6 +2233,45 @@ test("typing a message ends the spoken turn, so its reply does not reopen the mi
 });
 
 // --- diagnostics ----------------------------------------------------------------------
+
+test("a cue player that plays and answers with nothing never breaks the microphone state", async () => {
+	const { engine } = fakeEngine();
+	const played: string[] = [];
+	const h = harness({ installed: true, engine, voice: true, cues: { play: (name) => { played.push(name); return undefined as unknown as Promise<never>; }, warm: () => {}, dispose: () => {} } });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	const pressed = pi.shortcuts.get("alt+m")!.handler(ui.ctx);
+	await until(() => h.sessions.length === 1);
+	h.sessions[0]!.started.resolve();
+	await until(() => h.sessions[0]!.state === "recording");
+	h.sessions[0]!.emit("transcribing");
+	assert.deepEqual(played, ["open", "close"], "both cues still reach the player");
+	assert.equal(h.events.some((entry) => entry.event === "cue"), false, "nothing is claimed about a cue that reported nothing");
+	h.sessions[0]!.emit("finished");
+	h.sessions[0]!.result.resolve({ text: "hola", truncated: false });
+	await pressed;
+});
+
+test("each microphone cue logs its name, whether it played and how long it took", async () => {
+	const { engine } = fakeEngine();
+	const h = harness({ installed: true, engine, voice: true });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	const pressed = pi.shortcuts.get("alt+m")!.handler(ui.ctx);
+	await until(() => h.sessions.length === 1);
+	assert.equal(h.events.some((entry) => entry.event === "cue"), false, "nothing is logged before the cue settles");
+	h.sessions[0]!.started.resolve();
+	await until(() => h.events.some((entry) => entry.event === "cue"));
+	h.sessions[0]!.emit("transcribing");
+	await until(() => h.events.filter((entry) => entry.event === "cue").length === 2);
+	const cues = h.events.filter((entry) => entry.event === "cue");
+	assert.deepEqual(cues.map((entry) => [entry.name, entry.outcome, entry.ms, entry.session]), [["open", "done", 12, "session-alpha"], ["close", "done", 12, "session-alpha"]]);
+	h.sessions[0]!.emit("finished");
+	h.sessions[0]!.result.resolve({ text: "hola", truncated: false });
+	await pressed;
+});
 
 test("each reading and every microphone reopen decision is logged with its reason", async () => {
 	const { engine, readings } = fakeEngine();

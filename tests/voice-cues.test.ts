@@ -71,3 +71,47 @@ test("outside Linux the cues are silent and touch nothing", async () => {
 	player.play("open");
 	player.dispose();
 });
+
+// A cue reports what happened, so voice-events.log can tell a cue that was
+// played from one the Pulse player never confirmed.
+
+test("a cue reports its name, whether it played and how long it took", async () => {
+	const tempRoot = scratch();
+	const player = createCuePlayer({ tempRoot, backend: { probe: async () => ({ available: true }), play: async () => {} } });
+	const done = await player.play("open");
+	assert.equal(done.name, "open");
+	assert.equal(done.outcome, "done");
+	assert.equal(typeof done.ms, "number");
+	assert.ok(done.ms >= 0);
+	player.dispose();
+	const unavailable = createCuePlayer({ tempRoot, backend: { probe: async () => ({ available: false }), play: async () => { throw new Error("must not play"); } } });
+	assert.deepEqual(await unavailable.play("close"), { name: "close", outcome: "unavailable", ms: 0 });
+	unavailable.dispose();
+	const failing = createCuePlayer({ tempRoot, backend: { probe: async () => ({ available: true }), play: async () => { throw new Error("worker retired"); } } });
+	const failed = await failing.play("open");
+	assert.equal(failed.outcome, "failed");
+	assert.ok(failed.ms >= 0);
+	failing.dispose();
+	const silent = createCuePlayer({ platform: "win32" });
+	assert.deepEqual(await silent.play("open"), { name: "open", outcome: "unavailable", ms: 0 });
+	silent.dispose();
+});
+
+test("a cue that the player did not confirm plays again once after a short pause", async () => {
+	const tempRoot = scratch();
+	const attempts: number[] = [];
+	const player = createCuePlayer({ tempRoot, backend: {
+		probe: async () => ({ available: true }),
+		play: async () => {
+			attempts.push(Date.now());
+			if (attempts.length === 1) throw new Error("worker retired");
+		},
+	} });
+	const retried = await player.play("open");
+	assert.equal(retried.outcome, "done");
+	assert.equal(attempts.length, 2, "the failed cue is tried once more");
+	assert.ok(attempts[1]! - attempts[0]! >= 140, `the retry waits about 150 ms, waited ${attempts[1]! - attempts[0]!}`);
+	assert.equal((await player.play("open")).outcome, "done");
+	assert.equal(attempts.length, 3, "a cue that played is not played twice");
+	player.dispose();
+});

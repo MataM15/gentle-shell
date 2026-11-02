@@ -13,14 +13,28 @@ import { NativePulsePlayer } from "./notification-audio-native.ts";
 
 export type CueName = "open" | "close";
 
+// What became of one cue. "unavailable" means no PulseAudio player is reachable
+// at all, "failed" that the player was asked and did not confirm the play, and
+// "done" that it reported the tone drained to the sink. `ms` is how long the
+// player took, including the single retry when there was one.
+export type CueOutcome = "done" | "failed" | "unavailable";
+export interface CueResult {
+	readonly name: CueName;
+	readonly outcome: CueOutcome;
+	readonly ms: number;
+}
+
 export interface CuePlayer {
-	play(name: CueName): void;
+	play(name: CueName): Promise<CueResult>;
 	// Starts the player's worker ahead of the first cue.
 	warm(): void;
 	dispose(): void;
 }
 
 const RATE = 22_050;
+
+// How long a cue the player did not confirm waits before its one retry.
+const RETRY_PAUSE_MS = 150;
 
 // A 160 ms two-step tone with soft edges, at a quarter of full scale.
 export function cueWav(steps: readonly number[], ms = 160, gain = 0.25): Buffer {
@@ -61,7 +75,8 @@ interface CueBackend {
 
 export function createCuePlayer(options: { platform?: string; env?: NodeJS.ProcessEnv; backend?: CueBackend; tempRoot?: string } = {}): CuePlayer {
 	const platform = options.platform ?? process.platform;
-	if (!options.backend && platform !== "linux") return { play: () => {}, warm: () => {}, dispose: () => {} };
+	if (!options.backend && platform !== "linux")
+		return { play: async (name) => ({ name, outcome: "unavailable" as const, ms: 0 }), warm: () => {}, dispose: () => {} };
 	const backend: CueBackend = options.backend ?? new NativePulsePlayer({ platform, env: options.env ?? process.env });
 	let dir: string | undefined;
 	let available: Promise<boolean> | undefined;
@@ -78,19 +93,40 @@ export function createCuePlayer(options: { platform?: string; env?: NodeJS.Proce
 		}
 	};
 	const ready = () => (available ??= backend.probe().then((result) => result.available, () => false));
-	const playFile = (name: keyof typeof CUES) => {
-		if (disposed) return;
-		void ready().then((ok) => {
-			const path = ok && !disposed ? pathOf(name) : undefined;
-			if (path) return backend.play(path);
-			return undefined;
-		}).catch(() => {
-			/* a cue is advisory */
-		});
+	// One attempt, measured only when the player was really asked to play.
+	const attempt = async (name: keyof typeof CUES): Promise<{ outcome: CueOutcome; ms: number }> => {
+		if (!(await ready())) return { outcome: "unavailable", ms: 0 };
+		const path = disposed ? undefined : pathOf(name);
+		if (!path) return { outcome: "failed", ms: 0 };
+		const started = Date.now();
+		try {
+			await backend.play(path);
+			return { outcome: "done", ms: Date.now() - started };
+		} catch {
+			return { outcome: "failed", ms: Date.now() - started };
+		}
+	};
+	// A cue the player did not confirm is tried once more, after a short pause:
+	// the Pulse worker retires when it idles out, so the first cue after a long
+	// reading can reach a worker that is already on its way out. A cue that
+	// played is never played twice, and one with no player at all is not retried.
+	const playCue = async (name: keyof typeof CUES): Promise<CueOutcome> => {
+		const first = await attempt(name);
+		if (first.outcome !== "failed" || disposed) return first.outcome;
+		await new Promise((resolve) => setTimeout(resolve, RETRY_PAUSE_MS));
+		return (await attempt(name)).outcome;
+	};
+	const play = async (name: CueName): Promise<CueResult> => {
+		const started = Date.now();
+		const outcome = await playCue(name);
+		return { name, outcome, ms: outcome === "unavailable" ? 0 : Date.now() - started };
 	};
 	return {
-		play: (name) => playFile(name),
-		warm: () => playFile("silence"),
+		play,
+		// A silence cue now, so a real one does not pay the worker's start-up.
+		warm: () => {
+			void playCue("silence");
+		},
 		dispose: () => {
 			if (disposed) return;
 			disposed = true;
