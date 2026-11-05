@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { parseAnthropicOauthUsage, renderUsageCard, usageCardDigest, UsageSourceRegistry, USAGE_FETCH_FAILED_NOTE, type ProviderUsage } from "../lib/shell-usage.ts";
+import { displayUsageFor, parseAnthropicOauthUsage, renderUsageCard, renderUsagePanel, usageCardDigest, UsageSourceRegistry, UsageStore, USAGE_FETCH_FAILED_NOTE, type ProviderUsage } from "../lib/shell-usage.ts";
 
 const plain = { fg: (_color: string, text: string) => text };
 const NOW = Date.parse("2026-09-29T10:00:00Z");
@@ -223,4 +223,51 @@ test("S5: a provider without the layout hint renders as before even beside a com
 	assert.ok(text.includes("week") && text.includes("34%"));
 	assert.ok(text.includes("updated just now · alt+u"));
 	assert.ok(!text.includes("click or alt+u"), "the footer hint changes only when a compact section is drawn");
+});
+
+// S15: pi-claude-bridge files its weekly header snapshot under "claude-bridge"; the
+// card shows the one Claude account once, with the window set of the richer snapshot.
+const claudeMax: ProviderUsage = { provider: "anthropic", plan: "max", fetchedAt: NOW, limits: [
+	{ name: "claude", limitReached: false, windows: [
+		{ label: "5h", usedPercent: 26, windowSeconds: 18_000, resetAt: NOW + 3_600_000 },
+		{ label: "week", usedPercent: 4, windowSeconds: 604_800, resetAt: NOW + 86_400_000 },
+	] },
+] };
+const bridgeWeek: ProviderUsage = { provider: "claude-bridge", plan: undefined, fetchedAt: NOW, limits: [
+	{ name: "claude", limitReached: false, windows: [{ label: "week", usedPercent: 4, windowSeconds: 604_800, resetAt: NOW + 86_400_000 }] },
+] };
+
+test("a claude-bridge snapshot never adds a second Claude block next to anthropic (S15)", () => {
+	for (const order of [[claudeMax, bridgeWeek], [bridgeWeek, claudeMax]]) {
+		const text = renderUsageCard(order, plain, 48, NOW, { providers: ["openai-codex", "anthropic", "nan", "claude-bridge"] }).join("\n");
+		assert.equal((text.match(/claude/g) ?? []).length, 1, text);
+		assert.doesNotMatch(text, /claude-bridge/);
+		assert.match(text, /claude · max/);
+		assert.match(text, /5h +[▰▱]+ +26%/);
+		assert.match(text, /week +[▰▱]+ +4%/);
+	}
+});
+
+test("a claude-bridge snapshot alone still shows as the Claude block (S15)", () => {
+	const text = renderUsageCard([bridgeWeek], plain, 48, NOW, { providers: ["anthropic", "claude-bridge"] }).join("\n");
+	assert.equal((text.match(/claude/g) ?? []).length, 1, text);
+	assert.match(text, /week +[▰▱]+ +4%/);
+	assert.doesNotMatch(text, /claude-bridge/);
+});
+
+test("the /gentle:usage panel and the header gauge show the Claude account once too (S15)", () => {
+	const panel = renderUsagePanel([claudeMax, bridgeWeek], plain, 80, NOW, { provider: "claude-bridge" }, undefined, { providers: ["claude-bridge", "anthropic"], failed: new Set() }).join("\n");
+	assert.equal((panel.match(/anthropic ·/g) ?? []).length, 1, panel);
+	assert.equal(panel.split("\n").length, 3, "one provider line and its two windows");
+	assert.doesNotMatch(panel, /claude-bridge/);
+	assert.match(panel, /5h +[▰▱]+ +26%/);
+	const store = new UsageStore();
+	store.record(claudeMax);
+	store.record(bridgeWeek);
+	assert.equal(displayUsageFor(store, "claude-bridge"), claudeMax, "the bridge model's gauge reads the account's 5h + week snapshot");
+	assert.equal(store.get("claude-bridge"), bridgeWeek, "the store, and so the fallback cooldowns, still holds what was recorded");
+	const alone = new UsageStore();
+	alone.record(bridgeWeek);
+	assert.equal(displayUsageFor(alone, "claude-bridge"), bridgeWeek, "without the account's snapshot the bridge's own is used");
+	assert.equal(displayUsageFor(store, "openai-codex"), undefined);
 });

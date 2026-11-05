@@ -18,7 +18,9 @@ import { readFrozenInheritedProfile, resetFrozenInheritedProfilesForTesting } fr
 afterEach(() => resetFrozenInheritedProfilesForTesting());
 import { buildCommandPaletteGroups } from "../lib/command-palette-catalog.ts";
 import { CHANGE_STATUS, DIFF_MAX_BYTES, DIFF_MAX_LINES, DIFF_TOO_LARGE } from "../lib/shell-changes.ts";
+import { renderLayoutFrame } from "@earendil-works/pi-tui/dist/layout.js";
 import { sidebarPart, sidebarState, type SidebarRail } from "../lib/shell-sidebar.ts";
+import { SESSION_REFRESH_EVENT, SESSION_SNAPSHOT_EVENT } from "../lib/shell-session-state.ts";
 import { installSidebar } from "../lib/shell-sidebar-layout.ts";
 import { renderTodoCard } from "../lib/shell-todo.ts";
 import type { ShellBarTheme } from "../lib/shell-bar.ts";
@@ -3726,7 +3728,8 @@ test("T3 live style Cards action refreshes cached TODO and Status in both direct
 		assert.ok(hostRenders > beforeHost, "action requests the main render without another state change");
 		assert.ok(overlayRenders > beforeOverlay, "customize redraws too");
 		assert.equal(todoRenders, beforeTodo + 1, "revision invalidation refreshes digest-less TODO");
-		assert.equal(statusRenders, beforeStatus + 1, "live style digest refreshes cached Status");
+		// Status lives on its own rail tab (S13): while Activity is selected it is neither rendered nor digested.
+		assert.equal(statusRenders, beforeStatus, "a Status section on another tab is not rendered");
 		assert.notEqual(frame.rail, before.rail, "rail changes immediately");
 		// The wide chrome's title row and panel editor are not cards: no card style changes them.
 		assert.equal(frame.header, before.header, "the title row is the same in every card style");
@@ -3736,7 +3739,7 @@ test("T3 live style Cards action refreshes cached TODO and Status in both direct
 		const rendered = { ...frame };
 		paint();
 		assert.equal(todoRenders, beforeTodo + 1, "next unchanged render reuses TODO");
-		assert.equal(statusRenders, beforeStatus + 1, "next unchanged render reuses Status");
+		assert.equal(statusRenders, beforeStatus, "next unchanged render reuses the rail");
 		assert.deepEqual(frame, rendered);
 	}
 	assert.deepEqual(frame, neon, "returning to neon restores approved bytes");
@@ -5931,8 +5934,9 @@ test("gentleShell files header usage under the provider that served the response
 	const opened = commands.get("gentle:usage")!.handler("", ctx);
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	const plain = ui.overlayView!.render(90).map(stripAnsi).join("\n");
-	assert.match(plain, /active claude-bridge ·/);
-	assert.doesNotMatch(plain, /no subscription usage for this provider/);
+	// The snapshot is recorded under the serving provider, listed as the Claude account it belongs to (S15).
+	assert.match(plain, /active anthropic ·/);
+	assert.doesNotMatch(plain, /claude-bridge|no subscription usage for this provider/);
 	ui.closeOverlay?.();
 	await opened;
 });
@@ -7635,4 +7639,100 @@ test("Customize groups every setting like Layout while navigation keeps stores u
  await new Promise<void>(resolve => setImmediate(resolve));
  assert.equal(snapshot(), before, "browsing an off/on option cannot write a preference");
  ui.overlayView!.handleInput("\x1b"); await pending;
+});
+
+// T7 (odd/tasks/shell-personal-rework.md S13, S9, S14, S15): the rail tabs hold
+// the Sessions and Limits cards, fed by the same extension that paints them.
+function tabbedRail(handlers: Map<string, Array<(event: unknown, ctx: ExtensionContext) => unknown>>, ctx: ExtensionContext, ui: FakeUi, columns = 180) {
+	const node = Symbol.for("@earendil-works/pi-tui/layout-node");
+	const root = { render: () => [], invalidate() {}, [node]: () => ({ type: "vstack", entries: [] }) };
+	const tui = { mode: "fullscreen", terminal: { rows: 50, columns }, layoutRoot: root, requestRender() {} };
+	const factory = ui.footerFactory as (tui: unknown, theme: ShellBarTheme, data: unknown) => { dispose(): void };
+	const component = factory(tui, plainTheme, { getGitBranch: () => "main", getExtensionStatuses: () => new Map(), getAvailableProviderCount: () => 1, onBranchChange: () => () => {} });
+	type Node = { type: string; entries: Array<{ component: { [node]?(): Node; render(width: number): string[]; handleMouse?(event: TuiMouseEvent): unknown } }> };
+	const column = () => {
+		const top = root[node]() as unknown as Node;
+		const hstack = top.type === "hstack" ? top : top.entries[1]!.component[node]!();
+		return hstack.entries[1]!.component[node]!();
+	};
+	const screen = () => renderLayoutFrame(root as never, columns, 50, () => {}).lines.map((line) => stripAnsi(line).slice(columns - 50).trimEnd());
+	const select = (label: string) => {
+		screen();
+		const pinned = column().entries[0]!.component;
+		const rows = pinned.render(50).map(stripAnsi);
+		const y = rows.findIndex((row) => row.includes("Activity") && row.includes("Status"));
+		assert.ok(y >= 0, "the tab row is pinned in the rail");
+		const x = rows[y]!.indexOf(label);
+		assert.ok(x >= 0, label);
+		assert.deepEqual(pinned.handleMouse!({ type: "click", button: "left", x: x + 1, y, screenX: x + 1, screenY: y, width: 50, height: rows.length, shift: false, alt: false, ctrl: false } as TuiMouseEvent), { handled: true, render: true });
+		return screen().join("\n");
+	};
+	return { tui, screen, select, dispose: () => component.dispose() };
+}
+
+test("Sessions selection requests the snapshot, the extension produces it and Otras sesiones paints only validated data", async (t) => {
+	const home = scopedDoubleEscCancelConfigHome(t);
+	const agentHome = mkdtempSync(join(tmpdir(), "shell-tabs-agent-"));
+	t.after(() => rmSync(agentHome, { recursive: true, force: true }));
+	const { pi, handlers } = fakePi();
+	// The fake bus keeps one listener per event, so observe emissions instead of subscribing.
+	const emitted: Array<[string, unknown]> = [];
+	const realEmit = pi.events.emit.bind(pi.events);
+	pi.events.emit = (name: string, data: unknown) => { emitted.push([name, data]); realEmit(name, data); };
+	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home, GENTLE_PI_AGENT_HOME: agentHome, GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, { activeProfile: () => "team" });
+	const { ctx, ui } = fakeContext();
+	await fire(handlers, "session_start", ctx);
+	const seen = (name: string) => emitted.filter(([event]) => event === name).map(([, data]) => data);
+	const rail = tabbedRail(handlers, ctx, ui);
+	try {
+		assert.doesNotMatch(rail.screen().join("\n"), /Otras sesiones/, "Activity is the default tab");
+		const first = rail.select("Sessions");
+		assert.match(first, /Otras sesiones/);
+		for (let i = 0; i < 5 && seen(SESSION_SNAPSHOT_EVENT).length === 0; i++) await settle();
+		assert.equal(seen(SESSION_SNAPSHOT_EVENT).length, 1, "selecting Sessions makes the extension itself publish one snapshot");
+		assert.equal((seen(SESSION_SNAPSHOT_EVENT)[0] as { sessionId: string }).sessionId, "shell-session");
+		const ready = { kind: "ready", rows: [{ name: "erasure-1570n5-20261104", freshness: "recent", active: 1, lastSeen: Date.now() - 3_600_000 }], incomplete: true, observedAt: Date.now() };
+		pi.events.emit(SESSION_SNAPSHOT_EVENT, { sessionId: "foreign", snapshot: ready });
+		assert.doesNotMatch(rail.screen().join("\n"), /erasure-1570n5/, "another session's snapshot is ignored");
+		pi.events.emit(SESSION_SNAPSHOT_EVENT, { sessionId: "shell-session", snapshot: ready });
+		const text = rail.screen().join("\n");
+		assert.match(text, /● erasure-1570n5-20261104/);
+		assert.match(text, /hace 1 h · 1 agente/);
+		assert.match(text, /visto hace \d+ s · lista parcial/);
+		const requested = seen(SESSION_REFRESH_EVENT).length;
+		rail.select("Activity");
+		rail.select("Sessions");
+		assert.equal(seen(SESSION_REFRESH_EVENT).length, requested + 1, "coming back to Sessions rescans once");
+	} finally { rail.dispose(); await fire(handlers, "session_shutdown", ctx); }
+});
+
+test("the Resources tab carries the Limits card, one block per provider, a claude-bridge snapshot is not a second Claude block (S14, S15)", async (t) => {
+	const home = scopedDoubleEscCancelConfigHome(t);
+	const now = 1_788_600_000_000;
+	const { pi, handlers } = fakePi();
+	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home, GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, { activeProfile: () => "team", now: () => now, fetch: async () => { throw new Error("network forbidden"); } });
+	const window = (label: string, usedPercent: number, seconds: number) => ({ label, usedPercent, windowSeconds: seconds, resetAt: now + seconds * 500 });
+	pi.events.emit(USAGE_SOURCE_EVENT, { schema: USAGE_SOURCE_SCHEMA, provider: "anthropic", fetch: async () => ({ provider: "anthropic", plan: "max", fetchedAt: now, limits: [{ name: "claude", limitReached: false, windows: [window("5h", 26, 18000), window("week", 4, 604800)] }] }) });
+	const { ctx, ui } = fakeContext();
+	(ctx as unknown as { model: { provider: string } }).model.provider = "claude-bridge";
+	await fire(handlers, "session_start", ctx); await settle();
+	// The bridge's own response headers: a weekly-only snapshot for the same account.
+	for (const handler of handlers.get("after_provider_response") ?? []) handler({ status: 200, headers: { "anthropic-ratelimit-unified-7d-utilization": "0.04" } }, ctx);
+	const rail = tabbedRail(handlers, ctx, ui);
+	try {
+		const before = rail.select("Activity");
+		assert.doesNotMatch(before, /Limits/);
+		const part = sidebarState(rail.tui as unknown as TUI).parts.get("usage")!;
+		part.digest?.(); await settle(); await settle();
+		const text = rail.select("Resources");
+		assert.match(text, /╭─ Limits ─+╮/);
+		assert.equal((text.match(/claude/g) ?? []).length, 1, "one Claude block");
+		assert.doesNotMatch(text, /claude-bridge/);
+		assert.match(text, /claude · max/);
+		assert.match(text, /5h +[▰▱]+ +26%/);
+		assert.match(text, /week +[▰▱]+ +4%/);
+		assert.match(text, /updated .*· alt\+u/);
+		// The header gauge still reads the bridge snapshot of the model that answers.
+		assert.match(renderFooter(ui), /week .*4%/);
+	} finally { rail.dispose(); await fire(handlers, "session_shutdown", ctx); }
 });

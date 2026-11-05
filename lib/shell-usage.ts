@@ -2,6 +2,7 @@ import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { parseModelRef } from "./agents-config.ts";
 import { paintGauge, type GaugePaint } from "./shell-gauge.ts";
 import { cardInnerWidth, renderCard } from "./shell-card.ts";
+import { CLAUDE_BRIDGE_PROVIDER } from "./bridge-cost.ts";
 
 // Gentle Shell subscription usage: the rate-limit windows each connected
 // provider reports. Codex sends them as SSE headers and through its usage
@@ -597,6 +598,35 @@ function paintMeter(percent: number, cells: number, theme: UsageTheme, paint?: G
 	return paintGauge(percent, theme, cells, paint);
 }
 
+// pi-claude-bridge answers on the owner's Claude subscription, and the response
+// headers are filed under the provider that served them, so the store holds a
+// "claude-bridge" snapshot (week only) beside the "anthropic" one (5h and week).
+// The store and the fallback cooldowns keep both as recorded; every place that
+// LISTS usage (rail card, /gentle:usage, the header gauge) goes through these
+// helpers so the one Claude account shows once, from the richer snapshot.
+const DISPLAY_PROVIDER_ALIASES: Readonly<Record<string, string>> = { [CLAUDE_BRIDGE_PROVIDER]: ANTHROPIC_PROVIDER };
+
+/** The provider a snapshot is shown under: an alias reads as the account it serves. */
+export const displayProvider = (provider: string): string => DISPLAY_PROVIDER_ALIASES[provider] ?? provider;
+
+/** Snapshots as listed: one per displayed provider, the provider's own snapshot over an alias's, an alias alone relabelled. */
+export function displayUsages(usages: readonly ProviderUsage[]): ProviderUsage[] {
+	const shown = new Map<string, ProviderUsage>();
+	for (const usage of usages) {
+		const key = displayProvider(usage.provider);
+		if (usage.provider === key) shown.set(key, usage);
+		else if (!shown.has(key) && !usages.some((other) => other.provider === key && other.limits.length > 0)) shown.set(key, { ...usage, provider: key });
+	}
+	return [...shown.values()];
+}
+
+/** The snapshot the header gauge reads for the model's provider: the account's own when held, else the served provider's. */
+export function displayUsageFor(store: { get(provider: string): ProviderUsage | undefined }, provider: string): ProviderUsage | undefined {
+	const own = displayProvider(provider);
+	const account = own === provider ? undefined : store.get(own);
+	return account && account.limits.length > 0 ? account : store.get(provider);
+}
+
 export function renderUsageBar(usage: ProviderUsage, theme: UsageTheme, activeModelId?: string, paint?: GaugePaint): string | undefined {
 	const main = selectUsageLimit(usage, activeModelId);
 	const [first, ...rest] = main?.windows ?? [];
@@ -653,7 +683,10 @@ export interface UsagePanelScope {
 // snapshot keeps that snapshot and says so beside it, and a provider recorded
 // under a previous profile's routing is never presented as current scope after
 // a profile switch.
-export function renderUsagePanel(usages: ProviderUsage[], theme: UsageTheme, width: number, now: number, active?: ActiveProvider, registry?: UsageSourceRegistry, scope?: UsagePanelScope, paint?: GaugePaint): string[] {
+export function renderUsagePanel(recorded: ProviderUsage[], theme: UsageTheme, width: number, now: number, activeProvider?: ActiveProvider, registry?: UsageSourceRegistry, scope?: UsagePanelScope, paint?: GaugePaint): string[] {
+	const usages = displayUsages(recorded);
+	const active = activeProvider ? { ...activeProvider, provider: displayProvider(activeProvider.provider) } : undefined;
+	if (scope) scope = { providers: [...new Set(scope.providers.map(displayProvider))], failed: new Set([...scope.failed].map(displayProvider)) };
 	const activeUsage = active ? usages.find((usage) => usage.provider === active.provider) : undefined;
 	const byProvider = new Map(usages.map((usage) => [usage.provider, usage] as const));
 	const rows = scope
@@ -877,12 +910,12 @@ export function renderUsageCard(usages: readonly ProviderUsage[], theme: UsageTh
 		const index = CARD_PROVIDER_ORDER.indexOf(provider);
 		return index === -1 ? CARD_PROVIDER_ORDER.length : index;
 	};
-	const sorted = usages.filter((usage) => usage.limits.length > 0).sort((a, b) => rank(a.provider) - rank(b.provider));
+	const sorted = displayUsages(usages.filter((usage) => usage.limits.length > 0)).sort((a, b) => rank(a.provider) - rank(b.provider));
 	// One slot per provider either way: a named list keeps the caller's order, the
 	// default keeps the card's fixed order. A provider the store holds without
 	// any drawable row is still a slot, so it can explain itself below.
 	const planned = options?.providers
-		? [...new Set(options.providers)].map((provider) => ({ provider, usage: sorted.find((usage) => usage.provider === provider) }))
+		? [...new Set(options.providers.map(displayProvider))].map((provider) => ({ provider, usage: sorted.find((usage) => usage.provider === provider) }))
 		: sorted.map((usage) => ({ provider: usage.provider, usage }));
 	if (planned.length === 0) return [];
 	const innerWidth = cardInnerWidth(width);

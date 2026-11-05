@@ -38,6 +38,7 @@ import { GentleAiDevBinaryOverrideError, resolveGentleAiDevBinaryOverride } from
 import { DOUBLE_ESC_CANCEL_HINT, floatPromptRow, framePromptLines, panelPromptRow, resolvePromptLayout, IDLE_ESC_CLEAR_HINT, PANEL_BUTTON, PANEL_LABEL_TEXT, COMMANDS_LABEL_TEXT, PROMPT_HINT, PROMPT_STATE, SHELL_PULSE_WATCHDOG_MS, withPromptHint, type PromptState } from "../lib/shell-prompt.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 import { oddPhaseRegistry } from "../lib/odd-phase.ts";
+import { resolveAgentHomeDirectory } from "../lib/agent-model-resolution.ts";
 import { CLAUDE_BRIDGE_PROVIDER, priceBridgeMessage } from "../lib/bridge-cost.ts";
 import { inferOddPhase } from "../lib/odd-phase-inference.ts";
 import { isInteractiveMode } from "../lib/rpc-host.ts";
@@ -124,7 +125,7 @@ import {
 	type DoubleEscCancelPolicy,
 	type DoubleEscCancelResolution,
 } from "../lib/double-esc-cancel-policy.ts";
-import { accountIdFromToken, ANTHROPIC_PROVIDER, ANTHROPIC_USAGE_URL, CODEX_PROVIDER, CODEX_USAGE_URL, NAN_PROVIDER, NAN_QUOTA_URL, parseAnthropicOauthUsage, parseCodexUsage, parseNanQuota, parseProviderUsage, parseUsageHeaders, limitsFailureNotes, parseUsageSource, renderUsageCard, usageCardDigest, usageScopeProviders, UsageSourceRegistry, UsageStore, USAGE_SOURCE_EVENT, type ProviderUsage, type UsageSource } from "../lib/shell-usage.ts";
+import { accountIdFromToken, ANTHROPIC_PROVIDER, ANTHROPIC_USAGE_URL, CODEX_PROVIDER, CODEX_USAGE_URL, NAN_PROVIDER, NAN_QUOTA_URL, parseAnthropicOauthUsage, parseCodexUsage, parseNanQuota, parseProviderUsage, parseUsageHeaders, limitsFailureNotes, displayUsageFor, parseUsageSource, renderUsageCard, usageCardDigest, usageScopeProviders, UsageSourceRegistry, UsageStore, USAGE_SOURCE_EVENT, type ProviderUsage, type UsageSource } from "../lib/shell-usage.ts";
 import { UsageView } from "../lib/shell-usage-view.ts";
 import { releaseSidebarHover, setSidebarHover, sidebarHeader, sidebarPart, sidebarRailHeader, sidebarState, sidebarStatusBar, VISUAL_SETTINGS_CHANGED, type SidebarRail } from "../lib/shell-sidebar.ts";
 import { installSidebar, invalidateSidebar, narrowStatusOwner, SIDEBAR_BREAKPOINT, STATUS_OWNER } from "../lib/shell-sidebar-layout.ts";
@@ -142,7 +143,7 @@ import { acceptedJobs, activitySummaryRows, createWaitsReceiver, waitRows } from
 import { createVoiceReceiver } from "../lib/shell-voice-state.ts";
 import { renderVoiceIndicator } from "../lib/shell-voice-indicator.ts";
 import { reduceVoiceOverlay, renderVoiceOverlay, visibleVoiceOverlay, type VoiceOverlay } from "../lib/shell-voice-overlay.ts";
-import { acceptedSessionSnapshot, sessionRows, SESSION_REFRESH_EVENT, SESSION_SNAPSHOT_EVENT, SESSIONS_CARD_TITLE, type SessionSnapshot } from "../lib/shell-session-state.ts";
+import { acceptedSessionSnapshot, createSessionRefresh, readSessionSnapshot, sessionRows, SESSION_REFRESH_EVENT, SESSION_SNAPSHOT_EVENT, SESSIONS_CARD_TITLE, type SessionSnapshot } from "../lib/shell-session-state.ts";
 import { installSessionChangeCapture } from "../lib/session-change-capture.ts";
 import { SelectionEngine } from "../lib/selection-engine.ts";
 import { withOverlayRepaint } from "../lib/overlay-repaint.ts";
@@ -2532,6 +2533,19 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		sessionSnapshot = snapshot;
 		redrawReview();
 	});
+	// Producer of the snapshot above: a Sessions-tab request schedules one bounded
+	// header-page read of the presence directory; it never opens peer sockets or
+	// walks the registry during a render frame (restored from d6fb874a5, where
+	// Gentle Agents published it).
+	const agentHome = resolveAgentHomeDirectory({ env, home: os.homedir() });
+	const sessionRefresh = createSessionRefresh(sessionId, async (id) => readSessionSnapshot(agentHome, id, deps.now()),
+		(id, snapshot) => { try { pi.events.emit(SESSION_SNAPSHOT_EVENT, { sessionId: id, snapshot }); } catch { /* display only */ } });
+	const unsubscribeSessionRefresh = pi.events.on(SESSION_REFRESH_EVENT, (value) => {
+		const event = value as { sessionId?: unknown } | undefined;
+		const id = sessionId();
+		if (!id || event?.sessionId !== id) return;
+		sessionRefresh.request();
+	});
 	const unsubscribeReview = pi.events.on(REVIEW_SIDEBAR_EVENT, (value) => {
 		const event = value as { sessionId?: unknown; snapshot?: unknown } | undefined;
 		if (!currentContext || event?.sessionId !== currentContext.sessionManager.getSessionId()) return;
@@ -2592,6 +2606,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		runningJobs = undefined;
 		sessionSnapshot = undefined;
 		sessionSnapshotOwner = undefined;
+		sessionRefresh.reset();
 		waitsReceiver.reset();
 		voiceReceiver.reset();
 		adaptiveReasoningNotices.clear();
@@ -2635,7 +2650,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			setFullscreenProbe(fullscreenProbe);
 			if (tui.terminal) sidebarState(tui).visibility = { todo: visualSettings.visibility.todo };
 			renderHost = { requestRender: () => tui.requestRender(), invalidateSidebar: () => invalidateSidebar(tui) };
-			const bottom = createShellBarComponent(pi, ctx, renderHost, theme, footerData, () => tracker.model.files.length, () => usage.get(ctx.model?.provider ?? ""), () => visualSettings);
+			const bottom = createShellBarComponent(pi, ctx, renderHost, theme, footerData, () => tracker.model.files.length, () => displayUsageFor(usage, ctx.model?.provider ?? ""), () => visualSettings);
 			// The Status card paints live session state that no event re-registers a
 			// part for: model, effort, context, cost, session name and extension
 			// statuses. The digest is what keeps the fullscreen memo honest. Issue
@@ -2644,7 +2659,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			// (createFooterStatusMemo).
 			const footerStatus = createFooterStatusMemo({
 				pi, ctx, footerData,
-				usage: () => usage.get(ctx.model?.provider ?? ""),
+				usage: () => displayUsageFor(usage, ctx.model?.provider ?? ""),
 				profile: () => deps.activeProfile(),
 				profileTier: () => deps.activeProfile === profileReader ? profileReader.tier() : undefined,
 				// The compact bar and header derive ⧗ N jobs from model.jobs.length,
@@ -2883,6 +2898,32 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			// No timer of its own: painting the card is what asks for fresh data,
 			// throttled here and still bound by each provider's 5-minute rule.
 			let limitsCheckedAt = 0;
+			const limitsPart = sidebarPart(tui, "usage", { render: () => [], invalidate() {}, dispose() {} }, {
+				digest: () => {
+					const now = deps.now();
+					if (now - limitsCheckedAt >= LIMITS_CHECK_MS && currentContext === ctx) {
+						limitsCheckedAt = now;
+						void refreshAllUsage(ctx, false);
+					}
+					return `${usageCardDigest(usage.all(), now)}|${cardStyle()}`;
+				},
+				// The cached scope, never a fresh resolve: this runs per repaint.
+				render: (width) => renderUsageCard(usage.all(), theme, width, deps.now(), { providers: limitsProviders(usageScope), registry: usageSources, failed: usageFailures }),
+				invalidate() {},
+				// The card is a summary: a clean left click anywhere on it opens the
+				// full panel alt+u opens. The rail only dispatches hits on rows it painted.
+				handleMouse(event) {
+					if (event.type !== "click" || event.button !== "left") return undefined;
+					void openUsage(ctx);
+					return { handled: true, render: true };
+				},
+			});
+			const sessionsPart = sidebarPart(tui, "sessions", { render: () => [], invalidate() {}, dispose() {} }, {
+				// The minute bucket keeps the "hace N min" ages fresh without a timer.
+				digest: () => `${JSON.stringify(sessionData())}|${Math.floor(deps.now() / 60000)}`,
+				render: (width) => renderCard({ title: SESSIONS_CARD_TITLE, tone: CARD_TONE.INFO, rail: true, body: sessionRows(sessionData(), deps.now()) }, theme, width, { expanded: true, panel: true }),
+				invalidate() {},
+			});
 			const voicePart = sidebarPart(tui, "voice", { render: () => [], invalidate() {}, dispose() {} }, {
 				digest: () => `${voiceReceiver.current() ?? "idle"}|${visibleVoiceOverlay(voiceOverlay, deps.now()) ? voiceOverlay?.at : ""}`,
 				render: (width) => [
@@ -2891,7 +2932,9 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 				],
 				invalidate() {},
 			});
-			const uninstall = installSidebar(tui, theme, () => visualSettings.statusPlacement, () => visualSettings.headerPlacement, () => visualSettings.density, { collapsed: () => railCollapsed, toggle: () => toggleRail(), hint: () => railPanelKey(env) });
+			const uninstall = installSidebar(tui, theme, () => visualSettings.statusPlacement, () => visualSettings.headerPlacement, () => visualSettings.density, { collapsed: () => railCollapsed, toggle: () => toggleRail(), hint: () => railPanelKey(env) }, {
+				tabs: true, onTabSelect: (tab) => { const id = sessionId(); if (tab === "sessions" && id) pi.events.emit(SESSION_REFRESH_EVENT, { sessionId: id }); },
+			});
 			const disposeStatusBar = sidebarStatusBar(tui, {
 				digest: () => footerStatus.key(),
 				render: (width) => ideChrome() || narrowChrome() ? statusBarChrome(width).rows : [],
@@ -2935,6 +2978,8 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 				clearInterval(jobsTimer);
 				jobsPart.dispose();
 				voicePart.dispose?.();
+				limitsPart.dispose?.();
+				sessionsPart.dispose?.();
 				ctx.ui.setWidget(HEADER_WIDGET_KEY, undefined);
 				disposeHeader();
 				disposeRailHeader();
@@ -3036,6 +3081,8 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		unsubscribeReview();
 		unsubscribeJobs();
 		unsubscribeSessions();
+		sessionRefresh.dispose();
+		unsubscribeSessionRefresh();
 		sessionSnapshot = undefined;
 		sessionSnapshotOwner = undefined;
 		waitsReceiver.dispose();

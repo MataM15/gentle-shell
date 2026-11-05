@@ -4,6 +4,7 @@ import type { ShellBarTheme } from "./shell-bar.ts";
 import { CARD_STYLE, cardStyle, paintSurfaceRow, surfaceOpener, type CardStyle } from "./shell-card.ts";
 import { clipPanelText, isPanelFrameTop, PANEL_FRAME_COLUMNS, PANEL_SURFACE_ROLE, withPanelFrame } from "./shell-panel.ts";
 import { renderSidebarBanner } from "./shell-sidebar-banner.ts";
+import { SIDEBAR_TABS, sidebarTabSections, type SidebarTab } from "./shell-sidebar-tabs.ts";
 import type { Density, HeaderPlacement, StatusPlacement } from "./visual-customization-policy.ts";
 
 export const SIDEBAR_BREAKPOINT = 140;
@@ -34,6 +35,8 @@ type RailHit = {
 type FramedBlock = { start: number; rows: number; origin: number };
 // A pinned row group (rail header, Breaks): `xOffset` is the columns the part's own rows are inset in the rail.
 type PinnedHit = { key: string; component: Component; startY: number; height: number; width: number; xOffset: number };
+/** Tabs under the pinned header: `row` is the label row in the pinned rows. */
+export interface SidebarTabOptions { tabs?: boolean; onTabSelect?: (tab: SidebarTab) => void }
 type SectionCacheEntry = { component: Component; digest: string | undefined; revision: number; contentWidth: number; cardStyle: CardStyle; theme: ShellBarTheme; themeSignature: string; lines: string[]; blocks: FramedBlock[]; sectionHeight: number };
 type SidebarPresentation = { scrollTop: number; output: LayoutNode };
 type PreparedRail = {
@@ -59,6 +62,9 @@ type PreparedRail = {
 	/** Rows pinned above the scrolling sections (the rail header), painted on the rail surface at the full rail width. */
 	pinnedTop: string[];
 	pinnedTopHits: PinnedHit[];
+	/** The pinned row of the tab labels, or -1 without tabs. */
+	tabRow: number;
+	tab: SidebarTab;
 	/** The last rail row, `» hide panel · alt+h`; empty without a rail control. */
 	pinnedBottom: string[];
 	/** The tinted blank row that fills the rail below a trailing panel section, or "" when the rail ends on a card. */
@@ -170,7 +176,7 @@ function frameSection(lines: string[], inner: number, theme: ShellBarTheme): { l
 }
 
 /** Installs the fullscreen rail: wraps the host layout root with the [rail, transcript] hstack and returns a disposer restoring the original layout. */
-export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => StatusPlacement = () => "auto", headerPlacement: () => HeaderPlacement = () => "top", density: () => Density = () => "comfortable", control?: RailControl): () => void {
+export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => StatusPlacement = () => "auto", headerPlacement: () => HeaderPlacement = () => "top", density: () => Density = () => "comfortable", control?: RailControl, options?: SidebarTabOptions): () => void {
 	if (!tui.terminal) return () => {};
 	const host = tui as Host;
 	const state = sidebarState(tui);
@@ -186,6 +192,8 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 	let pinnedTop: string[] = [];
 	let pinnedBottom: string[] = [];
 	let prepared: PreparedRail | undefined;
+	// In-memory like the old rail: the session starts on Activity, a click keeps its tab until the next one.
+	let selectedTab: SidebarTab = "activity";
 	// One rendered-lines cache per rail section key, independent of the
 	// whole-rail `prepared` memo below: a section with its own digest is
 	// revalidated by that digest alone, so a sibling's ticking digest (the
@@ -263,6 +271,19 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 			const current = prepared;
 			if (!current || stopped || failed || !current.active || current.revision !== cache.revision || host.mode !== "fullscreen" ||
 				host.layoutRoot !== current.root || tui.terminal.columns !== current.width || event.y < 0 || event.y >= pinnedTop.length) return undefined;
+			// A click on a tab label switches the section set; the rule row under it is not a target.
+			if (current.tabRow >= 0 && event.y === current.tabRow) {
+				const target = event.type === "click" && event.button === "left" ? SIDEBAR_TABS.find((tab) => event.x >= tab.start && event.x < tab.end) : undefined;
+				if (!target) return undefined;
+				if (target.id !== selectedTab) {
+					selectedTab = target.id;
+					scroll.scrollBy(-scroll.scrollTop);
+					invalidateSidebar(tui);
+					tui.requestRender();
+					try { options?.onTabSelect?.(target.id); } catch { /* Display notifications must not break the rail. */ }
+				}
+				return { handled: true, render: true };
+			}
 			const hit = current.pinnedTopHits.find((candidate) => event.y >= candidate.startY && event.y < candidate.startY + candidate.height);
 			if (!hit || state.parts.get(hit.key) !== hit.component || event.x < hit.xOffset || event.x >= hit.xOffset + hit.width) return undefined;
 			return hit.component.handleMouse?.({ ...event, x: event.x - hit.xOffset, y: event.y - hit.startY, width: hit.width, height: hit.height });
@@ -369,9 +390,13 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 		// Digest closures read live session state, so they must be evaluated once
 		// per frame and stored for the next comparison (issue #1681): the sections
 		// loop below reuses this pass instead of calling each digest a second time.
-		const digests = parts.map(([, rail]) => railDigest(rail));
+		// With tabs, a section on another tab is not painted, so its digest (a
+		// ticking clock, a refresh it would trigger) must neither be read nor
+		// invalidate the rail.
+		const visibleKeys = options?.tabs ? new Set(["header", "railheader", "statusbar", "wellness", "voice", ...sidebarTabSections(selectedTab)]) : undefined;
+		const digests = parts.map(([key, rail]) => !visibleKeys || visibleKeys.has(key) ? railDigest(rail) : undefined);
 		const signature = themeSignature(theme);
-		const unchanged = prepared?.revision === cache.revision &&
+		const unchanged = prepared?.revision === cache.revision && prepared.tab === selectedTab &&
 			prepared.width === width && prepared.mode === host.mode && prepared.headerPlacement === headerPlacement() && prepared.cardStyle === style && prepared.root === root && prepared.theme === theme && prepared.themeSignature === signature &&
 			prepared.parts.length === parts.length && prepared.parts.every(([key, part], index) => parts[index]?.[0] === key && parts[index]?.[1] === part) &&
 			prepared.digests.length === digests.length && prepared.digests.every((digest, index) => digest === digests[index]);
@@ -394,7 +419,7 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 			const headerActive = headerPart !== undefined && preparedHeaderLines.some((line) => line.trim() !== "");
 			const contentWidth = scroll.getContentWidth(RAIL_WIDTH);
 			// Live work first, then the session Status sections (design/shell-rework/02-proposal.html).
-			const sections = ["todo", "jobs", "agents", "footer"].filter((key) => key !== "todo" || state.visibility?.todo !== false).map((key) => {
+			const sections = (options?.tabs ? sidebarTabSections(selectedTab) : ["todo", "jobs", "agents", "footer"]).filter((key) => key !== "todo" || state.visibility?.todo !== false).map((key) => {
 				const component = state.parts.get(key);
 				if (!component) {
 					sectionCache.delete(key);
@@ -450,6 +475,28 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 					pinnedRows.push(...breaks.map((line) => " ".repeat(RAIL_PADDING) + line + " ".repeat(RAIL_PADDING)));
 				}
 			}
+			// Tabs: one label row and one rule row under the header and Breaks; the
+			// active label is accent and bold, the rest dim, and the rule runs in
+			// accent under the active label's own columns (as in d6fb874a5).
+			let tabRow = -1;
+			if (options?.tabs) {
+				if (pinnedRows.length > 0) pinnedRows.push("");
+				tabRow = pinnedRows.length;
+				let labels = "";
+				for (const tab of SIDEBAR_TABS) {
+					const active = tab.id === selectedTab;
+					const label = ` ${tab.label} `;
+					labels += " ".repeat(Math.max(0, tab.start - visibleWidth(labels))) + theme.fg(active ? "accent" : "dim", active ? theme.bold(label) : label);
+				}
+				pinnedRows.push(labels);
+				const activeTab = SIDEBAR_TABS.find((tab) => tab.id === selectedTab);
+				const markerStart = activeTab ? activeTab.start + 1 : 0;
+				const markerEnd = activeTab ? Math.min(RAIL_WIDTH, markerStart + visibleWidth(activeTab.label)) : 0;
+				const rule = "─".repeat(RAIL_WIDTH);
+				pinnedRows.push(markerStart < markerEnd
+					? theme.fg("dim", rule.slice(0, markerStart)) + theme.fg("accent", rule.slice(markerStart, markerEnd)) + theme.fg("dim", rule.slice(markerEnd))
+					: theme.fg("dim", rule));
+			}
 			const fitPinned = (row: string) => paintSurfaceRow(visibleWidth(row) < RAIL_WIDTH ? row + " ".repeat(RAIL_WIDTH - visibleWidth(row)) : row, surface);
 			if (sections.length && branding.length) {
 				railLines.push(...branding.map((line) => " ".repeat(RAIL_PADDING) + line + " ".repeat(RAIL_PADDING)));
@@ -462,6 +509,8 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 			// included, and the gap between two of them are painted alike.
 			let previousPanel = false;
 			let previousFramed = false;
+			// A tab with nothing to show still leaves the rail painting.
+			if (options?.tabs && sections.length === 0) railLines.push(theme.fg("dim", " " + (selectedTab === "activity" ? "No activity" : "Unavailable")));
 			for (const section of sections) {
 				const panel = (section.component as SidebarRail).surface === "panel";
 				const paint = (row: string) => (panel ? paintSurfaceRow(row, surface) : row);
@@ -491,7 +540,7 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 			const hint = control?.hint();
 			const hideRow = control ? [" " + theme.fg("accent", HIDE_LABEL) + (hint ? theme.fg("dim", " · ") + theme.fg("text", hint) : "")] : [];
 			pinnedBottom = active ? hideRow.map(fitPinned) : [];
-			prepared = { pinnedTop, pinnedTopHits, pinnedBottom, revision: cache.revision, width, mode: host.mode, headerPlacement: headerPlacement(), cardStyle: style, root, theme, themeSignature: signature, parts, digests, contentWidth, active, lines: railLines, hits, headerLines, statusLines, fillRow, headerActive: headerLines.length > 0 };
+			prepared = { pinnedTop, pinnedTopHits, tabRow, tab: selectedTab, pinnedBottom, revision: cache.revision, width, mode: host.mode, headerPlacement: headerPlacement(), cardStyle: style, root, theme, themeSignature: signature, parts, digests, contentWidth, active, lines: railLines, hits, headerLines, statusLines, fillRow, headerActive: headerLines.length > 0 };
 			state.active = active;
 			return active;
 		} catch {
