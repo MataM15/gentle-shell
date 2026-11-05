@@ -116,6 +116,21 @@ export function sidebarHeader(tui: TUI, rail: SidebarRail): () => void {
 }
 
 /**
+ * Register the wide rail's pinned header (model, ctx and cost, the commands and
+ * usage actions): rows above the rail's scrolling sections that never scroll
+ * away. Rendered at the full rail width, clicks arrive in its own coordinates.
+ * Writes the "railheader" slot and returns its own disposer.
+ */
+export function sidebarRailHeader(tui: TUI, rail: SidebarRail): () => void {
+	if (!tui.terminal) return () => {};
+	const state = sidebarState(tui);
+	state.parts.set("railheader", rail);
+	return () => {
+		if (state.parts.get("railheader") === rail) state.parts.delete("railheader");
+	};
+}
+
+/**
  * Register the fullscreen status bar: one full-width row below the transcript
  * and the rail while the rail is shown. Below the breakpoint it paints nothing;
  * the compact bar carries the same data there. Writes the "statusbar" slot and

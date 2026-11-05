@@ -26,6 +26,8 @@ type LayoutRoot = Component & { [NODE]?: () => LayoutNode };
 type Host = TUI & { mode?: string; layoutRoot?: LayoutRoot };
 type SidebarCache = { revision: number };
 type RailHit = { key: string; component: Component; startY: number; height: number; width: number };
+// A pinned row group (rail header, Breaks): `xOffset` is the columns the part's own rows are inset in the rail.
+type PinnedHit = { key: string; component: Component; startY: number; height: number; width: number; xOffset: number };
 type SectionCacheEntry = { component: Component; digest: string | undefined; revision: number; contentWidth: number; cardStyle: CardStyle; theme: ShellBarTheme; themeSignature: string; lines: string[] };
 type SidebarPresentation = { scrollTop: number; output: LayoutNode };
 type PreparedRail = {
@@ -48,6 +50,9 @@ type PreparedRail = {
 	// falls back to the old hstack-direct shape with the banner restored.
 	headerLines: string[];
 	statusLines: string[];
+	/** Rows pinned above the scrolling sections (the rail header), painted on the rail surface at the full rail width. */
+	pinnedTop: string[];
+	pinnedTopHits: PinnedHit[];
 	/** The tinted blank row that fills the rail below a trailing panel section, or "" when the rail ends on a card. */
 	fillRow: string;
 	headerActive: boolean;
@@ -127,6 +132,7 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 	let fillRow = "";
 	let headerLines: string[] = [];
 	let statusLines: string[] = [];
+	let pinnedTop: string[] = [];
 	let prepared: PreparedRail | undefined;
 	// One rendered-lines cache per rail section key, independent of the
 	// whole-rail `prepared` memo below: a section with its own digest is
@@ -189,6 +195,22 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 			return state.parts.get("statusbar")?.handleMouse?.(event);
 		},
 	};
+	// The rail's pinned rows (header) are leaves of their own above the
+	// ScrollView, so they never scroll away. pi-tui hands a leaf's clicks to its
+	// handleMouse in leaf coordinates; each pinned group forwards to its part.
+	const pinnedTopLeaf: Component = {
+		render: () => pinnedTop,
+		invalidate() {},
+		handleMouse: (event) => {
+			if (event.type === "move" && event.button === "none") setSidebarHover(tui);
+			const current = prepared;
+			if (!current || stopped || failed || !current.active || current.revision !== cache.revision || host.mode !== "fullscreen" ||
+				host.layoutRoot !== current.root || tui.terminal.columns !== current.width || event.y < 0 || event.y >= pinnedTop.length) return undefined;
+			const hit = current.pinnedTopHits.find((candidate) => event.y >= candidate.startY && event.y < candidate.startY + candidate.height);
+			if (!hit || state.parts.get(hit.key) !== hit.component || event.x < hit.xOffset || event.x >= hit.xOffset + hit.width) return undefined;
+			return hit.component.handleMouse?.({ ...event, x: event.x - hit.xOffset, y: event.y - hit.startY, width: hit.width, height: hit.height });
+		},
+	};
 	const scroll = new ScrollView(rail, {
 		follow: "none",
 		primary: false,
@@ -243,12 +265,14 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 			prepared = undefined;
 			headerLines = [];
 			statusLines = [];
+			pinnedTop = [];
 			return false;
 		}
 		const railEligible = width >= SIDEBAR_BREAKPOINT && placement() !== "bottom" && placement() !== "hidden";
 		if (!railEligible) {
 			prepared = undefined;
 			statusLines = [];
+			pinnedTop = [];
 			try {
 				const headerPart = state.parts.get("header");
 				headerLines = headerPlacement() === "top" && headerPart
@@ -278,6 +302,7 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 		if (unchanged) {
 			railLines = prepared.lines;
 			statusLines = prepared.statusLines;
+			pinnedTop = prepared.pinnedTop;
 			fillRow = prepared.fillRow;
 			state.active = prepared.active;
 			return prepared.active;
@@ -319,6 +344,19 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 			railLines = [];
 			fillRow = "";
 			const surface = surfaceOpener(theme, PANEL_SURFACE_ROLE);
+			// Pinned top: the owner's rail header. Rows are fitted to the rail
+			// width and painted on the panel surface like the sections below.
+			const pinnedTopHits: PinnedHit[] = [];
+			const pinnedRows: string[] = [];
+			const railHeaderPart = state.parts.get("railheader");
+			if (railHeaderPart) {
+				const rendered = [...(railHeaderPart.render(RAIL_WIDTH) ?? [])];
+				if (rendered.some((line) => line.trim() !== "")) {
+					pinnedTopHits.push({ key: "railheader", component: railHeaderPart, startY: pinnedRows.length, height: rendered.length, width: RAIL_WIDTH, xOffset: 0 });
+					pinnedRows.push(...rendered);
+				}
+			}
+			const fitPinned = (row: string) => paintSurfaceRow(visibleWidth(row) < RAIL_WIDTH ? row + " ".repeat(RAIL_WIDTH - visibleWidth(row)) : row, surface);
 			if (sections.length && branding.length) {
 				railLines.push(...branding.map((line) => " ".repeat(RAIL_PADDING) + line + " ".repeat(RAIL_PADDING)));
 			} else if (sections.length && headerActive && (headerPlacement() === "top" || (density() === "comfortable" && style === CARD_STYLE.NEON))) {
@@ -347,7 +385,8 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 			const statusPart = state.parts.get("statusbar");
 			const preparedStatusLines = active && statusPart ? [...(statusPart.render(Math.max(0, width - HEADER_RIGHT_INSET)) ?? [])] : [];
 			statusLines = preparedStatusLines.some((line) => line.trim() !== "") ? preparedStatusLines : [];
-			prepared = { revision: cache.revision, width, mode: host.mode, headerPlacement: headerPlacement(), cardStyle: style, root, theme, themeSignature: signature, parts, digests, contentWidth, active, lines: railLines, hits, headerLines, statusLines, fillRow, headerActive: headerLines.length > 0 };
+			pinnedTop = active ? pinnedRows.map(fitPinned) : [];
+			prepared = { pinnedTop, pinnedTopHits, revision: cache.revision, width, mode: host.mode, headerPlacement: headerPlacement(), cardStyle: style, root, theme, themeSignature: signature, parts, digests, contentWidth, active, lines: railLines, hits, headerLines, statusLines, fillRow, headerActive: headerLines.length > 0 };
 			state.active = active;
 			return active;
 		} catch {
@@ -412,12 +451,22 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 			// NODE, exactly like `left` wraps the native transcript: the header
 			// vstack's second entry recurses into it the same way pi-tui already
 			// recurses into a nested layout via [NODE].
+			// The rail column: pinned rows above the ScrollView. With nothing
+			// pinned the ScrollView is the hstack's entry itself.
+			const railColumn: Component & { [NODE](): LayoutNode } = {
+				render: () => [],
+				invalidate() {},
+				[NODE]: () => ({ type: "vstack", gap: 0, align: "stretch", entries: [
+					{ component: pinnedTopLeaf, basis: "auto" as const, grow: 0, shrink: 0, minSize: 1 },
+					{ component: scroll, basis: 0, grow: 1, shrink: 1, minSize: 1 },
+				] }),
+			};
 			const hstackHost: Component & { [NODE](): LayoutNode } = {
 				render: () => [],
 				invalidate() {},
 				[NODE]: () => ({ type: "hstack", gap: GAP, align: "stretch", entries: [
 					{ component: left, basis: 0, grow: 1, shrink: 1, minSize: 1 },
-					{ component: scroll, basis: RAIL_WIDTH, grow: 0, shrink: 0, minSize: RAIL_WIDTH },
+					{ component: pinnedTop.length > 0 ? railColumn : scroll, basis: RAIL_WIDTH, grow: 0, shrink: 0, minSize: RAIL_WIDTH },
 				] }),
 			};
 			const replacement = () => {

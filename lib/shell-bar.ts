@@ -93,6 +93,9 @@ export interface ShellHeaderChrome {
 	rows: string[];
 	headerRow: number;
 	usageSpan?: HeaderUsageSpan;
+	/** Rail header only: the `≡ commands` action row and its hit span (the palette opener). */
+	commandsRow?: number;
+	commandsSpan?: HeaderUsageSpan;
 }
 
 export interface ShellBarTheme {
@@ -316,6 +319,19 @@ export function renderShellStatusSections(model: ShellBarModel, theme: ShellBarT
 // The wide fullscreen chrome (design/shell-rework/02-proposal.html): a title row
 // with the project identity above the transcript and the rail, and one status
 // bar row below them. Both sit on the rail's panel surface.
+/** The rail bar's gauge: the weekly window, or the last (longest) one when the provider names none. */
+function weeklyWindows(windows: UsageWindow[]): UsageWindow[] {
+	const weekly = windows.find((window) => window.label === "week") ?? windows[windows.length - 1];
+	return weekly ? [weekly] : [];
+}
+
+/** `week ▰▰▰▱▱▱▱▱ 40%  alt+u`: the weekly window and the shortcut, without the `usage` label the rail header already carries. */
+function weeklyUsageText(windows: UsageWindow[], theme: ShellBarTheme, stage: UsageStage, hint: string | undefined, paint?: GaugePaint): string {
+	const body = windows.map((window) => usageWindowText(window, theme, stage === "full", paint)).join(" ");
+	if (!body) return "";
+	return hint ? `${body}  ${theme.fg(USAGE_HINT_ROLE, hint)}` : body;
+}
+
 const STATUS_BAR_DIVIDER = "│";
 const paintChromeRow = (theme: ShellBarTheme, row: string) => paintSurfaceRow(row, surfaceOpener(theme, PANEL_SURFACE_ROLE));
 
@@ -338,7 +354,7 @@ export function renderShellTitleRow(model: ShellBarModel, theme: ShellBarTheme, 
  * way first (gauges, secondary windows, the segment), then the model; the
  * usage segment stays the click target that opens the usage view.
  */
-export function renderShellStatusBar(model: ShellBarModel, theme: ShellBarTheme, width: number, usageHint?: string, presentation?: Presentation, paint?: GaugePaint, extras: { jobs?: boolean } = {}): ShellHeaderChrome {
+export function renderShellStatusBar(model: ShellBarModel, theme: ShellBarTheme, width: number, usageHint?: string, presentation?: Presentation, paint?: GaugePaint, extras: { jobs?: boolean; rail?: boolean } = {}): ShellHeaderChrome {
 	const target = Math.max(0, Math.floor(width));
 	const divider = ` ${theme.fg(ROLE.SEPARATOR, STATUS_BAR_DIVIDER)} `;
 	const join = (segments: string[]) => segments.filter(Boolean).join(divider);
@@ -349,16 +365,20 @@ export function renderShellStatusBar(model: ShellBarModel, theme: ShellBarTheme,
 	const runningJobs = extras.jobs ? (model.jobs?.filter((job) => job.status === undefined).length ?? 0) : 0;
 	const tail = join([mode, runningJobs ? theme.fg(ROLE.STATUS, shellJobsCount(runningJobs)) : ""]);
 	const left = join([branch, tail]);
-	const showCounters = presentation?.visibility.usageCost !== false;
+	// With the rail's header showing model, ctx and cost, the bar keeps only the
+	// weekly gauge on the right, so no fact shows twice (shell-personal-rework S3).
+	const railBar = extras.rail === true;
+	const showCounters = presentation?.visibility.usageCost !== false && !railBar;
 	const tier = model.profileTier ? ` ${theme.fg(ROLE.LABEL, "·")} ${theme.fg(model.profileTier === "fast" ? "warning" : ROLE.LABEL, model.profileTier === "fast" ? "Fast" : "Standard")}` : "";
-	const exec = presentation?.visibility.modelDetails === false ? "" : executionSegment(model.modelId, model.effort, theme);
+	const exec = railBar || presentation?.visibility.modelDetails === false ? "" : executionSegment(model.modelId, model.effort, theme);
 	const counters = showCounters ? [contextSegment(model.contextPercent, theme, paint), costSegment(model.costTotal, model.subscription, theme)] : [];
-	const windows = model.usage ? (selectUsageLimit(model.usage, model.modelId)?.windows ?? []) : [];
-	const stages: Array<UsageStage | undefined> = showCounters ? ["full", "text", "primary", undefined] : [undefined];
+	const allWindows = model.usage ? (selectUsageLimit(model.usage, model.modelId)?.windows ?? []) : [];
+	const windows = railBar ? weeklyWindows(allWindows) : allWindows;
+	const stages: Array<UsageStage | undefined> = showCounters ? ["full", "text", "primary", undefined] : railBar && presentation?.visibility.usageCost !== false ? ["full", "text", undefined] : [undefined];
 	const attempts = [...stages.map((stage) => ({ stage, withExec: true, withTier: true })),
 		...(tier ? [{ stage: undefined, withExec: true, withTier: false }] : []), { stage: undefined, withExec: false, withTier: false }];
 	for (const { stage, withExec, withTier } of attempts) {
-		const usage = stage ? usageSegmentText(windows, theme, stage, usageHint, paint) : "";
+		const usage = stage ? (railBar ? weeklyUsageText(windows, theme, stage, usageHint, paint) : usageSegmentText(windows, theme, stage, usageHint, paint)) : "";
 		const right = join([withExec ? exec + (exec && withTier ? tier : "") : "", ...counters, usage]);
 		const room = target - 2;
 		if (visibleWidth(left) + (right ? RIGHT_PADDING : 0) + visibleWidth(right) > room) continue;
@@ -487,6 +507,77 @@ export function renderShellHeaderChrome(model: ShellHeaderModel, theme: ShellBar
 export function shellHeaderUsageHit(chrome: ShellHeaderChrome, x: number, y: number): boolean {
 	const { usageSpan } = chrome;
 	return y === chrome.headerRow && usageSpan !== undefined && x >= usageSpan.start && x < usageSpan.end;
+}
+
+/** The rail's commands action is interactive only on its own row, within its label and key hint. */
+export function shellHeaderCommandsHit(chrome: ShellHeaderChrome, x: number, y: number): boolean {
+	const { commandsSpan } = chrome;
+	return chrome.commandsRow !== undefined && y === chrome.commandsRow && commandsSpan !== undefined && x >= commandsSpan.start && x < commandsSpan.end;
+}
+
+// The rail's cards sit one column in from each rail edge; the pinned header
+// keeps the same inset so its text lines up with the card borders.
+const RAIL_HEADER_INSET = 1;
+// Action rows: `≡ commands   [alt+k]`; the key hints share one column. Every
+// glyph is one cell wide (≡ rather than ☰, which Pi measures as two cells but
+// many terminals draw in one), so Pi and the terminal agree on the columns.
+const RAIL_COMMANDS_ICON = "≡";
+const RAIL_USAGE_ICON = "◔";
+const RAIL_ACTION_KEY_COLUMN = 13;
+const RAIL_ACTION_RULE_CHAR = "┈";
+const RAIL_COMMANDS_ROLE = "accent";
+const RAIL_USAGE_ROLE = "borderAccent";
+const RAIL_ACTION_HINT_ROLE = "dim";
+const RAIL_COUNTER_SEPARATOR = "◇";
+
+/**
+ * The header pinned above the wide right rail's scrollable cards (the owner's
+ * look, design/shell-personal-rework/01-wide.html): model and effort, ctx and
+ * cost, a dotted rule, the `≡ commands` (`commandsRow`) and `◔ usage`
+ * (`headerRow`) actions with their key hints in one column, and a closing rule
+ * across the rail. Every other row and the rules are decorative; a missing
+ * hint means that shortcut is off. Location and session identity stay in the
+ * title row, branch and mode in the status bar, so nothing shows twice.
+ */
+export function renderShellRailHeader(model: ShellHeaderModel, theme: ShellBarTheme, width: number, usageHint?: string, presentation?: Presentation, commandsHint?: string, paint?: GaugePaint): ShellHeaderChrome {
+	const targetWidth = Math.max(0, Math.floor(width));
+	const inner = targetWidth - RAIL_HEADER_INSET * 2;
+	if (inner < 1) return { rows: [], headerRow: -1 };
+	const pad = " ".repeat(RAIL_HEADER_INSET);
+	const row = (text: string) => pad + truncateToWidth(text, inner, "…");
+	const rows: string[] = [];
+	if (presentation?.visibility.modelDetails !== false) {
+		const effort = model.effort ? ` ${theme.fg(ROLE.LABEL, "·")} ${theme.fg("accent", model.effort)}` : "";
+		rows.push(row(theme.fg(ROLE.MODEL, theme.bold(model.modelId)) + effort));
+	}
+	const jobs = model.jobs ? [theme.fg(ROLE.STATUS, shellJobsCount(model.jobs))] : [];
+	const showUsage = presentation?.visibility.usageCost !== false;
+	const counters = [...jobs, ...(showUsage ? [contextSegment(model.contextPercent, theme, paint), costSegment(model.costTotal, model.subscription, theme)] : [])];
+	if (counters.length > 0) rows.push(row(counters.join(` ${theme.fg(ROLE.SEPARATOR, RAIL_COUNTER_SEPARATOR)} `)));
+	// Two aligned action rows under a dotted rule: icon, label, then a key
+	// column. The commands row opens the palette; the usage row the usage panel.
+	const action = (icon: string, label: string, hint: string | undefined, role: string) => {
+		const labelText = truncateToWidth(`${icon} ${label}`, inner, "");
+		const keyText = hint ? truncateToWidth(`[${hint}]`, Math.max(0, inner - RAIL_ACTION_KEY_COLUMN), "…") : "";
+		const gap = " ".repeat(Math.max(1, RAIL_ACTION_KEY_COLUMN - visibleWidth(labelText)));
+		const showKey = keyText !== "" && visibleWidth(labelText) + gap.length + visibleWidth(keyText) <= inner;
+		const text = theme.fg(role, theme.bold(labelText)) + (showKey ? gap + theme.fg(ROLE.LABEL, keyText) : "");
+		return { text: pad + text, end: RAIL_HEADER_INSET + visibleWidth(labelText) + (showKey ? gap.length + visibleWidth(keyText) : 0) };
+	};
+	rows.push(pad + theme.fg(RAIL_ACTION_HINT_ROLE, RAIL_ACTION_RULE_CHAR.repeat(inner)));
+	const commands = action(RAIL_COMMANDS_ICON, "commands", commandsHint, RAIL_COMMANDS_ROLE);
+	const commandsRow = rows.length;
+	rows.push(commands.text);
+	let headerRow = -1;
+	let usageSpan: HeaderUsageSpan | undefined;
+	if (showUsage) {
+		const usage = action(RAIL_USAGE_ICON, "usage", usageHint, RAIL_USAGE_ROLE);
+		headerRow = rows.length;
+		rows.push(usage.text);
+		usageSpan = { start: RAIL_HEADER_INSET, end: usage.end };
+	}
+	rows.push(theme.fg(HEADER_RULE_ROLE, HEADER_RULE_CHAR.repeat(targetWidth)));
+	return { rows, headerRow, ...(usageSpan ? { usageSpan } : {}), commandsRow, commandsSpan: { start: RAIL_HEADER_INSET, end: commands.end } };
 }
 
 function headerContent(model: ShellHeaderModel, theme: ShellBarTheme, width: number, usageHint?: string, presentation?: Presentation, paint?: GaugePaint): ShellHeaderResult {

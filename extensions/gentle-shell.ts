@@ -14,7 +14,7 @@ import { profilesFilePath, profileRoleEntries, readProfilesFileResult } from "..
 import { resolveSessionProfile, sessionProfileLabel, sessionProfileModelProfiles } from "../lib/session-profile-freeze.ts";
 import * as os from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { buildShellHeaderModel, renderShellBar, renderShellBelowInputFloat, renderShellBottomOnlyBar, renderShellHeaderChrome, renderShellSidebarBar, renderShellStatusBar, renderShellStatusSections, renderShellTitleRow, type StatusSection, type StatusTarget, keepNativeWorkingRow, shellEnabled, shellHeaderUsageHit, shellJobsCount, type ShellBarModel, type ShellBarTheme } from "../lib/shell-bar.ts";
+import { buildShellHeaderModel, renderShellBar, renderShellBelowInputFloat, renderShellBottomOnlyBar, renderShellHeaderChrome, renderShellRailHeader, renderShellSidebarBar, renderShellStatusBar, renderShellStatusSections, renderShellTitleRow, type StatusSection, type StatusTarget, keepNativeWorkingRow, shellEnabled, shellHeaderCommandsHit, shellHeaderUsageHit, shellJobsCount, type ShellBarModel, type ShellBarTheme } from "../lib/shell-bar.ts";
 import { CHANGE_STATUS, DIFF_MAX_BYTES, DIFF_MAX_LINES, DIFF_TOO_LARGE, WorktreeChangesTracker, changesDigest, renderChangesWidget, type ChangedFile, type ChangesModel, type FileRevision, type GitRunner, type LineCounter, type WorktreeChanges } from "../lib/shell-changes.ts";
 import { WorktreeChangesView } from "../lib/shell-changes-view.ts";
 import { createNativeFullscreenInteraction } from "../lib/native-fullscreen-interaction.ts";
@@ -126,7 +126,7 @@ import {
 } from "../lib/double-esc-cancel-policy.ts";
 import { accountIdFromToken, ANTHROPIC_PROVIDER, ANTHROPIC_USAGE_URL, CODEX_PROVIDER, CODEX_USAGE_URL, NAN_PROVIDER, NAN_QUOTA_URL, parseAnthropicOauthUsage, parseCodexUsage, parseNanQuota, parseProviderUsage, parseUsageHeaders, limitsFailureNotes, parseUsageSource, renderUsageCard, usageCardDigest, usageScopeProviders, UsageSourceRegistry, UsageStore, USAGE_SOURCE_EVENT, type ProviderUsage, type UsageSource } from "../lib/shell-usage.ts";
 import { UsageView } from "../lib/shell-usage-view.ts";
-import { releaseSidebarHover, setSidebarHover, sidebarHeader, sidebarPart, sidebarState, sidebarStatusBar, VISUAL_SETTINGS_CHANGED, type SidebarRail } from "../lib/shell-sidebar.ts";
+import { releaseSidebarHover, setSidebarHover, sidebarHeader, sidebarPart, sidebarRailHeader, sidebarState, sidebarStatusBar, VISUAL_SETTINGS_CHANGED, type SidebarRail } from "../lib/shell-sidebar.ts";
 import { installSidebar, invalidateSidebar, narrowStatusOwner, SIDEBAR_BREAKPOINT, STATUS_OWNER } from "../lib/shell-sidebar-layout.ts";
 import { panelSheetBackHit, renderPanelSheet, renderWorkRow, workRowLead } from "../lib/shell-panel.ts";
 import { installPagePaint, type PageTheme } from "../lib/shell-page.ts";
@@ -2804,9 +2804,30 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 				// Both IDE chromes draw a status bar that shows the permission mode.
 				sidebarState(tui).statusBarShowsMode = () => chromeMode(tui) !== undefined;
 			}
+			// The wide bar keeps branch, mode and the weekly gauge: model, ctx and
+			// cost live once, in the rail header (shell-personal-rework S3).
 			const statusBarChrome = (width: number) => narrowChrome()
 				? renderShellStatusBar(footerModel(), theme, width, usageShortcutKey, { ...visualSettings, visibility: { ...visualSettings.visibility, modelDetails: false } }, gaugePaint(ctx), { jobs: true })
-				: renderShellStatusBar(footerModel(), theme, width, usageShortcutKey, visualSettings, gaugePaint(ctx));
+				: renderShellStatusBar(footerModel(), theme, width, usageShortcutKey, visualSettings, gaugePaint(ctx), { rail: true });
+			// The owner's rail header, pinned above the rail's cards: model, ctx and cost,
+			// then the commands and usage actions (both clickable).
+			const railHeaderChrome = (width: number) => renderShellRailHeader(buildShellHeaderModel(footerModel()), theme, width, usageShortcutKey, visualSettings, commandsKey(env, keymaps.bindings), gaugePaint(ctx));
+			const disposeRailHeader = sidebarRailHeader(tui, {
+				digest: () => footerStatus.key(),
+				render: (width) => railHeaderChrome(width).rows,
+				invalidate() {},
+				handleMouse(event) {
+					if (event.type !== "click" || event.button !== "left") return undefined;
+					const chrome = railHeaderChrome(event.width);
+					if (shellHeaderCommandsHit(chrome, event.x, event.y)) {
+						void showCommandPalette(pi, ctx, env, keymaps.bindings);
+						return { handled: true, render: true };
+					}
+					if (!shellHeaderUsageHit(chrome, event.x, event.y)) return undefined;
+					void openUsage(ctx);
+					return { handled: true, render: true };
+				},
+			});
 			const disposeHeader = sidebarHeader(tui, {
 				digest: () => footerStatus.key(),
 				render: (width) => ideChrome() ? [renderShellTitleRow(footerModel(), theme, width)] : narrowChrome() ? [renderShellTitleRow(footerModel(), theme, width, { model: true })] : headerBar(width).rows,
@@ -2876,6 +2897,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 				voicePart.dispose?.();
 				ctx.ui.setWidget(HEADER_WIDGET_KEY, undefined);
 				disposeHeader();
+				disposeRailHeader();
 				disposeStatusBar();
 				statusRegion.dispose();
 				uninstall();
