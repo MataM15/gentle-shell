@@ -95,9 +95,12 @@ export function sidebarPart<T extends Component & { dispose?(): void }>(tui: TUI
 	if (!tui.terminal) return bottom;
 	const state = sidebarState(tui);
 	state.parts.set(key, rail);
+	const hidden = () => (key === "todo" && state.visibility?.todo === false) || (key === "footer" && (state.statusHidden?.() || state.headerOwnsStatus?.() || state.compactWork?.())) || ((key === "todo" || key === "agents") && state.compactWork?.()) || (state.active && state.ownsHost?.());
 	return {
 		...bottom,
-		render: (width: number) => (key === "todo" && state.visibility?.todo === false) || (key === "footer" && (state.statusHidden?.() || state.headerOwnsStatus?.() || state.compactWork?.())) || ((key === "todo" || key === "agents") && state.compactWork?.()) || (state.active && state.ownsHost?.()) ? [] : bottom.render(width),
+		render: (width: number) => hidden() ? [] : bottom.render(width),
+		// A hidden bottom copy paints nothing and so is never a pointer target.
+		...(bottom.handleMouse ? { handleMouse: (event: Parameters<NonNullable<Component["handleMouse"]>>[0]) => hidden() ? undefined : bottom.handleMouse?.(event) } : {}),
 		dispose() {
 			if (state.parts.get(key) === rail) state.parts.delete(key);
 			bottom.dispose?.();
