@@ -3,15 +3,17 @@ import test from "node:test";
 import { ScrollView, visibleWidth, type Component, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { renderLayoutFrame } from "@earendil-works/pi-tui/dist/layout.js";
 import { CARD_STYLE, cardStyle, setCardStyle, type CardStyle } from "../lib/shell-card.ts";
-import { renderPanelHeader, renderPanelRow, withPanelFrame } from "../lib/shell-panel.ts";
+import { chromeSurface, railTitleCase, renderPanelHeader, renderPanelRow, renderStaticPanelHeader, setChromeSurface } from "../lib/shell-panel.ts";
 import { renderShellStatusSections, type ShellBarModel } from "../lib/shell-bar.ts";
 import { installSidebar } from "../lib/shell-sidebar-layout.ts";
+import { renderUsageCard, type ProviderUsage } from "../lib/shell-usage.ts";
 import { sidebarPart, sidebarState } from "../lib/shell-sidebar.ts";
 import { renderTodoSection, type TodoState } from "../lib/shell-todo.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 
-// T4 (odd/tasks/shell-personal-rework.md S5, S7): the rail's sections as neon
-// rounded cards, `▾ TITLE` and the count inset in the top border, and the last
+// T4 and T10 (odd/tasks/shell-personal-rework.md S5, S7, S17): the rail's
+// sections as the transparent surface's conversation cards in the owner's
+// style (mixed-case amber title, detail after a dot, `▾` folds), and the last
 // rail row `» hide panel · alt+h`.
 
 const plain = { fg: (_role: string, text: string) => text, bold: (text: string) => text, strikethrough: (text: string) => text };
@@ -67,63 +69,114 @@ function install(columns: number, style: CardStyle = CARD_STYLE.NEON, control?: 
 const screen = (f: ReturnType<typeof fixture>, columns: number, rows = 60) => renderLayoutFrame(f.root, columns, rows, () => {}).lines.map(stripAnsi);
 const railOf = (lines: string[], columns: number) => lines.map((line) => line.slice(columns - 50).trimEnd());
 
-test("a framed panel header insets the title and count in a rounded top border (S5)", () => {
-	const header = withPanelFrame(() => renderPanelHeader(plain, 43, { title: "Todos", count: "2/6", open: true }));
-	assert.equal(visibleWidth(header), 47);
-	assert.match(header, /^╭─ ▾ TODOS ─+ 2\/6 ─╮$/);
-	assert.match(withPanelFrame(() => renderPanelHeader(plain, 43, { title: "Todos", count: "2/6", open: false })), /^╭─ ▸ TODOS /);
-	assert.match(withPanelFrame(() => renderPanelHeader(plain, 43, { title: "Review", open: true })), /^╭─ ▾ REVIEW ─+╮$/, "no count: the rule runs to the corner");
-	assert.equal(visibleWidth(withPanelFrame(() => renderPanelHeader(plain, 12, { title: "Integrations", count: "2", open: true }))), 16, "a long title clips instead of overflowing");
-	assert.equal(renderPanelRow(30, "x").length, 30, "outside the frame rows keep their two-column indent");
-	assert.match(renderPanelRow(30, "x"), /^ {2}x/);
-	assert.match(withPanelFrame(() => renderPanelRow(30, "x")), /^x/, "inside a card the frame is the indent");
-});
-
-test("a framed panel paints only theme roles (S7)", () => {
-	const roles = new Set<string>();
-	const spy = { fg: (role: string, text: string) => { roles.add(role); return text; }, bold: (text: string) => text };
-	withPanelFrame(() => renderPanelHeader(spy, 43, { title: "Todos", count: "2/6", open: true, hovered: true }));
-	for (const role of roles) assert.match(role, /^(accent|border|borderAccent|muted|dim|text|success|warning|error)$/, role);
-});
-
-for (const columns of [180, 140]) {
-	test(`neon rail at ${columns} columns draws TODOS, JOBS, AGENTS, CHANGES, INTEGRATIONS as rounded cards with a gap between (S5)`, (t) => {
-		const found = cardStyle();
-		t.after(() => setCardStyle(found));
-		const f = install(columns);
-		t.after(f.dispose);
-		const lines = railOf(screen(f, columns), columns);
-		const tops = lines.map((line, y) => [line, y] as const).filter(([line]) => /^ ?╭─ /.test(line));
-		const titles = tops.map(([line]) => /▾ (\S+)/.exec(line)?.[1]);
-		assert.deepEqual(titles, ["TODOS", "JOBS", "AGENTS", "CHANGES", "INTEGRATIONS"], "upstream's order, every section its own card");
-		for (const [, y] of tops) {
-			assert.equal(lines[y - 1]?.trim() ?? "", "", `a gap row above the card at ${y}`);
-			assert.equal(visibleWidth(lines[y]!.trimEnd()), 49, "one pad column plus a 48-column card: the rail minus its inset");
-		}
-		const text = lines.join("\n");
-		assert.match(text, /╭─ ▾ TODOS ─+ 2\/6 ─╮/);
-		assert.match(text, /╭─ ▾ JOBS ─+ 1 running ─╮/);
-		assert.match(text, /│ ✓ 2 done +│/);
-		assert.match(text, /│ ● job-1 pnpm test +2m03s │/);
-		assert.equal((text.match(/╰─+╯/g) ?? []).length, 5, "every card closes");
-		assert.doesNotMatch(text, /Activity|Sessions|Resources/, "no tab row");
-		for (const line of lines) assert.ok(visibleWidth(line) <= 50, line);
-	});
+// Real SGR, one color per role, so widths measure as a terminal draws them and a hard-coded color shows up.
+const ROLE_COLOR: Record<string, number> = { borderAccent: 214, muted: 245, text: 255, accent: 211, border: 167, dim: 240, warning: 220 };
+const tagged = { fg: (role: string, text: string) => `\x1b[38;5;${ROLE_COLOR[role] ?? 250}m${text}\x1b[39m`, bold: (text: string) => `\x1b[1m${text}\x1b[22m`, strikethrough: (text: string) => text };
+const amberBold = (title: string) => new RegExp(`\\x1b\\[38;5;${ROLE_COLOR.borderAccent}m\\x1b\\[1m${title}\\x1b\\[22m\\x1b\\[39m`);
+function useSurface(t: { after(fn: () => void): void }, value: "transparent" | "tinted") {
+	const found = chromeSurface();
+	setChromeSurface(value);
+	t.after(() => setChromeSurface(found));
 }
 
-test("float style keeps upstream's flat panel sections, no cards (S5)", (t) => {
-	const found = cardStyle();
-	t.after(() => setCardStyle(found));
-	const f = install(180, CARD_STYLE.FLOAT);
-	t.after(f.dispose);
-	const text = railOf(screen(f, 180), 180).join("\n");
-	assert.match(text, /▾ TODOS +2\/6/);
-	assert.doesNotMatch(text, /╭─ ▾/);
+test("rail titles keep the owner's mixed case: first letter up, the rest down, escape codes intact", () => {
+	assert.equal(railTitleCase("AGENTS"), "Agents");
+	assert.equal(railTitleCase("OTRAS SESIONES"), "Otras sesiones");
+	assert.equal(railTitleCase("\x1b[33mLIMITS\x1b[39m"), "\x1b[33mLimits\x1b[39m");
 });
 
-test("clicks inside a card reach the section in the section's own rows, the border and gaps stay inert (S5)", (t) => {
+test("a transparent rail draws each section as a neon card titled in mixed case with its detail after a dot (S17 row 2)", (t) => {
 	const found = cardStyle();
 	t.after(() => setCardStyle(found));
+	useSurface(t, "transparent");
+	const f = install(180);
+	t.after(f.dispose);
+	const text = railOf(screen(f, 180), 180).join("\n");
+	assert.match(text, /╭─ ▾ Agents · idle ─+╮/);
+	assert.match(text, /╭─ ▾ Todos · 2\/6 ─+╮/);
+	assert.match(text, /╭─ ▾ Jobs · 1 running ─+╮/);
+	assert.doesNotMatch(text, /AGENTS|TODOS|JOBS/, "no upper-case titles");
+	assert.match(text, /│ none running · \/gentle:agents history +│/, "the rows sit inside the frame");
+});
+
+test("the card title is amber bold, with the detail muted, and the frame stays on theme roles (S7)", (t) => {
+	const found = cardStyle();
+	t.after(() => setCardStyle(found));
+	useSurface(t, "transparent");
+	setCardStyle(CARD_STYLE.NEON);
+	const f = fixture(180);
+	sidebarPart(f.tui, "agents", { render: () => [], invalidate() {} }, {
+		surface: "panel", digest: () => "agents", invalidate() {},
+		render: (width: number) => [renderPanelHeader(tagged, width, { title: "Agents", count: "1 running", open: true }), renderPanelRow(width, "● sdd-explore")],
+	} as never);
+	t.after(installSidebar(f.tui, tagged, () => "auto", () => "top", () => "minimal"));
+	const row = renderLayoutFrame(f.root, 180, 20, () => {}).lines.find((line) => stripAnsi(line).includes("Agents"))!;
+	assert.match(row, amberBold("Agents"), "amber (borderAccent), bold");
+	assert.match(row, new RegExp(`\\x1b\\[38;5;${ROLE_COLOR.muted}m·\\x1b\\[39m \\x1b\\[38;5;${ROLE_COLOR.muted}m1 running\\x1b\\[39m`), "the detail is muted");
+	for (const [, color] of row.matchAll(/\x1b\[38;5;(\d+)m/g)) assert.ok(Object.values(ROLE_COLOR).includes(Number(color)), `color ${color} comes from a theme role`);
+});
+
+test("Otras sesiones and Limits draw the same card title as every other section (S17 row 2)", (t) => {
+	const found = cardStyle();
+	t.after(() => setCardStyle(found));
+	useSurface(t, "transparent");
+	setCardStyle(CARD_STYLE.NEON);
+	const f = fixture(180);
+	for (const [key, title] of [["sessions", "Otras sesiones"], ["usage", "Limits"]] as const) {
+		sidebarPart(f.tui, key, { render: () => [], invalidate() {} }, {
+			surface: "panel", digest: () => key, invalidate() {},
+			render: (width: number) => [renderStaticPanelHeader(tagged, width, title), renderPanelRow(width, `${title} row`)],
+		} as never);
+	}
+	t.after(installSidebar(f.tui, tagged, () => "auto", () => "top", () => "minimal", undefined, { tabs: true }));
+	const rows = (tab: string) => {
+		const column = (() => {
+			const top = f.root[NODE]() as Node;
+			const hstack = top.type === "hstack" ? top : top.entries[1]!.component[NODE]!() as Node;
+			return hstack.entries[1]!.component[NODE]!() as Node;
+		})();
+		const pinned = column.entries[0]!.component;
+		const labels = stripAnsi(pinned.render(50).join("\n"));
+		const y = pinned.render(50).findIndex((row) => stripAnsi(row).includes("Activity"));
+		const x = stripAnsi(pinned.render(50)[y]!).indexOf(tab);
+		assert.ok(labels.includes(tab) && x >= 0);
+		pinned.handleMouse!({ type: "click", button: "left", x: x + 1, y, screenX: x + 1, screenY: y, width: 50, height: 4, shift: false, alt: false, ctrl: false } as TuiMouseEvent);
+		return renderLayoutFrame(f.root, 180, 40, () => {}).lines;
+	};
+	const sessions = rows("Sessions").map(stripAnsi).join("\n");
+	assert.match(sessions, /╭─ Otras sesiones ─+╮/);
+	const resources = rows("Resources");
+	assert.match(resources.map(stripAnsi).join("\n"), /╭─ Limits ─+╮/);
+	assert.match(resources.find((line) => stripAnsi(line).includes("Limits"))!, amberBold("Limits"), "amber like the others");
+});
+
+test("a transparent rail paints no background, a tinted one paints the panel rows (S17 row 1)", (t) => {
+	const found = cardStyle();
+	t.after(() => setCardStyle(found));
+	const painted = { ...plain, bg: (_role: string, text: string) => `\x1b[48;5;22m${text}\x1b[49m` };
+	const build = (surface: "transparent" | "tinted") => {
+		setChromeSurface(surface);
+		setCardStyle(CARD_STYLE.NEON);
+		const f = fixture(180);
+		sidebarPart(f.tui, "agents", { render: () => [], invalidate() {} }, {
+			surface: "panel", digest: () => "agents", invalidate() {},
+			render: (width: number) => [renderPanelHeader(plain, width, { title: "Agents", count: "idle", open: true }), renderPanelRow(width, "none running")],
+		} as never);
+		const dispose = installSidebar(f.tui, painted, () => "auto", () => "top", () => "minimal");
+		const lines = renderLayoutFrame(f.root, 180, 20, () => {}).lines;
+		dispose();
+		return lines.map((line) => line.slice(0, line.length));
+	};
+	const before = chromeSurface();
+	t.after(() => setChromeSurface(before));
+	assert.ok(!build("transparent").some((line) => line.includes("\x1b[48;5;22m")), "the terminal background shows through every rail row");
+	assert.ok(build("tinted").some((line) => line.includes("\x1b[48;5;22m")), "tinted keeps upstream's panel surface");
+});
+
+test("a transparent card's title row and body rows reach the section in the section's own rows, the border and gaps stay inert (S17 row 3)", (t) => {
+	const found = cardStyle();
+	t.after(() => setCardStyle(found));
+	useSurface(t, "transparent");
 	const f = install(180);
 	t.after(f.dispose);
 	const rail = railOf(screen(f, 180), 180);
@@ -131,11 +184,11 @@ test("clicks inside a card reach the section in the section's own rows, the bord
 	// No pinned rows in this fixture: the scroll box starts on screen row 0, so a screen row is a content row.
 	const click = (y: number, x = 5): TuiMouseEvent => ({ type: "click", button: "left", x, y, screenX: x + 127, screenY: y, width: 50, height: 60, shift: false, alt: false, ctrl: false });
 	const top = (title: string) => rail.findIndex((line) => line.includes(`▾ ${title}`));
-	const todo = top("TODOS");
+	const todo = top("Todos");
 	clicks.length = 0;
 	assert.equal(scroll.handleMouse(click(todo))?.handled, true);
 	assert.equal(scroll.handleMouse(click(todo + 1))?.handled, true);
-	assert.deepEqual(clicks.map(({ key, y, width }) => [key, y, width]), [["todo", 0, 44], ["todo", 1, 44]], "header row 0 is the collapse control, body rows keep their index");
+	assert.deepEqual(clicks.map(({ key, y }) => [key, y]), [["todo", 0], ["todo", 1]], "the title row is the collapse control, body rows keep their index");
 	const bottomBorder = rail.findIndex((line, y) => y > todo && /^ ?╰─+╯/.test(line));
 	clicks.length = 0;
 	scroll.handleMouse(click(bottomBorder));
@@ -145,15 +198,25 @@ test("clicks inside a card reach the section in the section's own rows, the bord
 	const sections = renderShellStatusSections(status, plain, 44, { density: "minimal", visibility }, undefined);
 	for (const target of sections.targets) {
 		if (target.kind !== "toggle") continue;
-		const title = target.section === "integrations" ? "INTEGRATIONS" : target.section.toUpperCase();
+		const title = target.section === "integrations" ? "Integrations" : target.section[0]!.toUpperCase() + target.section.slice(1);
 		const y = top(title);
 		if (y < 0) continue;
 		clicks.length = 0;
 		scroll.handleMouse(click(y));
-		assert.deepEqual(clicks.map(({ key, y: row }) => [key, row]), [["footer", target.row]], `${title} header maps to its row in the Status render`);
+		assert.deepEqual(clicks.map(({ key, y: row }) => [key, row]), [["footer", target.row]], `${title} title maps to its row in the Status render`);
 	}
 });
 
+test("float style draws the same mixed-case cards on a transparent rail (S17 row 2)", (t) => {
+	const found = cardStyle();
+	t.after(() => setCardStyle(found));
+	useSurface(t, "transparent");
+	const f = install(180, CARD_STYLE.FLOAT);
+	t.after(f.dispose);
+	const text = railOf(screen(f, 180), 180).join("\n");
+	assert.match(text, /▾ Todos · 2\/6/);
+	assert.doesNotMatch(text, /TODOS/);
+});
 test("the last rail row is `» hide panel · alt+h`, clickable, with the editor's alt+h behind it (S5)", (t) => {
 	const found = cardStyle();
 	t.after(() => setCardStyle(found));
@@ -192,67 +255,60 @@ test("a folded rail returns the native layout and the editor can offer `« panel
 	assert.notEqual((f.root[NODE]() as Node).type, "hstack");
 });
 
-test("the gap between two cards of one section is a full-width painted row and never an empty row inside a card (S5)", (t) => {
+
+test("cards sit one blank, unpainted row apart at the owner's minimal density (S12)", (t) => {
 	const found = cardStyle();
 	t.after(() => setCardStyle(found));
-	setCardStyle(CARD_STYLE.NEON);
-	const painted = { ...plain, bg: (_role: string, text: string) => `\x1b[48;5;22m${text}\x1b[49m` };
-	const f = fixture(180);
-	sidebarPart(f.tui, "footer", { render: () => [], invalidate() {} }, {
-		surface: "panel", digest: () => "footer", invalidate() {},
-		// Comfortable density: Status puts its own blank row between sections.
-		render: (width: number) => renderShellStatusSections(status, painted, width, { density: "comfortable", visibility }, undefined).lines,
-	} as never);
-	const dispose = installSidebar(f.tui, painted, () => "auto", () => "top", () => "comfortable");
-	t.after(dispose);
-	const frame = renderLayoutFrame(f.root, 180, 40, () => {}).lines;
-	const text = frame.map(stripAnsi);
-	const bottom = text.findIndex((line) => /╰─+╯/.test(line));
-	const nextTop = text.findIndex((line, y) => y > bottom && /╭─ ▾ INTEGRATIONS/.test(line));
-	assert.ok(bottom > 0 && nextTop === bottom + 2, "exactly one gap row between the cards");
-	assert.match(frame[bottom + 1]!, /\x1b\[48;5;22m {50}/, "the gap row is painted across the whole rail width");
-	const changes = text.findIndex((line) => /╭─ ▾ CHANGES/.test(line));
-	assert.equal(bottom - changes, 2, "the card is header, one body row and the bottom border: no blank row inside");
+	useSurface(t, "transparent");
+	const f = install(180);
+	t.after(f.dispose);
+	const rail = railOf(screen(f, 180), 180);
+	const bottom = rail.findIndex((line) => /^ ?╰─+╯/.test(line));
+	assert.equal(rail[bottom + 1], "", "a blank row after the first card");
+	assert.match(rail[bottom + 2]!, /^ ?╭─ ▾ /, "then the next card");
 });
 
-// T8 (S10): the AGENTS section is its own extension, and Pi loads each extension with its own
-// copy of lib/, so the frame switch must not live in a module variable.
-test("a section rendered by another copy of shell-panel is still drawn as a neon card (S10)", async (t) => {
+test("the Todos collapse key rides the card's top rule, the count stays beside the title (S17 row 3)", (t) => {
 	const found = cardStyle();
 	t.after(() => setCardStyle(found));
-	const other = await import(new URL("../lib/shell-panel.ts?agents-copy", import.meta.url).href) as typeof import("../lib/shell-panel.ts");
-	assert.notEqual(other.renderPanelHeader, renderPanelHeader, "a distinct module instance");
-	assert.match(withPanelFrame(() => other.renderPanelHeader(plain, 43, { title: "Agents", count: "idle", open: true })), /^╭─ ▾ AGENTS ─+ idle ─╮$/);
-	assert.match(other.withPanelFrame(() => renderPanelHeader(plain, 43, { title: "Agents", count: "idle", open: true })), /^╭─ ▾ AGENTS /);
-	const columns = 180;
-	setCardStyle(CARD_STYLE.NEON);
-	const f = fixture(columns);
-	sidebarPart(f.tui, "agents", { render: () => [], invalidate() {} }, {
-		surface: "panel", digest: () => "agents", invalidate() {},
-		render: (width: number) => [other.renderPanelHeader(plain, width, { title: "Agents", count: "idle", open: true }), other.renderPanelRow(width, "none running · /gentle:agents history")],
-	} as never);
-	const dispose = installSidebar(f.tui, plain, () => "auto", () => "top", () => "minimal");
-	t.after(dispose);
-	const lines = railOf(screen(f, columns), columns);
-	const top = lines.findIndex((line) => /^ ?╭─ ▾ AGENTS/.test(line));
-	assert.ok(top >= 0, lines.join("\n"));
-	assert.match(lines[top + 1]!, /^ ?│ none running · \/gentle:agents history +│$/);
-	assert.match(lines[top + 2]!, /^ ?╰─+╯$/);
-	for (const line of lines) assert.ok(visibleWidth(line) <= 50, line);
-});
-
-test("a panel section that ignores the frame is drawn flat at the full rail width, never short beside a tinted block (S10)", (t) => {
-	const found = cardStyle();
-	t.after(() => setCardStyle(found));
+	useSurface(t, "transparent");
 	setCardStyle(CARD_STYLE.NEON);
 	const f = fixture(180);
-	const widths: number[] = [];
-	sidebarPart(f.tui, "agents", { render: () => [], invalidate() {} }, {
-		surface: "panel", digest: () => "flat", invalidate() {},
-		render: (width: number) => { widths.push(width); return ["▾ AGENTS".padEnd(width), "  none running"]; },
+	sidebarPart(f.tui, "todo", { render: () => [], invalidate() {} }, {
+		surface: "panel", digest: () => "todo", invalidate() {},
+		render: (width: number) => { const section = renderTodoSection(todos, plain, width, { collapsed: false, staleTurns: 0, collapseKey: "ctrl+shift+t" }); return [section.header, ...section.body]; },
 	} as never);
 	t.after(installSidebar(f.tui, plain, () => "auto", () => "top", () => "minimal"));
-	const lines = railOf(screen(f, 180), 180);
-	assert.ok(lines.some((line) => line.includes("▾ AGENTS")));
-	assert.deepEqual(widths.slice(-2), [44, 48], "rendered framed (four columns short), then again at the card width");
+	const text = railOf(screen(f, 180), 180);
+	assert.match(text.find((row) => row.includes("Todos"))!, /^╭─ ▾ Todos · 2\/6 ─+ ctrl\+shift\+t ╮$/);
+});
+
+test("the real Limits section in panel mode fills its card: every row closes on the frame, none is cut with an ellipsis (S14, S17 row 2)", (t) => {
+	const found = cardStyle();
+	t.after(() => setCardStyle(found));
+	useSurface(t, "transparent");
+	setCardStyle(CARD_STYLE.NEON);
+	const now = 1_788_600_000_000;
+	const win = (label: string, usedPercent: number, seconds: number) => ({ label, usedPercent, windowSeconds: seconds, resetAt: now + seconds * 500 });
+	const usages = [{ provider: "anthropic", plan: "max", fetchedAt: now, limits: [{ name: "claude", limitReached: false, windows: [win("5h", 26, 18000), win("week", 4, 604800)] }] }] as ProviderUsage[];
+	const f = fixture(180);
+	sidebarPart(f.tui, "usage", { render: () => [], invalidate() {} }, {
+		surface: "panel", digest: () => "usage", invalidate() {},
+		render: (width: number) => renderUsageCard(usages, plain, width, now, { panel: true }),
+	} as never);
+	t.after(installSidebar(f.tui, plain, () => "auto", () => "top", () => "minimal", undefined, { tabs: true }));
+	const column = (() => {
+		const top = f.root[NODE]() as Node;
+		const hstack = top.type === "hstack" ? top : top.entries[1]!.component[NODE]!() as Node;
+		return hstack.entries[1]!.component[NODE]!() as Node;
+	})();
+	const pinned = column.entries[0]!.component;
+	const tabRows = pinned.render(50).map(stripAnsi);
+	const y = tabRows.findIndex((row) => row.includes("Resources"));
+	pinned.handleMouse!({ type: "click", button: "left", x: tabRows[y]!.indexOf("Resources") + 1, y, screenX: 0, screenY: y, width: 50, height: tabRows.length, shift: false, alt: false, ctrl: false } as TuiMouseEvent);
+	const rail = railOf(screen(f, 180), 180).filter((row) => /^ ?[╭│╰]/.test(row));
+	assert.match(rail[0]!, /^ ?╭─ Limits ─+╮$/);
+	assert.ok(rail.length > 4, "the card has its rows");
+	for (const row of rail.slice(1, -1)) assert.match(row, /│$/, `"${row}" closes on the frame`);
+	assert.doesNotMatch(rail.join("\n"), /…/, "no row is cut");
 });

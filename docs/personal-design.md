@@ -17,7 +17,7 @@ The owner, verbatim: "me gusta el diseño que tenemos, el estilo ... habría que
 |---|---|---|
 | Pi theme | `sakura-unificado` | `~/.pi/agent/settings.json`, `~/.pi/agent/themes/sakura-unificado.json` |
 | Card style | `neon` | `~/.pi/gentle-ai/card-style.json` |
-| Layout | header on top, Status on the right, density `minimal` | `~/.pi/gentle-ai/visual-customization.json` |
+| Layout | header on top (draws the IDE chrome: title row above, status bar below), Status on the right, density `minimal` | `~/.pi/gentle-ai/visual-customization.json` |
 | Background | transparent: a terminal background image shows through | Windows Terminal and herdr |
 | Assistant bubbles | J.A.R.V.I.S. speech bubbles with a tail | personal extension `~/.pi/agent/extensions/assistant-bubbles.ts` |
 
@@ -26,10 +26,11 @@ The owner, verbatim: "me gusta el diseño que tenemos, el estilo ... habría que
 | Piece | Behavior | Tests |
 |---|---|---|
 | No petals | No `✿`, `🌹`, `🌸` or ASCII rose anywhere: chrome, banner, cards, usage view, prompt | `tests/shell-no-petals.test.ts` |
-| Rail header | `model · effort`, `ctx` gauge and cost, `≡ commands [alt+k]`, `◔ usage [alt+u]`, clickable | `tests/shell-personal-rail.test.ts` |
+| Rail header | `model · effort · agent profile`, `ctx` gauge and cost, `≡ commands [alt+k]`, `◔ usage [alt+u]`, clickable | `tests/shell-personal-rail.test.ts` |
 | Breaks | Yellow card pinned under the header: Agua, Descanso, Estirar with clickable `↻` resets, Cena countdown, big clock and date | `tests/shell-personal-rail.test.ts`, `tests/shell-wellness.test.ts` |
 | Tabs | Activity (Agents, Jobs, Todos), Sessions (Otras sesiones), Resources (Limits), Status (Changes, Review, Stats, Integrations); click to switch | `tests/shell-personal-rail.test.ts` |
-| Cards | Rail sections as neon rounded cards, title in the top rule, `▾` folds | `tests/shell-personal-cards.test.ts` |
+| Cards | Rail sections as the transparent surface's conversation cards in the active style (neon): mixed-case amber title with its detail after a dot (`▾ Agents · 1 running · 1 waiting`), the same in every tab including Otras sesiones and Limits; a click on the title row or `▾` folds; a blank row between cards at every density | `tests/shell-personal-cards.test.ts`, `tests/shell-sidebar-tabs.test.ts` |
+| Transparent rail | The default surface paints nothing in the rail (pinned header, Breaks, tabs, cards, gaps) so the terminal background image shows through; `tinted` stays available | `tests/shell-personal-cards.test.ts`, `tests/shell-sidebar-tabs.test.ts` |
 | Limits | One block per provider in Resources; one Claude block (no duplicate `claude-bridge`) | `tests/shell-usage.test.ts`, `tests/shell-usage-card.test.ts` |
 | Otras sesiones | Other live sessions: name, age, agent count, inactive count, last seen | `tests/shell-session-state*.test.ts` |
 | Hide panel | `» hide panel · alt+h` as the last rail row | `tests/shell-personal-rail.test.ts` |

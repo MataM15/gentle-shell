@@ -6,7 +6,7 @@ import { createChatViewport } from "../node_modules/@earendil-works/pi-coding-ag
 import { CARD_STYLE, setCardStyle } from "../lib/shell-card.ts";
 import { installSidebar } from "../lib/shell-sidebar-layout.ts";
 import { sidebarPart, sidebarRailHeader } from "../lib/shell-sidebar.ts";
-import { renderPanelHeader, renderPanelRow } from "../lib/shell-panel.ts";
+import { chromeSurface, renderPanelHeader, renderPanelRow, setChromeSurface } from "../lib/shell-panel.ts";
 import { abbreviateModelNames, limitsFailureNotes, renderUsageCard, type ProviderUsage } from "../lib/shell-usage.ts";
 
 const plain = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
@@ -50,11 +50,13 @@ async function rail(density: "minimal" | "compact" | "comfortable") {
 for (const density of ["minimal", "compact", "comfortable"] as const) {
 	test(`neon rail at ${density} density: one blank row between the header and each card, every top border intact`, async () => {
 		setCardStyle(CARD_STYLE.NEON);
-		const screen = await rail(density);
+		const surface = chromeSurface();
+		setChromeSurface("transparent");
+		const screen = await rail(density).finally(() => setChromeSurface(surface));
 		const rule = screen.findIndex((row) => /^─{50}$/.test(row));
 		assert.ok(rule >= 0, "header rule is painted");
 		assert.equal(screen[rule + 1], "", "blank gap after the header rule");
-		for (const title of ["Breaks", "▾ AGENTS", "▾ CHANGES"]) {
+		for (const title of ["Breaks", "▾ Agents", "▾ Changes"]) {
 			const top = screen.findIndex((row) => row.includes(`╭─ ${title} `));
 			assert.ok(top >= 0, `${title} keeps its titled top border`);
 			assert.equal(screen[top - 1], "", `blank gap above ${title}`);

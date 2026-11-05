@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { ScrollView, visibleWidth, type Component, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { renderLayoutFrame } from "@earendil-works/pi-tui/dist/layout.js";
-import { CARD_STYLE, CARD_TONE, cardStyle, renderCard, setCardStyle } from "../lib/shell-card.ts";
-import { renderPanelHeader, renderPanelRow } from "../lib/shell-panel.ts";
+import { CARD_STYLE, cardStyle, setCardStyle } from "../lib/shell-card.ts";
+import { chromeSurface, renderPanelHeader, renderPanelRow, renderStaticPanelHeader, setChromeSurface } from "../lib/shell-panel.ts";
 import { renderShellStatusSections, type ShellBarModel } from "../lib/shell-bar.ts";
 import { installSidebar } from "../lib/shell-sidebar-layout.ts";
 import { SIDEBAR_TABS, sidebarTabSections } from "../lib/shell-sidebar-tabs.ts";
@@ -26,14 +26,17 @@ const click = (x: number, y: number, width = 50, height = 12): TuiMouseEvent => 
 
 function install(columns: number, onTabSelect?: (tab: string) => void, voice?: () => string[], theme: typeof plain & { bg?(role: string, text: string): string } = plain) {
 	setCardStyle(CARD_STYLE.NEON);
+	// The default surface: the layout draws each panel section as a transparent card (S17).
+	const surfaceBefore = chromeSurface();
+	setChromeSurface("transparent");
 	const original = () => ({ type: "vstack", entries: [] });
 	const root = { render: () => ["transcript"], invalidate() {}, [NODE]: original };
 	const host = { mode: "fullscreen", terminal: { columns }, layoutRoot: root, requestRender() {} };
 	const tui = host as unknown as TUI;
 	const clicks: string[] = [];
-	// Sessions and Limits are outlined cards drawn by renderCard, not panel sections.
+	// Every section, Otras sesiones and Limits included, is a panel section the layout frames.
 	const part = (key: string, render: (width: number) => string[]) => sidebarPart(tui, key, { render: () => [], invalidate() {} }, {
-		...(key === "sessions" || key === "usage" ? {} : { surface: "panel" }), digest: () => key, render, invalidate() {},
+		surface: "panel", digest: () => key, render, invalidate() {},
 		handleMouse(event) { clicks.push(`${key}@${event.y}`); return { handled: true }; },
 	} as never);
 	const card = (title: string, count: string, ...rows: string[]) => (width: number) => [renderPanelHeader(plain, width, { title, count, open: true }), ...rows.map((row) => renderPanelRow(width, row))];
@@ -45,10 +48,17 @@ function install(columns: number, onTabSelect?: (tab: string) => void, voice?: (
 	part("todo", card("Todos", "2/6", "✓ 2 done"));
 	part("jobs", card("Jobs", "1 running", "● job-1 pnpm test"));
 	part("agents", card("Agents", "idle", "none running"));
-	part("sessions", (width) => renderCard({ title: "Otras sesiones", tone: CARD_TONE.INFO, rail: true, body: ["● erasure-1570n5", "  hace 1 h · 1 agente"] }, theme, width, { expanded: true, panel: true }));
-	part("usage", (width) => renderCard({ title: "Limits", tone: CARD_TONE.INFO, rail: true, body: ["claude · max"] }, theme, width, { expanded: true, panel: true }));
-	part("footer", (width) => renderShellStatusSections(status, plain, width, { density: "minimal", visibility }, undefined).lines);
-	const dispose = installSidebar(tui, theme, () => "auto", () => "top", () => "minimal", undefined, { tabs: true, onTabSelect });
+	part("sessions", (width) => [renderStaticPanelHeader(plain, width, "Otras sesiones"), ...["● erasure-1570n5", "  hace 1 h · 1 agente"].map((row) => renderPanelRow(width, row))]);
+	part("usage", (width) => [renderStaticPanelHeader(plain, width, "Limits"), renderPanelRow(width, "claude · max")]);
+	const footerGroups = new Map<number, { groups: Array<{ start: number; end: number }>; loose: number[] }>();
+	sidebarPart(tui, "footer", { render: () => [], invalidate() {} }, {
+		surface: "panel", digest: () => "footer", invalidate() {},
+		render: (width: number) => { const view = renderShellStatusSections(status, plain, width, { density: "minimal", visibility }, undefined); footerGroups.set(width, { groups: view.groups, loose: view.loose }); return view.lines; },
+		cardGroups: (width: number) => footerGroups.get(width),
+		handleMouse(event) { clicks.push(`footer@${event.y}`); return { handled: true }; },
+	} as never);
+	const uninstall = installSidebar(tui, theme, () => "auto", () => "top", () => "minimal", undefined, { tabs: true, onTabSelect });
+	const dispose = () => { uninstall(); setChromeSurface(surfaceBefore); };
 	const column = () => {
 		const top = root[NODE]() as Node;
 		const hstack = top.type === "hstack" ? top : top.entries[1]!.component[NODE]!() as Node;
@@ -78,8 +88,8 @@ test("at 180 columns the tab row sits under the header and Breaks, with the acti
 	assert.ok(tabRow > lines.findIndex((line) => line.includes("Breaks")), "below Breaks");
 	assert.ok(tabRow > lines.findIndex((line) => line.includes("claude-fable-5-1")), "below the rail header");
 	assert.match(lines[tabRow + 1]!, /^─+$/, "the rule under the tabs");
-	assert.deepEqual(titles(lines), ["AGENTS", "JOBS", "TODOS"], "Activity holds Agents, Jobs, Todos as neon cards");
-	assert.doesNotMatch(lines.join("\n"), /Otras sesiones|Limits|CHANGES/i);
+	assert.deepEqual(titles(lines), ["Agents · idle", "Jobs · 1 running", "Todos · 2/6"], "Activity holds Agents, Jobs, Todos as neon cards titled in the owner's mixed case with their detail");
+	assert.doesNotMatch(lines.join("\n"), /Otras sesiones|Limits|Changes/i);
 	for (const line of lines) assert.ok(visibleWidth(line) <= 50, line);
 });
 
@@ -114,9 +124,9 @@ test("a click on a tab switches the section set, notifies, and the choice surviv
 	pin(26);
 	assert.deepEqual(titles(f.screen()), ["Limits"]);
 	pin(38);
-	assert.deepEqual(titles(f.screen()), ["CHANGES", "INTEGRATIONS"], "Status holds upstream's status sections");
+	assert.deepEqual(titles(f.screen()), ["Changes · clean", "Integrations · 1"], "Status holds upstream's status sections");
 	pin(3);
-	assert.deepEqual(titles(f.screen()), ["AGENTS", "JOBS", "TODOS"]);
+	assert.deepEqual(titles(f.screen()), ["Agents · idle", "Jobs · 1 running", "Todos · 2/6"]);
 	assert.deepEqual(selected, ["sessions", "resources", "status", "activity"]);
 	assert.equal(f.pinned().handleMouse!({ ...click(15, tabY), button: "right" }), undefined, "only the left button switches");
 	assert.equal(f.pinned().handleMouse!(click(15, tabY - 1)), undefined, "the Breaks row is not a tab");
@@ -130,7 +140,7 @@ test("a card keeps its own clicks inside the tab (collapse hits the section, not
 	f.screen();
 	const scroll = f.column().entries.map((entry) => entry.component).find((candidate) => candidate instanceof ScrollView) as ScrollView;
 	const lines = f.screen();
-	const header = lines.findIndex((line) => /╭─ ▾ AGENTS/.test(line));
+	const header = lines.findIndex((line) => /╭─ ▾ Agents/.test(line));
 	const top = f.pinned().render(50).length;
 	const result = scroll.handleMouse!(click(5, header - 1 - top, 50, 40));
 	assert.ok(result?.handled);
@@ -165,7 +175,7 @@ test("the voice line is pinned under the tabs while recording and gone when idle
 	assert.ok(!pinnedText().some((row) => row.includes("listening")), "idle hides it");
 });
 
-test("a card section that is not a panel section still sits on the rail's tinted surface on every tab (S12)", (t) => {
+test("the rail is one surface on every tab: tinted paints every row, transparent paints none so the terminal background shows through (S12, S17 row 1)", (t) => {
 	const found = cardStyle();
 	t.after(() => setCardStyle(found));
 	const tinted = { ...plain, bg: (_role: string, text: string) => `\x1b[44m${text}\x1b[49m` };
@@ -173,12 +183,19 @@ test("a card section that is not a panel section still sits on the rail's tinted
 	t.after(f.dispose);
 	f.screen();
 	const tabY = f.pinned().render(50).findIndex((row) => stripAnsi(row).includes("Resources"));
-	for (const x of [15, 26, 38, 3]) {
-		f.pinned().handleMouse!(click(x, tabY));
-		const raw = renderLayoutFrame(f.root as never, 180, 50, () => {}).lines.map((line) => line.slice(0));
-		// Every row of the rail column (pinned header, cards, gaps, the fill below the last card) carries the tint;
-		// the full-width title row on top is not part of the rail.
-		const untinted = raw.flatMap((line, row) => row === 0 || line.includes("\x1b[44m") ? [] : [row]);
-		assert.deepEqual(untinted, [], `tab at x=${x}`);
+	for (const surface of ["tinted", "transparent"] as const) {
+		setChromeSurface(surface);
+		for (const x of [15, 26, 38, 3]) {
+			f.pinned().handleMouse!(click(x, tabY));
+			const raw = renderLayoutFrame(f.root as never, 180, 50, () => {}).lines;
+			// The full-width title row on top is not part of the rail.
+			const rail = raw.map((line, row) => ({ line, row })).filter(({ row }) => row > 0);
+			if (surface === "tinted") {
+				// Every row of the rail column (pinned header, sections, gaps, the fill below the last one) carries the tint.
+				assert.deepEqual(rail.filter(({ line }) => !line.includes("\x1b[44m")).map(({ row }) => row), [], `tinted, tab at x=${x}`);
+			} else {
+				assert.deepEqual(rail.filter(({ line }) => line.includes("\x1b[44m")).map(({ row }) => row), [], `transparent, tab at x=${x}: no row paints a background`);
+			}
+		}
 	}
 });

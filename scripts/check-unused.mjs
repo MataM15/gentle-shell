@@ -6,7 +6,7 @@
 // Exports are not checked: a module may export for its tests.
 //
 // UPSTREAM_BASELINE records what upstream's own files already carried when
-// the personal rework was merged (origin/main 7ecb826a2). Those files stay
+// the personal rework was merged (origin/main 7ecb826a2, rebaselined at 895f353ca). Those files stay
 // untouched to keep merges clean, so the gate ratchets them: a file may not
 // gain a finding, and lowering a count after an upstream cleanup is welcome.
 // Every other file must have none.
@@ -22,7 +22,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const UPSTREAM_BASELINE = {
-	"extensions/gentle-ai.ts": 12,
+	"extensions/gentle-ai.ts": 11,
 	"extensions/quiet-tools.ts": 1,
 	"lib/native-review-cli.ts": 8,
 	"lib/review-candidate-view-owner.ts": 1,

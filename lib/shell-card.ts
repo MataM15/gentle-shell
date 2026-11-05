@@ -25,6 +25,8 @@ export interface Card {
 	 * `Gentle Shell` heading above it. Other tones keep their own role.
 	 */
 	rail?: boolean;
+	/** A pre-styled control glyph ahead of a rail card's title (the fold `▾`); the title row has no other glyph slot. */
+	railGlyph?: string;
 	/** Pre-styled text right after the title, outside its role (the Todos control). */
 	titleSuffix?: string;
 }
@@ -150,7 +152,9 @@ function titleHead(card: Card, theme: CardTheme): { styled: string; width: numbe
 	const role = card.rail && card.tone === CARD_TONE.INFO ? RAIL_TITLE_ROLE : TITLE_ROLE[card.tone];
 	const title = theme.fg(role, card.rail && theme.bold ? theme.bold(plain) : plain);
 	const suffix = card.titleSuffix ? ` ${card.titleSuffix}` : "";
-	return { styled: title + suffix, width: visibleWidth(plain) + visibleWidth(suffix) };
+	// A rail card keeps its collapse glyph (already painted) ahead of the title.
+	const lead = card.railGlyph ? `${card.railGlyph} ` : "";
+	return { styled: lead + title + suffix, width: visibleWidth(lead) + visibleWidth(plain) + visibleWidth(suffix) };
 }
 
 function titleText(card: Card, theme: CardTheme): { styled: string; width: number } {

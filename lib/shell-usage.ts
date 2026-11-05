@@ -2,6 +2,7 @@ import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { parseModelRef } from "./agents-config.ts";
 import { paintGauge, type GaugePaint } from "./shell-gauge.ts";
 import { cardInnerWidth, renderCard } from "./shell-card.ts";
+import { PANEL_ROW_INDENT, renderPanelRow, renderStaticPanelHeader } from "./shell-panel.ts";
 import { CLAUDE_BRIDGE_PROVIDER } from "./bridge-cost.ts";
 
 // Gentle Shell subscription usage: the rate-limit windows each connected
@@ -903,6 +904,8 @@ export interface UsageCardOptions {
 	providers?: readonly string[];
 	registry?: UsageSourceRegistry;
 	failed?: ReadonlySet<string>;
+	/** Header and rows for the rail layout to frame, instead of a card of its own. */
+	panel?: boolean;
 }
 
 export function renderUsageCard(usages: readonly ProviderUsage[], theme: UsageTheme, width: number, now: number, options?: UsageCardOptions): string[] {
@@ -918,7 +921,8 @@ export function renderUsageCard(usages: readonly ProviderUsage[], theme: UsageTh
 		? [...new Set(options.providers.map(displayProvider))].map((provider) => ({ provider, usage: sorted.find((usage) => usage.provider === provider) }))
 		: sorted.map((usage) => ({ provider: usage.provider, usage }));
 	if (planned.length === 0) return [];
-	const innerWidth = cardInnerWidth(width);
+	// The rail draws Limits as a panel section: its header and rows, and the layout frames them.
+	const innerWidth = options?.panel ? Math.max(1, Math.floor(width) - PANEL_ROW_INDENT) : cardInnerWidth(width);
 	const sections = planned.map((slot) => {
 		if (!slot.usage) {
 			// A settled refresh that answered nothing is a failure; otherwise the
@@ -975,6 +979,7 @@ export function renderUsageCard(usages: readonly ProviderUsage[], theme: UsageTh
 	const fetched = planned.flatMap((slot) => (slot.usage ? [slot.usage.fetchedAt] : []));
 	const hint = sections.some((section) => section.compact) ? COMPACT_FOOTER_HINT : CARD_FOOTER_HINT;
 	body.push("", theme.fg(ROLE.RESET, truncateToWidth(fetched.length > 0 ? `${updatedAgo(Math.min(...fetched), now)} · ${hint}` : hint, innerWidth, "…")));
+	if (options?.panel) return [renderStaticPanelHeader(theme, width, "Limits"), ...body.map((row) => renderPanelRow(width, row))];
 	return renderCard({ title: "Limits", body, tone: "info", rail: true }, theme, width, { expanded: true });
 }
 

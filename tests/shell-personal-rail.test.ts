@@ -32,7 +32,7 @@ test("the rail header stacks model, ctx and cost, then the commands and usage ac
 		const chrome = renderShellRailHeader(buildShellHeaderModel(model), plain, width, "alt+u", { density: "minimal", visibility: { changes: true, rdd: true, agents: true, todo: true, usageCost: true, modelDetails: true, contextWarning: true, stats: false } }, "alt+k");
 		const text = rows(chrome.rows);
 		assert.ok(text.every((row) => visibleWidth(row) <= width), `no row wider than ${width}`);
-		assert.equal(text[0]!.trim(), "claude-fable-5-1 · low");
+		assert.match(text[0]!.trim(), width === 50 ? /^claude-fable-5-1 · low · claude \(session\)$/ : /^claude-fable-5-1 · low · claude.*…$/, "the profile follows the model and gives way with an ellipsis, never wraps");
 		assert.equal(text[1]!.trim(), "ctx ▰▱▱▱▱▱▱▱ 17% ◇ $0.000");
 		assert.match(text[2]!, /^ ┈+ ?$/, "dotted rule");
 		assert.equal(text[3]!.trimEnd(), " ≡ commands   [alt+k]");
@@ -57,7 +57,7 @@ test("the rail header paints only theme roles (S7)", () => {
 test("the wide status bar keeps branch, mode and the weekly gauge and drops model, ctx and cost (S3)", () => {
 	const wide = stripAnsi(renderShellStatusBar(model, plain, 180, "alt+u", undefined, undefined, { rail: true }).rows[0]!);
 	assert.equal(visibleWidth(wide), 180);
-	assert.match(wide, /^ feat\/shell-visual-snapshots +│ +SUPER-YOLO +week ▰▰▰▱▱▱▱▱ 40% +alt\+u $/);
+	assert.match(wide, /^ feat\/shell-visual-snapshots +│ +💥 SUPER-YOLO +week ▰▰▰▱▱▱▱▱ 40% +alt\+u $/);
 	assert.doesNotMatch(wide, /claude-fable|ctx|\$0\.000|5h|usage ·/, "shown once, in the rail header");
 	const chrome = renderShellStatusBar(model, plain, 180, "alt+u", undefined, undefined, { rail: true });
 	assert.ok(chrome.usageSpan && stripAnsi(chrome.rows[0]!).slice(chrome.usageSpan.start, chrome.usageSpan.end).startsWith("week"), "the weekly gauge stays the click target");
@@ -94,7 +94,7 @@ test("the layout pins the rail header above the scrolling sections and forwards 
 	assert.equal(column.type, "vstack");
 	const pinned = column.entries[0]!.component;
 	const lines = rows(pinned.render(50));
-	assert.equal(lines[0]!.trim(), "claude-fable-5-1 · low");
+	assert.equal(lines[0]!.trim(), "claude-fable-5-1 · low · claude (session)");
 	assert.equal(lines.length, 6);
 	assert.ok(lines.every((line) => visibleWidth(line) === 50), "pinned rows fill the rail width");
 	pinned.handleMouse!(click(3, 3));
@@ -224,9 +224,15 @@ test("the narrow status row keeps the branch and permission mode only (S6)", () 
 	for (const width of [56, 44]) {
 		const row = stripAnsi(renderShellStatusBar(narrowModel, plain, width, "alt+u", undefined, undefined, { jobs: true, bare: true }).rows[0]!);
 		assert.equal(visibleWidth(row), width);
-		assert.match(row, /^ feat\/shell-visual-snapshots +│ SUPER-YOLO +$|^ feat\/shell…|^ feat\/shell-visual/);
+		assert.match(row, /^ feat\/shell-visual-snapshots +│ 💥 SUPER-YOLO +$|^ feat\/shell…|^ feat\/shell-visual/);
 		assert.doesNotMatch(row, /ctx|\$0\.000|usage|week|alt\+u/);
 	}
 	const wide = stripAnsi(renderShellStatusBar(narrowModel, plain, 56, "alt+u", undefined, undefined, { jobs: true, bare: true }).rows[0]!);
-	assert.match(wide, /feat\/shell-visual-snapshots │ SUPER-YOLO/);
+	assert.match(wide, /feat\/shell-visual-snapshots │ 💥 SUPER-YOLO/);
+});
+
+test("the agent profile rides next to the model in the rail header (S17 row 4)", () => {
+	const chrome = renderShellRailHeader(buildShellHeaderModel({ ...model, profile: "claude (session)" }), plain, 50, "alt+u", undefined, "alt+k");
+	assert.equal(rows(chrome.rows)[0]!.trim(), "claude-fable-5-1 · low · claude (session)");
+	assert.equal(rows(chrome.rows).length, rows(renderShellRailHeader(buildShellHeaderModel(model), plain, 50, "alt+u", undefined, "alt+k").rows).length, "no new row, no new bar");
 });

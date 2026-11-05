@@ -324,7 +324,7 @@ test("the rail draws Todos as a panel section whose header row 0 is the collapse
 		const rail = sidebarState(tui as never).parts.get("todo")!;
 		assert.equal((rail as { surface?: string }).surface, "panel", "the rail paints this section on the panel surface");
 		const rows = rail.render(48).map((row) => stripAnsi(row).trimEnd());
-		assert.deepEqual(rows, ["▾ TODOS                                      1/3", "  ✓ 1 done", "  ◐ B", "    └ job-1", "  ○ C"]);
+		assert.deepEqual(rows, ["▾ TODOS                        ctrl+shift+t  1/3", "  ✓ 1 done", "  ◐ B", "    └ job-1", "  ○ C"]);
 		assert.doesNotMatch(rows.join("\n"), /[╭╮╰╯│▎]/u, "no card chrome in the rail");
 		const pointer = (type: "move" | "click", y: number) => ({
 			type, button: type === "move" ? "none" as const : "left" as const, x: 1, y, screenX: 1, screenY: y, width: 48, height: rows.length, shift: false, alt: false, ctrl: false,
@@ -332,7 +332,7 @@ test("the rail draws Todos as a panel section whose header row 0 is the collapse
 		assert.deepEqual(rail.handleMouse?.(pointer("move", 0)), { handled: true, render: true }, "the header row is hoverable");
 		assert.equal(rail.handleMouse?.(pointer("click", 1)), undefined, "a body row is not the control");
 		assert.equal(rail.handleMouse?.(pointer("click", 0))?.handled, true);
-		assert.deepEqual(rail.render(48).map((row) => stripAnsi(row).trimEnd()), ["▸ TODOS                                      1/3", "  ◐ B"]);
+		assert.deepEqual(rail.render(48).map((row) => stripAnsi(row).trimEnd()), ["▸ TODOS                        ctrl+shift+t  1/3", "  ◐ B"]);
 	}
 });
 
@@ -949,7 +949,7 @@ test("hidden folded widget leaves the registered rail scrollable in both card st
 		rail.handleMouse?.({ type: "wheel", button: "none", wheelDelta: 10000, x: 5, y: 2, screenX: 5, screenY: 2, width: 40, height: before.length, shift: false, alt: false, ctrl: false });
 		const after = rail.render(40).map(stripAnsi);
 		assert.match(after.join("\n"), /TASK29/, `${style}: every task remains reachable`);
-		assert.match(after[0]!, /^▾ TODOS +0\/30$/u, `${style}: rail keeps its panel section header`);
+		assert.match(after[0]!, /^▾ TODOS +(ctrl\+shift\+t +)?0\/30$/u, `${style}: rail keeps its panel section header`);
 	}
 });
 

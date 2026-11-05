@@ -12,6 +12,7 @@ import {
 	todoStateMessage,
 	todoSummary,
 	type TodoState,
+	renderTodoSection,
 } from "../lib/shell-todo.ts";
 import { CARD_STYLE, cardStyle, panelExtraRows, panelHeaderRow, panelInnerWidth, setCardStyle, type CardStyle } from "../lib/shell-card.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";

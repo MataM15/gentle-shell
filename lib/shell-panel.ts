@@ -1,6 +1,7 @@
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { paintSurfaceRow, surfaceOpener, type CardTheme } from "./shell-card.ts";
-import { paintHoverable } from "./shell-hover.ts";
+import { HOVER_ROLE, paintHoverable } from "./shell-hover.ts";
+import type { ChromeSurface } from "./visual-customization-policy.ts";
 
 // Fullscreen rail sections drawn as one IDE-like panel (design/shell-rework/02-proposal.html):
 // a one-row header `▾ NAME … count`, dense rows indented under it, and one
@@ -8,37 +9,34 @@ import { paintHoverable } from "./shell-hover.ts";
 
 /** The theme background the rail panel paints behind its sections. */
 export const PANEL_SURFACE_ROLE = "customMessageBg";
+let surface: ChromeSurface = "tinted";
+/** The live chrome surface (Layout → Surface); `transparent` leaves the panel rows unpainted. */
+export function chromeSurface(): ChromeSurface { return surface; }
+export function setChromeSurface(value: ChromeSurface): void { surface = value; }
+/** The SGR that opens the panel surface, or "" when the chrome is transparent or the theme cannot paint it. */
+export function panelSurfaceOpener(theme: CardTheme): string {
+	return surface === "transparent" ? "" : surfaceOpener(theme, PANEL_SURFACE_ROLE);
+}
+/** Rail sections keep a blank row between them in comfortable density, whatever the surface. */
+export function sectionGap(density: string | undefined): boolean {
+	return density === undefined || density === "comfortable";
+}
 /** Columns a panel row is indented under its header. */
 export const PANEL_ROW_INDENT = 2;
 
-/** Columns a framed section card spends on its two borders and the padding inside them. */
-export const PANEL_FRAME_COLUMNS = 4;
-// Neon card frame (shell-personal-rework S5): the layout draws each rail
-// section as a rounded card. Sections render the same rows either way; while
-// a render runs inside `withPanelFrame` their header becomes the card's top
-// border and their rows lose the indent the frame now provides.
-const FRAME_ROLE = "accent";
-// Pi loads every extension with its own copy of lib/, so the switch lives on
-// globalThis under a Symbol.for key: the shell turns it on, and the Agents or
-// Todos extension (another copy of this module) reads it.
-const FRAME_STATE = Symbol.for("gentle-pi.shell-panel.frame");
-const frameState = (): { depth: number } => ((globalThis as Record<symbol, { depth: number }>)[FRAME_STATE] ??= { depth: 0 });
-const isFramed = () => frameState().depth > 0;
-
-/** Runs `render` with section headers drawn as rounded top borders and rows unindented. */
-export function withPanelFrame<T>(render: () => T): T {
-	const state = frameState();
-	state.depth++;
-	try {
-		return render();
-	} finally {
-		state.depth--;
-	}
-}
-
-/** True for a header that `withPanelFrame` drew as a card's top border. */
-export function isPanelFrameTop(line: string): boolean {
-	return /^(?:\x1b\[[0-9;]*m)*╭/.test(line);
+/**
+ * A rail card title in the owner's d6fb874a5 style: mixed case, the first
+ * letter up (`AGENTS` becomes `Agents`, `OTRAS SESIONES` becomes `Otras
+ * sesiones`). The header rows are drawn upper case; escape codes are kept.
+ */
+export function railTitleCase(title: string): string {
+	let first = true;
+	return title.split(/(\x1b\[[0-9;]*m)/).map((part) => {
+		if (part.startsWith("\x1b[")) return part;
+		const cased = first ? part.charAt(0).toUpperCase() + part.slice(1).toLowerCase() : part.toLowerCase();
+		if (part.trim() !== "") first = false;
+		return cased;
+	}).join("");
 }
 
 export interface PanelTheme extends CardTheme {
@@ -82,42 +80,32 @@ export function fitPanelLine(left: string, right: string, width: number): string
 	return `${shownLeft}${" ".repeat(Math.max(0, target - visibleWidth(shownLeft) - visibleWidth(shownRight)))}${shownRight}`;
 }
 
-function renderFramedHeader(theme: PanelTheme, width: number, header: PanelHeader): string {
-	const total = Math.max(0, Math.floor(width)) + PANEL_FRAME_COLUMNS;
-	const edge = (text: string) => theme.fg(FRAME_ROLE, text);
-	const glyph = paintHoverable(theme, header.open ? "▾" : "▸", header.hovered ?? false, FRAME_ROLE);
-	let name = header.title.toUpperCase();
-	let count = header.count ?? "";
-	// `╭─ ▾ NAME ` + at least one rule cell + (` count ─╮` | `╮`): the count gives way first, then the name.
-	const lead = (title: string) => 3 + 1 + 1 + visibleWidth(title) + 1;
-	const tail = (text: string) => (text ? visibleWidth(text) + 4 : 1);
-	if (lead(name) + tail(count) + 1 > total) count = "";
-	if (lead(name) + tail(count) + 1 > total) name = clipPanelText(name, Math.max(1, total - lead("") - tail(count) - 1));
-	const title = theme.fg(FRAME_ROLE, theme.bold ? theme.bold(name) : name);
-	const fill = Math.max(1, total - lead(name) - tail(count));
-	const end = count ? ` ${theme.fg(header.countRole ?? "muted", count)} ${edge("─╮")}` : edge("╮");
-	return `${edge("╭─ ")}${glyph} ${title} ${edge("─".repeat(fill))}${end}`;
-}
-
 export function renderPanelHeader(theme: PanelTheme, width: number, header: PanelHeader): string {
-	if (isFramed()) return renderFramedHeader(theme, width, header);
 	const glyph = paintHoverable(theme, header.open ? "▾" : "▸", header.hovered ?? false, "muted");
 	const name = header.title.toUpperCase();
-	const title = theme.fg("text", theme.bold ? theme.bold(name) : name);
+	// The hover paints the name too: a lone glyph is too small a signal, and other rail controls paint their text.
+	const title = theme.fg(header.hovered ? HOVER_ROLE : "text", theme.bold ? theme.bold(name) : name);
 	const count = header.count ? theme.fg(header.countRole ?? "muted", header.count) : "";
 	return fitPanelLine(`${glyph} ${title}`, count, width);
 }
 
+/**
+ * A header without a fold glyph, for a section that cannot collapse (Otras
+ * sesiones, Limits): the layout draws it as the card's title like the others.
+ */
+export function renderStaticPanelHeader(theme: PanelTheme, width: number, title: string, count?: string): string {
+	const name = theme.fg("text", theme.bold ? theme.bold(title.toUpperCase()) : title.toUpperCase());
+	return fitPanelLine(name, count ? theme.fg("muted", count) : "", width);
+}
+
 /** One section row, indented under the header, with an optional right column. */
 export function renderPanelRow(width: number, left: string, right = "", indent = PANEL_ROW_INDENT): string {
-	// Inside a card the frame is the indent; a nested row keeps only its extra columns.
-	const columns = isFramed() ? Math.max(0, indent - PANEL_ROW_INDENT) : indent;
-	return fitPanelLine(`${" ".repeat(columns)}${left}`, right, width);
+	return fitPanelLine(`${" ".repeat(indent)}${left}`, right, width);
 }
 
 /** Paints every row behind the rail surface; a theme that cannot paint it leaves rows as they are. */
 export function paintPanelSurface(theme: CardTheme, rows: readonly string[]): string[] {
-	const open = surfaceOpener(theme, PANEL_SURFACE_ROLE);
+	const open = panelSurfaceOpener(theme);
 	return rows.map((row) => paintSurfaceRow(row, open));
 }
 
