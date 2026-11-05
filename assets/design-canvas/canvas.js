@@ -267,6 +267,9 @@
 	};
 	els.viewport.addEventListener("pointerup", endDrag);
 	els.viewport.addEventListener("pointercancel", endDrag);
+	// A native drag (of a selection, an image or an iframe) would cancel the pointer
+	// sequence and show the no-drop cursor; every press in the viewport pans instead.
+	els.viewport.addEventListener("dragstart", (event) => event.preventDefault());
 	els.viewport.addEventListener("pointerleave", () => setHoverBoard(null));
 
 	els.viewport.addEventListener("keydown", (event) => {

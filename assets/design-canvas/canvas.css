@@ -153,6 +153,9 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, .gd-viewport
 	background: var(--gd-stage);
 	cursor: grab;
 	touch-action: none;
+	/* A text selection across artboard labels would turn the next press into a native drag
+	   (the browser shows the no-drop cursor and cancels the pan), so nothing here is selectable. */
+	user-select: none;
 }
 
 .gd-viewport.gd-panning { cursor: grabbing; }
