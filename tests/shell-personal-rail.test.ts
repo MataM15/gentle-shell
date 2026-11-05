@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { visibleWidth, type Component, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
-import { buildShellHeaderModel, renderShellRailHeader, renderShellStatusBar, shellHeaderCommandsHit, shellHeaderUsageHit, type ShellBarModel } from "../lib/shell-bar.ts";
+import { buildShellHeaderModel, renderShellNarrowTopBar, renderShellRailHeader, renderShellStatusBar, shellHeaderCommandsHit, shellHeaderUsageHit, type ShellBarModel } from "../lib/shell-bar.ts";
 import { installSidebar } from "../lib/shell-sidebar-layout.ts";
 import { sidebarPart, sidebarRailHeader, sidebarStatusBar } from "../lib/shell-sidebar.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
@@ -185,4 +185,48 @@ test("the Breaks card keeps the warning frame while a reminder is due and the in
 	session.render(at, 48, spy, { resetGlyphs: true });
 	assert.ok(!roles.has("warning"), "nothing due: no warning role");
 	for (const role of roles) assert.match(role, /^(info|border|accent|muted|dim|text|borderAccent)$/, role);
+});
+
+// T5 (S6): the narrow layout, the owner's top bar and a bare status row.
+
+const narrowModel: ShellBarModel = { ...model, cwd: "~/work/gentle-pi-review-2750", usage: { provider: "anthropic", plan: undefined, fetchedAt: 0, limits: [{ name: "claude-fable-5-1", limitReached: false, windows: [
+	{ label: "5h", usedPercent: 5, windowSeconds: 18000, resetAt: null },
+	{ label: "week", usedPercent: 99, windowSeconds: 604800, resetAt: null },
+] }] } };
+
+test("the narrow top bar stacks the project, then model with ctx and cost, then the usage gauges (S6)", () => {
+	const chrome = renderShellNarrowTopBar(narrowModel, plain, 56, "alt+u");
+	const text = rows(chrome.rows);
+	assert.equal(text.length, 3);
+	assert.ok(text.every((row) => visibleWidth(row) === 56), "every row fills the width");
+	assert.match(text[0]!, /^ ✿ gentle-pi-review-2750 +$/);
+	assert.match(text[1]!, /^ claude-fable-5-1 · low +ctx ▰▱▱ 17% ◇ \$0\.000 +$/);
+	assert.match(text[2]!, /^ ◔ usage 5h ▱▱▱ 5% · week ▰▰▰ 99% +alt\+u $/);
+	assert.equal(chrome.headerRow, 2);
+	assert.ok(chrome.usageSpan && text[2]!.slice(chrome.usageSpan.start, chrome.usageSpan.end).startsWith("◔ usage"), "the usage row is the click target");
+	assert.ok(shellHeaderUsageHit(chrome, 2, 2) && !shellHeaderUsageHit(chrome, 2, 1));
+	for (const width of [40, 30, 24]) {
+		const narrow = rows(renderShellNarrowTopBar(narrowModel, plain, width, "alt+u").rows);
+		assert.ok(narrow.every((row) => visibleWidth(row) <= width), `width ${width}: ${narrow.map(visibleWidth).join(",")}`);
+		assert.ok(narrow[1]!.includes("claude-fable-5-1") || narrow[1]!.includes("ctx"), `width ${width}: model or ctx survives`);
+	}
+});
+
+test("the narrow top bar honors the visibility switches and uses theme roles only (S6, S7)", () => {
+	const hidden = rows(renderShellNarrowTopBar(narrowModel, plain, 56, "alt+u", { density: "minimal", visibility: { changes: true, rdd: true, agents: true, todo: true, usageCost: false, modelDetails: false, contextWarning: true, stats: false } }).rows);
+	assert.equal(hidden.length, 1, "only the project row is left");
+	const roles = new Set<string>();
+	renderShellNarrowTopBar(narrowModel, { fg: (role, text) => { roles.add(role); return text; }, bold: (text) => text }, 56, "alt+u");
+	for (const role of roles) assert.match(role, /^(accent|border|borderAccent|muted|dim|text|success|warning|error|syntaxFunction)$/, role);
+});
+
+test("the narrow status row keeps the branch and permission mode only (S6)", () => {
+	for (const width of [56, 44]) {
+		const row = stripAnsi(renderShellStatusBar(narrowModel, plain, width, "alt+u", undefined, undefined, { jobs: true, bare: true }).rows[0]!);
+		assert.equal(visibleWidth(row), width);
+		assert.match(row, /^ feat\/shell-visual-snapshots +│ SUPER-YOLO +$|^ feat\/shell…|^ feat\/shell-visual/);
+		assert.doesNotMatch(row, /ctx|\$0\.000|usage|week|alt\+u/);
+	}
+	const wide = stripAnsi(renderShellStatusBar(narrowModel, plain, 56, "alt+u", undefined, undefined, { jobs: true, bare: true }).rows[0]!);
+	assert.match(wide, /feat\/shell-visual-snapshots │ SUPER-YOLO/);
 });

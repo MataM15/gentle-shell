@@ -71,3 +71,47 @@ test("the editor's « panel label unfolds the rail on a click of its own cells o
 		assert.equal(toggles, 2, "a label that is no longer shown is inert");
 	} finally { prompt.dispose(); }
 });
+
+for (const width of [56, 180]) {
+	test(`the panel rule offers ≡ commands · alt+k between the state and the mode at ${width} columns (S6)`, () => {
+		const text = rule(width, { escHint: "INSERT", commandsLabel: { hint: "alt+k" } });
+		assert.equal(visibleWidth(text), width);
+		assert.match(text, /^─ ✿ waiting for input ─+ ≡ commands · alt\+k ─ INSERT ─$/);
+		assert.match(rule(width, { escHint: "INSERT", commandsLabel: {} }), /≡ commands ─ INSERT ─$/, "no shortcut, no key shown");
+		const both = rule(width, { escHint: "INSERT", commandsLabel: { hint: "alt+k" }, panelLabel: { hint: "alt+h" } });
+		if (width >= 100) assert.match(both, /≡ commands · alt\+k {2}« panel · alt\+h ─ INSERT ─$/, "both labels, commands first");
+		else assert.match(both, /≡ commands · alt\+k ─ INSERT ─$/, "short of room the panel label gives way first");
+		assert.doesNotMatch(rule(width, { escHint: "INSERT" }), /commands/, "absent while the rail card carries the action");
+	});
+}
+
+test("the commands label takes the slot of the Panel button while it fits and the button returns when it does not (S6)", () => {
+	const withBoth = rule(56, { escHint: "INSERT", commandsLabel: { hint: "alt+k" }, panelButton: true });
+	assert.match(withBoth, /≡ commands · alt\+k/);
+	assert.doesNotMatch(withBoth, /\[ Panel \]/);
+	const tight = rule(30, { escHint: "INSERT", commandsLabel: { hint: "alt+k" }, panelButton: true });
+	assert.equal(visibleWidth(tight), 30);
+	assert.match(tight, /\[ Panel \]/, "no room for the label: the existing control stays reachable");
+});
+
+test("the editor's ≡ commands label opens the palette on a click of its own cells only (S6)", () => {
+	let shown: { hint?: string } | undefined = { hint: "alt+k" };
+	let opens = 0;
+	const prompt = editor({ commandsLabel: () => shown, openCommands: () => { opens++; } });
+	try {
+		const text = stripAnsi(prompt.render(56)[0]!);
+		const start = text.indexOf("≡ commands");
+		assert.ok(start >= 0);
+		const end = start + "≡ commands · alt+k".length;
+		prompt.handleMouse(click(start - 1, 0, 56));
+		prompt.handleMouse(click(end, 0, 56));
+		assert.equal(opens, 0);
+		assert.equal(prompt.handleMouse(click(start, 0, 56))?.handled, true);
+		assert.equal(prompt.handleMouse(click(end - 1, 0, 56))?.handled, true);
+		assert.equal(opens, 2);
+		shown = undefined;
+		prompt.render(56);
+		prompt.handleMouse(click(start, 0, 56));
+		assert.equal(opens, 2, "a label that is no longer shown is inert");
+	} finally { prompt.dispose(); }
+});

@@ -70,6 +70,12 @@ export interface PromptFrameOptions {
 	 * `hint` is the resolved shortcut; absent when it is disabled.
 	 */
 	panelLabel?: { hint?: string };
+	/**
+	 * Present while the rail card does not carry the commands action (phone
+	 * chrome, folded rail): paints `≡ commands · key` between the state and the
+	 * mode. `hint` is the resolved shortcut; absent when it is disabled.
+	 */
+	commandsLabel?: { hint?: string };
 	/** A working panel callback is available in fullscreen editor chrome. */
 	panelButton?: boolean;
 	panelHovered?: boolean;
@@ -232,32 +238,39 @@ export const PANEL_BUTTON = "[ Panel ]";
 
 /** The clickable text of the rail labels in the panel rule: `« panel`. */
 export const PANEL_LABEL_TEXT = "« panel";
+/** The clickable text of the commands label in the panel rule: `≡ commands`. */
+export const COMMANDS_LABEL_TEXT = "≡ commands";
 const ACTION_NAME_ROLE = "accent";
 const ACTION_HINT_ROLE = "muted";
 
-/** The owner's labels, `« panel · alt+h`: the name in accent, the shortcut muted. Plain text is what the editor hit-tests. */
-function panelActions(options: PromptFrameOptions): { text: string; plain: string } | undefined {
-	const entries = [options.panelLabel ? { name: PANEL_LABEL_TEXT, hint: options.panelLabel.hint } : undefined].filter((entry) => entry !== undefined);
-	if (entries.length === 0) return undefined;
-	const painted = entries.map(({ name, hint }) => options.fg(ACTION_NAME_ROLE, options.bold ? options.bold(name) : name) + (hint ? options.fg(ACTION_HINT_ROLE, ` · ${hint}`) : ""));
-	const plain = entries.map(({ name, hint }) => name + (hint ? ` · ${hint}` : ""));
-	return { text: painted.join("  "), plain: plain.join("  ") };
+/**
+ * The owner's labels, `≡ commands · alt+k` and `« panel · alt+h`: the name in
+ * accent, the shortcut muted. Candidates run widest first (both, commands
+ * alone, panel alone); plain text is what the editor hit-tests.
+ */
+function panelActionCandidates(options: PromptFrameOptions): Array<{ text: string; plain: string }> {
+	const commands = options.commandsLabel ? { name: COMMANDS_LABEL_TEXT, hint: options.commandsLabel.hint } : undefined;
+	const panel = options.panelLabel ? { name: PANEL_LABEL_TEXT, hint: options.panelLabel.hint } : undefined;
+	const sets = [[commands, panel], [commands], [panel]].map((set) => set.filter((entry) => entry !== undefined));
+	const unique = sets.filter((set, index) => set.length > 0 && sets.findIndex((other) => other.length === set.length && other.every((entry, at) => entry === set[at])) === index);
+	return unique.map((entries) => ({
+		text: entries.map(({ name, hint }) => options.fg(ACTION_NAME_ROLE, options.bold ? options.bold(name) : name) + (hint ? options.fg(ACTION_HINT_ROLE, ` · ${hint}`) : "")).join("  "),
+		plain: entries.map(({ name, hint }) => name + (hint ? ` · ${hint}` : "")).join("  "),
+	}));
 }
 
 function panelPromptRule(width: number, options: PromptFrameOptions, top: string | undefined, right: string | undefined): string {
 	const glyph = petalGlyph(options.state, options.tick);
 	const petal = options.fg(petalTone(options.state, options.tick), options.bold ? options.bold(glyph) : glyph);
 	const label = top ?? stateLabel(options) ?? "waiting for input";
-	const actions = panelActions(options);
-	if (actions) {
-		// `─ ✿ state ──── « panel · key ─ MODE ─`; when it does not fit, the plain rule below takes over.
+	// `─ ✿ state ──── ≡ commands · key  « panel · key ─ MODE ─`; when no candidate fits, the plain rule below takes over.
+	for (const actions of panelActionCandidates(options)) {
 		const end = ` ${actions.text} ${options.borderColor("─")}${right ? ` ${options.fg(LABEL_ROLE, right)} ${options.borderColor("─")}` : ""}`;
 		const labelled = 2 + visibleWidth(glyph) + 1 + visibleWidth(label) + 1;
 		const fill = width - labelled - visibleWidth(end);
-		if (fill >= 1) {
-			const painted = options.state === PROMPT_STATE.WORKING && !top ? scanWorkingText(label, options.tick, options.fg) : options.fg(LABEL_ROLE, label);
-			return `${options.borderColor("─ ")}${petal} ${painted} ${options.borderColor(rule(fill))}${end}`;
-		}
+		if (fill < 1) continue;
+		const painted = options.state === PROMPT_STATE.WORKING && !top ? scanWorkingText(label, options.tick, options.fg) : options.fg(LABEL_ROLE, label);
+		return `${options.borderColor("─ ")}${petal} ${painted} ${options.borderColor(rule(fill))}${end}`;
 	}
 	if (options.panelButton && width >= visibleWidth(PANEL_BUTTON)) {
 		const button = paintHoverable({ fg: options.fg }, PANEL_BUTTON, options.panelHovered ?? false, "accent");

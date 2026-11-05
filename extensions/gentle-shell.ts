@@ -14,7 +14,7 @@ import { profilesFilePath, profileRoleEntries, readProfilesFileResult } from "..
 import { resolveSessionProfile, sessionProfileLabel, sessionProfileModelProfiles } from "../lib/session-profile-freeze.ts";
 import * as os from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { buildShellHeaderModel, renderShellBar, renderShellBelowInputFloat, renderShellBottomOnlyBar, renderShellHeaderChrome, renderShellRailHeader, renderShellSidebarBar, renderShellStatusBar, renderShellStatusSections, renderShellTitleRow, type StatusSection, type StatusTarget, keepNativeWorkingRow, shellEnabled, shellHeaderCommandsHit, shellHeaderUsageHit, shellJobsCount, type ShellBarModel, type ShellBarTheme } from "../lib/shell-bar.ts";
+import { buildShellHeaderModel, renderShellBar, renderShellBelowInputFloat, renderShellBottomOnlyBar, renderShellHeaderChrome, renderShellNarrowTopBar, renderShellRailHeader, renderShellSidebarBar, renderShellStatusBar, renderShellStatusSections, renderShellTitleRow, type StatusSection, type StatusTarget, keepNativeWorkingRow, shellEnabled, shellHeaderCommandsHit, shellHeaderUsageHit, shellJobsCount, type ShellBarModel, type ShellBarTheme } from "../lib/shell-bar.ts";
 import { CHANGE_STATUS, DIFF_MAX_BYTES, DIFF_MAX_LINES, DIFF_TOO_LARGE, WorktreeChangesTracker, changesDigest, renderChangesWidget, type ChangedFile, type ChangesModel, type FileRevision, type GitRunner, type LineCounter, type WorktreeChanges } from "../lib/shell-changes.ts";
 import { WorktreeChangesView } from "../lib/shell-changes-view.ts";
 import { createNativeFullscreenInteraction } from "../lib/native-fullscreen-interaction.ts";
@@ -35,7 +35,7 @@ import { applyVisualPreset, DEFAULT_VISUAL_SETTINGS, DENSITY, HEADER_PLACEMENT, 
 import { BANNER_COLORS, DEFAULT_BANNER_CONFIG, readBannerConfig, readBannerConfigForEdit, writeBannerConfig } from "./startup-banner.ts";
 import { commandKeymapId, commandKeymapIds, effectiveKey, keymapCommand, keymapLabel, keymapSavedNotice, loadKeymaps, prepareKeymapChange, writeKeymaps, type KeymapBindings, type PiKeybindings } from "../lib/keymaps.ts";
 import { GentleAiDevBinaryOverrideError, resolveGentleAiDevBinaryOverride } from "../lib/gentle-ai-binary.ts";
-import { DOUBLE_ESC_CANCEL_HINT, floatPromptRow, framePromptLines, panelPromptRow, resolvePromptLayout, IDLE_ESC_CLEAR_HINT, PANEL_BUTTON, PANEL_LABEL_TEXT, PROMPT_HINT, PROMPT_STATE, SHELL_PULSE_WATCHDOG_MS, withPromptHint, type PromptState } from "../lib/shell-prompt.ts";
+import { DOUBLE_ESC_CANCEL_HINT, floatPromptRow, framePromptLines, panelPromptRow, resolvePromptLayout, IDLE_ESC_CLEAR_HINT, PANEL_BUTTON, PANEL_LABEL_TEXT, COMMANDS_LABEL_TEXT, PROMPT_HINT, PROMPT_STATE, SHELL_PULSE_WATCHDOG_MS, withPromptHint, type PromptState } from "../lib/shell-prompt.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 import { oddPhaseRegistry } from "../lib/odd-phase.ts";
 import { CLAUDE_BRIDGE_PROVIDER, priceBridgeMessage } from "../lib/bridge-cost.ts";
@@ -617,6 +617,7 @@ export class GentlePromptEditor extends CustomEditor {
 	private panelStart: number | undefined;
 	// Where `« panel` sits on the rule row, in the width it was painted at.
 	private panelLabelHit: { start: number; end: number; width: number } | undefined;
+	private commandsLabelHit: { start: number; end: number; width: number } | undefined;
 	// Native selection engine (shift+home/end, alt+a, replace-on-key): ported
 	// from pi-select-del so the petal prompt owns the feature without factory
 	// composition. Constructed with `this`; the internals probe degrades to
@@ -1362,6 +1363,13 @@ export class GentlePromptEditor extends CustomEditor {
 			if (event.type === "click") this.deps.togglePanel();
 			return { handled: true, render: event.type === "click" };
 		}
+		// `≡ commands` opens the palette, like alt+k; same rules as `« panel`.
+		const commands = this.commandsLabelHit;
+		if (commands && (event.type === "click" || event.type === "press") && event.button === "left" && event.y === this.topRowCount && event.width === commands.width &&
+			event.x >= commands.start && event.x < commands.end && this.deps.commandsLabel?.() && this.deps.openCommands) {
+			if (event.type === "click") this.deps.openCommands();
+			return { handled: true, render: event.type === "click" };
+		}
 		const onPanel = (this.deps.panelButton?.() ?? true) && this.panelStart !== undefined && this.floatMouseLayout?.panel && event.width === this.floatMouseLayout.width && event.y === this.topRowCount &&
 			event.x >= this.panelStart && event.x < this.panelStart + visibleWidth(PANEL_BUTTON);
 		if (event.type === "move" && event.button === "none") {
@@ -1454,6 +1462,7 @@ export class GentlePromptEditor extends CustomEditor {
 			panelButton: Boolean(layout.panel && this.deps.onPanelClick && (this.deps.panelButton?.() ?? true)),
 			panelHovered: this.hoveredPanel,
 			panelLabel: layout.panel ? this.deps.panelLabel?.() : undefined,
+			commandsLabel: layout.panel ? this.deps.commandsLabel?.() : undefined,
 			escHint: [
 				this.vimPolicy === "on" ? (this.vimVisual.active ? (this.vimVisual.kind === "line" ? "VISUAL LINE" : "VISUAL") : this.vimNormal ? "NORMAL" : "INSERT") : undefined,
 				this.promptState === PROMPT_STATE.WORKING && this.isPendingEscapeCancel()
@@ -1478,11 +1487,14 @@ export class GentlePromptEditor extends CustomEditor {
 		const panelAt = layout.panel && this.deps.onPanelClick && (this.deps.panelButton?.() ?? true) ? plainRule.lastIndexOf(PANEL_BUTTON) : -1;
 		this.panelStart = panelAt < 0 ? undefined : visibleWidth(plainRule.slice(0, panelAt));
 		const labelAt = layout.panel && this.deps.panelLabel?.() ? plainRule.indexOf(PANEL_LABEL_TEXT) : -1;
-		this.panelLabelHit = labelAt < 0 ? undefined : (() => {
-			const start = visibleWidth(plainRule.slice(0, labelAt));
-			const hint = this.deps.panelLabel?.()?.hint;
-			return { start, end: start + visibleWidth(PANEL_LABEL_TEXT) + (hint ? 3 + visibleWidth(hint) : 0), width };
-		})();
+		const labelHit = (text: string, hint: string | undefined) => {
+			const at = plainRule.indexOf(text);
+			if (at < 0) return undefined;
+			const start = visibleWidth(plainRule.slice(0, at));
+			return { start, end: start + visibleWidth(text) + (hint ? 3 + visibleWidth(hint) : 0), width };
+		};
+		this.panelLabelHit = labelAt < 0 ? undefined : labelHit(PANEL_LABEL_TEXT, this.deps.panelLabel?.()?.hint);
+		this.commandsLabelHit = layout.panel && this.deps.commandsLabel?.() ? labelHit(COMMANDS_LABEL_TEXT, this.deps.commandsLabel()?.hint) : undefined;
 		if (this.panelStart === undefined && this.hoveredPanel) this.clearEditorHover();
 		framed.unshift(...topRows);
 		// Pi places autocomplete after its bottom border. Keep those rows below
@@ -1510,6 +1522,7 @@ export class GentlePromptEditor extends CustomEditor {
 		super.invalidate();
 		this.panelStart = undefined;
 		this.panelLabelHit = undefined;
+		this.commandsLabelHit = undefined;
 		this.clearEditorHover();
 	}
 
@@ -1594,7 +1607,7 @@ type PromptFactory = NonNullable<ReturnType<ExtensionContext["ui"]["getEditorCom
 function installPrompt(
 	ctx: ExtensionContext,
 	onCreated: (prompt: GentlePromptEditor) => void,
-	promptDeps: { now: () => number; doubleEscCancelEnabled: () => boolean; dispatchQueuedText: (text: string) => void; vimRuntimeVersion?: () => string | undefined; attachments?: ImageAttachments; readClipboardImage?: () => Promise<ClipboardImage | null>; panelChrome?: (tui: TUI) => boolean; panelButton?: (tui: TUI) => boolean; topRows?: (tui: TUI, width: number, hovered?: number) => string[]; onTopRowClick?: (tui: TUI, index: number) => void; onPanelClick?: () => void; panelLabel?: (tui: TUI) => { hint?: string } | undefined; togglePanel?: () => void },
+	promptDeps: { now: () => number; doubleEscCancelEnabled: () => boolean; dispatchQueuedText: (text: string) => void; vimRuntimeVersion?: () => string | undefined; attachments?: ImageAttachments; readClipboardImage?: () => Promise<ClipboardImage | null>; panelChrome?: (tui: TUI) => boolean; panelButton?: (tui: TUI) => boolean; topRows?: (tui: TUI, width: number, hovered?: number) => string[]; onTopRowClick?: (tui: TUI, index: number) => void; onPanelClick?: () => void; panelLabel?: (tui: TUI) => { hint?: string } | undefined; togglePanel?: () => void; commandsLabel?: (tui: TUI) => { hint?: string } | undefined; openCommands?: () => void },
 ): boolean {
 	const previous = ctx.ui.getEditorComponent() as PromptFactory | undefined;
 	if (previous && !previous[PROMPT_OWNER]) return false;
@@ -1620,6 +1633,8 @@ function installPrompt(
 			onPanelClick: promptDeps.onPanelClick,
 			panelLabel: promptDeps.panelLabel ? () => promptDeps.panelLabel!(tui) : undefined,
 			togglePanel: promptDeps.togglePanel,
+			commandsLabel: promptDeps.commandsLabel ? () => promptDeps.commandsLabel!(tui) : undefined,
+			openCommands: promptDeps.openCommands,
 		});
 		// Pi's own docs require an explicit requestRender() after a state change
 		// (docs/tui.md: "Call tui.requestRender() after state changes"); no host
@@ -2830,7 +2845,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			// The wide bar keeps branch, mode and the weekly gauge: model, ctx and
 			// cost live once, in the rail header (shell-personal-rework S3).
 			const statusBarChrome = (width: number) => narrowChrome()
-				? renderShellStatusBar(footerModel(), theme, width, usageShortcutKey, { ...visualSettings, visibility: { ...visualSettings.visibility, modelDetails: false } }, gaugePaint(ctx), { jobs: true })
+				? renderShellStatusBar(footerModel(), theme, width, usageShortcutKey, visualSettings, gaugePaint(ctx), { jobs: true, bare: true })
 				: renderShellStatusBar(footerModel(), theme, width, usageShortcutKey, visualSettings, gaugePaint(ctx), { rail: true });
 			// The owner's rail header, pinned above the rail's cards: model, ctx and cost,
 			// then the commands and usage actions (both clickable).
@@ -2851,13 +2866,15 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 					return { handled: true, render: true };
 				},
 			});
+			// The owner's phone top bar: project, model with ctx and cost, then the usage gauges.
+			const narrowTopBar = (width: number) => renderShellNarrowTopBar(footerModel(), theme, width, usageShortcutKey, visualSettings, gaugePaint(ctx));
 			const disposeHeader = sidebarHeader(tui, {
 				digest: () => footerStatus.key(),
-				render: (width) => ideChrome() ? [renderShellTitleRow(footerModel(), theme, width)] : narrowChrome() ? [renderShellTitleRow(footerModel(), theme, width, { model: true })] : headerBar(width).rows,
+				render: (width) => ideChrome() ? [renderShellTitleRow(footerModel(), theme, width)] : narrowChrome() ? narrowTopBar(width).rows : headerBar(width).rows,
 				invalidate() {},
 				handleMouse(event) {
-					if (ideChrome() || narrowChrome() || event.type !== "click" || event.button !== "left") return undefined;
-					if (!shellHeaderUsageHit(headerBar(event.width), event.x, event.y)) return undefined;
+					if (ideChrome() || event.type !== "click" || event.button !== "left") return undefined;
+					if (!shellHeaderUsageHit(narrowChrome() ? narrowTopBar(event.width) : headerBar(event.width), event.x, event.y)) return undefined;
 					void openUsage(ctx);
 					return { handled: true, render: true };
 				},
@@ -2966,7 +2983,10 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 				onPanelClick: () => { void openPanelSheet(ctx); },
 				// Only while the user folded the rail away and the layout could show it again.
 				panelLabel: (tui) => ((tui as TUI & { mode?: string }).mode === "fullscreen" && sidebarState(tui).railAvailable?.() ? { hint: railPanelKey(env) } : undefined),
-				togglePanel: () => toggleRail(ctx) },
+				togglePanel: () => toggleRail(ctx),
+				// The rail header carries this action while the rail shows; the phone chrome and a folded rail get it in the editor rule.
+				commandsLabel: (tui) => (chromeMode(tui) === "narrow" ? { hint: commandsKey(env, keymaps.bindings) } : undefined),
+				openCommands: () => { void showCommandPalette(pi, ctx, env, keymaps.bindings); } },
 		);
 		imageAttachments.clear();
 		ctx.ui.setWidget(IMAGE_ATTACHMENTS_WIDGET_KEY, ownsPrompt

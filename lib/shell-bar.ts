@@ -354,7 +354,7 @@ export function renderShellTitleRow(model: ShellBarModel, theme: ShellBarTheme, 
  * way first (gauges, secondary windows, the segment), then the model; the
  * usage segment stays the click target that opens the usage view.
  */
-export function renderShellStatusBar(model: ShellBarModel, theme: ShellBarTheme, width: number, usageHint?: string, presentation?: Presentation, paint?: GaugePaint, extras: { jobs?: boolean; rail?: boolean } = {}): ShellHeaderChrome {
+export function renderShellStatusBar(model: ShellBarModel, theme: ShellBarTheme, width: number, usageHint?: string, presentation?: Presentation, paint?: GaugePaint, extras: { jobs?: boolean; rail?: boolean; bare?: boolean } = {}): ShellHeaderChrome {
 	const target = Math.max(0, Math.floor(width));
 	const divider = ` ${theme.fg(ROLE.SEPARATOR, STATUS_BAR_DIVIDER)} `;
 	const join = (segments: string[]) => segments.filter(Boolean).join(divider);
@@ -368,13 +368,15 @@ export function renderShellStatusBar(model: ShellBarModel, theme: ShellBarTheme,
 	// With the rail's header showing model, ctx and cost, the bar keeps only the
 	// weekly gauge on the right, so no fact shows twice (shell-personal-rework S3).
 	const railBar = extras.rail === true;
-	const showCounters = presentation?.visibility.usageCost !== false && !railBar;
+	// The phone chrome's top bar carries model, ctx, cost and usage, so its status row is bare: branch, mode and jobs.
+	const bare = extras.bare === true;
+	const showCounters = presentation?.visibility.usageCost !== false && !railBar && !bare;
 	const tier = model.profileTier ? ` ${theme.fg(ROLE.LABEL, "·")} ${theme.fg(model.profileTier === "fast" ? "warning" : ROLE.LABEL, model.profileTier === "fast" ? "Fast" : "Standard")}` : "";
-	const exec = railBar || presentation?.visibility.modelDetails === false ? "" : executionSegment(model.modelId, model.effort, theme);
+	const exec = railBar || bare || presentation?.visibility.modelDetails === false ? "" : executionSegment(model.modelId, model.effort, theme);
 	const counters = showCounters ? [contextSegment(model.contextPercent, theme, paint), costSegment(model.costTotal, model.subscription, theme)] : [];
 	const allWindows = model.usage ? (selectUsageLimit(model.usage, model.modelId)?.windows ?? []) : [];
 	const windows = railBar ? weeklyWindows(allWindows) : allWindows;
-	const stages: Array<UsageStage | undefined> = showCounters ? ["full", "text", "primary", undefined] : railBar && presentation?.visibility.usageCost !== false ? ["full", "text", undefined] : [undefined];
+	const stages: Array<UsageStage | undefined> = bare ? [undefined] : showCounters ? ["full", "text", "primary", undefined] : railBar && presentation?.visibility.usageCost !== false ? ["full", "text", undefined] : [undefined];
 	const attempts = [...stages.map((stage) => ({ stage, withExec: true, withTier: true })),
 		...(tier ? [{ stage: undefined, withExec: true, withTier: false }] : []), { stage: undefined, withExec: false, withTier: false }];
 	for (const { stage, withExec, withTier } of attempts) {
@@ -578,6 +580,67 @@ export function renderShellRailHeader(model: ShellHeaderModel, theme: ShellBarTh
 	}
 	rows.push(theme.fg(HEADER_RULE_ROLE, HEADER_RULE_CHAR.repeat(targetWidth)));
 	return { rows, headerRow, ...(usageSpan ? { usageSpan } : {}), commandsRow, commandsSpan: { start: RAIL_HEADER_INSET, end: commands.end } };
+}
+
+const NARROW_GAUGE_CELLS = 3;
+
+/**
+ * The phone chrome's top bar (design/shell-personal-rework/02-portrait.html):
+ * the project, then model with ctx and cost, then `◔ usage` with the 5h and
+ * week gauges and the shortcut. Gauges are three cells wide here. The usage
+ * row (`headerRow`) is the click target that opens the usage view; rows give
+ * way from the right (second window, gauges, shortcut) before anything wraps.
+ */
+export function renderShellNarrowTopBar(model: ShellBarModel, theme: ShellBarTheme, width: number, usageHint?: string, presentation?: Presentation, paint?: GaugePaint): ShellHeaderChrome {
+	const target = Math.max(0, Math.floor(width));
+	const room = Math.max(0, target - 2);
+	const row = (content: string) => paintChromeRow(theme, ` ${fitPanelLine(content, "", room)} `);
+	const name = model.cwd.split("/").filter((part) => part.length > 0).pop() ?? model.cwd;
+	const rows = [row(`${theme.fg(ROLE.BRAND, "✿")} ${theme.fg(ROLE.VALUE, theme.bold(name))}`)];
+	const modelDetails = presentation?.visibility.modelDetails !== false;
+	const showUsage = presentation?.visibility.usageCost !== false;
+	if (modelDetails || showUsage) {
+		const effort = model.effort ? ` ${theme.fg(ROLE.LABEL, "·")} ${theme.fg("accent", model.effort)}` : "";
+		const exec = modelDetails ? theme.fg(ROLE.MODEL, theme.bold(model.modelId)) + effort : "";
+		const percent = model.contextPercent === null ? "?%" : `${Math.round(model.contextPercent)}%`;
+		const ctx = `${theme.fg(ROLE.LABEL, "ctx")} ${paintGauge(model.contextPercent, theme, NARROW_GAUGE_CELLS, paint)} ${theme.fg(ROLE.VALUE, percent)}`;
+		const counters = showUsage ? [ctx, costSegment(model.costTotal, model.subscription, theme)].join(` ${theme.fg(ROLE.SEPARATOR, RAIL_COUNTER_SEPARATOR)} `) : "";
+		const attempts = [[exec, counters], [exec, showUsage ? ctx : ""], [exec, ""]];
+		const fitted = attempts.find(([left, right]) => visibleWidth(left) + (left && right ? 2 : 0) + visibleWidth(right) <= room) ?? attempts[attempts.length - 1]!;
+		const [left, right] = fitted;
+		rows.push(paintChromeRow(theme, ` ${left}${" ".repeat(Math.max(left && right ? 2 : 0, 0))}${right}${" ".repeat(Math.max(0, room - visibleWidth(left) - (left && right ? 2 : 0) - visibleWidth(right)))} `));
+	}
+	let headerRow = -1;
+	let usageSpan: HeaderUsageSpan | undefined;
+	if (showUsage) {
+		const windows = model.usage ? (selectUsageLimit(model.usage, model.modelId)?.windows ?? []) : [];
+		const label = `${theme.fg(RAIL_USAGE_ROLE, theme.bold(`${RAIL_USAGE_ICON} usage`))}`;
+		const window = (item: UsageWindow, gauge: boolean) => {
+			const percent = `${Math.round(item.usedPercent)}%`;
+			return [...(item.label.length > 0 ? [theme.fg(ROLE.LABEL, item.label)] : []), ...(gauge ? [paintGauge(item.usedPercent, theme, NARROW_GAUGE_CELLS, paint)] : []), theme.fg(ROLE.VALUE, percent)].join(" ");
+		};
+		const hint = usageHint ? theme.fg(USAGE_HINT_ROLE, usageHint) : "";
+		const dot = ` ${theme.fg(ROLE.LABEL, "·")} `;
+		const stages: string[][] = [
+			[windows.map((item) => window(item, true)).join(dot)],
+			[windows.map((item) => window(item, false)).join(dot)],
+			[windows.slice(0, 1).map((item) => window(item, false)).join(dot)],
+			[""],
+		];
+		for (const [body] of stages) {
+			const left = body ? `${label} ${body}` : label;
+			const gap = hint ? 2 : 0;
+			if (visibleWidth(left) + gap + visibleWidth(hint) > room && body !== "") continue;
+			const shown = visibleWidth(left) + gap + visibleWidth(hint) <= room ? hint : "";
+			const used = visibleWidth(left) + (shown ? gap + visibleWidth(shown) : 0);
+			headerRow = rows.length;
+			// The span runs from the label to the shortcut, so a tap on the row or the hint opens the view.
+			usageSpan = { start: 1, end: 1 + (shown ? room : used) };
+			rows.push(paintChromeRow(theme, ` ${left}${" ".repeat(Math.max(shown ? gap : 0, shown ? room - used + gap : 0))}${shown} `));
+			break;
+		}
+	}
+	return { rows, headerRow, ...(usageSpan ? { usageSpan } : {}) };
 }
 
 function headerContent(model: ShellHeaderModel, theme: ShellBarTheme, width: number, usageHint?: string, presentation?: Presentation, paint?: GaugePaint): ShellHeaderResult {

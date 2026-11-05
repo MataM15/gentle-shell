@@ -1,8 +1,12 @@
 import type { Component, TUI } from "@earendil-works/pi-tui";
 import type { PanelSummary } from "./shell-panel.ts";
 
-/** Phone-width terminals: Wellness and the above-editor Agents/Todos cards stay hidden. */
-export const PHONE_COLUMNS = 60;
+/**
+ * Phone-width terminals: the Wellness card stays hidden. The owner's portrait
+ * layout (design/shell-personal-rework/02-portrait.html) shows Breaks below the
+ * editor at 56 columns, so only terminals under the card's 44-column floor are phones.
+ */
+export const PHONE_COLUMNS = 43;
 export function isPhoneWidth(tui: TUI): boolean {
 	const columns = tui.terminal?.columns;
 	return typeof columns === "number" && columns > 0 && columns <= PHONE_COLUMNS;

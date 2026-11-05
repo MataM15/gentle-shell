@@ -287,15 +287,17 @@ test("a hidden phone-width card never requests a render from the poll", async t 
 	assert.equal(renders, 0);
 });
 
-test("phone-sized terminals (60 columns or fewer) hide the Wellness paint but keep reminders and resets running", async t => {
+test("phone-sized terminals (43 columns or fewer) hide the Wellness paint but keep reminders and resets running", async t => {
 	const f = await extensionFixture(t);
 	const columns = f.tui.terminal as { columns: number };
-	for (const width of [40, 60]) {
+	for (const width of [40, 43]) {
 		columns.columns = width;
 		assert.deepEqual(f.widget.render(width), [], `hidden at ${width} columns`);
 	}
-	columns.columns = 61;
-	assert.ok(f.widget.render(61).length > 0, "painted again one column past the phone breakpoint");
+	columns.columns = 44;
+	assert.ok(f.widget.render(44).length > 0, "painted again one column past the phone breakpoint");
+	columns.columns = 56;
+	assert.ok(f.widget.render(56).length > 0, "the portrait layout shows Breaks below the editor at 56 columns");
 	columns.columns = 40;
 	t.mock.timers.tick(1000);
 	for (let i = 0; i < 12; i++) await Promise.resolve();
@@ -305,7 +307,7 @@ test("phone-sized terminals (60 columns or fewer) hide the Wellness paint but ke
 	assert.equal(f.resets.at(-1), "water", "the reset command still works while hidden");
 });
 
-test("a stale reset hit never fires while Wellness is hidden on a phone-sized terminal, and works again above 60", async t => {
+test("a stale reset hit never fires while Wellness is hidden on a phone-sized terminal, and works again above 43", async t => {
 	const f = await extensionFixture(t);
 	const columns = f.tui.terminal as { columns: number };
 	const rows = f.widget.render(140);
@@ -314,7 +316,7 @@ test("a stale reset hit never fires while Wellness is hidden on a phone-sized te
 	const x = visibleWidth(rows[y]!.slice(0, rows[y]!.indexOf("Agua")));
 	const click = { type: "click", button: "left", x, y, screenX: x, screenY: y, width: 140, height: rows.length, shift: false, alt: false, ctrl: false } as const;
 	const flush = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); };
-	for (const width of [60, 40]) {
+	for (const width of [43, 40]) {
 		columns.columns = width;
 		assert.deepEqual(f.widget.render(width), []);
 		assert.equal(f.widget.handleMouse?.(click), undefined, `hidden click is not handled at ${width}`);

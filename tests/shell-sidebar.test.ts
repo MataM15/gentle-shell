@@ -73,14 +73,14 @@ test("sidebarHeader dispose does not remove a replacement rail registered after 
 	assert.equal(sidebarState(tui).parts.get("header"), second);
 });
 
-test("phone width is terminal columns only: 60 is phone-sized, 61 is not, and unknown hosts never are", () => {
-	assert.equal(PHONE_COLUMNS, 60);
-	for (const [columns, phone] of [[1, true], [40, true], [60, true], [61, false], [140, false]] as const) assert.equal(isPhoneWidth(host({ columns })), phone, `${columns} columns`);
+test("phone width is terminal columns only: 43 is phone-sized, 44 is not, and unknown hosts never are", () => {
+	assert.equal(PHONE_COLUMNS, 43);
+	for (const [columns, phone] of [[1, true], [40, true], [43, true], [44, false], [56, false], [60, false], [140, false]] as const) assert.equal(isPhoneWidth(host({ columns })), phone, `${columns} columns`);
 	for (const tui of [host(), host({}), host({ columns: 0 }), host({ columns: Number.NaN }), host({ columns: "40" })]) assert.equal(isPhoneWidth(tui), false);
-	const resized = host({ columns: 61 });
+	const resized = host({ columns: 44 });
 	assert.equal(isPhoneWidth(resized), false);
-	(resized.terminal as { columns: number }).columns = 60;
+	(resized.terminal as { columns: number }).columns = 43;
 	assert.equal(isPhoneWidth(resized), true, "resizing down is picked up on the next call");
-	(resized.terminal as { columns: number }).columns = 61;
+	(resized.terminal as { columns: number }).columns = 44;
 	assert.equal(isPhoneWidth(resized), false, "and back up");
 });
