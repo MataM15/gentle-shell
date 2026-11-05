@@ -2,12 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { ScrollView, visibleWidth, type Component, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { renderLayoutFrame } from "@earendil-works/pi-tui/dist/layout.js";
-import { CARD_STYLE, cardStyle, setCardStyle } from "../lib/shell-card.ts";
+import { CARD_STYLE, CARD_TONE, cardStyle, renderCard, setCardStyle } from "../lib/shell-card.ts";
 import { renderPanelHeader, renderPanelRow } from "../lib/shell-panel.ts";
 import { renderShellStatusSections, type ShellBarModel } from "../lib/shell-bar.ts";
 import { installSidebar } from "../lib/shell-sidebar-layout.ts";
 import { SIDEBAR_TABS, sidebarTabSections } from "../lib/shell-sidebar-tabs.ts";
-import { sidebarPart, sidebarRailHeader } from "../lib/shell-sidebar.ts";
+import { sidebarHeader, sidebarPart, sidebarRailHeader } from "../lib/shell-sidebar.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 
 // T7 (odd/tasks/shell-personal-rework.md S13, S9, S12): the rail tabs are back,
@@ -24,28 +24,31 @@ const visibility = { changes: true, rdd: true, agents: true, todo: true, usageCo
 type Node = { type: string; entries: Array<{ component: Component & { [NODE]?: () => Node } }> };
 const click = (x: number, y: number, width = 50, height = 12): TuiMouseEvent => ({ type: "click", button: "left", x, y, screenX: x, screenY: y, width, height, shift: false, alt: false, ctrl: false });
 
-function install(columns: number, onTabSelect?: (tab: string) => void, voice?: () => string[]) {
+function install(columns: number, onTabSelect?: (tab: string) => void, voice?: () => string[], theme: typeof plain & { bg?(role: string, text: string): string } = plain) {
 	setCardStyle(CARD_STYLE.NEON);
 	const original = () => ({ type: "vstack", entries: [] });
 	const root = { render: () => ["transcript"], invalidate() {}, [NODE]: original };
 	const host = { mode: "fullscreen", terminal: { columns }, layoutRoot: root, requestRender() {} };
 	const tui = host as unknown as TUI;
 	const clicks: string[] = [];
+	// Sessions and Limits are outlined cards drawn by renderCard, not panel sections.
 	const part = (key: string, render: (width: number) => string[]) => sidebarPart(tui, key, { render: () => [], invalidate() {} }, {
-		surface: "panel", digest: () => key, render, invalidate() {},
+		...(key === "sessions" || key === "usage" ? {} : { surface: "panel" }), digest: () => key, render, invalidate() {},
 		handleMouse(event) { clicks.push(`${key}@${event.y}`); return { handled: true }; },
 	} as never);
 	const card = (title: string, count: string, ...rows: string[]) => (width: number) => [renderPanelHeader(plain, width, { title, count, open: true }), ...rows.map((row) => renderPanelRow(width, row))];
+	// A registered title row, so the fallback banner never joins the rail.
+	sidebarHeader(tui, { render: () => [" title"], invalidate() {} });
 	sidebarRailHeader(tui, { render: () => ["claude-fable-5-1 · low", "━".repeat(50)], invalidate() {} });
 	sidebarPart(tui, "wellness", { render: () => ["Breaks"], invalidate() {} });
 	if (voice) sidebarPart(tui, "voice", { render: () => [], invalidate() {} }, { digest: () => voice().join("|"), render: voice, invalidate() {} });
 	part("todo", card("Todos", "2/6", "✓ 2 done"));
 	part("jobs", card("Jobs", "1 running", "● job-1 pnpm test"));
 	part("agents", card("Agents", "idle", "none running"));
-	part("sessions", card("Otras sesiones", "1", "● erasure-1570n5 · hace 1 h"));
-	part("usage", card("Limits", "", "claude · max"));
+	part("sessions", (width) => renderCard({ title: "Otras sesiones", tone: CARD_TONE.INFO, rail: true, body: ["● erasure-1570n5", "  hace 1 h · 1 agente"] }, theme, width, { expanded: true, panel: true }));
+	part("usage", (width) => renderCard({ title: "Limits", tone: CARD_TONE.INFO, rail: true, body: ["claude · max"] }, theme, width, { expanded: true, panel: true }));
 	part("footer", (width) => renderShellStatusSections(status, plain, width, { density: "minimal", visibility }, undefined).lines);
-	const dispose = installSidebar(tui, plain, () => "auto", () => "top", () => "minimal", undefined, { tabs: true, onTabSelect });
+	const dispose = installSidebar(tui, theme, () => "auto", () => "top", () => "minimal", undefined, { tabs: true, onTabSelect });
 	const column = () => {
 		const top = root[NODE]() as Node;
 		const hstack = top.type === "hstack" ? top : top.entries[1]!.component[NODE]!() as Node;
@@ -55,7 +58,7 @@ function install(columns: number, onTabSelect?: (tab: string) => void, voice?: (
 	const pinned = () => column().entries[0]!.component;
 	return { tui, root, clicks, dispose, column, screen, pinned };
 }
-const titles = (lines: string[]) => lines.flatMap((line) => /^ ?╭─ [▾▸] (.+?) ─/.exec(line)?.[1] ?? []);
+const titles = (lines: string[]) => lines.flatMap((line) => /^ ?╭─ (?:[▾▸] )?(.+?) ─/.exec(line)?.[1] ?? []);
 
 test("the tab sections follow what each tab held in d6fb874a5", () => {
 	assert.deepEqual(SIDEBAR_TABS.map((tab) => tab.label), ["Activity", "Sessions", "Resources", "Status"]);
@@ -104,12 +107,12 @@ test("a click on a tab switches the section set, notifies, and the choice surviv
 	const pin = (x: number) => f.pinned().handleMouse!(click(x, tabY));
 	assert.deepEqual(pin(15), { handled: true, render: true });
 	lines = f.screen();
-	assert.deepEqual(titles(lines), ["OTRAS SESIONES"], "Sessions tab: Otras sesiones (S9)");
+	assert.deepEqual(titles(lines), ["Otras sesiones"], "Sessions tab: Otras sesiones (S9)");
 	assert.deepEqual(selected, ["sessions"]);
 	f.screen();
-	assert.deepEqual(titles(f.screen()), ["OTRAS SESIONES"], "the choice persists across frames");
+	assert.deepEqual(titles(f.screen()), ["Otras sesiones"], "the choice persists across frames");
 	pin(26);
-	assert.deepEqual(titles(f.screen()), ["LIMITS"]);
+	assert.deepEqual(titles(f.screen()), ["Limits"]);
 	pin(38);
 	assert.deepEqual(titles(f.screen()), ["CHANGES", "INTEGRATIONS"], "Status holds upstream's status sections");
 	pin(3);
@@ -129,7 +132,7 @@ test("a card keeps its own clicks inside the tab (collapse hits the section, not
 	const lines = f.screen();
 	const header = lines.findIndex((line) => /╭─ ▾ AGENTS/.test(line));
 	const top = f.pinned().render(50).length;
-	const result = scroll.handleMouse!(click(5, header - top, 50, 40));
+	const result = scroll.handleMouse!(click(5, header - 1 - top, 50, 40));
 	assert.ok(result?.handled);
 	assert.deepEqual(f.clicks, ["agents@0"]);
 });
@@ -160,4 +163,22 @@ test("the voice line is pinned under the tabs while recording and gone when idle
 	assert.ok(pinnedText().some((row) => row.includes("listening")), "still shown on the Resources tab");
 	state = [];
 	assert.ok(!pinnedText().some((row) => row.includes("listening")), "idle hides it");
+});
+
+test("a card section that is not a panel section still sits on the rail's tinted surface on every tab (S12)", (t) => {
+	const found = cardStyle();
+	t.after(() => setCardStyle(found));
+	const tinted = { ...plain, bg: (_role: string, text: string) => `\x1b[44m${text}\x1b[49m` };
+	const f = install(180, undefined, undefined, tinted);
+	t.after(f.dispose);
+	f.screen();
+	const tabY = f.pinned().render(50).findIndex((row) => stripAnsi(row).includes("Resources"));
+	for (const x of [15, 26, 38, 3]) {
+		f.pinned().handleMouse!(click(x, tabY));
+		const raw = renderLayoutFrame(f.root as never, 180, 50, () => {}).lines.map((line) => line.slice(0));
+		// Every row of the rail column (pinned header, cards, gaps, the fill below the last card) carries the tint;
+		// the full-width title row on top is not part of the rail.
+		const untinted = raw.flatMap((line, row) => row === 0 || line.includes("\x1b[44m") ? [] : [row]);
+		assert.deepEqual(untinted, [], `tab at x=${x}`);
+	}
 });

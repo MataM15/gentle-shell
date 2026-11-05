@@ -30,7 +30,7 @@ Worktree: `/home/pablo/proyectos/gentle-shell-worktrees/integrate-main-20261105`
 - T4 [S5,S7] Neon card frames for rail sections + hide panel row. Route: visual-opus. Commit: 0cf0ed8fa.
 - T5 [S6,S7] Narrow layout: top bar, commands label in editor border, Breaks below editor. Route: visual-opus. Commit: 83e5177a3, 7d9c6180b (gap-row fix).
 - T6 Full suite on integration vs pristine, DESIGN vs AFTER sheet at wide and portrait, fast-forward `personal/main`, push to `personal`, delete stale local `main`, owner restarts Pi. Route: parent.
-- T7 [S13,S9,S12,S7] Rail tabs back with upstream sections distributed into them; "Otras sesiones" in Sessions. Route: visual-opus. Commit: c868372ff.
+- T7 [S13,S9,S12,S7] Rail tabs back with upstream sections distributed into them; "Otras sesiones" in Sessions. Route: visual-opus. Commit: c868372ff; rail surface kept continuous on the card tabs (found in the after2 sheet): see L12.
 - T8 [S10,S7] AGENTS frame + stray block; voice line in the wide rail. Route: visual-opus. Commit: 86b8e190a (AGENTS frame, voice line); S16 petals: bc6846e49, rose art: see the next commit.
 - T9 [S11] Dead code, stale docs, unused-import check. Route: visual-opus. Commit: 11f2d0a0c.
 
@@ -47,3 +47,4 @@ Worktree: `/home/pablo/proyectos/gentle-shell-worktrees/integrate-main-20261105`
 - L9 (owner): "Sí, como tarjeta" for Otras sesiones; "Sí, todo" for the cleanup (git branches, stale managed-assets.lock, dead code) plus the voice and AGENTS fixes.
 - L10 (owner): principle S12 (verbatim above); then "Sí, volver a las pestañas" → S13, T7 widened.
 - L11 (owner, S14-S16): Limits kept ("eso me gustaria mantenerlo ..."), the duplicate claude-bridge block dropped (S15) and "hay que sacar las florcitas esas ..." (S16). The parent widened the surfaces to extensions/startup-banner.ts and extensions/gentle-ai.ts for S16 only.
+- L12 (T7 sheet finding): with Sessions or Resources selected the outlined cards left the scroll area untinted under a tinted pinned header; with tabs the whole rail is now one surface (lib/shell-sidebar-layout.ts `onSurface`).

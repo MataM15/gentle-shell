@@ -512,13 +512,16 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 				const voice = [...(voicePart.render(RAIL_WIDTH - RAIL_PADDING * 2) ?? [])].filter((line) => line.trim() !== "");
 				pinnedRows.push(...voice.map((line) => " ".repeat(RAIL_PADDING) + line));
 			}
+			// With tabs the whole rail is one surface: an outlined card (Otras sesiones,
+			// Limits) sits on the same tint as the pinned rows above it and the fill below.
+			const onSurface = (component: Component) => options?.tabs === true || (component as SidebarRail).surface === "panel";
 			const fitPinned = (row: string) => paintSurfaceRow(visibleWidth(row) < RAIL_WIDTH ? row + " ".repeat(RAIL_WIDTH - visibleWidth(row)) : row, surface);
 			if (sections.length && branding.length) {
 				railLines.push(...branding.map((line) => " ".repeat(RAIL_PADDING) + line + " ".repeat(RAIL_PADDING)));
 			} else if (sections.length && (pinnedRows.length > 0 || (headerActive && (headerPlacement() === "top" || (density() === "comfortable" && style === CARD_STYLE.NEON))))) {
 				// Pad the first section beneath the header without breaking its surface.
 				// Keep neon's existing comfortable gap for below-input headers too.
-				railLines.push((sections[0].component as SidebarRail).surface === "panel" ? paintSurfaceRow(" ".repeat(contentWidth), surface) : "");
+				railLines.push(onSurface(sections[0].component) ? paintSurfaceRow(" ".repeat(contentWidth), surface) : "");
 			}
 			// Panel sections share one tinted surface: their rows, padding
 			// included, and the gap between two of them are painted alike.
@@ -527,7 +530,7 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 			// A tab with nothing to show still leaves the rail painting.
 			if (options?.tabs && sections.length === 0) railLines.push(theme.fg("dim", " " + (selectedTab === "activity" ? "No activity" : "Unavailable")));
 			for (const section of sections) {
-				const panel = (section.component as SidebarRail).surface === "panel";
+				const panel = onSurface(section.component);
 				const paint = (row: string) => (panel ? paintSurfaceRow(row, surface) : row);
 				// One blank row separates a section from the banner or the
 				// previous section; neon's header gap above is not a section.
