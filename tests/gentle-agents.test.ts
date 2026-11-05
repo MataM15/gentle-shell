@@ -3765,7 +3765,7 @@ test("while pi-subagents-j0k3r is still installed the tools stay unregistered an
 	const notices: string[] = [];
 	const ctx = { hasUI: true, ui: { notify: (message: string, level: string) => notices.push(`${level}:${message}`) } } as unknown as ExtensionContext;
 	await fire("session_start", ctx);
-	assert.match(notices[0] ?? "", /^warning:❀ Gentle Agents is waiting: remove the old package first with "pi remove npm:pi-subagents-j0k3r"/);
+	assert.match(notices[0] ?? "", /^warning:  Gentle Agents is waiting: remove the old package first with "pi remove npm:pi-subagents-j0k3r"/);
 });
 
 test("subagent_list_agents publishes each agent's declared tool inventory so routing can check capabilities", async () => {
@@ -3814,7 +3814,7 @@ test("subagent_list_agents and subagent_run in task mode launch a child with the
 	assert.equal(args[args.indexOf("--tools") + 1], "read,grep,subagent_parent_message");
 	await tick();
 	assert.match(String(harness.children[0].written[1].message), /Map lib\/ and report every module\.\n\n## Context\nFocus on agents-\*\.ts/);
-	assert.match(widget()![0], /^╭─ ❀ Agents ▾ Collapse · 1 active ─+╮$/);
+	assert.match(widget()![0], /^╭─   Agents ▾ Collapse · 1 active ─+╮$/);
 	assert.match(widget()![1], /^│ ◐  explore  map lib modules +gpt-5\.6-terra · low · \d+s │$/);
 	harness.children[0].emit({ type: "tool_execution_start", toolCallId: "c", toolName: "grep", args: {} });
 	harness.children[0].emit({ type: "message_end", message: { role: "assistant", usage: { totalTokens: 12_000, cost: { total: 0.09 } } } });
@@ -4260,7 +4260,7 @@ test("a task-mode child's dialog reaches the host UI and the answer goes back to
 	harness.children[0].emit({ type: "extension_ui_request", id: "u1", method: "select", title: "Which file?", options: ["a.ts", "b.ts"] });
 	await tick();
 	await tick();
-	assert.deepEqual(dialogs, ["select:❀ Which file?:a.ts|b.ts"]);
+	assert.deepEqual(dialogs, ["select:  Which file?:a.ts|b.ts"]);
 	assert.deepEqual(harness.children[0].written.at(-1), { type: "extension_ui_response", id: "u1", value: "a.ts" });
 	assert.match(widget()![1], /◐  explore  Ask me/);
 	harness.children[0].emit({ type: "agent_end", messages: [] });

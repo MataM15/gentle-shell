@@ -119,7 +119,7 @@ const ROLE = {
 	SESSION: "dim",
 } as const;
 
-export const SHELL_BAR_BRAND = "✿ gentle shell";
+export const SHELL_BAR_BRAND = "  gentle shell";
 export const SHELL_BAR_SEPARATOR = "⟡";
 export const SHELL_BAR_GAUGE_CELLS = GAUGE_CELLS;
 const RIGHT_PADDING = 2;
@@ -335,11 +335,11 @@ function weeklyUsageText(windows: UsageWindow[], theme: ShellBarTheme, stage: Us
 const STATUS_BAR_DIVIDER = "│";
 const paintChromeRow = (theme: ShellBarTheme, row: string) => paintSurfaceRow(row, surfaceOpener(theme, PANEL_SURFACE_ROLE));
 
-/** `✿ name  path` left, the session name and profile right; the path gives way first, so the profile always shows. */
+/** `name  path` left, the session name and profile right; the path gives way first, so the profile always shows. */
 export function renderShellTitleRow(model: ShellBarModel, theme: ShellBarTheme, width: number, options: { model?: boolean } = {}): string {
 	const target = Math.max(0, Math.floor(width));
 	const name = model.cwd.split("/").filter((part) => part.length > 0).pop() ?? model.cwd;
-	const left = `${theme.fg(ROLE.BRAND, "✿")} ${theme.fg(ROLE.VALUE, theme.bold(name))}  ${theme.fg(ROLE.PATH, model.cwd)}`;
+	const left = `${theme.fg(ROLE.VALUE, theme.bold(name))}  ${theme.fg(ROLE.PATH, model.cwd)}`;
 	// Mobile: the narrow status bar leaves the model out, so the title row carries it.
 	const right = options.model
 		? executionSegment(model.modelId, model.effort, theme)
@@ -403,7 +403,7 @@ export function renderShellStatusBar(model: ShellBarModel, theme: ShellBarTheme,
 	return { rows: [paintChromeRow(theme, ` ${fitPanelLine(left, "", room)} `)], headerRow: 0 };
 }
 
-const HEADER_BRAND = "✿ Gentle Shell";
+const HEADER_BRAND = "  Gentle Shell";
 
 // Narrower than the width, widest first: dropping the profile, then the
 // effort, then the whole location keeps the brand and the model alive.
@@ -596,7 +596,7 @@ export function renderShellNarrowTopBar(model: ShellBarModel, theme: ShellBarThe
 	const room = Math.max(0, target - 2);
 	const row = (content: string) => paintChromeRow(theme, ` ${fitPanelLine(content, "", room)} `);
 	const name = model.cwd.split("/").filter((part) => part.length > 0).pop() ?? model.cwd;
-	const rows = [row(`${theme.fg(ROLE.BRAND, "✿")} ${theme.fg(ROLE.VALUE, theme.bold(name))}`)];
+	const rows = [row(theme.fg(ROLE.VALUE, theme.bold(name)))];
 	const modelDetails = presentation?.visibility.modelDetails !== false;
 	const showUsage = presentation?.visibility.usageCost !== false;
 	if (modelDetails || showUsage) {

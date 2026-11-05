@@ -83,8 +83,8 @@ export interface PromptFrameOptions {
 
 // A terminal cell cannot grow, so the petal earns presence with weight and
 // the brightest rose in the theme. Working spins through four flowers.
-export const PROMPT_PETAL = "✿";
-const PETAL_FRAMES = ["✿", "❀", "❁", "✾"] as const;
+export const PROMPT_PETAL = " ";
+const PETAL_FRAMES = [" ", " ", " ", " "] as const;
 export const PROMPT_HINT = "type, or / for commands";
 export const DOUBLE_ESC_CANCEL_HINT = "esc again to cancel";
 export const IDLE_ESC_CLEAR_HINT = "esc again to clear";
@@ -230,7 +230,7 @@ function floatPromptHint(top: string, bottom: string, options: PromptFrameOption
 	return hint + " ".repeat(Math.max(0, width - visibleWidth(hint)));
 }
 
-// The panel editor: `─ ✿ state ──── mode ─` above the input, where the state
+// The panel editor: `─  state ──── mode ─` above the input, where the state
 // scans while working and the right end carries the vim mode or esc hint.
 const PANEL_PROMPT = "› ";
 const PANEL_PROMPT_ROLE = "accent";
@@ -263,7 +263,7 @@ function panelPromptRule(width: number, options: PromptFrameOptions, top: string
 	const glyph = petalGlyph(options.state, options.tick);
 	const petal = options.fg(petalTone(options.state, options.tick), options.bold ? options.bold(glyph) : glyph);
 	const label = top ?? stateLabel(options) ?? "waiting for input";
-	// `─ ✿ state ──── ≡ commands · key  « panel · key ─ MODE ─`; when no candidate fits, the plain rule below takes over.
+	// `─  state ──── ≡ commands · key  « panel · key ─ MODE ─`; when no candidate fits, the plain rule below takes over.
 	for (const actions of panelActionCandidates(options)) {
 		const end = ` ${actions.text} ${options.borderColor("─")}${right ? ` ${options.fg(LABEL_ROLE, right)} ${options.borderColor("─")}` : ""}`;
 		const labelled = 2 + visibleWidth(glyph) + 1 + visibleWidth(label) + 1;

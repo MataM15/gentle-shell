@@ -1957,7 +1957,7 @@ function spaced(component: { render(width: number): string[]; invalidate(): void
 }
 
 // Same rose identity as the Gentle AI tool cards (lib/gentle-ai-renderer.ts).
-const GENTLE_AI_GLYPH = "\u{1F339}";
+const GENTLE_AI_GLYPH = "  ";
 
 export function devBinaryCard(notice: DevBinaryNotice): Card {
 	if (notice.state === "invalid") {
@@ -3244,7 +3244,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 					animationPolicy = resolveAnimationPolicy(animationOptions).policy;
 					prompt?.setAnimationPolicy(animationPolicy);
 				},
-				() => ({ title: `${policy} · static animation sample`, sample: policy === "potato" ? "✿  idle → working (no pulse)" : policy === "performance" ? "✿  short pulse → settle (static)" : "✿  gentle wave → settle (static)" }),
+				() => ({ title: `${policy} · static animation sample`, sample: policy === "potato" ? "   idle → working (no pulse)" : policy === "performance" ? "   short pulse → settle (static)" : "   gentle wave → settle (static)" }),
 				{ setting: "Animations", value: policy, current: () => resolveAnimationPolicy(animationOptions).policy === policy, hint: "Prompt and startup motion; potato turns it off" },
 			);
 			category = "Banner";

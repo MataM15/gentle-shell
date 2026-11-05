@@ -199,7 +199,7 @@ test("the narrow top bar stacks the project, then model with ctx and cost, then 
 	const text = rows(chrome.rows);
 	assert.equal(text.length, 3);
 	assert.ok(text.every((row) => visibleWidth(row) === 56), "every row fills the width");
-	assert.match(text[0]!, /^ ✿ gentle-pi-review-2750 +$/);
+	assert.match(text[0]!, /^ gentle-pi-review-2750 +$/);
 	assert.match(text[1]!, /^ claude-fable-5-1 · low +ctx ▰▱▱ 17% ◇ \$0\.000 +$/);
 	assert.match(text[2]!, /^ ◔ usage 5h ▱▱▱ 5% · week ▰▰▰ 99% +alt\+u $/);
 	assert.equal(chrome.headerRow, 2);

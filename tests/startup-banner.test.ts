@@ -285,7 +285,7 @@ for (const showRose of [false, true]) for (const showTextLogo of [false, true]) 
 					assert.equal(/[\u2800-\u28ff]/.test(text), showRose);
 					assert.equal(/[▒▄▀█]/.test(text), showTextLogo);
 				} else if (width === 80 && showTextLogo) {
-					assert.match(text, /✿ Gentle Shell ✿/, "narrow terminal shows graceful fallback branding");
+					assert.match(text, / {2}Gentle Shell {2}/, "narrow terminal shows graceful fallback branding");
 				}
 				assert.match(lines.join("\n"), /\x1b\[38;2;85;170;205m/, "startup labels use the saved cyan palette");
 			}
@@ -302,7 +302,7 @@ for (const showRose of [false, true]) for (const showTextLogo of [false, true]) 
 			t.mock.timers.tick(150);
 			const minimal = stripAnsi(header!.render(80).join("\n"));
 			assert.doesNotMatch(minimal, /[\u2800-\u28ff]/);
-			assert.equal(/✿ Gentle Shell ✿/.test(minimal), showTextLogo);
+			assert.equal(/ {2}Gentle Shell {2}/.test(minimal), showTextLogo);
 			if (showTextLogo) {
 				const wideMinimal = stripAnsi(header!.render(160).join("\n"));
 				assert.equal(/[▒▄▀█]/.test(wideMinimal), true);

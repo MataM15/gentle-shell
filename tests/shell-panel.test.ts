@@ -160,7 +160,7 @@ const chromeModel = {
 test("the title row names the project once and always keeps the session and profile", () => {
 	const row = stripAnsi(renderShellTitleRow(chromeModel, plain as never, 90));
 	assert.equal(visibleWidth(row), 90);
-	assert.match(row, /^ ✿ gentle-pi  ~\/work\/gentle-pi +fleet adopt · claude \(session\) $/);
+	assert.match(row, /^ gentle-pi  ~\/work\/gentle-pi +fleet adopt · claude \(session\) $/);
 	const narrow = stripAnsi(renderShellTitleRow(chromeModel, plain as never, 44));
 	assert.equal(visibleWidth(narrow), 44);
 	assert.match(narrow, /fleet adopt · claude \(session\) $/, "the path gives way before the profile");
@@ -247,7 +247,7 @@ test("the panel sheet stacks the rail sections under a title row and scrolls wit
 	]);
 	const sheet = renderPanelSheet(parts as never, plain, 30, { rows: 20, scrollTop: 0 });
 	const rows = sheet.lines.map((line) => stripAnsi(line).trimEnd());
-	assert.deepEqual(rows, [edge(" ✿ Panel", "esc back ", 30).trimEnd(), "", " ▾ TODOS", "   ○ one", "", " ▾ AGENTS", "", " ▾ CHANGES", "   clean", ...Array(11).fill("")]);
+	assert.deepEqual(rows, [edge(" Panel", "esc back ", 30).trimEnd(), "", " ▾ TODOS", "   ○ one", "", " ▾ AGENTS", "", " ▾ CHANGES", "   clean", ...Array(11).fill("")]);
 	for (const line of sheet.lines) assert.equal(visibleWidth(stripAnsi(line)), 30);
 	const clipped = renderPanelSheet(parts as never, plain, 30, { rows: 5, scrollTop: 2 });
 	assert.equal(clipped.lines.length, 5, "title row plus four content rows");
@@ -289,7 +289,7 @@ test("a short sheet fills the resized viewport with painted rows without adding 
 test("the mobile title row carries the model, since the narrow status bar leaves it out", () => {
 	const row = stripAnsi(renderShellTitleRow(chromeModel, plain as never, 56, { model: true }));
 	assert.equal(visibleWidth(row), 56);
-	assert.match(row, /^ ✿ gentle-pi .*claude-opus-5-5 · high $/);
+	assert.match(row, /^ gentle-pi .*claude-opus-5-5 · high $/);
 });
 
 test("a long branch gives way before the context and cost in a phone-width status bar", () => {

@@ -22,7 +22,7 @@ for (const width of [56, 180]) {
 	test(`the panel rule offers « panel · alt+h between the state and the mode at ${width} columns (S5)`, () => {
 		const text = rule(width, { escHint: "INSERT", panelLabel: { hint: "alt+h" } });
 		assert.equal(visibleWidth(text), width);
-		assert.match(text, /^─ ✿ waiting for input ─+ « panel · alt\+h ─ INSERT ─$/);
+		assert.match(text, /^─   waiting for input ─+ « panel · alt\+h ─ INSERT ─$/);
 		assert.match(rule(width, { escHint: "INSERT", panelLabel: {} }), /« panel ─ INSERT ─$/, "no shortcut, no key shown");
 		assert.doesNotMatch(rule(width, { escHint: "INSERT" }), /panel/, "absent while the rail shows");
 	});
@@ -76,7 +76,7 @@ for (const width of [56, 180]) {
 	test(`the panel rule offers ≡ commands · alt+k between the state and the mode at ${width} columns (S6)`, () => {
 		const text = rule(width, { escHint: "INSERT", commandsLabel: { hint: "alt+k" } });
 		assert.equal(visibleWidth(text), width);
-		assert.match(text, /^─ ✿ waiting for input ─+ ≡ commands · alt\+k ─ INSERT ─$/);
+		assert.match(text, /^─   waiting for input ─+ ≡ commands · alt\+k ─ INSERT ─$/);
 		assert.match(rule(width, { escHint: "INSERT", commandsLabel: {} }), /≡ commands ─ INSERT ─$/, "no shortcut, no key shown");
 		const both = rule(width, { escHint: "INSERT", commandsLabel: { hint: "alt+k" }, panelLabel: { hint: "alt+h" } });
 		if (width >= 100) assert.match(both, /≡ commands · alt\+k {2}« panel · alt\+h ─ INSERT ─$/, "both labels, commands first");

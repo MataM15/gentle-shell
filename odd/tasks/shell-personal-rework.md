@@ -20,6 +20,7 @@ Worktree: `/home/pablo/proyectos/gentle-shell-worktrees/integrate-main-20261105`
 - S13. The rail tabs come back (owner: "Sí, volver a las pestañas"): Activity, Sessions, Resources, Status, styled as in d6fb874a5, below the pinned rail header and Breaks. Upstream's sections (TODOS, JOBS, AGENTS, CHANGES, REVIEW, INTEGRATIONS, STATS) are distributed into the tabs following what each tab held in d6fb874a5; Sessions holds "Otras sesiones" (S9). Each section keeps upstream's data, collapse and click behavior inside a neon card. This reverses the S8 loss of the tabs.
 - S14. The Limits card stays, exactly as in d6fb874a5, in the Resources tab (neon card titled "Limits", one block per provider, footer `updated Nm ago · alt+u`, a click opens /gentle:usage). Owner: "eso me gustaria mantenerlo y ya de paso te comento que lo de claude bridge esta repetido ... creo que la de mas arriba es nuestra y la de abajo es la que vino de main de gentle-shell, fijate con cual te quedas". This overrides the Limits card removal in S11.
 - S15. One Claude block, not two. Root cause: the OAuth usage fetch records the `anthropic` snapshot (plan, 5h and week windows), while `after_provider_response` files the response headers under the provider that served them, `claude-bridge` (week only), so every list of usage drew both. Kept: the personal `anthropic` block. The store, the claude-bridge pricing (817e8e95d, 28068b0f6) and the profile fallback cooldowns are untouched; the Limits card, /gentle:usage and the header gauge list usage through `displayUsages`/`displayUsageFor` in lib/shell-usage.ts, which show an alias as the account it serves.
+- S16. No petal or rose glyph anywhere in the owner's shell. Owner: "hay que sacar las florcitas esas que te dije que no me gustan en el mi diseño ... nosotros hicimos como un tema que es todo lo que es gentle shell y herdr incluso ... para tratar de mantener ese estilo ese diseño". Upstream's `✿` in the title row, the editor rule, the sidebar banner, the brand strings, the panel sheet title, the agents glyph, the animation samples, the Gentle AI notice glyph and the startup banner is gone; each glyph slot is blank again, as in d6fb874a5 (the title row and the panel sheet title carry no slot). tests/shell-no-petals.test.ts renders the chrome and scans the source so one cannot come back. This reverts the petal kept in c4a334ce7 (float editor rule `/^ ▎ ✿/`). The startup banner's rose ASCII art (`showRose`) is a drawing, not a glyph, and is a separate owner decision.
 
 ## Tasks
 
@@ -30,7 +31,7 @@ Worktree: `/home/pablo/proyectos/gentle-shell-worktrees/integrate-main-20261105`
 - T5 [S6,S7] Narrow layout: top bar, commands label in editor border, Breaks below editor. Route: visual-opus. Commit: 83e5177a3, 7d9c6180b (gap-row fix).
 - T6 Full suite on integration vs pristine, DESIGN vs AFTER sheet at wide and portrait, fast-forward `personal/main`, push to `personal`, delete stale local `main`, owner restarts Pi. Route: parent.
 - T7 [S13,S9,S12,S7] Rail tabs back with upstream sections distributed into them; "Otras sesiones" in Sessions. Route: visual-opus. Commit: c868372ff.
-- T8 [S10,S7] AGENTS frame + stray block; voice line in the wide rail. Route: visual-opus. Commit: pending.
+- T8 [S10,S7] AGENTS frame + stray block; voice line in the wide rail. Route: visual-opus. Commit: 86b8e190a (AGENTS frame, voice line); S16 petals: see L11.
 - T9 [S11] Dead code, stale docs, unused-import check. Route: visual-opus. Commit: pending.
 
 ## Log
@@ -45,3 +46,4 @@ Worktree: `/home/pablo/proyectos/gentle-shell-worktrees/integrate-main-20261105`
 - L8 (owner, comparing the new rail with the old one): "eso es como lo dejaste.. asi es como lo tenia y como es en esta sesion" → AGENTS frame missing, "Otras sesiones" lost.
 - L9 (owner): "Sí, como tarjeta" for Otras sesiones; "Sí, todo" for the cleanup (git branches, stale managed-assets.lock, dead code) plus the voice and AGENTS fixes.
 - L10 (owner): principle S12 (verbatim above); then "Sí, volver a las pestañas" → S13, T7 widened.
+- L11 (owner, S14-S16): Limits kept ("eso me gustaria mantenerlo ..."), the duplicate claude-bridge block dropped (S15) and "hay que sacar las florcitas esas ..." (S16). The parent widened the surfaces to extensions/startup-banner.ts and extensions/gentle-ai.ts for S16 only.

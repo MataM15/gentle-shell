@@ -336,7 +336,7 @@ test("rail orders live work first, then Status, without standalone changes", (t)
 		sidebarPart(f.tui, key, { render: () => [key, ""], invalidate() {} });
 	}
 	t.after(installSidebar(f.tui, theme));
-	assert.deepEqual(rail(f).render(50).map((line) => line.trim()), ["✿ Gentle Shell ✿", "", "todo", "", "agents", "", "Status"]);
+	assert.deepEqual(rail(f).render(50).map((line) => line.trim()), ["Gentle Shell", "", "todo", "", "agents", "", "Status"]);
 });
 
 test("branding belongs to scroll content before Status, never transcript or narrow bottom", (t) => {
@@ -344,14 +344,14 @@ test("branding belongs to scroll content before Status, never transcript or narr
 	t.after(installSidebar(f.tui, theme));
 	const scroll = rail(f);
 	const lines = scroll.render(50);
-	const brandIndex = lines.findIndex((line) => line.includes("✿ Gentle Shell ✿"));
+	const brandIndex = lines.findIndex((line) => line.includes("  Gentle Shell  "));
 	assert.ok(brandIndex >= 0 && brandIndex < lines.findIndex((line) => line.includes("Status")));
 	assert.doesNotMatch(lines.join("\n"), /[\u2800-\u28ff]/);
 	const heading = lines[brandIndex];
 	const usableWidth = scroll.getContentWidth(50) - 2;
-	const spare = usableWidth - visibleWidth("✿ Gentle Shell ✿");
+	const spare = usableWidth - visibleWidth("  Gentle Shell  ");
 	const scrollbarWidth = 50 - scroll.getContentWidth(50);
-	assert.equal(heading, " ".repeat(1 + Math.floor(spare / 2)) + "✿ Gentle Shell ✿" + " ".repeat(1 + Math.ceil(spare / 2) + scrollbarWidth));
+	assert.equal(heading, " ".repeat(1 + Math.floor(spare / 2)) + "  Gentle Shell  " + " ".repeat(1 + Math.ceil(spare / 2) + scrollbarWidth));
 	assert.deepEqual(f.root.render(), ["transcript"]);
 	scroll.updateLayout(lines.length, 2, () => {});
 	scroll.scrollBy(9);
@@ -1087,7 +1087,7 @@ test("float rail alignment preserves fallback banners and neon bytes across live
 		t.after(installSidebar(f.tui, theme));
 		const baseline = railWithHeader(f).render(50);
 		if (header) assert.deepEqual(baseline, ["", " TODO ", "", " Status "]);
-		else assert.match(baseline.join("\n"), /✿ Gentle Shell ✿/);
+		else assert.match(baseline.join("\n"), /  Gentle Shell  /);
 		setCardStyle(CARD_STYLE.FLOAT);
 		assert.deepEqual(railWithHeader(f).render(50), baseline, "the active top header keeps its gap in both styles");
 		setCardStyle(CARD_STYLE.NEON);
@@ -1126,7 +1126,7 @@ test("without a registered header the rail keeps the banner and the plain hstack
 	const node = f.root[NODE]() as unknown as { type: string };
 	assert.equal(node.type, "hstack");
 	const scroll = rail(f);
-	assert.match(scroll.render(50).join("\n"), /✿ Gentle Shell ✿/);
+	assert.match(scroll.render(50).join("\n"), /  Gentle Shell  /);
 });
 
 test("a header too narrow to show anything falls back to the plain hstack and the banner", (t) => {
@@ -1136,7 +1136,7 @@ test("a header too narrow to show anything falls back to the plain hstack and th
 	const node = f.root[NODE]() as unknown as { type: string };
 	assert.equal(node.type, "hstack", "a blank header line does not earn its own row");
 	const scroll = rail(f);
-	assert.match(scroll.render(50).join("\n"), /✿ Gentle Shell ✿/);
+	assert.match(scroll.render(50).join("\n"), /  Gentle Shell  /);
 });
 
 test("header content changes reach the header row while an unrelated part is untouched", (t) => {

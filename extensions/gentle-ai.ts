@@ -11587,7 +11587,7 @@ function createGentleAiExtensionForTesting(
 
 	// Loud, every session: an active dev-binary override means this session
 	// runs an unpinned gentle-ai. One visible startup notice: the gentle-shell
-	// 🌹 card owns the announcement when it can render (shell enabled with UI);
+	// card owns the announcement when it can render (shell enabled with UI);
 	// this toast is only the fallback for when the card is unavailable. The
 	// hasUI guard stays: headless contexts have no toast to show.
 	const surfaceDevBinaryOverride = async (ctx: ExtensionContext): Promise<void> => {

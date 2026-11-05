@@ -847,9 +847,9 @@ export default function (pi: ExtensionAPI) {
                   }
                 } else {
                   b.addRow();
-                  b.add("accent", "✿ ");
+                  b.add("accent", "  ");
                   b.add("value", "Gentle Shell");
-                  b.add("accent", " ✿");
+                  b.add("accent", "  ");
                   b.center(width);
                 }
               }
@@ -894,9 +894,9 @@ export default function (pi: ExtensionAPI) {
                 }
               } else if (bannerConfig.showTextLogo) {
                 b.addRow();
-                b.add("accent", "✿ ");
+                b.add("accent", "  ");
                 b.add("value", "Gentle Shell");
-                b.add("accent", " ✿");
+                b.add("accent", "  ");
                 b.center(width);
                 if (showRose) {
                   b.addRow();

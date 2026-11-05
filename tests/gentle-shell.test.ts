@@ -969,6 +969,13 @@ test("gentleShell stays out of the way without a UI or when disabled", () => {
 
 const fakeTui = { terminal: { rows: 40, columns: 120 }, requestRender() {} };
 const editorTheme = { borderColor: (text: string) => text, selectList: {} };
+// A theme that tags every role, so the working label scan is visible: the local frame has no flower.
+const markedTheme = {
+	...plainTheme,
+	fg(color: string, value: string) {
+		return `<${color}>${value}</${color}>`;
+	},
+};
 const fakeKeybindings = { matches: () => false };
 
 test("panel control owns its rendered mouse cells across top rows and Vim modes", () => {
@@ -1204,7 +1211,7 @@ test("gentleShell frames the editor with the petal prompt and a hint while empty
 	assert.equal(ui.workingVisible, false, "pi's own Working row must be hidden");
 	editor.focused = true;
 	const lines = editor.render(60).map(stripAnsi);
-	assert.match(lines[0], /^╭─ ✿ ─+╮$/);
+	assert.match(lines[0], /^╭─   ─+╮$/);
 	assert.doesNotMatch(editor.render(60).join("\n"), /\x1b\[44m/, "prompt must not paint passive backgrounds");
 	assert.match(lines[1], /^│.*type, or \/ for commands +│$/);
 	assert.match(lines[lines.length - 1], /^╰─+╯$/);
@@ -2361,14 +2368,14 @@ test("gentleShell shows working while the agent runs and queued when messages wa
 	const editor = installedPrompt(ctx, ui, handlers);
 
 	for (const handler of handlers.get("agent_start") ?? []) handler({}, ctx);
-	assert.match(stripAnsi(editor.render(60)[0]), /^╭─ [✿❀❁✾] working… ─+╮$/);
+	assert.match(stripAnsi(editor.render(60)[0]), /^╭─ [    ] working… ─+╮$/);
 	pending.value = true;
-	assert.match(stripAnsi(editor.render(60)[0]), /^╭─ [✿❀❁✾] queued ─+╮$/);
+	assert.match(stripAnsi(editor.render(60)[0]), /^╭─ [    ] queued ─+╮$/);
 	for (const handler of handlers.get("agent_end") ?? []) handler({}, ctx);
 	assert.match(stripAnsi(editor.render(60)[0]), /queued/, "low-level run end is not settled");
 	pending.value = false;
 	for (const handler of handlers.get("agent_settled") ?? []) handler({}, ctx);
-	assert.match(stripAnsi(editor.render(60)[0]), /^╭─ ✿ ─+╮$/);
+	assert.match(stripAnsi(editor.render(60)[0]), /^╭─   ─+╮$/);
 	editor.dispose();
 });
 
@@ -3233,7 +3240,7 @@ test("potato repaints start/settle and shows queued state on the host's next ren
 	let before = renders.mock.callCount();
 	for (const handler of handlers.get("agent_start") ?? []) handler({}, ctx);
 	assert.ok(renders.mock.callCount() > before);
-	assert.match(stripAnsi(editor.render(60)[0]), /✿ working/);
+	assert.match(stripAnsi(editor.render(60)[0]), /  working/);
 	before = renders.mock.callCount();
 	pending.value = true;
 	assert.equal(renders.mock.callCount(), before, "changing the queue flag is not a Gentle repaint event");
@@ -3242,7 +3249,7 @@ test("potato repaints start/settle and shows queued state on the host's next ren
 	// this proves next-render visibility, not real Pi enqueue-to-paint latency.
 	fakeTui.requestRender();
 	assert.equal(renders.mock.callCount(), before + 1);
-	assert.match(stripAnsi(editor.render(60)[0]), /✿ queued/);
+	assert.match(stripAnsi(editor.render(60)[0]), /  queued/);
 	before = renders.mock.callCount();
 	for (const handler of handlers.get("agent_settled") ?? []) handler({}, ctx);
 	assert.ok(renders.mock.callCount() > before);
@@ -3340,24 +3347,24 @@ function recordIntervals(t: TestContext): RecordedInterval[] {
 	return intervals;
 }
 
-function petalGlyphOf(editor: GentlePromptEditor): string {
-	return stripAnsi(editor.render(60)[0]).match(/[✿❀❁✾]/)?.[0] ?? "";
+function workingFrameOf(editor: GentlePromptEditor): string {
+	return editor.render(60)[0] ?? "";
 }
 
-test("streaming frames advance the working petal and the quality watchdog stays silent while renders flow", (t) => {
+test("streaming frames advance the working label scan and the quality watchdog stays silent while renders flow", (t) => {
 	const configHome = scopedDoubleEscCancelConfigHome(t);
 	writeFileSync(join(configHome, "animations.json"), '{"schema":"gentle-pi.animations/v1","policy":"quality"}');
 	const intervals = recordIntervals(t);
 	const renders = t.mock.method(fakeTui, "requestRender", () => {});
 	const { pi, handlers } = fakePi();
 	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: configHome }, { now: () => 1_000_000 });
-	const { ctx, ui } = fakeContext();
+	const { ctx, ui } = fakeContext({ theme: markedTheme });
 	const editor = installedPrompt(ctx, ui, handlers);
 	for (const handler of handlers.get("agent_start") ?? []) handler({}, ctx);
 	const watchdog = intervals.find((entry) => entry.delay === 1000);
 	assert.ok(watchdog, "working installs the 1000ms silence watchdog");
-	const glyphs = [0, 1, 2, 3].map(() => petalGlyphOf(editor));
-	assert.ok(new Set(glyphs).size > 1, `each streamed frame must advance the petal, got ${glyphs.join("")}`);
+	const glyphs = [0, 1, 2, 3].map(() => workingFrameOf(editor));
+	assert.ok(new Set(glyphs).size > 1, `each streamed frame must advance the working label scan`);
 	const before = renders.mock.callCount();
 	watchdog!.tick();
 	assert.equal(renders.mock.callCount(), before, "renders are already flowing, so the watchdog must not force one");
@@ -3373,26 +3380,26 @@ test("silent working phases repaint only through the 1000ms watchdog window", (t
 	let clock = 1_000_000;
 	const { pi, handlers } = fakePi();
 	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: configHome }, { now: () => clock });
-	const { ctx, ui } = fakeContext();
+	const { ctx, ui } = fakeContext({ theme: markedTheme });
 	const editor = installedPrompt(ctx, ui, handlers);
 	for (const handler of handlers.get("agent_start") ?? []) handler({}, ctx);
 	const watchdog = intervals.find((entry) => entry.delay === 1000);
 	assert.ok(watchdog, "working installs the 1000ms silence watchdog");
-	const baseline = petalGlyphOf(editor);
+	const baseline = workingFrameOf(editor);
 	const before = renders.mock.callCount();
 	watchdog!.tick();
 	assert.equal(renders.mock.callCount(), before, "no frame painted within the window, but the window has not elapsed yet");
 	clock += 1000;
 	watchdog!.tick();
 	assert.equal(renders.mock.callCount(), before + 1, "silence past the window forces exactly one repaint");
-	assert.notEqual(petalGlyphOf(editor), baseline, "the watchdog advanced the petal tick");
+	assert.notEqual(workingFrameOf(editor), baseline, "the watchdog advanced the working tick");
 	const afterForced = renders.mock.callCount();
 	watchdog!.tick();
 	assert.equal(renders.mock.callCount(), afterForced, "the watchdog's own repaint counts as render traffic for the next window");
 	editor.dispose();
 });
 
-test("potato installs no working watchdog and the petal never advances", (t) => {
+test("potato installs no working watchdog and the working frame never advances", (t) => {
 	const configHome = scopedDoubleEscCancelConfigHome(t);
 	writeFileSync(join(configHome, "animations.json"), '{"schema":"gentle-pi.animations/v1","policy":"potato"}');
 	const intervals = recordIntervals(t);
@@ -3402,8 +3409,8 @@ test("potato installs no working watchdog and the petal never advances", (t) => 
 	const editor = installedPrompt(ctx, ui, handlers);
 	for (const handler of handlers.get("agent_start") ?? []) handler({}, ctx);
 	assert.ok(!intervals.some((entry) => entry.delay !== 2000), "potato must not animate: no watchdog interval at all");
-	const glyphs = [0, 1, 2].map(() => petalGlyphOf(editor));
-	assert.deepEqual(glyphs, ["✿", "✿", "✿"], "potato keeps the petal static");
+	const glyphs = [0, 1, 2].map(() => workingFrameOf(editor));
+	assert.equal(new Set(glyphs).size, 1, "potato keeps the working frame static");
 	editor.dispose();
 });
 
@@ -3705,7 +3712,7 @@ test("T3 live style Cards action refreshes cached TODO and Status in both direct
 	// The wide chrome: the title row on top and one status bar row as the last layout entry.
 	const wide = root[node]() as unknown as { entries: { component: { render(width: number): string[] } }[] };
 	assert.equal(wide.entries.length, 3, "title row, transcript with the rail, status bar");
-	assert.match(stripAnsi(frame.header), /^ ✿ repo  \/repo .*team $/);
+	assert.match(stripAnsi(frame.header), /^ repo  \/repo .*team $/);
 	// The owner's rail header carries model/ctx/cost once, so the wide status bar keeps only the branch (and mode, usage gauge when known).
 	const statusRow = stripAnsi(wide.entries[2]!.component.render(160).join("\n"));
 	assert.match(statusRow, /^ main/);
@@ -6068,7 +6075,7 @@ test("gentleShell keeps a dev-binary override visible above the editor for the w
 	const factory = ui.widgets.get("gentle-shell-dev-binary") as (tui: unknown, theme: unknown) => { render(width: number): string[] };
 	assert.ok(factory, "dev binary widget missing");
 	const lines = factory(fakeTui, plainTheme).render(100).map(stripAnsi);
-	assert.match(lines[0], /^╭─ \u{1F339} gentle-ai · dev binary override · field-test only ─+╮$/u, "the override notice carries the Gentle AI rose");
+	assert.match(lines[0], /^╭─    gentle-ai · dev binary override · field-test only ─+╮$/u, "the override notice keeps the reserved glyph cells");
 	assert.match(lines[1], /^│ \/Users\/me\/go\/bin\/gentle-ai · sha256:6e53bfc6305a3949 +│$/);
 	assert.match(lines[2], /^╰─+╯$/);
 	assert.equal(lines[3], "", "a blank line keeps the card off the prompt frame");
@@ -6088,7 +6095,7 @@ test("gentleShell keeps a dev-binary override visible above the editor for the w
 
 	const invalid = devBinaryCard({ state: "invalid", reason: "binary missing" });
 	assert.equal(invalid.tone, "error");
-	assert.equal(invalid.glyph, "\u{1F339}", "the invalid override notice keeps the rose too");
+	assert.equal(invalid.glyph, "  ", "the invalid override notice keeps the reserved glyph cells");
 	assert.deepEqual(factory(fakeTui, plainTheme).render(0), [""], "zero width keeps only the spacer");
 });
 
@@ -7093,7 +7100,7 @@ test("the installed editor draws the panel frame in the wide and mobile IDE chro
 		state.active = true;
 		state.ownsHost = () => true;
 		const rows = editor.render(80).map(stripAnsi);
-		assert.match(rows[0]!, /^─ ✿ waiting for input ─+─$/, "a titled rule replaces the frame");
+		assert.match(rows[0]!, /^─   waiting for input ─+─$/, "a titled rule replaces the frame");
 		assert.match(rows[1]!, /^› /, "the input sits behind the prompt");
 		assert.doesNotMatch(rows.join("\n"), /[╭╮╰╯│]/u);
 		for (const row of rows) assert.equal(visibleWidth(row), 80);
@@ -7101,12 +7108,12 @@ test("the installed editor draws the panel frame in the wide and mobile IDE chro
 		const agents = sidebarPart(fakeTui as unknown as TUI, "agents", { render: (_width: number) => [], invalidate() {}, dispose() {} }, { render: () => [], alert: () => [" ? explore asked: Which file?"], invalidate() {} });
 		const asked = editor.render(80).map(stripAnsi);
 		assert.match(asked[0]!, /explore asked: Which file\?/);
-		assert.match(asked[1]!, /^─ ✿ waiting for input/);
+		assert.match(asked[1]!, /^─   waiting for input/);
 		assert.deepEqual(editor.handleMouse?.({ type: "move", button: "none", x: 2, y: 0, screenX: 2, screenY: 0, width: 80, height: asked.length, shift: false, alt: false, ctrl: false }), { handled: true, render: true }, "the shell owns the alert row's pointer events; they never reach Pi's editor");
 		agents.dispose();
 		state.active = false;
 		state.layoutAttached = () => true;
-		assert.match(stripAnsi(editor.render(80)[0]!), /^─ ✿ waiting for input/, "a narrow fullscreen terminal (mobile) keeps the panel editor");
+		assert.match(stripAnsi(editor.render(80)[0]!), /^─   waiting for input/, "a narrow fullscreen terminal (mobile) keeps the panel editor");
 		state.layoutAttached = undefined;
 		assert.match(stripAnsi(editor.render(80)[0]!), /^╭/, "without the fullscreen layout installed the framed editor stays");
 		delete host.mode;
@@ -7143,19 +7150,19 @@ test("mobile folds live work into one row above the editor that opens /gentle:pa
 		const editor = (ui.editorFactory as (tui: unknown, theme: unknown, keybindings: unknown) => GentlePromptEditor)(tui, editorTheme, fakeKeybindings);
 		const editorRows = editor.render(56).map(stripAnsi);
 		assert.match(editorRows[0]!, /^ ▸ ◐ Run the suite +1\/3 $/);
-		assert.match(editorRows[1]!, /^─ ✿ waiting for input/, "the editor rule follows the work row directly");
+		assert.match(editorRows[1]!, /^─   waiting for input/, "the editor rule follows the work row directly");
 		assert.equal(editor.handleMouse?.({ type: "click", button: "left", x: 3, y: 0, screenX: 3, screenY: 0, width: 56, height: editorRows.length, shift: false, alt: false, ctrl: false })?.handled, true, "a tap on the work row is handled");
 		await new Promise((resolve) => setImmediate(resolve));
-		assert.match(openPanelLines(ui)[0]!, /^ ✿ Panel/, "the tap opens the panel sheet");
+		assert.match(openPanelLines(ui)[0]!, /^ Panel/, "the tap opens the panel sheet");
 		(ui.overlayView as unknown as { handleInput(data: string): void }).handleInput("\x1b");
 		editor.dispose();
 		const header = state.parts.get("header")!;
-		assert.match(stripAnsi(header.render(56).join("\n")), /^ ✿ repo[^\n]*\n gpt-5\.5 · medium +ctx /, "the mobile top bar carries the model and context");
+		assert.match(stripAnsi(header.render(56).join("\n")), /^ repo[^\n]*\n gpt-5\.5 · medium +ctx /, "the mobile top bar carries the model and context");
 		assert.match(stripAnsi(state.parts.get("statusbar")!.render(56).join("\n")), /^ main/, "the mobile status bar leads with the branch");
 		void commands.get("gentle:panel")!.handler("", ctx);
 		await new Promise((resolve) => setImmediate(resolve));
 		const sheet = openPanelLines(ui);
-		assert.match(sheet[0]!, /^ ✿ Panel +esc back $/);
+		assert.match(sheet[0]!, /^ Panel +esc back $/);
 		assert.ok(sheet.some((line) => /▾ TODOS/.test(line)) && sheet.some((line) => /Run the suite/.test(line)), "the sheet shows the rail sections");
 		(ui.overlayView as unknown as { handleInput(data: string): void }).handleInput("\x1b");
 		tui.terminal.columns = 160;
@@ -7403,7 +7410,7 @@ test("Status at the bottom with the header on top draws the minimal IDE chrome o
 			assert.equal(state.compactWork?.(), true, "the minimal edition folds live work like a phone");
 			assert.deepEqual(footer.render(180), [], "the old compact bottom bar steps aside for the status bar");
 			assert.deepEqual(todo.render(180), [], "the Todos card folds into the work row");
-			assert.match(stripAnsi(state.parts.get("header")!.render(180).join("\n")), /^ ✿ repo /, "the title row draws");
+			assert.match(stripAnsi(state.parts.get("header")!.render(180).join("\n")), /^ repo /, "the title row draws");
 			assert.match(stripAnsi(state.parts.get("statusbar")!.render(180).join("\n")), /^ main /, "the status bar draws");
 			assert.match(stripAnsi(editor.render(180)[0]!), /▸ ◐ Run the suite/, "the work row sits right above the editor");
 		} finally {

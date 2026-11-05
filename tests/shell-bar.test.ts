@@ -215,7 +215,7 @@ test("renderShellBar renders one line with the segments in order", () => {
 	assert.equal(rest.length, 0);
 	assert.equal(
 		line,
-		"✿ gentle shell ⟡ ~/work/gentle-pi main ⟡ gpt-5.5 · medium ⟡ ctx ▰▰▰▰▱▱▱▱ 45% ⟡ $9.49 sub",
+		"  gentle shell ⟡ ~/work/gentle-pi main ⟡ gpt-5.5 · medium ⟡ ctx ▰▰▰▰▱▱▱▱ 45% ⟡ $9.49 sub",
 	);
 });
 
@@ -228,7 +228,7 @@ test("renderShellBar paints the context gauge with the given gauge roles", () =>
 
 test("renderShellBar colors the brand, model, effort, and gauge by role", () => {
 	const [line] = renderShellBar(model(), taggedTheme, 400);
-	assert.match(line, /<accent>✿ gentle shell<\/accent>/);
+	assert.match(line, /<accent>  gentle shell<\/accent>/);
 	assert.match(line, /<text>gpt-5\.5<\/text>/);
 	assert.match(line, /<syntaxFunction>medium<\/syntaxFunction>/);
 	assert.match(line, /<accent>▰▰▰▰<\/accent><border>▱▱▱▱<\/border>/);
@@ -333,7 +333,7 @@ test("renderShellBar drops the session name, then trailing segments, before trun
 
 	const [atFifty] = renderShellBar(wide, plainTheme, 50);
 	assert.ok(visibleWidth(atFifty) <= 50, `line overflowed: ${visibleWidth(atFifty)}`);
-	assert.match(atFifty, /^✿ gentle shell/);
+	assert.match(atFifty, /^  gentle shell/);
 });
 
 test("shellEnabled stays off inside a Gentle Agents child", () => {
@@ -469,7 +469,7 @@ test("buildShellHeaderModel keeps only the header's fields from the bar model", 
 test("renderShellHeaderBar draws the brand, identity, and right-aligned counters (plus the standing usage segment) in one line", () => {
 	const header = buildShellHeaderModel(model({ profile: "team" }));
 	const { text: line } = renderShellHeaderBar(header, plainTheme, 120);
-	const left = "✿ Gentle Shell ⟡ ~/work/gentle-pi main ⟡ gpt-5.5 · medium · team";
+	const left = "  Gentle Shell ⟡ ~/work/gentle-pi main ⟡ gpt-5.5 · medium · team";
 	const right = "ctx ▰▰▰▰▱▱▱▱ 45% ⟡ $9.49 sub ⟡ usage";
 	assert.equal(line, left + " ".repeat(120 - visibleWidth(left) - visibleWidth(right)) + right);
 	assert.equal(visibleWidth(line), 120);
@@ -486,7 +486,7 @@ test("renderShellHeaderBar colors the brand bold and by role", () => {
 	const bolding = { fg: (color: string, text: string) => `<${color}>${text}</${color}>`, bold: (text: string) => `**${text}**` };
 	const header = buildShellHeaderModel(model());
 	const { text: line } = renderShellHeaderBar(header, bolding, 120);
-	assert.match(line, /<accent>\*\*✿ Gentle Shell\*\*<\/accent>/);
+	assert.match(line, /<accent>\*\*  Gentle Shell\*\*<\/accent>/);
 });
 
 test("renderShellHeaderBar drops the profile, then the effort, then the whole location before the right group", () => {
@@ -515,7 +515,7 @@ test("renderShellHeaderBar drops the profile, then the effort, then the whole lo
 	const { text: noLocation } = renderShellHeaderBar(withProfile, plainTheme, 82);
 	assert.doesNotMatch(noLocation, /~\/work\/gentle-pi/);
 	assert.match(noLocation, /gpt-5\.5/);
-	assert.match(noLocation, /✿ Gentle Shell/);
+	assert.match(noLocation, /  Gentle Shell/);
 	assert.match(noLocation, /ctx ▰▰▰▰▱▱▱▱ 45% ⟡ \$9\.49 sub ⟡ usage$/);
 	assert.equal(visibleWidth(noLocation), 82);
 
@@ -524,14 +524,14 @@ test("renderShellHeaderBar drops the profile, then the effort, then the whole lo
 	assert.doesNotMatch(noUsage, /~\/work\/gentle-pi/);
 	assert.doesNotMatch(noUsage, /usage/);
 	assert.match(noUsage, /gpt-5\.5/);
-	assert.match(noUsage, /✿ Gentle Shell/);
+	assert.match(noUsage, /  Gentle Shell/);
 	assert.match(noUsage, /ctx ▰▰▰▰▱▱▱▱ 45% ⟡ \$9\.49 sub$/);
 	assert.equal(visibleWidth(noUsage), 60);
 });
 
 test("renderShellHeaderBar returns an empty string only once the brand itself cannot fit", () => {
 	assert.equal(renderShellHeaderBar(buildShellHeaderModel(model()), plainTheme, 3).text, "");
-	assert.match(renderShellHeaderBar(buildShellHeaderModel(model()), plainTheme, 40).text, /✿ Gentle Shell/);
+	assert.match(renderShellHeaderBar(buildShellHeaderModel(model()), plainTheme, 40).text, /  Gentle Shell/);
 });
 
 // T8: the usage segment. It rides after cost in the right group, shows every
@@ -561,7 +561,7 @@ test("header retains effort without location when it fits beside full usage wind
 	for (const density of ["minimal", "compact", "comfortable"] as const) {
 		const settings = { ...DEFAULT_VISUAL_SETTINGS, density };
 		const right = "ctx ▰▰▰▰▱▱▱▱ 45% ⟡ $9.49 sub ⟡ usage 5h ▰▰▱▱▱▱▱▱ 26% · week ▰▱▱▱▱▱▱▱ 12% · alt+u";
-		const left = density === "minimal" ? "gpt-5.5 · medium" : "✿ Gentle Shell ⟡ gpt-5.5 · medium";
+		const left = density === "minimal" ? "gpt-5.5 · medium" : "  Gentle Shell ⟡ gpt-5.5 · medium";
 		const width = visibleWidth(left) + 2 + visibleWidth(right);
 		const result = renderShellHeaderBar(header, plainTheme, width, "alt+u", settings);
 		assert.equal(result.text, left + "  " + right, density);

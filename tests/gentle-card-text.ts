@@ -18,10 +18,10 @@ export function cardTitle(rendered: string): string {
 }
 
 export function cardTone(rendered: string): string | undefined {
-	// Shell notices read `✿ Gentle AI` in their tone role. Routine tool cards tag
+	// Shell notices tag the blank glyph slot with `Gentle AI`. Routine tool cards tag
 	// the blank glyph slot with the title (`<warning>   rdd …`), so the tone role
 	// is whatever directly precedes the routine title.
-	return (rendered.split("\n")[0] ?? "").match(/<([a-zA-Z]+)>(?:✿ Gentle AI<\/|\s{0,3}(?:rdd|gentle-ai)\b)/u)?.[1];
+	return (rendered.split("\n")[0] ?? "").match(/<([a-zA-Z]+)>(?:\s{0,3}Gentle AI<\/|\s{0,3}(?:rdd|gentle-ai)\b)/u)?.[1];
 }
 
 export function cardBody(rendered: string): string {
