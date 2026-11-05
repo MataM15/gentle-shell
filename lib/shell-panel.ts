@@ -11,6 +11,31 @@ export const PANEL_SURFACE_ROLE = "customMessageBg";
 /** Columns a panel row is indented under its header. */
 export const PANEL_ROW_INDENT = 2;
 
+/** Columns a framed section card spends on its two borders and the padding inside them. */
+export const PANEL_FRAME_COLUMNS = 4;
+// Neon card frame (shell-personal-rework S5): the layout draws each rail
+// section as a rounded card. Sections render the same rows either way; while
+// a render runs inside `withPanelFrame` their header becomes the card's top
+// border and their rows lose the indent the frame now provides.
+const FRAME_ROLE = "accent";
+let framed = false;
+
+/** Runs `render` with section headers drawn as rounded top borders and rows unindented. */
+export function withPanelFrame<T>(render: () => T): T {
+	const previous = framed;
+	framed = true;
+	try {
+		return render();
+	} finally {
+		framed = previous;
+	}
+}
+
+/** True for a header that `withPanelFrame` drew as a card's top border. */
+export function isPanelFrameTop(line: string): boolean {
+	return /^(?:\x1b\[[0-9;]*m)*╭/.test(line);
+}
+
 export interface PanelTheme extends CardTheme {
 	bold?(text: string): string;
 }
@@ -52,7 +77,25 @@ export function fitPanelLine(left: string, right: string, width: number): string
 	return `${shownLeft}${" ".repeat(Math.max(0, target - visibleWidth(shownLeft) - visibleWidth(shownRight)))}${shownRight}`;
 }
 
+function renderFramedHeader(theme: PanelTheme, width: number, header: PanelHeader): string {
+	const total = Math.max(0, Math.floor(width)) + PANEL_FRAME_COLUMNS;
+	const edge = (text: string) => theme.fg(FRAME_ROLE, text);
+	const glyph = paintHoverable(theme, header.open ? "▾" : "▸", header.hovered ?? false, FRAME_ROLE);
+	let name = header.title.toUpperCase();
+	let count = header.count ?? "";
+	// `╭─ ▾ NAME ` + at least one rule cell + (` count ─╮` | `╮`): the count gives way first, then the name.
+	const lead = (title: string) => 3 + 1 + 1 + visibleWidth(title) + 1;
+	const tail = (text: string) => (text ? visibleWidth(text) + 4 : 1);
+	if (lead(name) + tail(count) + 1 > total) count = "";
+	if (lead(name) + tail(count) + 1 > total) name = clipPanelText(name, Math.max(1, total - lead("") - tail(count) - 1));
+	const title = theme.fg(FRAME_ROLE, theme.bold ? theme.bold(name) : name);
+	const fill = Math.max(1, total - lead(name) - tail(count));
+	const end = count ? ` ${theme.fg(header.countRole ?? "muted", count)} ${edge("─╮")}` : edge("╮");
+	return `${edge("╭─ ")}${glyph} ${title} ${edge("─".repeat(fill))}${end}`;
+}
+
 export function renderPanelHeader(theme: PanelTheme, width: number, header: PanelHeader): string {
+	if (framed) return renderFramedHeader(theme, width, header);
 	const glyph = paintHoverable(theme, header.open ? "▾" : "▸", header.hovered ?? false, "muted");
 	const name = header.title.toUpperCase();
 	const title = theme.fg("text", theme.bold ? theme.bold(name) : name);
@@ -62,7 +105,9 @@ export function renderPanelHeader(theme: PanelTheme, width: number, header: Pane
 
 /** One section row, indented under the header, with an optional right column. */
 export function renderPanelRow(width: number, left: string, right = "", indent = PANEL_ROW_INDENT): string {
-	return fitPanelLine(`${" ".repeat(indent)}${left}`, right, width);
+	// Inside a card the frame is the indent; a nested row keeps only its extra columns.
+	const columns = framed ? Math.max(0, indent - PANEL_ROW_INDENT) : indent;
+	return fitPanelLine(`${" ".repeat(columns)}${left}`, right, width);
 }
 
 /** Paints every row behind the rail surface; a theme that cannot paint it leaves rows as they are. */

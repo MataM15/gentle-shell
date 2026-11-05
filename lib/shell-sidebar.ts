@@ -17,6 +17,8 @@ export interface SidebarState {
 	active: boolean;
 	visibility?: { todo?: boolean };
 	ownsHost?: () => boolean;
+	/** True while the user folded the rail away (`» hide panel`, alt+h) and the layout could show it again. */
+	railAvailable?: () => boolean;
 	/**
 	 * Columns the fullscreen rail reserves at the right edge (rail plus gap)
 	 * while `active && ownsHost()`. Overlays read it to stay inside the editor

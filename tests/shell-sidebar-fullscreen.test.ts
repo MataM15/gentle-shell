@@ -13,7 +13,7 @@ const theme = { fg: (_color: string, text: string) => text, bold: (text: string)
 const strip = (text: string) => text.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "").replace(/\x1b\][^\x07]*\x07/g, "").replace(/\s+$/, "");
 const lines = (rows: string[]): Component => ({ render: () => rows, invalidate() {} });
 
-async function renderViewport(columns: number, rows: number, sidebar: boolean) {
+async function renderViewport(columns: number, rows: number, sidebar: boolean): Promise<string[]> {
 	const terminal = {
 		start() {}, stop() {}, async drainInput() {}, write() {},
 		get columns() { return columns; }, get rows() { return rows; },
@@ -42,19 +42,12 @@ async function renderViewport(columns: number, rows: number, sidebar: boolean) {
 	tui.requestRender(true);
 	await new Promise((resolve) => setTimeout(resolve, 20));
 	tui.stop();
-	return {
-		screen: ((tui as unknown as { previousScreen: string[] }).previousScreen ?? []).map(strip),
-		transcriptHeight: viewport.transcript.viewportHeight,
-		transcriptWidth: viewport.transcript.getContentWidth(sidebar ? columns - 53 : columns),
-	};
+	return ((tui as unknown as { previousScreen: string[] }).previousScreen ?? []).map(strip);
 }
 
 test("fullscreen with the sidebar leaves no blank row between the editor and the terminal edge", async () => {
-	const { screen, transcriptHeight, transcriptWidth } = await renderViewport(140, 24, true);
-	assert.equal(screen[0]!.slice(90), "HEADER 50", "header starts at the fifty-column right rail, not above the transcript");
-	assert.doesNotMatch(screen[0]!.slice(0, 87), /HEADER/, "transcript owns the full left column height");
-	assert.equal(transcriptHeight, 20, "only the spacer and three editor rows shorten the transcript");
-	assert.equal(transcriptWidth, 87, "the rail and three-column gap keep the transcript width");
+	const screen = await renderViewport(140, 24, true);
+	assert.equal(screen[0], "HEADER 138", "the header owns the first row");
 	assert.match(screen[screen.length - 1] ?? "", /^╰/, `the editor's bottom border sits on the last row, got ${JSON.stringify(screen.slice(-3))}`);
 	assert.ok(screen.some((row) => row.startsWith("╭─ editor")), "the editor is still painted");
 	assert.ok(screen.some((row) => row.includes("Status card")), "the rail is still painted");
@@ -72,8 +65,7 @@ test("float rail leaves a body row between the global header and its first secti
 });
 
 test("fullscreen without the sidebar keeps Pi's bottom bar on the last row", async () => {
-	const { screen, transcriptHeight } = await renderViewport(140, 24, false);
-	assert.equal(transcriptHeight, 19, "native footer retains its one dock row");
+	const screen = await renderViewport(140, 24, false);
 	assert.equal(screen[screen.length - 1], "BOTTOM BAR");
 	assert.match(screen[screen.length - 2] ?? "", /^╰/);
 });

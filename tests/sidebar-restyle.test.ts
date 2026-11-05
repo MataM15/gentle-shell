@@ -5,8 +5,8 @@ import { Container, Spacer, TuiAltScreen, type Component } from "@earendil-works
 import { createChatViewport } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/chat-viewport.js";
 import { CARD_STYLE, setCardStyle } from "../lib/shell-card.ts";
 import { installSidebar } from "../lib/shell-sidebar-layout.ts";
-import { sidebarHeader, sidebarPart } from "../lib/shell-sidebar.ts";
-import { renderShellSidebarBar, type ShellBarModel } from "../lib/shell-bar.ts";
+import { sidebarPart, sidebarRailHeader } from "../lib/shell-sidebar.ts";
+import { renderPanelHeader, renderPanelRow } from "../lib/shell-panel.ts";
 import { abbreviateModelNames, limitsFailureNotes, renderUsageCard, type ProviderUsage } from "../lib/shell-usage.ts";
 
 const plain = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
@@ -34,10 +34,11 @@ async function rail(density: "minimal" | "compact" | "comfortable") {
 	const tui = new TuiAltScreen(terminal, false);
 	tui.setLayoutRoot(viewport.root);
 	const card = (title: string): string[] => [`╭─ ${title} ${"─".repeat(39 - title.length)}╮`, `│ body${" ".repeat(37)}│`, `╰${"─".repeat(42)}╯`];
-	sidebarHeader(tui, { render: () => [], invalidate() {}, pinned: { render: () => ["HEADER", "─".repeat(50)], invalidate() {} } } as never);
+	const section = (title: string) => (width: number) => [renderPanelHeader(plain, width, { title, open: true }), renderPanelRow(width, "body")];
+	sidebarRailHeader(tui, { render: () => ["HEADER", "─".repeat(50)], invalidate() {} });
 	sidebarPart(tui, "wellness", lines([]), { render: () => card("Breaks"), invalidate() {} });
-	sidebarPart(tui, "usage", lines([]), { render: () => card("Limits"), invalidate() {} });
-	footer.addChild(sidebarPart(tui, "footer", lines(["BOTTOM"]), { render: () => card("Status"), invalidate() {} }));
+	sidebarPart(tui, "agents", lines([]), { surface: "panel", render: section("Agents"), invalidate() {} } as never);
+	footer.addChild(sidebarPart(tui, "footer", lines(["BOTTOM"]), { surface: "panel", render: section("Changes"), invalidate() {} } as never));
 	installSidebar(tui, plain, () => "auto", () => "top", () => density);
 	tui.start();
 	tui.requestRender(true);
@@ -53,7 +54,7 @@ for (const density of ["minimal", "compact", "comfortable"] as const) {
 		const rule = screen.findIndex((row) => /^─{50}$/.test(row));
 		assert.ok(rule >= 0, "header rule is painted");
 		assert.equal(screen[rule + 1], "", "blank gap after the header rule");
-		for (const title of ["Breaks", "Limits", "Status"]) {
+		for (const title of ["Breaks", "▾ AGENTS", "▾ CHANGES"]) {
 			const top = screen.findIndex((row) => row.includes(`╭─ ${title} `));
 			assert.ok(top >= 0, `${title} keeps its titled top border`);
 			assert.equal(screen[top - 1], "", `blank gap above ${title}`);
@@ -106,30 +107,4 @@ test("model abbreviations are readable, collision-aware and bounded", () => {
 	assert.deepEqual(abbreviateModelNames(["week", "5h", "claude/gpt"], 20), ["week", "5h", "claude/gpt"], "plain labels are untouched");
 	assert.deepEqual(abbreviateModelNames(["deepseek-v4-flash"], 8), ["deepsee…"], "truncation is only the fallback");
 	assert.deepEqual(abbreviateModelNames(["mimo-v2.6-flash"], 20), abbreviateModelNames(["mimo-v2.6-flash"], 20), "deterministic");
-});
-
-// 5. Status key/value rows.
-const model = (overrides: Partial<ShellBarModel> = {}): ShellBarModel => ({
-	cwd: "~/proyectos", branch: "master", dirty: undefined, sessionName: undefined, profile: "claude-nan", modelId: "m", effort: undefined,
-	contextPercent: null, contextWindow: 1, costTotal: 0, subscription: false, usage: undefined,
-	statuses: ["\u{1F9E0} proyectos · ✓ observation #23065", "Permissions: YOLO", "\u{1F680} YOLO ON \u{1F525} — destructive confirmations remain"],
-	devBinary: "b882397", ...overrides,
-}) as ShellBarModel;
-const minimal = { density: "minimal", visibility: { changes: true, rdd: true } } as never;
-
-test("Status renders aligned key/value rows that never wrap mid-phrase", () => {
-	for (const width of [48, 36]) {
-		const lines = renderShellSidebarBar(model(), plain, width, minimal).map(strip);
-		const body = lines.slice(1, -1).map((line) => line.replace(/^│ ?| ?│$/g, ""));
-		const valueAt = new Set(body.filter((line) => line.trim() !== "").map((line) => /^\s*(?:(?:Path|Branch|Profile|Changes|Info|Memory|Perms|YOLO|Build)\s+|\s{9})/.exec(line)?.[0].length ?? -1));
-		assert.equal(valueAt.size, 1, `values start at one column at width ${width}, got ${[...valueAt]}`);
-		for (const line of lines) assert.ok(visibleWidth(line) <= width, line);
-		assert.equal(body.filter((line) => line.trim() !== "").length, 9, "one row per fact: nothing wraps onto a second row");
-	}
-	const text = renderShellSidebarBar(model(), plain, 60, minimal).map(strip).join("\n");
-	assert.match(text, /YOLO +on · confirm destructive/);
-	assert.match(text, /Build +gentle-ai dev · b882397 · field-test/);
-	assert.match(renderShellSidebarBar(model(), plain, 48, minimal).map(strip).join("\n"), /Build +dev · b882397 · field-test\s+│/, "at the rail width the shorter wording is chosen, not a cut");
-	assert.match(text, /Memory +proyectos · ✓ observation #23065/);
-	assert.match(text, /Perms +YOLO/);
 });

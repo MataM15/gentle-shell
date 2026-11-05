@@ -35,7 +35,7 @@ import { applyVisualPreset, DEFAULT_VISUAL_SETTINGS, DENSITY, HEADER_PLACEMENT, 
 import { BANNER_COLORS, DEFAULT_BANNER_CONFIG, readBannerConfig, readBannerConfigForEdit, writeBannerConfig } from "./startup-banner.ts";
 import { commandKeymapId, commandKeymapIds, effectiveKey, keymapCommand, keymapLabel, keymapSavedNotice, loadKeymaps, prepareKeymapChange, writeKeymaps, type KeymapBindings, type PiKeybindings } from "../lib/keymaps.ts";
 import { GentleAiDevBinaryOverrideError, resolveGentleAiDevBinaryOverride } from "../lib/gentle-ai-binary.ts";
-import { DOUBLE_ESC_CANCEL_HINT, floatPromptRow, framePromptLines, panelPromptRow, resolvePromptLayout, IDLE_ESC_CLEAR_HINT, PANEL_BUTTON, PROMPT_HINT, PROMPT_STATE, SHELL_PULSE_WATCHDOG_MS, withPromptHint, type PromptState } from "../lib/shell-prompt.ts";
+import { DOUBLE_ESC_CANCEL_HINT, floatPromptRow, framePromptLines, panelPromptRow, resolvePromptLayout, IDLE_ESC_CLEAR_HINT, PANEL_BUTTON, PANEL_LABEL_TEXT, PROMPT_HINT, PROMPT_STATE, SHELL_PULSE_WATCHDOG_MS, withPromptHint, type PromptState } from "../lib/shell-prompt.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 import { oddPhaseRegistry } from "../lib/odd-phase.ts";
 import { CLAUDE_BRIDGE_PROVIDER, priceBridgeMessage } from "../lib/bridge-cost.ts";
@@ -615,6 +615,8 @@ export class GentlePromptEditor extends CustomEditor {
 	private hoveredTopRow: number | undefined;
 	private hoveredPanel = false;
 	private panelStart: number | undefined;
+	// Where `« panel` sits on the rule row, in the width it was painted at.
+	private panelLabelHit: { start: number; end: number; width: number } | undefined;
 	// Native selection engine (shift+home/end, alt+a, replace-on-key): ported
 	// from pi-select-del so the petal prompt owns the feature without factory
 	// composition. Constructed with `this`; the internals probe degrades to
@@ -1353,6 +1355,13 @@ export class GentlePromptEditor extends CustomEditor {
 	}
 
 	handleMouse(event: Parameters<CustomEditor["handleMouse"]>[0]): ReturnType<CustomEditor["handleMouse"]> {
+		// `« panel` brings a folded rail back: only its own cells, and only while it is still painted.
+		const label = this.panelLabelHit;
+		if (label && (event.type === "click" || event.type === "press") && event.button === "left" && event.y === this.topRowCount && event.width === label.width &&
+			event.x >= label.start && event.x < label.end && this.deps.panelLabel?.() && this.deps.togglePanel) {
+			if (event.type === "click") this.deps.togglePanel();
+			return { handled: true, render: event.type === "click" };
+		}
 		const onPanel = (this.deps.panelButton?.() ?? true) && this.panelStart !== undefined && this.floatMouseLayout?.panel && event.width === this.floatMouseLayout.width && event.y === this.topRowCount &&
 			event.x >= this.panelStart && event.x < this.panelStart + visibleWidth(PANEL_BUTTON);
 		if (event.type === "move" && event.button === "none") {
@@ -1444,6 +1453,7 @@ export class GentlePromptEditor extends CustomEditor {
 			workingLabel: this.promptState === PROMPT_STATE.WORKING ? this.deps.workingLabel?.() : undefined,
 			panelButton: Boolean(layout.panel && this.deps.onPanelClick && (this.deps.panelButton?.() ?? true)),
 			panelHovered: this.hoveredPanel,
+			panelLabel: layout.panel ? this.deps.panelLabel?.() : undefined,
 			escHint: [
 				this.vimPolicy === "on" ? (this.vimVisual.active ? (this.vimVisual.kind === "line" ? "VISUAL LINE" : "VISUAL") : this.vimNormal ? "NORMAL" : "INSERT") : undefined,
 				this.promptState === PROMPT_STATE.WORKING && this.isPendingEscapeCancel()
@@ -1467,6 +1477,12 @@ export class GentlePromptEditor extends CustomEditor {
 		const plainRule = stripAnsi(framed[0] ?? "");
 		const panelAt = layout.panel && this.deps.onPanelClick && (this.deps.panelButton?.() ?? true) ? plainRule.lastIndexOf(PANEL_BUTTON) : -1;
 		this.panelStart = panelAt < 0 ? undefined : visibleWidth(plainRule.slice(0, panelAt));
+		const labelAt = layout.panel && this.deps.panelLabel?.() ? plainRule.indexOf(PANEL_LABEL_TEXT) : -1;
+		this.panelLabelHit = labelAt < 0 ? undefined : (() => {
+			const start = visibleWidth(plainRule.slice(0, labelAt));
+			const hint = this.deps.panelLabel?.()?.hint;
+			return { start, end: start + visibleWidth(PANEL_LABEL_TEXT) + (hint ? 3 + visibleWidth(hint) : 0), width };
+		})();
 		if (this.panelStart === undefined && this.hoveredPanel) this.clearEditorHover();
 		framed.unshift(...topRows);
 		// Pi places autocomplete after its bottom border. Keep those rows below
@@ -1493,6 +1509,7 @@ export class GentlePromptEditor extends CustomEditor {
 	invalidate(): void {
 		super.invalidate();
 		this.panelStart = undefined;
+		this.panelLabelHit = undefined;
 		this.clearEditorHover();
 	}
 
@@ -1577,7 +1594,7 @@ type PromptFactory = NonNullable<ReturnType<ExtensionContext["ui"]["getEditorCom
 function installPrompt(
 	ctx: ExtensionContext,
 	onCreated: (prompt: GentlePromptEditor) => void,
-	promptDeps: { now: () => number; doubleEscCancelEnabled: () => boolean; dispatchQueuedText: (text: string) => void; vimRuntimeVersion?: () => string | undefined; attachments?: ImageAttachments; readClipboardImage?: () => Promise<ClipboardImage | null>; panelChrome?: (tui: TUI) => boolean; panelButton?: (tui: TUI) => boolean; topRows?: (tui: TUI, width: number, hovered?: number) => string[]; onTopRowClick?: (tui: TUI, index: number) => void; onPanelClick?: () => void },
+	promptDeps: { now: () => number; doubleEscCancelEnabled: () => boolean; dispatchQueuedText: (text: string) => void; vimRuntimeVersion?: () => string | undefined; attachments?: ImageAttachments; readClipboardImage?: () => Promise<ClipboardImage | null>; panelChrome?: (tui: TUI) => boolean; panelButton?: (tui: TUI) => boolean; topRows?: (tui: TUI, width: number, hovered?: number) => string[]; onTopRowClick?: (tui: TUI, index: number) => void; onPanelClick?: () => void; panelLabel?: (tui: TUI) => { hint?: string } | undefined; togglePanel?: () => void },
 ): boolean {
 	const previous = ctx.ui.getEditorComponent() as PromptFactory | undefined;
 	if (previous && !previous[PROMPT_OWNER]) return false;
@@ -1601,6 +1618,8 @@ function installPrompt(
 			topRows: promptDeps.topRows ? (width, hovered) => promptDeps.topRows!(tui, width, hovered) : undefined,
 			onTopRowClick: promptDeps.onTopRowClick ? (index) => promptDeps.onTopRowClick!(tui, index) : undefined,
 			onPanelClick: promptDeps.onPanelClick,
+			panelLabel: promptDeps.panelLabel ? () => promptDeps.panelLabel!(tui) : undefined,
+			togglePanel: promptDeps.togglePanel,
 		});
 		// Pi's own docs require an explicit requestRender() after a state change
 		// (docs/tui.md: "Call tui.requestRender() after state changes"); no host
@@ -2272,6 +2291,8 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		if (visualSettings.headerPlacement !== "top" || (tui as TUI & { mode?: string }).mode !== "fullscreen" || !tui.terminal) return undefined;
 		const state = sidebarState(tui);
 		if (state.active && state.ownsHost?.()) return "wide";
+		// A rail the user folded away leaves the phone chrome, whose editor offers `« panel`.
+		if (state.railAvailable?.()) return "narrow";
 		// The compact chrome replaces the bottom bar, so it only applies while the
 		// layout that draws its title row and status bar is installed.
 		if (!state.layoutAttached?.()) return undefined;
@@ -2660,9 +2681,11 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 				render(width: number) {
 					// The rail drops what the wide chrome's title row and status bar show
 					// (session, permission mode) only while that chrome actually draws.
+					// A neon rail closes on `» hide panel · alt+h`, which replaces the key-hint row.
+					const hints = statusCardVisible() && cardStyle() === CARD_STYLE.NEON ? undefined : railHints;
 					const view = statusCardVisible() && visualSettings.headerPlacement === "top"
-						? renderShellStatusSections(withStats(footerModel()), theme, width, visualSettings, railHints, { collapsed: statusCollapsed, hovered: statusHover })
-						: renderShellStatusSections(withStats({ ...footerModel(), integrations: undefined, permission: undefined }), theme, width, visualSettings, railHints, { session: true, collapsed: statusCollapsed, hovered: statusHover });
+						? renderShellStatusSections(withStats(footerModel()), theme, width, visualSettings, hints, { collapsed: statusCollapsed, hovered: statusHover })
+						: renderShellStatusSections(withStats({ ...footerModel(), integrations: undefined, permission: undefined }), theme, width, visualSettings, hints, { session: true, collapsed: statusCollapsed, hovered: statusHover });
 					statusTargets.set(width, view.targets);
 					return view.lines;
 				},
@@ -2851,7 +2874,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 				],
 				invalidate() {},
 			});
-			const uninstall = installSidebar(tui, theme, () => visualSettings.statusPlacement, () => visualSettings.headerPlacement, () => visualSettings.density);
+			const uninstall = installSidebar(tui, theme, () => visualSettings.statusPlacement, () => visualSettings.headerPlacement, () => visualSettings.density, { collapsed: () => railCollapsed, toggle: () => toggleRail(), hint: () => railPanelKey(env) });
 			const disposeStatusBar = sidebarStatusBar(tui, {
 				digest: () => footerStatus.key(),
 				render: (width) => ideChrome() || narrowChrome() ? statusBarChrome(width).rows : [],
@@ -2940,7 +2963,10 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 				topRows: (tui, width, hovered) => panelTopRows(tui, width, ctx.ui.theme, hovered),
 				// The mobile work row is the first top row; a tap on it opens the leading section's view.
 				onTopRowClick: (tui, index) => { if (chromeMode(tui) === "narrow" && index === 0) openWorkRow(tui, ctx); },
-				onPanelClick: () => { void openPanelSheet(ctx); } },
+				onPanelClick: () => { void openPanelSheet(ctx); },
+				// Only while the user folded the rail away and the layout could show it again.
+				panelLabel: (tui) => ((tui as TUI & { mode?: string }).mode === "fullscreen" && sidebarState(tui).railAvailable?.() ? { hint: railPanelKey(env) } : undefined),
+				togglePanel: () => toggleRail(ctx) },
 		);
 		imageAttachments.clear();
 		ctx.ui.setWidget(IMAGE_ATTACHMENTS_WIDGET_KEY, ownsPrompt
@@ -3070,6 +3096,14 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 				}
 				pi.sendUserMessage(`/${command}`, { expandPromptTemplates: true });
 			},
+		});
+	}
+	// `» hide panel` / `« panel`: alt+h folds and unfolds the rail (/gentle:panel opens the sheet).
+	const panelShortcut = railPanelKey(env);
+	if (panelShortcut) {
+		pi.registerShortcut(panelShortcut as Parameters<ExtensionAPI["registerShortcut"]>[0], {
+			description: "Fold or unfold the right side panel",
+			handler: async (ctx) => toggleRail(ctx),
 		});
 	}
 	const jobsKey = jobsCollapseKey(env, keymaps.bindings);
