@@ -1,16 +1,18 @@
 import type { Component, TUI } from "@earendil-works/pi-tui";
+import type { PanelSummary } from "./shell-panel.ts";
 
-// Store on the terminal, not a module singleton: extension loaders may isolate
-// modules, while Pi keeps this terminal across regular/fullscreen transitions.
-const STATE = Symbol.for("gentle-pi.experimental-sidebar.state");
-/** In-process notification after a visual preference is persisted. */
-export const VISUAL_SETTINGS_CHANGED = "gentle-pi.visual-settings-changed";
 /** Phone-width terminals: Wellness and the above-editor Agents/Todos cards stay hidden. */
 export const PHONE_COLUMNS = 60;
 export function isPhoneWidth(tui: TUI): boolean {
 	const columns = tui.terminal?.columns;
 	return typeof columns === "number" && columns > 0 && columns <= PHONE_COLUMNS;
 }
+
+// Store on the terminal, not a module singleton: extension loaders may isolate
+// modules, while Pi keeps this terminal across regular/fullscreen transitions.
+const STATE = Symbol.for("gentle-pi.experimental-sidebar.state");
+/** In-process notification after a visual preference is persisted. */
+export const VISUAL_SETTINGS_CHANGED = "gentle-pi.visual-settings-changed";
 export interface SidebarState {
 	active: boolean;
 	visibility?: { todo?: boolean };
@@ -24,31 +26,16 @@ export interface SidebarState {
 	railColumns?: number;
 	/** True while Status placement is "hidden": the bottom Status bar paints nothing at any width or mode. */
 	statusHidden?: () => boolean;
-	/**
-	 * True when the user folded the rail away (`» hide panel` / alt+h) but the
-	 * layout would show it otherwise: fullscreen, wide enough, and a Status
-	 * placement that allows it. The editor offers `« panel` only then.
-	 */
-	railAvailable?: () => boolean;
-	/**
-	 * True while the folded rail's bottom band owns the identity chrome: the rail
-	 * is folded at full width (the `railAvailable` condition). The top header, the
-	 * bottom Status bar, the standalone Breaks paint and the separate YOLO line
-	 * all step aside; the band paints Sesión and Breaks together instead.
-	 */
-	foldedBand?: () => boolean;
 	/** True while a painting top header is the only status row of a narrow fullscreen terminal: the bottom Status bar steps aside. */
 	headerOwnsStatus?: () => boolean;
-	/**
-	 * True while the rail is folded at full width and a top header paints: the
-	 * header carries the session identity and counters, so the bottom Status bar
-	 * keeps only the jobs count and extension statuses instead of repeating them.
-	 */
-	headerOwnsIdentity?: () => boolean;
-	/** Whether the current rail presents the Status section. */
-	statusSectionVisible?: () => boolean;
-	/** Whether Limits and Status are presented together in the current rail. */
-	limitsAlongsideStatus?: () => boolean;
+	/** True while a narrow fullscreen terminal folds live work into the mobile work row: the Todos and Agents cards step aside. */
+	compactWork?: () => boolean;
+	/** True while the IDE chrome's status bar shows the permission mode: the above-editor YOLO banner steps aside. */
+	statusBarShowsMode?: () => boolean;
+	/** True while the fullscreen layout is installed on the host's root, so its title row and status bar can actually draw. */
+	layoutAttached?: () => boolean;
+	/** Current shell-owned pointer hover; shared across separately loaded extensions. */
+	hover?: { owner: object; clear: () => void };
 	parts: Map<string, SidebarRail>;
 }
 
@@ -61,41 +48,50 @@ export interface SidebarRail extends Component {
 	 * one; explicit invalidateSidebar() stays for discrete state changes.
 	 */
 	digest?(): string;
-	/** Optional session-local counts used by the pinned activity summary. */
-	activitySummary?(): { active: number; attention: number };
-	commandsCount?(): number | undefined;
-	waitsCount?(): number | undefined;
-}
-/** The header slot: one part, painted as the narrow top row or pinned above the wide rail. */
-export interface SidebarHeaderRail extends SidebarRail {
 	/**
-	 * Rail-width rendering and hit testing for the pinned wide header. Its
-	 * state is covered by the header's digest. Defaults to the part itself.
+	 * "panel" sections render IDE-like panel rows (lib/shell-panel.ts) and the
+	 * rail paints them, padding included, on one shared surface; others are
+	 * cards that carry their own chrome.
 	 */
-	pinned?: Component;
+	surface?: "panel";
+	/** A one-row digest for the mobile work row; undefined when the section has nothing live. */
+	summary?(): PanelSummary | undefined;
+	/** Opens the section's own view (Agents: /gentle:agents); a tap on the mobile work row runs it when this section leads the row. */
+	open?(): void;
+	/** "Needs you" rows the panel editor draws right above its rule (an agent asking the user); [] when none. */
+	alert?(width: number): string[];
+	/** What this section's work spent (the Agents section: started subagents), for the Stats section. */
+	spend?(): { runs: number; tokens: number; cost: number } | undefined;
 }
 export function sidebarState(tui: TUI): SidebarState {
 	const terminal = tui.terminal as unknown as Record<symbol, SidebarState>;
 	return terminal[STATE] ??= { active: false, parts: new Map() };
 }
 
-/**
- * Keep the original bottom component mounted, suppressing only its paint.
- * A folded rail (`railAvailable`) keeps the Todos card hidden rather than
- * moving it above the prompt.
- */
+/** Transfer shell hover ownership without clearing an unchanged owner. */
+export function setSidebarHover(tui: TUI, owner?: object, clear?: () => void): void {
+	if (!tui.terminal) return;
+	const state = sidebarState(tui);
+	if (state.hover?.owner === owner) return;
+	const previous = state.hover;
+	state.hover = owner && clear ? { owner, clear } : undefined;
+	previous?.clear();
+}
+
+/** Forget a disposed or invalidated owner without disturbing another surface. */
+export function releaseSidebarHover(tui: TUI, owner: object): void {
+	if (tui.terminal && sidebarState(tui).hover?.owner === owner) sidebarState(tui).hover = undefined;
+}
+
+/** Keep the original bottom component mounted, suppressing only its paint. */
 export function sidebarPart<T extends Component & { dispose?(): void }>(tui: TUI, key: string, bottom: T, rail: SidebarRail = bottom): T {
 	// Minimal extension hosts cannot share terminal-owned layout state.
 	if (!tui.terminal) return bottom;
 	const state = sidebarState(tui);
 	state.parts.set(key, rail);
-	// Hide only the bottom copies. Rail registrations, tasks and their updates
-	// remain live; columns are read on every paint and pointer dispatch.
-	const phoneHidden = () => (key === "agents" || key === "todo") && isPhoneWidth(tui);
 	return {
 		...bottom,
-		render: (width: number) => phoneHidden() || (key === "todo" && (state.visibility?.todo === false || state.railAvailable?.() === true)) || (key === "footer" && (state.statusHidden?.() || state.headerOwnsStatus?.())) || ((key === "footer" || key === "wellness") && state.foldedBand?.() === true) || (state.active && state.ownsHost?.()) ? [] : bottom.render(width),
-		...(bottom.handleMouse ? { handleMouse: (event: Parameters<NonNullable<Component["handleMouse"]>>[0]) => phoneHidden() ? undefined : bottom.handleMouse?.(event) } : {}),
+		render: (width: number) => (key === "todo" && state.visibility?.todo === false) || (key === "footer" && (state.statusHidden?.() || state.headerOwnsStatus?.() || state.compactWork?.())) || ((key === "todo" || key === "agents") && state.compactWork?.()) || (state.active && state.ownsHost?.()) ? [] : bottom.render(width),
 		dispose() {
 			if (state.parts.get(key) === rail) state.parts.delete(key);
 			bottom.dispose?.();
@@ -104,18 +100,32 @@ export function sidebarPart<T extends Component & { dispose?(): void }>(tui: TUI
 }
 
 /**
- * Register the fullscreen header: pinned above the wide right rail's
- * scrollable cards, or the top row of a narrow fullscreen terminal. It
+ * Register the fullscreen header rail: the one row above the hstack that
  * carries the brand, session identity, and the per-frame counters. There is
- * no regular-mode bottom counterpart — the compact bar already carries this
+ * no narrow-mode bottom counterpart — the compact bar already carries this
  * data when the sidebar is inactive — so this only ever writes the "header"
  * slot in sidebarState(tui).parts, and returns its own disposer.
  */
-export function sidebarHeader(tui: TUI, rail: SidebarHeaderRail): () => void {
+export function sidebarHeader(tui: TUI, rail: SidebarRail): () => void {
 	if (!tui.terminal) return () => {};
 	const state = sidebarState(tui);
 	state.parts.set("header", rail);
 	return () => {
 		if (state.parts.get("header") === rail) state.parts.delete("header");
+	};
+}
+
+/**
+ * Register the fullscreen status bar: one full-width row below the transcript
+ * and the rail while the rail is shown. Below the breakpoint it paints nothing;
+ * the compact bar carries the same data there. Writes the "statusbar" slot and
+ * returns its own disposer.
+ */
+export function sidebarStatusBar(tui: TUI, rail: SidebarRail): () => void {
+	if (!tui.terminal) return () => {};
+	const state = sidebarState(tui);
+	state.parts.set("statusbar", rail);
+	return () => {
+		if (state.parts.get("statusbar") === rail) state.parts.delete("statusbar");
 	};
 }

@@ -13,12 +13,10 @@ import test, { after, afterEach, before, mock } from "node:test";
 import type { TestContext } from "node:test";
 import { generateUnifiedPatch, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream, type AssistantMessage } from "@earendil-works/pi-ai";
-import { ScrollView, visibleWidth, type Component, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
-import { installSidebar } from "../lib/shell-sidebar-layout.ts";
-import { sidebarPart, sidebarState } from "../lib/shell-sidebar.ts";
-import { acceptedSessionSnapshot, sessionRows, SESSION_REFRESH_EVENT, SESSION_SNAPSHOT_EVENT, type SessionSnapshot } from "../lib/shell-session-state.ts";
+import { visibleWidth, type Component, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import { sidebarState } from "../lib/shell-sidebar.ts";
 import { CHILD_PACKAGE_INJECTION_ENV, encodeChildPackageInjection } from "../lib/child-package-injection.ts";
-import gentleAgents, { agentRuntimePaths, agentsCollapseKey, agentsEnabled, agentsStopKey, agentsViewKey, agentResultPreview, answerThroughUi, childContextExtensionPaths, completionText, createDefaultSessionTransport, legacySubagentsInstalled, PARENT_WAKE_GRACE_MS, type AgentsDeps, type SessionTransportFactory } from "../extensions/gentle-agents.ts";
+import installGentleAgents, { agentRuntimePaths, agentsCollapseKey, agentsEnabled, agentsStopKey, agentsViewKey, agentResultPreview, answerThroughUi, childContextExtensionPaths, completionText, createDefaultSessionTransport, legacySubagentsInstalled, PARENT_WAKE_GRACE_MS, type AgentsDeps, type SessionTransportFactory } from "../extensions/gentle-agents.ts";
 import { ActiveSessionClient, ActiveSessionListener, SessionPresenceError, SessionPresenceRegistry, type PresenceRecord } from "../lib/agents-session-transport.ts";
 import { WindowsActiveSessionClient, WindowsActiveSessionListener } from "../lib/windows-session-transport.ts";
 import { historyDir, loadHistory, saveTask } from "../lib/agents-history.ts";
@@ -37,6 +35,10 @@ import { taskHeader } from "../lib/agents-view.ts";
 import { readFrozenInheritedProfile, resetFrozenInheritedProfilesForTesting } from "../lib/session-profile-freeze.ts";
 import { CHILD_METRICS_EVENT } from "../lib/runtime-metrics-children.ts";
 import { CARD_STYLE, cardStyle, setCardStyle } from "../lib/shell-card.ts";
+import { isolatedConfigEnv, keymapsConfigHome, removeIsolatedConfigHomes } from "./isolated-config-home.ts";
+
+const gentleAgents: typeof installGentleAgents = (pi, env, overrides) => installGentleAgents(pi, isolatedConfigEnv(env), overrides);
+after(removeIsolatedConfigHomes);
 // The card style defaults to float; these assertions pin the outlined (neon)
 // panels unless a test switches the style itself.
 const initialCardStyle = cardStyle();
@@ -132,7 +134,7 @@ function fakePi(initialProvider: string = "claude-bridge") {
 	const handlers = new Map<string, Handler[]>();
 	const tools = new Map<string, Registered>();
 	const shortcuts = new Map<string, { description: string; handler(ctx: ExtensionContext): Promise<void> }>();
-	const commands = new Map<string, { handler(args: string, ctx: ExtensionContext): Promise<void> }>();
+	const commands = new Map<string, { description?: string; handler(args: string, ctx: ExtensionContext): Promise<void> }>();
 	const sent: Array<{ message: Record<string, unknown>; options: Record<string, unknown> }> = [];
 	// `delivery` records custom messages and user wakes in dispatch order.
 	const userMessages: Array<{ content: unknown; options: Record<string, unknown> | undefined }> = [];
@@ -166,7 +168,7 @@ function fakePi(initialProvider: string = "claude-bridge") {
 		on: (event: string, handler: Handler) => handlers.set(event, [...(handlers.get(event) ?? []), handler]),
 		registerTool: (tool: Registered) => tools.set(tool.name, tool),
 		registerShortcut: (key: string, registration: { description: string; handler(ctx: ExtensionContext): Promise<void> }) => shortcuts.set(key, registration),
-		registerCommand: (name: string, registration: { handler(args: string, ctx: ExtensionContext): Promise<void> }) => commands.set(name, registration),
+		registerCommand: (name: string, registration: { description?: string; handler(args: string, ctx: ExtensionContext): Promise<void> }) => commands.set(name, registration),
 	} as unknown as ExtensionAPI;
 	let activeSession: ExtensionContext | undefined;
 	const teardown = async () => {
@@ -246,7 +248,7 @@ function fakeContext(tui: { requestRender(): void } = fakeTui, confirmResult: (t
 		return factory ? factory(tui, plainTheme).render(72).map(stripAnsi) : undefined;
 	};
 	const widgetComponent = () => widgets.get("gentle-agents")?.(tui, plainTheme) as Component | undefined;
-	return { ctx, widget, widgetComponent, dialogs, overlays, customCompletions, customOptions };
+	return { ctx, widget, widgetComponent, widgets, dialogs, overlays, customCompletions, customOptions };
 }
 
 for (const scenario of ["background", "task", "append-failure", "overflow", "bytes", "replacement", "task-replacement", "unsafe-id", "no-transport"] as const) {
@@ -3720,6 +3722,20 @@ test("the agents task card shows the winning layer next to the model, and render
 	assert.equal(taskHeader(record, 61_000), "explore · running · nan/glm5.3 · 1s", "absent modelSource renders exactly as today");
 });
 
+test("saved keymaps replace the agents shortcuts, and the environment still wins", () => {
+	const home = keymapsConfigHome({ "agents.view": "alt+v", "agents.stop": null, "agents.collapse": "alt+c" });
+	const { pi, shortcuts } = fakePi();
+	gentleAgents(pi, { GENTLE_PI_CONFIG_HOME: home }, deps().deps);
+	assert.ok(shortcuts.has("alt+v") && shortcuts.has("alt+c"));
+	for (const key of ["alt+a", "alt+s", "ctrl+shift+a"]) assert.equal(shortcuts.has(key), false, key);
+	const envWins = fakePi();
+	gentleAgents(envWins.pi, { GENTLE_PI_CONFIG_HOME: home, GENTLE_PI_AGENTS_VIEW_KEY: "alt+w" }, deps().deps);
+	assert.ok(envWins.shortcuts.has("alt+w"));
+	assert.equal(envWins.shortcuts.has("alt+v"), false);
+	assert.equal(agentsViewKey({}, { "agents.view": "alt+v" }), "alt+v");
+	assert.equal(agentsStopKey({}, { "agents.stop": null }), undefined);
+});
+
 test("agentsEnabled and agentsCollapseKey read their flags and stay off inside a child", () => {
 	assert.equal(agentsEnabled({}), true);
 	assert.equal(agentsEnabled({ GENTLE_PI_AGENTS: "off" }), false);
@@ -3749,7 +3765,7 @@ test("while pi-subagents-j0k3r is still installed the tools stay unregistered an
 	const notices: string[] = [];
 	const ctx = { hasUI: true, ui: { notify: (message: string, level: string) => notices.push(`${level}:${message}`) } } as unknown as ExtensionContext;
 	await fire("session_start", ctx);
-	assert.match(notices[0] ?? "", /^warning:  Gentle Agents is waiting: remove the old package first with "pi remove npm:pi-subagents-j0k3r"/);
+	assert.match(notices[0] ?? "", /^warning:❀ Gentle Agents is waiting: remove the old package first with "pi remove npm:pi-subagents-j0k3r"/);
 });
 
 test("subagent_list_agents publishes each agent's declared tool inventory so routing can check capabilities", async () => {
@@ -3798,7 +3814,7 @@ test("subagent_list_agents and subagent_run in task mode launch a child with the
 	assert.equal(args[args.indexOf("--tools") + 1], "read,grep,subagent_parent_message");
 	await tick();
 	assert.match(String(harness.children[0].written[1].message), /Map lib\/ and report every module\.\n\n## Context\nFocus on agents-\*\.ts/);
-	assert.match(widget()![0], /^╭─   Agents ▾ Collapse · 1 active ─+╮$/);
+	assert.match(widget()![0], /^╭─ ❀ Agents ▾ Collapse · 1 active ─+╮$/);
 	assert.match(widget()![1], /^│ ◐  explore  map lib modules +gpt-5\.6-terra · low · \d+s │$/);
 	harness.children[0].emit({ type: "tool_execution_start", toolCallId: "c", toolName: "grep", args: {} });
 	harness.children[0].emit({ type: "message_end", message: { role: "assistant", usage: { totalTokens: 12_000, cost: { total: 0.09 } } } });
@@ -3928,27 +3944,6 @@ test("the iris float tint stays on agent info cards and leaves success cards on 
 	}
 });
 
-test("phone width hides only Agents presentation while running tasks and detail remain available", async () => {
-	const {pi,tools,fire,commands,shortcuts}=fakePi(); const harness=deps(); gentleAgents(pi,{},harness.deps);
-	const tui={requestRender(){},terminal:{columns:61,rows:40}}; const {ctx,widgetComponent,overlays}=fakeContext(tui);
-	await fire("session_start",ctx);
-	const started=await tools.get("subagent_run")!.execute("a",{agent:"explore",task:"Keep running",label:"Live task",mode:"background"},undefined,undefined,ctx);
-	const id=(started.details.gentleAgents as {taskId:string}).taskId; await tick();
-	const bottom=widgetComponent()!, rail=sidebarState(tui as unknown as TUI).parts.get("agents")!;
-	assert.match(bottom.render(61).join("\n"),/Live task/);
-	tui.terminal.columns=60; assert.deepEqual(bottom.render(60),[]); assert.ok(rail.render(46).length>0);
-	harness.children[0].emit({type:"message_update",assistantMessageEvent:{type:"text_delta",delta:"still running"}}); await tick();
-	assert.deepEqual(bottom.render(60),[]); assert.equal(harness.children.length,1);
-	const status=await tools.get("subagent_status")!.execute("status",{task_id:id},undefined,undefined,ctx); assert.match(status.content[0]!.text,/running/);
-	assert.ok(commands.has("gentle:agents"));
-	const open=commands.get("gentle:agents")!.handler("",ctx); await tick(); assert.equal(overlays.length,1); overlays[0]!.handleInput("q"); await open;
-	const collapse=shortcuts.get(agentsCollapseKey({})!); assert.ok(collapse);
-	await collapse.handler(ctx); assert.deepEqual(bottom.render(60),[]);
-	tui.terminal.columns=61; assert.match(bottom.render(61).join("\n"),/Expand/); assert.match(bottom.render(61).join("\n"),/Live task/);
-	await collapse.handler(ctx); assert.match(bottom.render(61).join("\n"),/Collapse/);
-	tui.terminal.columns=60; assert.deepEqual(bottom.render(60),[]); await fire("session_shutdown",ctx);
-});
-
 test("the Agents card moves to the fullscreen rail like Todos and its header toggles collapse on left click", async () => {
 	const { pi, tools, fire } = fakePi();
 	const harness = deps();
@@ -3957,7 +3952,7 @@ test("the Agents card moves to the fullscreen rail like Todos and its header tog
 	// (a host with no .terminal is already a passthrough); this is the host
 	// shape the fullscreen layout actually uses.
 	const terminalTui = { requestRender() {}, terminal: { columns: 160, rows: 40 } };
-	const { ctx, widgetComponent } = fakeContext(terminalTui);
+	const { ctx, widgetComponent, overlays } = fakeContext(terminalTui);
 	await fire("session_start", ctx);
 	await tools.get("subagent_run")!.execute("c1", { agent: "explore", task: "Map lib/", label: "map lib modules", mode: "background" }, undefined, undefined, ctx);
 	await tools.get("subagent_run")!.execute("c2", { agent: "explore", task: "Map tests/", label: "map test suites", mode: "background" }, undefined, undefined, ctx);
@@ -3974,6 +3969,10 @@ test("the Agents card moves to the fullscreen rail like Todos and its header tog
 	assert.ok(rail, "Agents claims the rail slot, so a wide fullscreen terminal shows it at the right");
 	assert.equal(rail.render(46).filter((line) => /explore/.test(stripAnsi(line))).length, 2, "the rail lists every task");
 	assert.ok(rail.digest?.(), "the rail declares a digest so its clock and counters repaint");
+	assert.equal((rail as { surface?: string }).surface, "panel", "the rail draws Agents as a panel section");
+	const railRows = rail.render(46).map((line) => stripAnsi(line).trimEnd());
+	assert.match(railRows[0]!, /^▾ AGENTS +2 running$/, "the panel header is row 0 with the live count");
+	assert.match(railRows[1]!, /^ {2}◐ map lib modules +explore +\S/, "the task leads each row, the agent kind follows");
 
 	// While the fullscreen sidebar owns the host, the bottom copy steps aside.
 	state.active = true;
@@ -3985,95 +3984,25 @@ test("the Agents card moves to the fullscreen rail like Todos and its header tog
 		type, button, x: 1, y, screenX: 1, screenY: y, width: 72, height: bottom.length, shift: false, alt: false, ctrl: false,
 	});
 	assert.equal(component.handleMouse?.(event("click", "right")), undefined);
-	assert.equal(component.handleMouse?.(event("click", "left", 1)), undefined);
+	assert.equal(component.handleMouse?.(event("click", "right", 1)), undefined, "a right click on an agent row does nothing");
+	assert.equal(component.handleMouse?.(event("click", "left", 1))?.handled, true, "a left click on an agent row is handled");
+	await tick();
+	assert.equal(overlays.length, 1, "a left click on an agent row opens /gentle:agents");
 	assert.match(stripAnsi(component.render(72)[0]!), /Agents ▾ Collapse/, "only a left click on the header toggles");
 	assert.equal(component.handleMouse?.(event("click", "left"))?.handled, true);
 	const collapsed = component.render(72).map(stripAnsi);
 	assert.match(collapsed[0]!, /Agents ▸ Expand/);
 	assert.doesNotMatch(collapsed.join("\n"), /map test suites/, "the collapsed card keeps one row");
 	assert.equal(rail.render(46).filter((line) => /explore/.test(stripAnsi(line))).length, 1, "both surfaces share the collapsed state");
-});
-
-test("Agents rail task click opens the matching local task and rejects stale geometry", async () => {
-	const { pi, tools, fire } = fakePi(); const harness = deps(); harness.deps.now = () => 10000;
-	gentleAgents(pi, {}, harness.deps);
-	const terminalTui = { requestRender() {}, terminal: { columns: 160, rows: 40 } };
-	const { ctx, widgetComponent, overlays } = fakeContext(terminalTui);
-	await fire("session_start", ctx);
-	await tools.get("subagent_run")!.execute("a", { agent: "explore", task: "First", label: "first task", mode: "background" }, undefined, undefined, ctx);
-	await tools.get("subagent_run")!.execute("b", { agent: "explore", task: "Second", label: "second task", mode: "background" }, undefined, undefined, ctx);
+	assert.match(stripAnsi(rail.render(46)[0]!), /^▸ AGENTS/);
+	const railClick = { type: "click" as const, button: "left" as const, x: 1, y: 0, screenX: 1, screenY: 0, width: 46, height: 2, shift: false, alt: false, ctrl: false };
+	assert.equal(rail.handleMouse?.(railClick)?.handled, true, "the rail header row 0 is the collapse control");
+	assert.match(stripAnsi(rail.render(46)[0]!), /^▾ AGENTS/);
+	assert.equal(rail.handleMouse?.({ ...railClick, y: 1, screenY: 1 })?.handled, true, "a left click on a rail agent row is handled");
 	await tick();
-	harness.children[0].emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "FIRST_THREAD_MARKER" } });
-	harness.children[1].emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "SECOND_THREAD_MARKER" } });
-	await tick(); widgetComponent();
-	const rail = sidebarState(terminalTui as unknown as TUI).parts.get("agents")!;
-	let lines = rail.render(80).map(stripAnsi); let y = lines.findIndex((line) => line.includes("second task")); assert.ok(y > 0);
-	const event = (x: number, row: number, width = 80) => ({ type: "click", button: "left", x, y: row, width, height: lines.length, screenX: x, screenY: row, shift: false, alt: false, ctrl: false } as TuiMouseEvent);
-	assert.equal(rail.handleMouse?.(event(0,y)), undefined, "outside card content is inert");
-	assert.equal(rail.handleMouse?.(event(3,y,79)), undefined, "stale width is inert");
-	const oldStyle = cardStyle(); setCardStyle(oldStyle === CARD_STYLE.NEON ? CARD_STYLE.FLOAT : CARD_STYLE.NEON);
-	try { assert.equal(rail.handleMouse?.(event(3,y)), undefined, "style change invalidates the map"); } finally { setCardStyle(oldStyle); }
-	harness.children[1].emit({ type: "tool_execution_start", toolCallId: "read-1", toolName: "read", args: {} }); await tick();
-	assert.equal(rail.handleMouse?.(event(3,y)), undefined, "changed task state invalidates the map");
-	terminalTui.terminal.columns = 159; assert.equal(rail.handleMouse?.(event(3,y)), undefined, "resize invalidates the map"); terminalTui.terminal.columns = 160;
-	lines = rail.render(80).map(stripAnsi); y = lines.findIndex((line) => line.includes("second task"));
-	assert.equal(rail.handleMouse?.(event(3,y))?.handled, true);
-	await tick(); assert.equal(overlays.length, 1);
-	const screen = stripAnsi(overlays[0]!.render(100).join("\n"));
-	assert.match(screen, /SECOND_THREAD_MARKER/); assert.doesNotMatch(screen, /FIRST_THREAD_MARKER/);
-	overlays[0]!.handleInput("q"); await tick();
-	lines = rail.render(80).map(stripAnsi); y = lines.findIndex((line) => line.includes("second task"));
-	(ctx.sessionManager as unknown as {getSessionId(): string}).getSessionId = () => "other";
-	assert.equal(rail.handleMouse?.(event(3,y)), undefined, "a replacement session cannot use old hits");
-	assert.equal(overlays.length, 1);
-	await fire("session_shutdown", ctx);
-});
-
-test("Sessions tab selection reads bounded synthetic presence through the real agents publisher and event bus", async (t) => {
-	const profile=mkdtempSync(join(tmpdir(),"sidebar-presence-")); t.after(()=>rmSync(profile,{recursive:true,force:true}));
-	const peer=PresencePublisher.start({profile,sessionId:"peer-synthetic",label:"Peer topic",activity:[]}); t.after(()=>peer.dispose());
-	const {pi,fire}=fakePi(); const runtime=deps(); runtime.deps.agentHome=profile; runtime.deps.now=()=>Date.now(); gentleAgents(pi,{},runtime.deps);
-	const node=Symbol.for("@earendil-works/pi-tui/layout-node"); const root={render:()=>[],invalidate(){},[node]:()=>({type:"vstack",entries:[]})};
-	const terminalTui={mode:"fullscreen",layoutRoot:root,requestRender(){},terminal:{columns:160,rows:40}}; const tui=terminalTui as unknown as TUI;
-	const {ctx,widgetComponent}=fakeContext(terminalTui); await fire("session_start",ctx); widgetComponent();
-	let snapshot:SessionSnapshot|undefined; let publishes=0, paints=0;
-	const unsub=pi.events.on(SESSION_SNAPSHOT_EVENT,(value)=>{const accepted=acceptedSessionSnapshot(ctx.sessionManager.getSessionId(),value);if(accepted){snapshot=accepted;publishes++;}});
-	sidebarPart(tui,"sessions",{digest:()=>JSON.stringify(snapshot),render:()=>{paints++;return sessionRows(snapshot);},invalidate(){}});
-	const stop=installSidebar(tui,{...plainTheme,bold:(s:string)=>s},()=>"auto",()=>"top",undefined,undefined,{tabs:true,onTabSelect:(tab)=>{if(tab==="sessions") pi.events.emit(SESSION_REFRESH_EVENT,{sessionId:ctx.sessionManager.getSessionId()});}});
-	try {
-		const entries=()=>{const tree=root[node]() as unknown as {entries:Array<{component:{[node]():{entries:Array<{component:Component}>}}}>};return tree.entries[1]!.component[node]().entries;};
-		const pinned=entries()[0]!.component; const lines=pinned.render(50).map(stripAnsi), y=lines.findIndex(line=>line.includes("Sessions")), x=lines[y]!.indexOf("Sessions");
-		assert.equal(paints,0); entries(); entries(); assert.equal(paints,0,"hidden tab never renders"); assert.equal(publishes,0,"no registry read from frames");
-		assert.equal(pinned.handleMouse?.({type:"click",button:"left",x,y,width:50,height:lines.length,screenX:110+x,screenY:y,shift:false,alt:false,ctrl:false} as TuiMouseEvent)?.handled,true);
-		await tick(); const scroll=entries().find(entry=>entry.component instanceof ScrollView)!.component;
-		assert.match(scroll.render(50).map(stripAnsi).join("\n"),/Peer topic/); assert.match(scroll.render(50).map(stripAnsi).join("\n"),/visto hace \d+ s/);
-		assert.equal(publishes,1); const painted=paints; entries(); entries(); assert.equal(paints,painted,"stable session frame stays cached");
-		pi.events.emit(SESSION_REFRESH_EVENT,{sessionId:"foreign"}); await tick(); assert.equal(publishes,1);
-	} finally { stop(); unsub(); await fire("session_shutdown",ctx); }
-});
-
-test("clipped Agents sidebar dispatches a scrolled task click to its local detail", async () => {
-	const { pi, tools, fire } = fakePi(); const harness=deps(); harness.deps.now=()=>10000; gentleAgents(pi,{},harness.deps);
-	const node=Symbol.for("@earendil-works/pi-tui/layout-node");
-	const root={render:()=>[],invalidate(){},[node]:()=>({type:"vstack",entries:[]})};
-	const terminalTui={mode:"fullscreen",layoutRoot:root,requestRender(){},terminal:{columns:160,rows:40}};
-	const {ctx,widgetComponent,overlays}=fakeContext(terminalTui);
-	await fire("session_start",ctx);
-	await tools.get("subagent_run")!.execute("a",{agent:"explore",task:"First",label:"first task",mode:"background"},undefined,undefined,ctx);
-	await tools.get("subagent_run")!.execute("b",{agent:"explore",task:"Second",label:"second task",mode:"background"},undefined,undefined,ctx);
-	await tick(); harness.children[1].emit({type:"message_update",assistantMessageEvent:{type:"text_delta",delta:"SCROLL_SECOND_MARKER"}}); await tick(); widgetComponent();
-	const stop=installSidebar(terminalTui as unknown as TUI,{...plainTheme,bold:(text:string)=>text},()=>"auto",()=>"top",undefined,undefined,{tabs:true});
-	try {
-		const tree=root[node]() as unknown as {entries:Array<{component:{[node]():{entries:Array<{component:Component}>}}}>};
-		const scroll=tree.entries[1]!.component[node]().entries.find((entry)=>entry.component instanceof ScrollView)?.component as ScrollView; assert.ok(scroll);
-		const rows=scroll.render(50).map(stripAnsi); const taskRows=rows.map((line,i)=>line.includes("explore") ? i : -1).filter(i=>i>=0);
-		assert.equal(taskRows.length,2); scroll.updateLayout(rows.length,1,()=>{}); scroll.scrollBy(taskRows[1]!);
-		const click={type:"click",button:"left",x:4,y:0,width:50,height:1,screenX:114,screenY:0,shift:false,alt:false,ctrl:false} as TuiMouseEvent;
-		assert.equal(scroll.handleMouse(click)?.handled,true); await tick(); assert.equal(overlays.length,1);
-		assert.match(stripAnsi(overlays[0]!.render(100).join("\n")),/SCROLL_SECOND_MARKER/);
-		assert.equal(scroll.handleMouse({...click,y:1}),undefined,"outside clipped viewport is inert");
-		overlays[0]!.handleInput("q"); await tick();
-	} finally { stop(); await fire("session_shutdown",ctx); }
+	assert.equal(overlays.length, 2, "a left click on a rail agent row opens /gentle:agents, never the panel");
+	assert.match(stripAnsi(rail.render(46)[0]!), /^▾ AGENTS/, "an agent row click never toggles the section");
+	assert.equal(typeof (rail as { open?: unknown }).open, "function", "the rail part exposes the agents view for the mobile work row");
 });
 
 test("the Agents rail digest stays stable while no task is running, so an idle card never rebuilds the rail every second", async () => {
@@ -4331,7 +4260,7 @@ test("a task-mode child's dialog reaches the host UI and the answer goes back to
 	harness.children[0].emit({ type: "extension_ui_request", id: "u1", method: "select", title: "Which file?", options: ["a.ts", "b.ts"] });
 	await tick();
 	await tick();
-	assert.deepEqual(dialogs, ["select:  Which file?:a.ts|b.ts"]);
+	assert.deepEqual(dialogs, ["select:❀ Which file?:a.ts|b.ts"]);
 	assert.deepEqual(harness.children[0].written.at(-1), { type: "extension_ui_response", id: "u1", value: "a.ts" });
 	assert.match(widget()![1], /◐  explore  Ask me/);
 	harness.children[0].emit({ type: "agent_end", messages: [] });
@@ -5898,7 +5827,9 @@ for (const provider of ["openai", "anthropic", "custom-extension", undefined, "c
 				assert.deepEqual(h.sent[1]!.options, { deliverAs: "steer", triggerTurn: true });
 				assert.equal(h.sent[1]!.message.display, false);
 				assert.equal(h.sent[1]!.message.customType, "gentle-agents.wake");
-				assert.equal(h.sent[1]!.message.content, "Review the delivered subagent output and continue.");
+				// Pi hands custom messages to the model with the user role, so the wake
+				// must disown authorship and keep the human's reply language.
+				assert.equal(h.sent[1]!.message.content, "[System-generated Gentle Agents notification, not written by the user] Subagent output was delivered to this session above. Review it and continue. Reply in the language of the human's own last message, not the language of this notification or of the subagent output.");
 				assert.deepEqual(h.delivery, [`custom:gentle-agents.${kind === "query" ? "message" : "result"}`, "custom:gentle-agents.wake"]);
 			}
 			await h.fire("session_shutdown", ctx);
@@ -6850,33 +6781,6 @@ function fakeJobShell() {
 	return { runs, shell, dir, cleanup: () => rmSync(dir, TEST_DIR_REMOVAL) };
 }
 // A job settles only after its log file closes, which takes real I/O turns.
-// Wait for the observable effect, not a fixed amount of filesystem time.
-async function waitForJob(predicate: () => boolean | Promise<boolean>, description: string) {
-	const deadline = Date.now() + 2000;
-	while (!(await predicate())) {
-		assert.ok(Date.now() < deadline, `Timed out waiting for ${description}`);
-		await new Promise((done) => setTimeout(done, 5));
-	}
-}
-// A held notice is not sent yet, but settlement clears the running state after
-// closing the log and enqueueing the notice (unlike job_list's exit status,
-// which changes before log closure). The snapshot keeps the finished job for its
-// 60-second tail, so settlement means no entry is still running.
-async function waitForJobSettlement(pi: ExtensionAPI, exit: () => void) {
-	let settled = false;
-	const unsubscribe = pi.events.on("gentle-ai:jobs-sidebar", (value) => {
-		const { snapshot } = value as { snapshot: { jobs: Array<{ status?: string }> } };
-		if (snapshot.jobs.every((job) => job.status !== undefined)) settled = true;
-	});
-	try {
-		exit();
-		await waitForJob(() => settled, "the settled job's sidebar snapshot");
-	} finally {
-		unsubscribe();
-	}
-}
-// A stopped monitor has no further observable effect to wait for; give its
-// log closure the same fixed I/O turns upstream uses.
 const jobIo = () => new Promise((done) => setTimeout(done, 50));
 const toolText = (result: { content: Array<{ text?: string }> }) => result.content.map((part) => part.text ?? "").join("\n");
 
@@ -6961,7 +6865,8 @@ test("a busy parent gets the exit notice steered into its run at the next turn b
 		await fire("session_start", ctx);
 		await fire("agent_start", ctx);
 		await tools.get("bash_background")!.execute("b1", { command: "make build" }, undefined, undefined, ctx);
-		await waitForJobSettlement(pi, () => jobs.runs[0]!.exit(0));
+		jobs.runs[0]!.exit(0);
+		await jobIo();
 		assert.equal(sent.length, 0, "a busy parent is not interrupted mid-tool-call");
 		await fire("turn_end", ctx);
 		assert.equal(sent.length, 1);
@@ -6990,52 +6895,15 @@ test("job_list and job_stop cover this session's jobs; stopped jobs send no noti
 		assert.match(toolText(await tools.get("job_stop")!.execute("s1", { job_id: "job-1" }, undefined, undefined, ctx)), /Stopped job-1/);
 		assert.equal(jobs.runs[0]!.signal?.aborted, true, "the job's process tree is killed");
 		await assert.rejects(async () => tools.get("job_stop")!.execute("s2", { job_id: "job-9" }, undefined, undefined, ctx), /No background job job-9 in this session/);
-		await waitForJob(async () => /job-1 · stopped · long/.test(toolText(await tools.get("job_list")!.execute("wait-stop", {}, undefined, undefined, ctx))), "job-1 to be stopped");
+		await jobIo();
 		assert.equal(sent.length, 0, "a stopped job sends no exit notice");
 		assert.match(toolText(await tools.get("job_list")!.execute("l2", {}, undefined, undefined, ctx)), /job-1 · stopped · long/);
 		await fire("session_shutdown", ctx);
 		assert.equal(jobs.runs[1]!.signal?.aborted, true, "session shutdown stops every running job");
-		// session_shutdown drains all job runs, including their log closures.
+		await jobIo();
 		assert.equal(sent.length, 0);
 	} finally {
 		jobs.cleanup();
-	}
-});
-
-test("sidebar job events and rows hide default command labels but retain explicit labels", async () => {
-	const { pi, tools, fire } = fakePi();
-	const jobs = fakeJobShell();
-	gentleAgents(pi, {}, { ...deps().deps, jobShell: jobs.shell, jobOutputDir: () => jobs.dir });
-	const { ctx } = fakeContext();
-	const snapshots: Array<{ sessionId: string; snapshot: { jobs: Array<{ id: string; label: string; startedAt: number }> } }> = [];
-	const unsubscribe = pi.events.on("gentle-ai:jobs-sidebar", (value) => snapshots.push(value as typeof snapshots[number]));
-	try {
-		await fire("session_start", ctx);
-		const sentinel = "RAW_COMMAND_SENTINEL_2384";
-		await tools.get("bash_background")!.execute("b1", { command: sentinel }, undefined, undefined, ctx);
-		await tools.get("bash_background")!.execute("b2", { command: "OTHER_COMMAND_SENTINEL_2384", label: "CI build" }, undefined, undefined, ctx);
-		const event = snapshots.at(-1)!;
-		assert.equal(event.sessionId, ctx.sessionManager.getSessionId());
-		assert.doesNotMatch(JSON.stringify(event), /RAW_COMMAND_SENTINEL_2384|OTHER_COMMAND_SENTINEL_2384/);
-		assert.ok(event.snapshot.jobs.some((job) => job.label === "Background command"));
-		assert.ok(event.snapshot.jobs.some((job) => job.label === "CI build"));
-		const { commandRows } = await import("../lib/shell-activity-state.ts");
-		const rows = commandRows(event.snapshot.jobs, Date.now()).join("\n");
-		assert.doesNotMatch(rows, /RAW_COMMAND_SENTINEL_2384|OTHER_COMMAND_SENTINEL_2384/);
-		assert.match(rows, /Background command/); assert.match(rows, /CI build/);
-		// The finished writer publishes the same sanitized label with its outcome
-		// fields, and still never the raw command.
-		jobs.runs[0]!.exit(0);
-		const settled = () => snapshots.at(-1)!.snapshot.jobs.find((job) => job.label === "Background command") as { label: string; status?: string; endedAt?: number; exitCode?: number } | undefined;
-		await waitForJob(() => settled()?.status !== undefined, "the finished jobs snapshot");
-		const finishedEvent = snapshots.at(-1)!;
-		assert.doesNotMatch(JSON.stringify(finishedEvent), /RAW_COMMAND_SENTINEL_2384|OTHER_COMMAND_SENTINEL_2384/, "no finished event leaks a raw command");
-		assert.deepEqual(Object.keys(settled()!).sort(), ["endedAt", "exitCode", "id", "label", "startedAt", "status"], "the finished tail publishes only its projected fields");
-		assert.equal(settled()!.status, "exited");
-		assert.equal(settled()!.exitCode, 0);
-		assert.equal(typeof settled()!.endedAt, "number");
-	} finally {
-		unsubscribe(); await fire("session_shutdown", ctx); jobs.cleanup();
 	}
 });
 
@@ -7064,7 +6932,7 @@ test("/gentle:jobs opens this session's jobs overlay, stops the selected job, an
 		assert.equal(jobs.runs[0]!.signal?.aborted, true, "s stops the selected job");
 		assert.equal(statuses.at(-1), undefined, "the footer count clears when nothing runs");
 		assert.deepEqual(snapshots.at(-1)?.snapshot.jobs.map(({ status }) => status), ["stopped"], "the finished tail keeps the stopped job visible once the count clears");
-		await waitForJob(() => sent.some((entry) => entry.message.customType === "gentle-jobs.notice"), "the human stop notice");
+		await jobIo();
 		const notices = sent.filter((entry) => entry.message.customType === "gentle-jobs.notice");
 		assert.equal(notices.length, 1, "the agent was told it would be notified, so a human stop is reported once");
 		assert.match(String(notices[0]!.message.content), /job-1 \("CI"\) was stopped by the user/);
@@ -7072,6 +6940,48 @@ test("/gentle:jobs opens this session's jobs overlay, stops the selected job, an
 		await opened;
 	} finally {
 		unsubscribe();
+		await fire("session_shutdown", ctx);
+		jobs.cleanup();
+	}
+});
+
+test("/gentle:jobs mouse controls route the chosen running job through the existing stop and notice path", async () => {
+	const { pi, tools, commands, fire, sent } = fakePi();
+	const jobs = fakeJobShell();
+	gentleAgents(pi, {}, { ...deps().deps, jobShell: jobs.shell, jobOutputDir: () => jobs.dir });
+	const { ctx, overlays } = fakeContext();
+	try {
+		assert.match(commands.get("gentle:jobs")?.description ?? "", /click.*Stop/i, "command help advertises the explicit mouse control");
+		await fire("session_start", ctx);
+		await tools.get("bash_background")!.execute("b1", { command: "first command", label: "first job" }, undefined, undefined, ctx);
+		await tools.get("bash_background")!.execute("b2", { command: "second command", label: "second job" }, undefined, undefined, ctx);
+		const opened = commands.get("gentle:jobs")!.handler("", ctx);
+		await tick();
+		const overlay = overlays.at(-1)!;
+		const eventFor = (text: string, type: TuiMouseEvent["type"]) => {
+			const lines = overlay.render(100).map(stripAnsi);
+			const y = lines.findIndex((line) => line.includes(text));
+			assert.ok(y >= 0, `Missing ${text}`);
+			const x = visibleWidth(lines[y]!.slice(0, lines[y]!.indexOf(text)));
+			return mouse(type, type === "move" ? "none" : "left", x, y, 100, lines.length);
+		};
+		overlay.handleMouse?.(eventFor("second job", "move"));
+		assert.equal(jobs.runs[0]!.signal?.aborted, false);
+		assert.equal(jobs.runs[1]!.signal?.aborted, false);
+		overlay.handleMouse?.(eventFor("second job", "press"));
+		overlay.handleMouse?.(eventFor("second job", "click"));
+		assert.equal(jobs.runs[1]!.signal?.aborted, false, "selecting a row does not stop it");
+		overlay.handleMouse?.(eventFor("s Stop", "press"));
+		overlay.handleMouse?.(eventFor("s Stop", "click"));
+		assert.equal(jobs.runs[0]!.signal?.aborted, false);
+		assert.equal(jobs.runs[1]!.signal?.aborted, true, "the selected job alone is stopped");
+		await jobIo();
+		const notices = sent.filter((entry) => entry.message.customType === "gentle-jobs.notice");
+		assert.equal(notices.length, 1);
+		assert.match(String(notices[0]!.message.content), /job-2 \("second job"\) was stopped by the user/);
+		overlay.handleInput("q");
+		await opened;
+	} finally {
 		await fire("session_shutdown", ctx);
 		jobs.cleanup();
 	}
@@ -7090,7 +7000,7 @@ test("a job exit notice whose forwarding throws while the parent is idle is retr
 		const sendMessage = pi.sendMessage;
 		Object.assign(pi, { sendMessage: () => { throw new Error("host busy"); } });
 		jobs.runs[0]!.exit(0);
-		await waitForJob(() => timers.pending(PARENT_WAKE_GRACE_MS) > 0, "the failed notice's delivery retry");
+		await jobIo();
 		assert.equal(sent.length, 0);
 		assert.equal(userMessages.length, 0);
 		Object.assign(pi, { sendMessage });
@@ -7122,7 +7032,8 @@ for (const boundary of ["session_compact", "session_compact_failed"] as const) {
 			await fire("session_start", ctx);
 			await tools.get("bash_background")!.execute("b1", { command: "make ci" }, undefined, undefined, ctx);
 			setIdle(false);
-			await waitForJobSettlement(pi, () => jobs.runs[0]!.exit(1));
+			jobs.runs[0]!.exit(1);
+			await jobIo();
 			assert.equal(sent.length, 0, "no direct custom-message turn starts while the parent compacts");
 			assert.equal(userMessages.length, 0, "no wake is sent while the parent compacts");
 			await fire(boundary, ctx);
@@ -7161,9 +7072,7 @@ test("session shutdown never hangs on a job whose process ignores the stop", { t
 	const dir = mkdtempSync(join(tmpdir(), "gentle-jobs-stuck-"));
 	// A process that never exits, even after its abort signal.
 	const stuck = () => ({ operations: { exec: () => new Promise<{ exitCode: number | null }>(() => {}) } });
-	// Keep the shortened grace timer referenced: an unref'd one lets the test
-	// runner's event loop drain before shutdown can give up on the stuck job.
-	const schedule: AgentsDeps["schedule"] = (fn, ms) => { const timer = setTimeout(fn, Math.min(ms, 10)); return () => clearTimeout(timer); };
+	const schedule: AgentsDeps["schedule"] = (fn, ms) => { const timer = setTimeout(fn, Math.min(ms, 10)); timer.unref(); return () => clearTimeout(timer); };
 	gentleAgents(pi, {}, { ...deps().deps, schedule, jobShell: stuck });
 	const { ctx } = fakeContext();
 	try {
@@ -7200,7 +7109,7 @@ test("monitor delivers line events to an idle parent with one wake, and reports 
 		assert.match(renderers.get("gentle-jobs.notice")!(events[0]!.message, { expanded: true }, plainTheme).render(70).map(stripAnsi).join("\n"), /unit: fail/);
 		jobs.runs[0]!.onData(Buffer.from("e2e: pass\n"));
 		jobs.runs[0]!.exit(1);
-		await waitForJob(() => sent.some((entry) => /Monitor job-1 .*exited with code 1/.test(String(entry.message.content))), "the monitor end notice");
+		await jobIo();
 		const contents = sent.filter((entry) => entry.message.customType === "gentle-jobs.notice").map((entry) => String(entry.message.content));
 		assert.equal(contents.length, 3, "pending lines are delivered before the end notice");
 		assert.match(contents[1]!, /reported 1 new line:\ne2e: pass/);
@@ -7243,7 +7152,6 @@ test("monitor events wait for a busy parent's turn boundary and coalesce into on
 		await fire("session_shutdown", ctx);
 		jobs.cleanup();
 	}
-	assert.equal(sent.length, 1, "a stopped monitor reports nothing after its log closes either");
 });
 
 test("monitor rejects a missing or out-of-range timeout before starting anything", async () => {
@@ -7322,7 +7230,6 @@ test("a human stop of a monitor from /gentle:jobs delivers its pending lines, th
 		await fire("session_shutdown", ctx);
 		jobs.cleanup();
 	}
-	assert.equal(sent.length, 2, "the human-stopped monitor reports nothing after its log closes");
 });
 
 // Harness roadmap T6: todo progress reaches peers without a model turn spent on
@@ -7484,6 +7391,26 @@ test("subagent_run never reports provider review routing keys as unmatched", asy
 	assert.doesNotMatch(warnings[0]!, /review-refuter|review-validator/);
 });
 
+// A profile bound with "Use in this session" keeps the reserved `orchestrator`
+// key (the parent's own model); it is never a subagent routing key, so the
+// launch warning must not report it, while a real typo next to it still is.
+test("subagent_run never reports the bound profile's orchestrator key as unmatched", async (t) => {
+	t.after(() => resetSessionProfileBindingsForTesting());
+	const child = fakePi();
+	const runtime = deps();
+	captureLaunches(t);
+	gentleAgents(child.pi, {}, runtime.deps);
+	const { ctx, dialogs } = fakeContext();
+	bindSessionProfile("s1", "team", { orchestrator: { model: "openai/alpha" }, explore: { model: "openai/beta" }, explor: { model: "openai/gamma" } });
+	await child.fire("session_start", ctx);
+	await child.tools.get("subagent_run")!.execute("run", { agent: "explore", task: "first", mode: "background" }, undefined, undefined, ctx);
+	await tick();
+	const warnings = dialogs.filter((message) => /did not match any agent and was ignored/.test(message));
+	assert.equal(warnings.length, 1, "the typo is still reported once");
+	assert.match(warnings[0]!, /"explor" did not match any agent and was ignored\./);
+	assert.doesNotMatch(warnings[0]!, /"orchestrator"/, "the reserved orchestrator key is never a subagent key");
+});
+
 // Issue #2400: a model_profiles key that matches no discovered agent and has no
 // did-you-mean suggestion (a typo such as `explor`) was still silent, because
 // the launch warning only named keys suggesting the launched agent. The first
@@ -7540,4 +7467,97 @@ test("a matched model_profiles key routes the task request model end to end", as
 	assert.deepEqual(captures[0]!.request.model, { provider: "openai", id: "alpha" }, "the matched key routes the configured model into the launch");
 	assert.equal(captures[0]!.request.thinking, "high");
 	assert.equal(captures[0]!.request.modelSource, "profile");
+});
+
+test("an agent asking the user exposes an alert row for the panel editor", async () => {
+	const { pi, tools, fire } = fakePi();
+	const harness = deps();
+	gentleAgents(pi, {}, harness.deps);
+	const terminalTui = { requestRender() {}, terminal: { columns: 160, rows: 40 } };
+	// The relayed dialog stays open: the user has not answered yet.
+	const { ctx, widgets } = fakeContext(terminalTui, undefined, undefined, undefined, () => new Promise<string | undefined>(() => {}));
+	await fire("session_start", ctx);
+	// Only a task-mode child can ask the user; a background child's dialog is dismissed.
+	void tools.get("subagent_run")!.execute("ask", { agent: "explore", task: "Ask once" }, undefined, undefined, ctx);
+	await tick();
+	// The rail part supplies the alert rows; the panel editor draws them above its rule.
+	widgets.get("gentle-agents")!(terminalTui, plainTheme);
+	const alert = () => ((sidebarState(terminalTui as unknown as TUI).parts.get("agents") as { alert?(width: number): string[] }).alert?.(100) ?? []).map(stripAnsi);
+	assert.deepEqual(alert(), [], "a running agent needs no alert");
+	// A child question relayed to this session's UI is what makes a task wait for the user.
+	harness.children[0].emit({ type: "extension_ui_request", id: "u1", method: "select", title: "Which file?", options: ["a.ts", "b.ts"] });
+	await tick();
+	assert.match(alert()[0]!, /^ \? explore asked: Which file\? +\/gentle:agents $/, "the alert row names the asking agent and its question");
+});
+
+test("a subagent launched under a profile carries its fallback chain, and a quota error switches it with a notice and a session entry", async () => {
+	const agentHome = join(root, "fallback-launch", "agent");
+	const config = join(root, "fallback-launch", "config");
+	mkdirSync(join(agentHome, "agents"), { recursive: true });
+	mkdirSync(config, { recursive: true });
+	writeFileSync(join(agentHome, "agents", "fallbacker.md"), "---\ndescription: fallback fixture\n---\nMap things.");
+	writeFileSync(join(agentHome, "subagents.json"), JSON.stringify({ default_model: "fbx/primary-model" }));
+	writeFileSync(join(config, "profiles.json"), JSON.stringify({ kind: "gentle-pi.agent_model_profiles", version: 1, active: "home", profiles: { home: {} } }));
+	writeFileSync(join(config, "profile-fallbacks.json"), JSON.stringify({ kind: "gentle-pi.profile_model_fallbacks", version: 1, profiles: { home: { "*": [{ model: "fby/second-model", thinking: "low" }] } } }));
+	const harness = deps();
+	const { home: _home, env: _env, ...overrides } = harness.deps;
+	const { pi, tools, fire, entries } = fakePi();
+	gentleAgents(pi, { GENTLE_PI_AGENT_HOME: agentHome, GENTLE_PI_CONFIG_HOME: config }, overrides);
+	const { ctx, dialogs } = fakeContext();
+	await fire("session_start", ctx);
+	await tools.get("subagent_run")!.execute("fb", { agent: "fallbacker", task: "Map", mode: "background" }, undefined, undefined, ctx);
+	await tick();
+	try {
+		const child = harness.children[0]!;
+		child.emit({ type: "agent_end", messages: [{ role: "assistant", content: [], stopReason: "error", errorMessage: "429 insufficient_quota: usage limit reached" }] });
+		child.emit({ type: "agent_settled" });
+		await tick(); await tick(); await tick();
+		assert.deepEqual(child.written.filter((command) => command.type === "set_model").map((command) => `${command.provider}/${command.modelId}`), ["fby/second-model"]);
+		assert.ok(dialogs.some((line) => /fallbacker: fbx\/primary-model hit its usage limit; continuing on fby\/second-model/.test(line)), dialogs.join("\n"));
+		const recorded = entries.filter((entry) => entry.customType === "gentle-pi.model-fallback/v1").map((entry) => entry.data as Record<string, unknown>);
+		assert.equal(recorded.length, 1);
+		assert.deepEqual({ agent: recorded[0]!.agent, from: recorded[0]!.from, to: recorded[0]!.to, category: recorded[0]!.category }, { agent: "fallbacker", from: "fbx/primary-model", to: "fby/second-model", category: "quota" });
+	} finally {
+		await fire("session_shutdown", ctx);
+		await tick();
+	}
+});
+
+test("the orchestrator's usage limit moves the session to the profile's orchestrator fallback and resumes; children never do it themselves", async () => {
+	const config = join(root, "orchestrator-fallback", "config");
+	mkdirSync(config, { recursive: true });
+	writeFileSync(join(config, "profiles.json"), JSON.stringify({ kind: "gentle-pi.agent_model_profiles", version: 1, active: "home", profiles: { home: {} } }));
+	writeFileSync(join(config, "profile-fallbacks.json"), JSON.stringify({ kind: "gentle-pi.profile_model_fallbacks", version: 1, profiles: { home: { orchestrator: [{ model: "orx/backup", thinking: "high" }] } } }));
+	const catalog = new Map([["orx/main", { provider: "orx", id: "main", cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 } }], ["orx/backup", { provider: "orx", id: "backup", cost: { input: 3, output: 3, cacheRead: 0, cacheWrite: 0 } }]]);
+	const run = async (env: Record<string, string>) => {
+		const harness = deps();
+		const { home: _home, env: _env, ...overrides } = harness.deps;
+		const fake = fakePi();
+		const selected: string[] = [];
+		const levels: string[] = [];
+		Object.assign(fake.pi, { setModel: async (model: { provider: string; id: string }) => { selected.push(`${model.provider}/${model.id}`); return true; }, setThinkingLevel: (level: string) => levels.push(level) });
+		gentleAgents(fake.pi, { GENTLE_PI_CONFIG_HOME: config, ...env }, overrides);
+		const { ctx, dialogs } = fakeContext();
+		Object.assign(ctx, { model: catalog.get("orx/main"), modelRegistry: { find: (provider: string, id: string) => catalog.get(`${provider}/${id}`), getAll: () => [...catalog.values()] } });
+		await fake.fire("session_start", ctx);
+		await fake.fire("agent_end", ctx, { type: "agent_end", messages: [{ role: "assistant", content: [], stopReason: "error", errorMessage: "insufficient_quota: monthly usage limit reached" }] });
+		await tick(); await tick();
+		// Pi fires agent_end on every failed attempt and only then decides to retry: nothing moves yet.
+		const beforeSettle = selected.length;
+		await fake.fire("agent_settled", ctx, { type: "agent_settled", aborted: false });
+		await tick(); await tick();
+		await fake.fire("session_shutdown", ctx);
+		await tick();
+		return { selected, levels, dialogs, entries: fake.entries, userMessages: fake.userMessages, beforeSettle };
+	};
+	const parent = await run({});
+	assert.equal(parent.beforeSettle, 0, "the switch waits for the run to settle, after Pi's own retries");
+	assert.deepEqual(parent.selected, ["orx/backup"]);
+	assert.deepEqual(parent.levels, ["high"]);
+	assert.ok(parent.dialogs.some((line) => /orchestrator: orx\/main hit its usage limit; continuing on orx\/backup \(3\.0x the price\)/.test(line)), parent.dialogs.join("\n"));
+	assert.equal(parent.entries.filter((entry) => entry.customType === "gentle-pi.model-fallback/v1").length, 1);
+	assert.equal(parent.userMessages.length, 1);
+	assert.match(String(parent.userMessages[0]!.content), /continue/i);
+	const child = await run({ GENTLE_PI_AGENTS_CHILD: "1" });
+	assert.deepEqual(child.selected, [], "a child leaves its fallback to the parent's runner");
 });

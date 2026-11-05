@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { existsSync, readFileSync } from "node:fs";
-import { visibleWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import { TuiAltScreen, visibleWidth, type Terminal, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import { getThemeByName } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js";
 import { CommandPalette, commandsKey, rankPaletteGroups, type CommandPaletteGroup, type CommandPaletteItem, type CommandPaletteResult, type CommandPaletteTheme } from "../lib/command-palette.ts";
 import { buildCommandPaletteGroups, COMMAND_PALETTE_CATALOG } from "../lib/command-palette-catalog.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -188,6 +189,20 @@ test("ctrl+j and ctrl+k also move the selection", () => {
 	assert.deepEqual(results, [{ type: "run", name: "gentle:models" }]);
 });
 
+test("tab captures the next key for the highlighted command, and esc cancels the capture", () => {
+	const results: CommandPaletteResult[] = [];
+	const palette = new CommandPalette([{ title: "Session", items: [{ command: "gentle:design", label: "Design" }, { command: "gentle:voice", label: "Voice" }] }], (result) => results.push(result));
+	palette.handleInput("\x1b[B");
+	palette.handleInput("\t");
+	assert.match(palette.render(80).join("\n"), /Press the new key for Voice · esc cancel/);
+	palette.handleInput("\x1b");
+	assert.deepEqual(results, [], "esc only cancels the capture");
+	assert.match(palette.render(80).join("\n"), /tab set key/);
+	palette.handleInput("\t");
+	palette.handleInput("\x1bv");
+	assert.deepEqual(results, [{ type: "bind", name: "gentle:voice", data: "\x1bv" }]);
+});
+
 test("enter runs the highlighted item and is a no-op with no match", () => {
 	const { palette, results } = createPalette(GROUPS);
 	type(palette, "nothing-like-this");
@@ -296,7 +311,7 @@ test("render escapes control characters in labels and shortcuts", () => {
 
 test("render footer lists the key bindings", () => {
 	const lines = render(GROUPS, "").join("\n");
-	assert.match(lines, /type to search • ↑\/↓ move • enter\/click run • esc close/);
+	assert.match(lines, /↑\/↓ move • enter run • tab set key • esc close/);
 });
 
 test("render keeps the right border aligned when a label has wide characters", () => {
@@ -337,6 +352,288 @@ test("a small terminal still renders at least the minimum 12-line card", () => {
 	assert.ok(lines.length <= 12, `expected at most 12 total lines for a tiny terminal, got ${lines.length}`);
 });
 
+// --- fullscreen pointer interaction ------------------------------------------
+
+function point(frame: string[], text: string): { x: number; y: number } {
+	const y = frame.findIndex((line) => line.includes(text));
+	assert.ok(y >= 0, `missing ${JSON.stringify(text)} in rendered frame`);
+	const line = frame[y]!;
+	return { x: visibleWidth(line.slice(0, line.indexOf(text))), y };
+}
+
+function mouse(frame: string[], x: number, y: number, type: TuiMouseEvent["type"] = "click", button: TuiMouseEvent["button"] = "left"): TuiMouseEvent {
+	return { type, button, x, y, screenX: x + 10, screenY: y + 5, width: visibleWidth(frame[0]!), height: frame.length, shift: false, alt: false, ctrl: false };
+}
+
+function at(frame: string[], text: string, type: TuiMouseEvent["type"] = "click", button: TuiMouseEvent["button"] = "left"): TuiMouseEvent {
+	const { x, y } = point(frame, text);
+	return mouse(frame, x, y, type, button);
+}
+
+const pointerTheme: CommandPaletteTheme = {
+	fg: (role, text) => role === "warning" ? `\x1b[33m${text}\x1b[39m` : text,
+	bg: (_role, text) => `\x1b[44m${text}\x1b[49m`,
+};
+
+test("visible command rows use primary click; headings, blanks, borders and other buttons do not run", () => {
+	const { palette, results } = createPalette(GROUPS);
+	const frame = palette.render(80);
+	for (const event of [
+		at(frame, "Configuration"), at(frame, "Session"), mouse(frame, 5, 3),
+		mouse(frame, 0, point(frame, "Agent-model profiles").y),
+		mouse(frame, 79, point(frame, "Agent-model profiles").y),
+		at(frame, "Agent-model profiles", "click", "right"),
+		at(frame, "Agent-model profiles", "click", "middle"),
+	]) palette.handleMouse(event);
+	assert.deepEqual(results, []);
+	assert.equal(palette.handleMouse(at(frame, "Agent-model profiles", "press"))?.handled, true);
+	assert.deepEqual(results, [], "press alone cannot run a command");
+	assert.equal(palette.handleMouse(at(frame, "Agent-model profiles"))?.handled, true);
+	assert.deepEqual(results, [{ type: "run", name: "gentle:profiles" }]);
+	palette.handleMouse(at(frame, "Assign models and effort"));
+	assert.deepEqual(results, [{ type: "run", name: "gentle:profiles" }], "completion is once only");
+});
+
+test("hover paints only the visible row with the shared warning role, without selecting it", () => {
+	const { palette, results } = createPalette(GROUPS, pointerTheme);
+	let frame = palette.render(80);
+	const motion = at(frame, "Agent-model profiles", "move", "none");
+	const hoverResult = palette.handleMouse(motion);
+	assert.equal(hoverResult?.render, true);
+	assert.equal(hoverResult?.focus, undefined, "hover cannot request focus");
+	frame = palette.render(80);
+	const hovered = frame.find((line) => line.includes("Agent-model profiles"))!;
+	assert.match(hovered, /\x1b\[33m/);
+	assert.doesNotMatch(frame.find((line) => line.includes("Assign models and effort"))!, /\x1b\[33m/);
+	assert.deepEqual(results, []);
+	assert.equal(palette.handleMouse(motion)?.render, false, "repeated motion does not redraw");
+	assert.equal(palette.handleMouse(at(frame, "Configuration", "move", "none"))?.render, true);
+	frame = palette.render(80);
+	assert.doesNotMatch(frame.find((line) => line.includes("Agent-model profiles"))!, /\x1b\[33m/);
+	palette.handleInput(KEY.ENTER);
+	assert.deepEqual(results, [{ type: "run", name: "gentle:models" }], "hover never changes keyboard selection");
+});
+
+test("hover retains the selected background and uses the warning role for the hovered label and shortcut", () => {
+	const { palette } = createPalette(GROUPS, pointerTheme);
+	palette.handleInput(KEY.DOWN);
+	palette.handleInput(KEY.DOWN);
+	let frame = palette.render(80);
+	palette.handleMouse(at(frame, "Browse changes", "move", "none"));
+	frame = palette.render(80);
+	const selected = frame.find((line) => line.includes("Browse changes"))!;
+	assert.match(selected, /\x1b\[44m/);
+	assert.match(selected, /\x1b\[33m[^\x1b]*Browse changes[^\x1b]*alt\+g/);
+});
+
+test("filtering rejects stale hit geometry and runs the newly rendered matching command", () => {
+	const { palette, results } = createPalette(GROUPS);
+	let frame = palette.render(80);
+	const stale = at(frame, "Agent-model profiles");
+	type(palette, "changes");
+	palette.handleMouse(stale);
+	assert.deepEqual(results, []);
+	frame = palette.render(80);
+	assert.doesNotMatch(frame.join("\n"), /Agent-model profiles|Configuration/);
+	palette.handleMouse(at(frame, "Browse changes"));
+	assert.deepEqual(results, [{ type: "run", name: "gentle:changes" }]);
+});
+
+test("geometry and item identity are invalidated by resize, data changes, invalidate and dispose", () => {
+	let height = 24;
+	const groups: CommandPaletteGroup[] = [{ title: "Group", items: [{ command: "safe", label: "Safe command" }] }];
+	const { palette, results } = createPalette(groups, pointerTheme, () => height);
+	let frame = palette.render(80);
+	const original = at(frame, "Safe command");
+	height = 20;
+	palette.handleMouse(original);
+	height = 24;
+	frame = palette.render(80);
+	palette.handleMouse({ ...at(frame, "Safe command"), width: 79 });
+	frame = palette.render(80);
+	groups[0]!.items[0]!.command = "changed";
+	palette.handleMouse(at(frame, "Safe command"));
+	assert.deepEqual(results, [], "a stale frame cannot target changed content or dimensions");
+	groups[0]!.items[0]!.command = "safe";
+	frame = palette.render(80);
+	palette.handleMouse(at(frame, "Safe command", "move", "none"));
+	palette.invalidate();
+	palette.handleMouse(at(frame, "Safe command"));
+	assert.deepEqual(results, []);
+	frame = palette.render(80);
+	assert.doesNotMatch(frame.join("\n"), /\x1b\[33m/, "invalidation clears hover");
+	palette.dispose();
+	palette.handleMouse(at(frame, "Safe command"));
+	palette.handleInput(KEY.ENTER);
+	assert.deepEqual(results, [], "disposed palettes cannot act");
+});
+
+test("resize clears hover and clipped or empty command rows cannot be activated", () => {
+	const groups: CommandPaletteGroup[] = [{ title: "Group", items: [
+		{ command: "first", label: "First" },
+		{ command: "long", label: "A long command name that cannot fit" },
+		{ command: "empty", label: "" },
+	] }];
+	const { palette, results } = createPalette(groups, pointerTheme, () => 24);
+	let frame = palette.render(80);
+	palette.handleMouse(at(frame, "First", "move", "none"));
+	frame = palette.render(20);
+	assert.doesNotMatch(frame.join("\n"), /\x1b\[33m/, "a new width clears hover");
+	const clippedY = frame.findIndex((line) => line.includes("A long comm"));
+	assert.ok(clippedY >= 0);
+	palette.handleMouse(mouse(frame, 4, clippedY));
+	palette.handleMouse(mouse(frame, 4, clippedY + 1));
+	assert.deepEqual(results, [], "clipped and blank entries are not actionable");
+	palette.handleMouse(at(frame, "First"));
+	assert.deepEqual(results, [{ type: "run", name: "first" }]);
+});
+
+test("wheel reaches scrolled commands and keeps keyboard navigation working", () => {
+	const groups: CommandPaletteGroup[] = [{ title: "Many", items: Array.from({ length: 20 }, (_, i) => ({ command: `cmd:${i}`, label: `Item ${String(i).padStart(2, "0")}` })) }];
+	const { palette, results } = createPalette(groups, undefined, () => 16);
+	let frame = palette.render(80);
+	assert.doesNotMatch(frame.join("\n"), /Item 19/);
+	for (let i = 0; i < 19; i++) {
+		const event = { ...mouse(frame, 4, 4, "wheel", "none"), wheelDelta: 1 };
+		assert.equal(palette.handleMouse(event)?.handled, true);
+		frame = palette.render(80);
+	}
+	assert.match(frame.join("\n"), /Item 19/);
+	palette.handleInput(KEY.UP);
+	frame = palette.render(80);
+	assert.match(frame.join("\n"), /Item 18/);
+	palette.handleMouse(at(frame, "Item 18"));
+	assert.deepEqual(results, [{ type: "run", name: "cmd:18" }]);
+});
+
+test("mouse cannot select, run, scroll or bind while the next key is being captured", () => {
+	const { palette, results } = createPalette(GROUPS, pointerTheme);
+	palette.handleInput(KEY.DOWN);
+	palette.handleInput("\t");
+	const frame = palette.render(80);
+	palette.handleMouse(at(frame, "Browse changes", "move", "none"));
+	palette.handleMouse(at(frame, "Browse changes", "press"));
+	palette.handleMouse(at(frame, "Browse changes"));
+	palette.handleMouse({ ...at(frame, "Browse changes", "wheel", "none"), wheelDelta: 1 });
+	assert.deepEqual(results, []);
+	assert.doesNotMatch(palette.render(80).join("\n"), /\x1b\[33m/);
+	palette.handleInput("\x1bv");
+	assert.deepEqual(results, [{ type: "bind", name: "gentle:profiles", data: "\x1bv" }]);
+});
+
+test("centered native overlay receives real SGR motion, click and outside-card motion", (t) => {
+	let input: ((data: string) => void) | undefined;
+	const terminal: Terminal = {
+		start(onInput) { input = onInput; }, stop() {}, async drainInput() {}, write() {},
+		get columns() { return 120; }, get rows() { return 30; }, get kittyProtocolActive() { return false; },
+		moveBy() {}, hideCursor() {}, showCursor() {}, clearLine() {}, clearFromCursor() {}, clearScreen() {}, setTitle() {}, setProgress() {}, setProgramStatus() {},
+	};
+	const theme = getThemeByName("dark");
+	assert.ok(theme);
+	const { palette, results } = createPalette(GROUPS, theme, () => terminal.rows);
+	const tui = new TuiAltScreen(terminal, false, undefined, { mouse: true });
+	const overlay = tui.showOverlay(palette, { anchor: "center", width: 80, maxHeight: "85%" });
+	tui.start();
+	tui.renderNow(true);
+	try {
+		let frame = palette.render(80);
+		const beforeFrame = frame.join("\n");
+		const before = frame.find((line) => line.includes("Agent-model profiles"))!;
+		const bounds = overlay.getBounds();
+		assert.ok(bounds && bounds.col > 0 && bounds.row > 0);
+		const target = point(frame, "Agent-model profiles");
+		const x = bounds.col + target.x + 1, y = bounds.row + target.y + 1;
+		input?.(`\x1b[<35;${x};${y}M`);
+		frame = palette.render(80);
+		const after = frame.find((line) => line.includes("Agent-model profiles"))!;
+		if (process.env.GENTLE_PI_PALETTE_VISUAL === "1") {
+			t.diagnostic(`before ANSI base64: ${Buffer.from(beforeFrame).toString("base64")}`);
+			t.diagnostic(`after ANSI base64: ${Buffer.from(frame.join("\n")).toString("base64")}`);
+		}
+		assert.notEqual(after, before, "real SGR motion paints hover");
+		assert.deepEqual(results, []);
+		input?.("\x1b[<35;1;1M");
+		frame = palette.render(80);
+		assert.equal(frame.find((line) => line.includes("Agent-model profiles")), after,
+			"native overlay routing does not deliver outside-card motion to the palette");
+		input?.(`\x1b[<0;${x};${y}M`);
+		input?.(`\x1b[<0;${x};${y}m`);
+		assert.deepEqual(results, [{ type: "run", name: "gentle:profiles" }]);
+	} finally {
+		tui.stop();
+	}
+});
+
+test("native SGR wheel reaches and clicks an initially hidden command", () => {
+	let input: ((data: string) => void) | undefined;
+	const terminal: Terminal = {
+		start(onInput) { input = onInput; }, stop() {}, async drainInput() {}, write() {},
+		get columns() { return 100; }, get rows() { return 16; }, get kittyProtocolActive() { return false; },
+		moveBy() {}, hideCursor() {}, showCursor() {}, clearLine() {}, clearFromCursor() {}, clearScreen() {}, setTitle() {}, setProgress() {}, setProgramStatus() {},
+	};
+	const groups: CommandPaletteGroup[] = [{ title: "Many", items: Array.from({ length: 15 }, (_, i) => ({ command: `cmd:${i}`, label: `Item ${String(i).padStart(2, "0")}` })) }];
+	const { palette, results } = createPalette(groups, undefined, () => terminal.rows);
+	const tui = new TuiAltScreen(terminal, false, undefined, { mouse: true });
+	const overlay = tui.showOverlay(palette, { anchor: "center", width: 80, maxHeight: "85%" });
+	tui.start();
+	tui.renderNow(true);
+	try {
+		assert.doesNotMatch(palette.render(80).join("\n"), /Item 14/);
+		for (let i = 0; i < 14; i++) {
+			const bounds = overlay.getBounds();
+			assert.ok(bounds);
+			input?.(`\x1b[<65;${bounds.col + 5};${bounds.row + 5}M`);
+			tui.renderNow(true);
+		}
+		const frame = palette.render(80);
+		const bounds = overlay.getBounds();
+		assert.ok(bounds);
+		const target = point(frame, "Item 14");
+		const x = bounds.col + target.x + 1, y = bounds.row + target.y + 1;
+		input?.(`\x1b[<0;${x};${y}M`);
+		input?.(`\x1b[<0;${x};${y}m`);
+		assert.deepEqual(results, [{ type: "run", name: "cmd:14" }]);
+	} finally {
+		tui.stop();
+	}
+});
+
+test("a height-clipped native overlay never dispatches a hidden row", () => {
+	let input: ((data: string) => void) | undefined;
+	const terminal: Terminal = {
+		start(onInput) { input = onInput; }, stop() {}, async drainInput() {}, write() {},
+		get columns() { return 100; }, get rows() { return 8; }, get kittyProtocolActive() { return false; },
+		moveBy() {}, hideCursor() {}, showCursor() {}, clearLine() {}, clearFromCursor() {}, clearScreen() {}, setTitle() {}, setProgress() {}, setProgramStatus() {},
+	};
+	const groups: CommandPaletteGroup[] = [{ title: "Group", items: [
+		{ command: "first", label: "First" }, { command: "hidden", label: "Hidden" },
+	] }];
+	const { palette, results } = createPalette(groups, undefined, () => terminal.rows);
+	const tui = new TuiAltScreen(terminal, false, undefined, { mouse: true });
+	const overlay = tui.showOverlay(palette, { anchor: "center", width: 80, maxHeight: "85%" });
+	tui.start();
+	tui.renderNow(true);
+	try {
+		const frame = palette.render(80);
+		const bounds = overlay.getBounds();
+		assert.ok(bounds && bounds.height < frame.length);
+		const hidden = point(frame, "Hidden");
+		assert.ok(hidden.y >= bounds.height);
+		const hiddenX = bounds.col + hidden.x + 1, hiddenY = bounds.row + hidden.y + 1;
+		input?.(`\x1b[<0;${hiddenX};${hiddenY}M`);
+		input?.(`\x1b[<0;${hiddenX};${hiddenY}m`);
+		assert.deepEqual(results, []);
+		const first = point(frame, "First");
+		assert.ok(first.y < bounds.height);
+		const x = bounds.col + first.x + 1, y = bounds.row + first.y + 1;
+		input?.(`\x1b[<0;${x};${y}M`);
+		input?.(`\x1b[<0;${x};${y}m`);
+		assert.deepEqual(results, [{ type: "run", name: "first" }]);
+	} finally {
+		tui.stop();
+	}
+});
+
 // --- commandsKey ---------------------------------------------------------------
 
 test("commandsKey defaults to alt+k", () => {
@@ -373,7 +670,7 @@ test("COMMAND_PALETTE_CATALOG matches the curated command set, in order", () => 
 		"gentle:telemetry",
 		"gentle:dev-binary",
 	]);
-	assert.deepEqual(byTitle("Session"), ["gentle:yolo", "gentle:changes", "gentle:agents", "gentle:jobs", "gentle:usage", "gentle:panel", "gentle:review-session-permission", "gentle:voice", "gentle:design"]);
+	assert.deepEqual(byTitle("Session"), ["gentle:guide", "gentle:yolo", "gentle:changes", "gentle:agents", "gentle:jobs", "gentle:usage", "gentle:review-session-permission", "gentle:voice", "gentle:design"]);
 	assert.deepEqual(byTitle("Diagnostics"), ["gentle:status", "gentle:doctor"]);
 	assert.equal(byTitle("SDD"), undefined);
 	assert.deepEqual(byTitle("Skills"), ["skill-registry:refresh"]);
@@ -431,125 +728,4 @@ test("buildCommandPaletteGroups keeps only registered commands, attaches descrip
 test("buildCommandPaletteGroups drops every group when nothing in the catalog is registered", () => {
 	const groups = buildCommandPaletteGroups([{ name: "not-in-catalog", description: "n/a" }], {});
 	assert.deepEqual(groups, []);
-});
-
-// S11 (odd/tasks/palette-button.md): the palette answers the mouse in
-// fullscreen. Card rows are the body lines shifted down one row by the top
-// border; content columns start two cells in ("│ ").
-function mouse(type: TuiMouseEvent["type"], x: number, y: number, width: number, height: number, button: TuiMouseEvent["button"] = "left"): TuiMouseEvent {
-	return { type, button, x, y, screenX: x, screenY: y, width, height, shift: false, alt: false, ctrl: false } as TuiMouseEvent;
-}
-
-test("a click on the header esc or the footer esc close closes the palette, like Esc", () => {
-	for (const target of ["header", "footer"] as const) {
-		const { palette, results } = createPalette(GROUPS);
-		const lines = palette.render(60);
-		const y = target === "header" ? 1 : lines.length - 2;
-		const plain = lines[y]!;
-		const x = target === "header" ? plain.lastIndexOf("esc") : plain.indexOf("esc close") + 4;
-		assert.deepEqual(palette.handleMouse(mouse("click", x, y, 60, lines.length)), { handled: true, render: true }, target);
-		assert.deepEqual(results, [{ type: "close" }], target);
-	}
-});
-
-test("a click on a command row runs that command; titles, blanks, search and border are inert", () => {
-	const { palette, results } = createPalette(GROUPS);
-	const lines = palette.render(60);
-	const rowOf = (label: string) => lines.findIndex((line) => line.includes(label));
-	for (const y of [0, 2, 3, rowOf("Configuration"), rowOf("Session") - 1, rowOf("Session"), lines.length - 1]) {
-		palette.handleMouse(mouse("click", 10, y, 60, lines.length));
-	}
-	palette.handleMouse(mouse("click", 0, rowOf("Agent-model profiles"), 60, lines.length));
-	assert.deepEqual(results, [], "none of those ran or closed anything");
-	assert.deepEqual(palette.handleMouse(mouse("click", 10, rowOf("Agent-model profiles"), 60, lines.length)), { handled: true, render: true });
-	assert.deepEqual(results, [{ type: "run", name: "gentle:profiles" }]);
-});
-
-test("a click runs the row under the pointer even when a query filters the list", () => {
-	const { palette, results } = createPalette(GROUPS);
-	type(palette, "changes");
-	const lines = palette.render(60);
-	palette.handleMouse(mouse("click", 10, lines.findIndex((line) => line.includes("Browse changes")), 60, lines.length));
-	assert.deepEqual(results, [{ type: "run", name: "gentle:changes" }]);
-});
-
-test("presses, drags, releases, other buttons and stale geometry never act", () => {
-	const { palette, results } = createPalette(GROUPS);
-	const lines = palette.render(60);
-	const y = lines.findIndex((line) => line.includes("Agent-model profiles"));
-	for (const type of ["press", "drag", "release", "move"] as const) palette.handleMouse(mouse(type, 10, y, 60, lines.length));
-	palette.handleMouse(mouse("click", 10, y, 60, lines.length, "right"));
-	palette.handleMouse(mouse("click", 10, y, 70, lines.length));
-	palette.handleMouse(mouse("click", 10, y, 60, lines.length + 1));
-	assert.deepEqual(results, []);
-});
-
-test("the wheel moves the selection like up and down", () => {
-	const { palette, results } = createPalette(GROUPS);
-	const lines = palette.render(60);
-	const wheel = (delta: number) => palette.handleMouse({ ...mouse("wheel", 10, 5, 60, lines.length, "none"), wheelDelta: delta });
-	assert.deepEqual(wheel(1), { handled: true, render: true });
-	wheel(1);
-	wheel(-1);
-	palette.handleInput(KEY.ENTER);
-	assert.deepEqual(results, [{ type: "run", name: "gentle:profiles" }], "down, down, up lands on the second item");
-});
-
-// S12 / P3 (odd/tasks/palette-button.md): a rose icon before each group title
-// and a dim icon per entry in the two-cell left gutter, rose on the selected
-// row. Every icon is one terminal cell, so labels and click columns never move.
-const ICON_GROUPS: CommandPaletteGroup[] = [
-	{ title: "Configuration", icon: "⬢", items: [{ command: "gentle:models", label: "Assign models and effort", icon: "⇄" }, { command: "gentle:profiles", label: "Agent-model profiles", icon: "◫" }] },
-	{ title: "Session", items: [{ command: "gentle:changes", label: "Browse captured changes", shortcut: "alt+g" }] },
-];
-const tagTheme = (bg: boolean): CommandPaletteTheme => ({
-	fg: (color, text) => `<${color}>${text}</${color}>`,
-	...(bg ? { bg: (color: string, text: string) => `[${color}]${text}[/${color}]` } : {}),
-});
-
-test("every catalog group and entry carries a one-cell icon", () => {
-	for (const group of COMMAND_PALETTE_CATALOG) {
-		assert.equal(visibleWidth(group.icon ?? ""), 1, `${group.title} icon`);
-		for (const item of group.items) assert.equal(visibleWidth(item.icon ?? ""), 1, `${item.command} icon`);
-	}
-	const built = buildCommandPaletteGroups([{ name: "gentle:profiles" }], {});
-	assert.equal(built[0]!.icon, COMMAND_PALETTE_CATALOG[0]!.icon);
-	assert.equal(built[0]!.items[0]!.icon, COMMAND_PALETTE_CATALOG[0]!.items.find((item) => item.command === "gentle:profiles")!.icon);
-});
-
-test("icons render before titles and in the entry gutter without moving any label", () => {
-	const lines = render(ICON_GROUPS, "", 60, { fg: (_color, text) => text, bg: (_color, text) => text });
-	const row = (label: string) => lines.find((line) => line.includes(label))!;
-	assert.match(row("Configuration"), /^│ ⬢ Configuration +│$/);
-	assert.match(row("Assign models"), /^│ ⇄ Assign models and effort +│$/);
-	assert.match(row("Agent-model"), /^│ ◫ Agent-model profiles +│$/);
-	assert.match(row("Session"), /^│ Session +│$/, "a group without an icon keeps its plain title");
-	assert.match(row("Browse"), /^│   Browse captured changes +alt\+g │$/, "an entry without an icon keeps its blank gutter");
-});
-
-test("group icons are rose, entry icons dim, and the selected entry's icon rose", () => {
-	// Wide enough that the tag markup, which counts as visible text here, never truncates a row.
-	const lines = render(ICON_GROUPS, "", 200, tagTheme(true)).join("\n");
-	assert.match(lines, /<borderAccent>⬢<\/borderAccent> <accent>Configuration/);
-	assert.match(lines, /\[selectedBg\]<borderAccent>⇄<\/borderAccent> Assign models and effort/);
-	assert.match(lines, /<dim>◫<\/dim> <text>Agent-model profiles<\/text>/);
-	const moved = createPalette(ICON_GROUPS, tagTheme(true));
-	moved.palette.handleInput(KEY.DOWN);
-	const after = moved.palette.render(200).join("\n");
-	assert.match(after, /<dim>⇄<\/dim> <text>Assign models and effort<\/text>/);
-	assert.match(after, /\[selectedBg\]<borderAccent>◫<\/borderAccent> Agent-model profiles/);
-});
-
-test("without bg the ▸ marker still replaces the gutter of the selected entry", () => {
-	const lines = render(ICON_GROUPS, "", 60, { fg: (_color, text) => text });
-	assert.ok(lines.some((line) => /^│ ▸ Assign models and effort/.test(line)));
-	assert.ok(lines.some((line) => /^│ ◫ Agent-model profiles/.test(line)));
-});
-
-test("a click on an iconed entry still runs it", () => {
-	const { palette, results } = createPalette(ICON_GROUPS);
-	const lines = palette.render(60);
-	const y = lines.findIndex((line) => line.includes("Agent-model profiles"));
-	palette.handleMouse({ type: "click", button: "left", x: 2, y, screenX: 2, screenY: y, width: 60, height: lines.length, shift: false, alt: false, ctrl: false } as TuiMouseEvent);
-	assert.deepEqual(results, [{ type: "run", name: "gentle:profiles" }]);
 });

@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { execFileSync, execFile } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { after, afterEach, type TestContext } from "node:test";
 import { initTheme, type ExtensionAPI, type ExtensionContext, type SlashCommandInfo, type SourceInfo } from "@earendil-works/pi-coding-agent";
-import { CURSOR_MARKER, matchesKey, stripTerminalSequences as stripAnsi, TuiMainScreen, visibleWidth, type Component, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import { CURSOR_MARKER, matchesKey, stripTerminalSequences as stripAnsi, TuiAltScreen, TuiMainScreen, VStack, visibleWidth, type Terminal, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import installGentleShell, { backgroundChangeRefreshesSettled, buildShellBarModel, createActiveProfileReader, changesShortcut, devBinaryCard, extractQueuedText, fetchCodexUsage, fetchNanUsage, loadFileDiff, shellGitRunner, openInExternalEditor, usageShortcut, GentlePromptEditor } from "../extensions/gentle-shell.ts";
 import { CODEX_USAGE_URL, NAN_QUOTA_URL, USAGE_SOURCE_EVENT, USAGE_SOURCE_SCHEMA } from "../lib/shell-usage.ts";
 import { bindSessionProfile, clearSessionProfileBinding, resetSessionProfileBindingsForTesting } from "../lib/session-profile-binding.ts";
@@ -18,18 +18,16 @@ import { readFrozenInheritedProfile, resetFrozenInheritedProfilesForTesting } fr
 afterEach(() => resetFrozenInheritedProfilesForTesting());
 import { buildCommandPaletteGroups } from "../lib/command-palette-catalog.ts";
 import { CHANGE_STATUS, DIFF_MAX_BYTES, DIFF_MAX_LINES, DIFF_TOO_LARGE } from "../lib/shell-changes.ts";
-import { sidebarPart, sidebarState, type SidebarHeaderRail, type SidebarRail } from "../lib/shell-sidebar.ts";
+import { sidebarPart, sidebarState, type SidebarRail } from "../lib/shell-sidebar.ts";
 import { installSidebar } from "../lib/shell-sidebar-layout.ts";
 import { renderTodoCard } from "../lib/shell-todo.ts";
 import type { ShellBarTheme } from "../lib/shell-bar.ts";
 import { createGentleAiExtension } from "../extensions/gentle-ai.ts";
 import { decodeReviewStatusV3 } from "../lib/review-integration-v2.ts";
 import { REVIEW_SIDEBAR_EVENT } from "../lib/review-sidebar-state.ts";
-import { createVoiceStatePublisher, VOICE_STATE_EVENT, VOICE_STATE_SCHEMA } from "../lib/voice-status-event.ts";
-import { SESSION_REFRESH_EVENT, SESSION_SNAPSHOT_EVENT } from "../lib/shell-session-state.ts";
 import { isJobsSidebarSnapshot } from "../lib/jobs-sidebar-state.ts";
 import type { NativeReviewCli } from "../lib/native-review-cli.ts";
-import { resolveVisualSettings, writeVisualSettings } from "../lib/visual-customization-policy.ts";
+import { DEFAULT_VISUAL_SETTINGS, DENSITY, VISUAL_PRESET, VISUAL_SCHEMA, resolveVisualSettings, visualPresetOf, writeVisualSettings } from "../lib/visual-customization-policy.ts";
 import { resolveAnimationPolicy } from "../lib/animation-policy.ts";
 import { resolveVimPolicy, writeVimPolicy } from "../lib/vim-policy.ts";
 import { resolveHistoryCapturePolicy, writeHistoryCapturePolicy } from "../lib/history-capture-policy.ts";
@@ -375,6 +373,108 @@ test("gentleShell installs the footer on session_start when a UI exists", () => 
 	assert.match(lines[0], /main ⟡ gpt-5\.5 · medium/);
 });
 
+test("session shutdown detaches the footer before a queued fullscreen render and reload", async (t) => {
+	const intervals: Array<{ tick: () => void; delay: number; stopped: boolean }> = [];
+	t.mock.method(globalThis, "setInterval", (tick: () => void, delay: number) => {
+		const timer = { tick, delay, stopped: false };
+		intervals.push(timer);
+		return { unref() {}, timer };
+	});
+	t.mock.method(globalThis, "clearInterval", (handle: { timer: (typeof intervals)[number] }) => { handle.timer.stopped = true; });
+	const old = fakePi();
+	const first = fakeContext();
+	const oldUi = first.ctx.ui;
+	const oldSession = first.ctx.sessionManager;
+	let oldLive = true;
+	let staleReads = 0;
+	Object.defineProperty(first.ctx, "ui", { configurable: true, get() {
+		if (!oldLive) { staleReads++; throw new Error("old extension context is stale"); }
+		return oldUi;
+	} });
+	Object.defineProperty(first.ctx, "sessionManager", { configurable: true, get() {
+		if (!oldLive) { staleReads++; throw new Error("old session is stale"); }
+		return oldSession;
+	} });
+	const state = { appearance: "light" };
+	const foreground = "\x1b[38;2;64;66;72m";
+	const theme = { ...plainTheme, get appearance() { return state.appearance; }, getFgAnsi: () => foreground, getColorMode: () => "truecolor" };
+	(oldUi as unknown as { theme: typeof theme }).theme = theme;
+	// The provider is deliberately inert: this lifecycle test makes no network calls.
+	(first.ctx as unknown as { model: { provider: string } }).model.provider = "test";
+	const deps = { activeProfile: () => undefined };
+	gentleShell(old.pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, deps);
+	const frames: string[] = [];
+	let mounted: { render(width: number): string[]; dispose(): void } | undefined;
+	let mountedWidget: { render(width: number): string[] } | undefined;
+	const tui = {
+		mode: "fullscreen",
+		terminal: { rows: 40, columns: 160 },
+		requestRender() {},
+		applyLineResets: (lines: string[]) => lines.map((line) => `${line}\x1b[0m`),
+		doRender() { frames.push(this.applyLineResets(["hi"])[0]!); mounted?.render(160); mountedWidget?.render(160); },
+	};
+	let unsubscribed = 0;
+	const data = { getGitBranch: () => "main", getExtensionStatuses: () => new Map(), getAvailableProviderCount: () => 1, onBranchChange: () => () => { unsubscribed++; } };
+	const installFooter = (ui: FakeUi) => (ui.footerFactory as (host: unknown, theme: ShellBarTheme, data: unknown) => NonNullable<typeof mounted>)(tui, theme, data);
+	let oldFooter: NonNullable<typeof mounted> | undefined;
+	let fresh: ReturnType<typeof fakePi> | undefined;
+	let second: ReturnType<typeof fakeContext> | undefined;
+	let freshFooter: NonNullable<typeof mounted> | undefined;
+	let freshStopped = false;
+	try {
+		await fire(old.handlers, "session_start", first.ctx);
+		oldFooter = mounted = installFooter(first.ui);
+		mountedWidget = (first.ui.widgets.get("gentle-shell-below-input-header") as () => NonNullable<typeof mountedWidget>)();
+		const jobsTimer = intervals.find((timer) => timer.delay === 1000);
+		const sidebarTimer = intervals.find((timer) => timer.delay === 100);
+		assert.ok(jobsTimer);
+		assert.ok(sidebarTimer);
+		tui.doRender();
+		assert.ok(frames.at(-1)!.startsWith("\x1b[48;2;"), "the old fullscreen light theme paints");
+		const queuedRender = () => tui.doRender(); // The real scheduled callback resolves the host method when it runs.
+		await fire(old.handlers, "session_shutdown", first.ctx);
+		oldLive = false;
+		assert.doesNotThrow(queuedRender, "the queued frame cannot touch an invalidated context");
+		assert.equal(staleReads, 0);
+		assert.equal(frames.at(-1), "hi\x1b[0m", "the frame after shutdown is unpainted");
+		assert.equal(jobsTimer.stopped, true, "shutdown stops the footer's jobs interval");
+		assert.equal(sidebarTimer.stopped, true, "shutdown stops the sidebar attachment interval");
+		assert.equal(unsubscribed, 1, "shutdown disposes the native footer subscription once");
+
+		fresh = fakePi();
+		second = fakeContext();
+		(second.ctx as unknown as { model: { provider: string } }).model.provider = "test";
+		(second.ctx.ui as unknown as { theme: typeof theme }).theme = theme;
+		gentleShell(fresh.pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, deps);
+		await fire(fresh.handlers, "session_start", second.ctx);
+		freshFooter = mounted = installFooter(second.ui);
+		mountedWidget = (second.ui.widgets.get("gentle-shell-below-input-header") as () => NonNullable<typeof mountedWidget>)();
+		tui.mode = "regular";
+		tui.doRender();
+		assert.equal(frames.at(-1), "hi\x1b[0m", "regular mode keeps the terminal background");
+		tui.mode = "fullscreen";
+		tui.doRender();
+		assert.ok(frames.at(-1)!.startsWith(`\x1b[48;2;243;242;241m${foreground}`), "the replacement paints its own light theme");
+		oldFooter.dispose();
+		oldFooter.dispose();
+		state.appearance = "dark";
+		tui.doRender();
+		assert.equal(frames.at(-1), "hi\x1b[0m", "the replacement still follows a dark switch");
+		state.appearance = "light";
+		tui.doRender();
+		assert.ok(frames.at(-1)!.startsWith("\x1b[48;2;"), "late old disposal cannot remove the new paint");
+		assert.equal(staleReads, 0);
+		assert.equal(unsubscribed, 1);
+		await fire(fresh.handlers, "session_shutdown", second.ctx);
+		freshStopped = true;
+	} finally {
+		oldLive = true;
+		oldFooter?.dispose();
+		if (fresh && second && !freshStopped) await fire(fresh.handlers, "session_shutdown", second.ctx);
+		freshFooter?.dispose();
+	}
+});
+
 async function reviewSidebarHarness() {
 	const { pi, handlers, tools } = fakePi();
 	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, { activeProfile: () => undefined });
@@ -507,159 +607,6 @@ test("review sidebar rejects foreign-session events and unsubscribes on shutdown
 	}
 });
 
-test("account failures follow Status and Resources visibility without legacy duplicates", async (t) => {
-	const home = scopedDoubleEscCancelConfigHome(t), { pi, handlers } = fakePi(), { ctx, ui } = fakeContext({ token: "fixture" });
-	(ctx as unknown as { model: { provider: string } }).model.provider = "acme-cloud";
-	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home, GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, { activeProfile: () => "team", now: () => 1_788_600_000_000 });
-	pi.events.emit(USAGE_SOURCE_EVENT, { schema: USAGE_SOURCE_SCHEMA, provider: "acme-cloud", fetch: async () => ({ provider: "acme-cloud", layout: "accounts", fetchedAt: 1_788_600_000_000, unavailable: [{ label: "Pay02", reason: "HTTP 403" }], limits: [{ name: "Pay01 C7d", account: "Pay01", family: "claude", limitReached: false, windows: [{ label: "week", usedPercent: 40, windowSeconds: 604800, resetAt: null }] }] }) });
-	await fire(handlers, "session_start", ctx); await settle();
-	const node = Symbol.for("@earendil-works/pi-tui/layout-node"), root = { render: () => [], invalidate() {}, [node]: () => ({ type: "vstack", entries: [] }) };
-	const tui = { mode: "fullscreen", terminal: { rows: 40, columns: 160 }, layoutRoot: root, requestRender() {} };
-	const factory = ui.footerFactory as (tui: unknown, theme: ShellBarTheme, data: unknown) => { dispose(): void };
-	const component = factory(tui, plainTheme, { getGitBranch: () => "main", getExtensionStatuses: () => new Map([["failure", "Pay02 unavailable (HTTP 403)"]]), getAvailableProviderCount: () => 1, onBranchChange: () => () => {} });
-	const entries = () => { const tree = root[node]() as unknown as { entries: Array<{ component: { [node](): { entries: Array<{ component: Component }> } } }> }; return tree.entries[1]!.component[node]().entries; };
-	const select = (label: string) => { const p = entries()[0]!.component, rows = p.render(50).map(stripAnsi), y = rows.findIndex(row => row.includes("Sessions") && row.includes("Status")), x = rows[y]!.indexOf(label); assert.ok(x >= 0); assert.equal(p.handleMouse?.({ type: "click", button: "left", x, y, width: 50, height: rows.length, screenX: x, screenY: y, shift: false, alt: false, ctrl: false } as TuiMouseEvent)?.handled, true); };
-	const body = () => entries()[1]!.component.render(50).map(stripAnsi).join("\n");
-	try {
-		assert.doesNotMatch(body(), /Pay02/);
-		select("Status"); assert.match(body(), /Pay02 unavailable \(HTTP 403\)/);
-		select("Resources"); assert.match(body(), /Pay02.*HTTP 403/); assert.doesNotMatch(body(), /Pay02 unavailable/);
-		select("Activity"); assert.doesNotMatch(body(), /Pay02/);
-		select("Status"); assert.match(body(), /Pay02 unavailable \(HTTP 403\)/);
-		const disposeLegacy = installSidebar(tui as unknown as TUI, plainTheme);
-		try {
-			root[node](); const parts = sidebarState(tui as unknown as TUI).parts;
-			const usage = parts.get("usage")!, footer = parts.get("footer")!;
-			assert.match(usage.render(48).join("\n"), /Pay02.*HTTP 403/);
-			assert.doesNotMatch(footer.render(48).join("\n"), /Pay02 unavailable/);
-			parts.delete("usage"); assert.match(footer.render(48).join("\n"), /Pay02 unavailable \(HTTP 403\)/); parts.set("usage", usage);
-		} finally { disposeLegacy(); }
-	} finally { component.dispose(); await fire(handlers, "session_shutdown", ctx); }
-});
-
-test("Sessions selection requests current-session metadata and renders only validated snapshots", async (t) => {
-	const home=scopedDoubleEscCancelConfigHome(t), {pi,handlers}=fakePi(), {ctx,ui}=fakeContext();
-	gentleShell(pi,{GENTLE_PI_CONFIG_HOME:home,GENTLE_PI_SHELL_CHANGES_WATCH_MS:"off"},{activeProfile:()=>"team"});
-	let session="shell-session"; (ctx.sessionManager as unknown as {getSessionId():string}).getSessionId=()=>session;
-	await fire(handlers,"session_start",ctx);
-	const node=Symbol.for("@earendil-works/pi-tui/layout-node"),root={render:()=>[],invalidate(){},[node]:()=>({type:"vstack",entries:[]})};
-	const tui={mode:"fullscreen",terminal:{rows:40,columns:160},layoutRoot:root,requestRender(){}};
-	const factory=ui.footerFactory as (tui:unknown,theme:ShellBarTheme,data:unknown)=>{dispose():void};
-	const component=factory(tui,plainTheme,{getGitBranch:()=>"main",getExtensionStatuses:()=>new Map(),getAvailableProviderCount:()=>1,onBranchChange:()=>()=>{}});
-	const section=sidebarState(tui as unknown as TUI).parts.get("sessions")!; const original=section.render.bind(section); let paints=0;
-	section.render=(w)=>{paints++;return original(w);}; let requests:unknown[]=[]; const off=pi.events.on(SESSION_REFRESH_EVENT,(value)=>requests.push(value));
-	const entries=()=>{const tree=root[node]() as unknown as {entries:Array<{component:{[node]():{entries:Array<{component:Component}>}}}>};return tree.entries[1]!.component[node]().entries;};
-	const select=(label:string)=>{const p=entries()[0]!.component, rows=p.render(50).map(stripAnsi), y=rows.findIndex(row=>row.includes("Sessions")&&row.includes("Status")),x=rows[y]!.indexOf(label);assert.ok(x>=0);assert.equal(p.handleMouse?.({type:"click",button:"left",x,y,width:50,height:rows.length,screenX:110+x,screenY:y,shift:false,alt:false,ctrl:false} as TuiMouseEvent)?.handled,true);};
-	const body=()=>entries()[1]!.component.render(50).map(stripAnsi).join("\n");
-	try {
-		entries(); entries(); assert.equal(paints,0); assert.equal(requests.length,0);
-		select("Sessions"); assert.deepEqual(requests,[{sessionId:"shell-session"}]); assert.match(body(),/Sessions unavailable/);
-		select("Sessions"); assert.equal(requests.length,1,"reselecting the same tab does not rescan");
-		const ready={kind:"ready",rows:[{name:"Peer topic",freshness:"recent",active:2}],incomplete:false,observedAt:1};
-		pi.events.emit(SESSION_SNAPSHOT_EVENT,{sessionId:"foreign",snapshot:ready}); assert.match(body(),/Sessions unavailable/);
-		pi.events.emit(SESSION_SNAPSHOT_EVENT,{sessionId:session,snapshot:ready}); assert.match(body(),/Peer topic/); assert.match(body(),/visto hace \d+ s/, "one human footer replaces the technical disclaimers");
-		// Human-language card (S2): no technical disclaimers, one age line per session.
-		assert.match(body(),/● Peer topic/); assert.match(body(),/hace \d+ (min|h) · 2 agentes/); assert.doesNotMatch(body(),/not verified live|running \+ queued|recent at snapshot/);
-		const count=paints; body(); assert.equal(paints,count,"stable session rows are cached");
-		select("Status"); const hidden=paints; pi.events.emit(SESSION_SNAPSHOT_EVENT,{sessionId:session,snapshot:{kind:"ready",rows:[],incomplete:false,observedAt:1}}); entries(); assert.equal(paints,hidden,"hidden Sessions does not render");
-		select("Sessions"); assert.match(body(),/Sin otras sesiones/); assert.equal(requests.length,2);
-		session="replacement"; assert.match(body(),/Sessions unavailable/,"old parent snapshot cannot leak to replacement");
-	} finally {off();component.dispose();await fire(handlers,"session_shutdown",ctx);}
-});
-
-test("scoped voice and waits events reach the actual pinned rail and clear on replacement", async (t) => {
-	const home = scopedDoubleEscCancelConfigHome(t);
-	const { pi, handlers } = fakePi();
-	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home, GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, { activeProfile: () => "team" });
-	const { ctx, ui } = fakeContext(); let session = "shell-session";
-	(ctx.sessionManager as unknown as { getSessionId(): string }).getSessionId = () => session;
-	await fire(handlers, "session_start", ctx);
-	const node = Symbol.for("@earendil-works/pi-tui/layout-node");
-	const root = { render: () => ["transcript"], invalidate() {}, [node]: () => ({ type: "vstack", entries: [] }) };
-	const tui = { mode: "fullscreen", terminal: { rows: 40, columns: 160 }, layoutRoot: root, requestRender() {} };
-	const data = { getGitBranch: () => "main", getExtensionStatuses: () => new Map(), getAvailableProviderCount: () => 1, onBranchChange: () => () => {} };
-	const factory = ui.footerFactory as (tui: unknown, theme: ShellBarTheme, data: unknown) => { dispose(): void };
-	const voicePaint: Array<{ role: string; text: string }> = [];
-	const voiceTheme = { ...plainTheme, fg: (role: string, value: string) => { if (value === "\x1b[7m●") voicePaint.push({ role, text: value }); return plainTheme.fg(role, value); } };
-	const component = factory(tui, voiceTheme, data);
-	const status = sidebarState(tui as unknown as TUI).parts.get("footer")!; const render = status.render.bind(status); let statusRenders = 0;
-	status.render = (width) => { statusRenders++; return render(width); };
-	const parts = () => {
-		const tree = root[node]() as unknown as { entries: Array<{ component: { [node](): { entries: Array<{ component: Component }> } } }> };
-		const entries = tree.entries[1]!.component[node]().entries;
-		return { pinned: entries[0]!.component, scroll: entries[1]!.component };
-	};
-	const text = () => { const p = parts(); return { pinned: p.pinned.render(50).map(stripAnsi).join("\n"), body: p.scroll.render(50).map(stripAnsi).join("\n") }; };
-	const select = (label: string) => {
-		const pin = parts().pinned, rows = pin.render(50).map(stripAnsi), y = rows.findIndex(row => row.includes("Activity") && row.includes("Status")), x = rows[y]!.indexOf(label);
-		assert.ok(x >= 0); assert.equal(pin.handleMouse?.({ type:"click", button:"left", x, y, width:50, height:rows.length, screenX:110+x, screenY:y, shift:false, alt:false, ctrl:false } as TuiMouseEvent)?.handled,true);
-	};
-	const voice = createVoiceStatePublisher(pi, ctx);
-	try {
-		const badge = /● (Preparando|Escuchando|Transcribiendo) /;
-		assert.match(text().body, /Waits unavailable/); assert.doesNotMatch(text().pinned, badge);
-		pi.events.emit("background-waits:pending", { waits: [{id:"w",label:"old",startedAt:1}] });
-		pi.events.emit("background-waits:pending", { sessionId:"foreign", waits:[{id:"w",label:"foreign",startedAt:1}] });
-		assert.match(text().body,/Waits unavailable/);
-		pi.events.emit("background-waits:pending", { sessionId:session, waits:[{id:"w",label:"CI check",startedAt:1}] });
-		// The counts live inside the Activity card now (S1), not under the tabs.
-		assert.match(text().body,/CI check/); assert.match(text().body,/Waits\s+1\b/); assert.doesNotMatch(text().pinned,/Waits 1/);
-		voice.publish("preparing"); assert.match(text().pinned,/● Preparando /); assert.equal(voicePaint.at(-1)?.role, "warning");
-		voice.publish("listening"); assert.match(text().pinned,/● Escuchando /); assert.equal(voicePaint.at(-1)?.role, "error");
-		assert.match(text().pinned,/● Escuchando…/); assert.match(text().pinned,/micrófono abierto/);
-		pi.events.emit(VOICE_STATE_EVENT,{schema:VOICE_STATE_SCHEMA,sessionId:"foreign",state:"transcribing"});
-		pi.events.emit(VOICE_STATE_EVENT,{schema:VOICE_STATE_SCHEMA,sessionId:session,state:"recording"});
-		assert.match(text().pinned,/● Escuchando /);
-		assert.equal(statusRenders,0,"hidden Status never renders for events");
-		select("Status"); assert.match(text().pinned,/● Escuchando /); assert.ok(statusRenders>0);
-		voice.publish("transcribing"); assert.match(text().pinned,/● Transcribiendo /); assert.equal(voicePaint.at(-1)?.role, "warning");
-		voice.publish("idle"); assert.doesNotMatch(text().pinned,badge);
-		select("Activity"); pi.events.emit("background-waits:pending", {sessionId:session,waits:[]}); assert.match(text().body,/Waits\s+0\b/);
-		component.dispose(); session = "replacement"; await fire(handlers,"session_start",ctx);
-		const next = (ui.footerFactory as typeof factory)(tui,plainTheme,data);
-		try {
-			voice.publish("preparing"); pi.events.emit("background-waits:pending",{sessionId:"shell-session",waits:[{id:"w",label:"stale",startedAt:1}]});
-			assert.doesNotMatch(text().pinned,badge); assert.doesNotMatch(text().body,/Waits\s+1\b/); assert.match(text().body,/Waits unavailable/);
-			await fire(handlers,"session_shutdown",ctx);
-			pi.events.emit(VOICE_STATE_EVENT,{schema:VOICE_STATE_SCHEMA,sessionId:session,state:"listening"});
-			assert.doesNotMatch(text().pinned,badge);
-		} finally { next.dispose(); }
-	} finally { voice.close(); component.dispose(); }
-});
-
-test("tabbed rail keeps job counts and keeps the active dev notice out of the transcript on every tab", async (t) => {
-	const previous = cardStyle(); t.after(() => setCardStyle(previous));
-	const home = scopedDoubleEscCancelConfigHome(t), { pi, handlers } = fakePi(), { ctx, ui } = fakeContext();
-	writeCardStyle("float", { gentlePiConfigHome: home });
-	writeVisualSettings({ ...resolveVisualSettings({ gentlePiConfigHome: home }).settings, headerPlacement: "below-input" }, { gentlePiConfigHome: home });
-	const bg = "\x1b[48;5;22m", theme = { ...plainTheme, bg: (_role: string, text: string) => `${bg}${text}\x1b[49m`, getBgAnsi: () => bg };
-	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home, GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, { now: () => 0, fetch: fakeFetch({}, false).fetchFn, devBinary: () => ({ state: "active", path: "/fixture/gentle-ai", sha256: "0dac40684a053f2b00" }) });
-	await fire(handlers, "session_start", ctx);
-	const node = Symbol.for("@earendil-works/pi-tui/layout-node"), root = { render: () => [], invalidate() {}, [node]: () => ({ type: "vstack", entries: [] }) };
-	const tui = { mode: "fullscreen", terminal: { rows: 40, columns: 160 }, layoutRoot: root, requestRender() {} };
-	const factory = ui.footerFactory as (tui: unknown, theme: ShellBarTheme, data: unknown) => { dispose(): void };
-	const component = factory(tui, theme, { getGitBranch: () => "main", getExtensionStatuses: () => new Map(), getAvailableProviderCount: () => 1, onBranchChange: () => () => {} });
-	const widget = (ui.widgets.get("gentle-shell-dev-binary") as (tui: unknown, theme: ShellBarTheme) => Component)(tui, theme);
-	const below = (ui.widgets.get("gentle-shell-below-input-header") as (tui: unknown, theme: ShellBarTheme) => Component)(tui, theme);
-	const entries = () => { const tree = root[node]() as unknown as { entries: Array<{ component: { [node](): { entries: Array<{ component: Component }> } } }> }; return tree.entries[1]!.component[node]().entries; };
-	const text = () => { const e = entries(); return { pinned: e[0]!.component.render(50).map(stripAnsi).join("\n"), body: e[1]!.component.render(50).map(stripAnsi).join("\n"), widget: widget.render(100).map(stripAnsi).join("\n") }; };
-	const select = (label: string) => { const p = entries()[0]!.component, rows = p.render(50).map(stripAnsi), y = rows.findIndex(row => row.includes("Sessions") && row.includes("Status")), x = rows[y]!.indexOf(label); assert.ok(x >= 0); assert.equal(p.handleMouse?.({ type: "click", button: "left", x, y, width: 50, height: rows.length, screenX: x, screenY: y, shift: false, alt: false, ctrl: false } as TuiMouseEvent)?.handled, true); };
-	try {
-		pi.events.emit("gentle-ai:jobs-sidebar", { sessionId: "shell-session", snapshot: { jobs: [{ id: "job-1", label: "CI for PR 1860", startedAt: 1 }] } });
-		for (const tab of ["Activity", "Sessions", "Resources"]) {
-			if (tab !== "Activity") select(tab);
-			// The command count lives in the Activity card (S1); the tab header carries navigation only.
-			const view = text(); assert.doesNotMatch(view.pinned, /1 command\b/); assert.doesNotMatch(view.body, /field-test/);
-			assert.doesNotMatch(below.render(100).map(stripAnsi).join("\n"), /1 job/, "the Activity card owns the count, not the float");
-			if (tab === "Activity") { assert.match(view.body, /Commands\s+1 command\b/); assert.match(view.body, /CI for PR 1860/); }
-			assert.equal(view.widget, "", `${tab} keeps the startup notice inside the rail Status section, never in the transcript`);
-		}
-		select("Status"); const status = text(); assert.doesNotMatch(status.pinned, /1 command\b/); assert.match(status.body, /field-test/); assert.doesNotMatch(status.body, /CI for PR 1860/, "jobs keep their own card instead of repeating inside Status"); assert.equal(status.widget, "");
-		select("Resources"); assert.equal(text().widget, "", "leaving Status does not bounce the notice back into the transcript");
-		await fire(handlers, "agent_start", ctx); assert.equal(ui.widgets.has("gentle-shell-dev-binary"), false);
-	} finally { component.dispose(); await fire(handlers, "session_shutdown", ctx); }
-});
-
 test("jobs snapshots feed their own rail card, keep one compact fallback, and reject stale sessions", async () => {
 	const { pi, handlers } = fakePi();
 	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" });
@@ -674,21 +621,24 @@ test("jobs snapshots feed their own rail card, keep one compact fallback, and re
 	const rail = state.parts.get("footer")!;
 	const jobs = state.parts.get("jobs")!;
 	const header = state.parts.get("header")!;
+	// Mobile keeps the running-job count in its status bar: no rail lists jobs there.
+	const statusbar = state.parts.get("statusbar")!;
+	state.layoutAttached = () => true; // installSidebar sets this on a real fullscreen root
 	const publish = (sessionId: string, jobs: unknown) => pi.events.emit("gentle-ai:jobs-sidebar", { sessionId, snapshot: { jobs } });
 	try {
 		publish("shell-session", [{ id: "job-1", label: "CI for PR 1860", startedAt: 1 }]);
 		assert.doesNotMatch(rail.render(46).join("\n"), /Jobs|CI for PR 1860/, "the Status card never prints jobs; the jobs card owns them");
 		assert.match(rail.render(46).join("\n"), /MCP: 3 servers/);
-		assert.match(jobs.render(46).join("\n"), /Jobs[\s\S]*CI for PR 1860/);
+		assert.match(jobs.render(46).join("\n"), /▾ JOBS[\s\S]*CI for PR 1860/);
 		publish("shell-session", [{ id: "job-1", label: "CI for PR 1860", startedAt: 1 }, { id: "job-0", label: "Build runtime", startedAt: 1, status: "exited", endedAt: Date.now(), exitCode: 0 }]);
 		assert.match(jobs.render(60).join("\n"), /1 running · 1 finished/, "finished tails ride the same snapshot");
-		assert.match(jobs.render(60).join("\n"), /✓\s+Build runtime/);
+		assert.match(jobs.render(60).join("\n"), /✓ \S+ Build runtime/);
 		// The compact count is running-only: a finished tail still paints the
 		// card, but the header's ⧗ N jobs derives from running entries alone.
 		publish("shell-session", [{ id: "job-2", label: "Fresh tail", startedAt: 1, status: "exited", endedAt: Date.now(), exitCode: 0 }]);
 		tui.terminal.columns = 80;
 		assert.match(jobs.render(46).join("\n"), /Fresh tail/, "the finished tail still paints the card");
-		assert.doesNotMatch(header.render(80).join("\n"), /⧗ 1 job/, "the compact count is running-only");
+		assert.doesNotMatch(statusbar.render(80).join("\n"), /⧗ 1 job/, "the compact count is running-only");
 		tui.terminal.columns = 160;
 		publish("shell-session", [{ id: "job-0", label: "Stale tail", startedAt: 1, status: "exited", endedAt: 5, exitCode: 0 }]);
 		assert.doesNotMatch(jobs.render(46).join("\n"), /Stale tail/, "a finished job past the TTL paints nothing");
@@ -696,23 +646,25 @@ test("jobs snapshots feed their own rail card, keep one compact fallback, and re
 		state.active = true;
 		state.ownsHost = () => true;
 		assert.doesNotMatch(header.render(160).join("\n"), /1 job/, "the visible rail owns job details");
+		assert.doesNotMatch(statusbar.render(160).join("\n"), /1 job/, "the wide status bar leaves jobs to the rail");
 		state.active = false;
 		tui.terminal.columns = 80;
 		publish("shell-session", [{ id: "job-1", label: "CI for PR 1860", startedAt: 1 }]);
-		assert.match(header.render(80).join("\n"), /1 job/, "mobile topbar preserves the count of a running job");
+		assert.match(statusbar.render(80).join("\n"), /1 job/, "the mobile status bar preserves the count of a running job");
 		const before = jobs.render(46).join("\n");
 		publish("foreign", []);
 		publish("shell-session", [{ label: "invalid" }]);
 		assert.equal(jobs.render(46).join("\n"), before);
 		publish("shell-session", []);
 		assert.doesNotMatch(jobs.render(46).join("\n"), /Jobs|CI for PR/);
-		assert.doesNotMatch(header.render(80).join("\n"), /1 job/);
+		assert.doesNotMatch(statusbar.render(80).join("\n"), /1 job/);
 		publish("shell-session", [{ id: "job-2", label: "Build runtime", startedAt: 2 }]);
 		await fire(handlers, "session_start", ctx);
 		assert.doesNotMatch(state.parts.get("jobs")!.render(46).join("\n"), /Build runtime/);
 		await fire(handlers, "session_shutdown", ctx);
+		assert.equal(state.parts.has("jobs"), false, "shutdown removes the footer-owned jobs rail");
 		publish("shell-session", [{ id: "job-3", label: "late", startedAt: 3 }]);
-		assert.doesNotMatch(state.parts.get("jobs")!.render(46).join("\n"), /late/);
+		assert.doesNotMatch(jobs.render(46).join("\n"), /late/, "shutdown also unsubscribes the jobs consumer");
 	} finally { component.dispose(); }
 });
 
@@ -722,35 +674,11 @@ test("the jobs snapshot validator admits the finished-tail statuses", () => {
 	assert.equal(isJobsSidebarSnapshot({ jobs: [{ id: "job-3", label: "Bad", startedAt: 1, status: "exploded" }] }), false);
 });
 
-test("a folded wide rail with a top header leaves only statuses in the bottom bar", async (t) => {
-	const home = scopedDoubleEscCancelConfigHome(t);
-	const { pi, handlers } = fakePi();
-	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home, GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" });
-	const { ctx, ui } = fakeContext();
-	await fire(handlers, "session_start", ctx);
-	const tui = { mode: "fullscreen", terminal: { rows: 40, columns: 160 }, requestRender() {} };
-	const data = { getGitBranch: () => "main", getExtensionStatuses: () => new Map([["mcp", "MCP connected"]]), getAvailableProviderCount: () => 1, onBranchChange: () => () => {} };
-	const factory = ui.footerFactory as (tui: unknown, theme: ShellBarTheme, footerData: unknown) => { render(width: number): string[]; dispose(): void };
-	const component = factory(tui, plainTheme, data);
-	const state = sidebarState(tui as unknown as TUI);
-	try {
-		pi.events.emit("gentle-ai:jobs-sidebar", { sessionId: "shell-session", snapshot: { jobs: [{ id: "job-1", label: "CI for PR 1860", startedAt: 1 }] } });
-		state.railAvailable = () => true;
-		state.headerOwnsIdentity = () => true;
-		const folded = component.render(160).map(stripAnsi).join("\n");
-		assert.match(folded, /⧗ 1 job/);
-		assert.match(folded, /MCP connected/);
-		assert.doesNotMatch(folded, /main|ctx|\$/, "the top header already paints path, branch, model, context and cost");
-		state.headerOwnsIdentity = () => false;
-		assert.match(component.render(160).map(stripAnsi).join("\n"), /main/, "without the header the bottom bar keeps the whole row");
-	} finally { component.dispose(); }
-});
-
 test("hidden Status leaves only a jobs count in regular bottom and fullscreen header chrome", async (t) => {
 	const home = scopedDoubleEscCancelConfigHome(t);
 	writeVisualSettings({ ...resolveVisualSettings({ gentlePiConfigHome: home }).settings, statusPlacement: "hidden" }, { gentlePiConfigHome: home });
 	const { pi, handlers } = fakePi();
-	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home, GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, { devBinary: () => ({ state: "active", path: "/fixture/gentle-ai", sha256: "0dac40684a053f2b00" }) });
+	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home, GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" });
 	const { ctx, ui } = fakeContext();
 	await fire(handlers, "session_start", ctx);
 	const tui = { mode: "regular", terminal: { rows: 40, columns: 160 }, requestRender() {} };
@@ -765,8 +693,6 @@ test("hidden Status leaves only a jobs count in regular bottom and fullscreen he
 		assert.doesNotMatch(component.render(80).join("\n"), /⧗/, "a finished-only tail never paints a ⧗ 0 jobs row");
 		pi.events.emit("gentle-ai:jobs-sidebar", { sessionId: "shell-session", snapshot: { jobs: [{ id: "job-1", label: "CI for PR 1860", startedAt: 1 }] } });
 		tui.mode = "fullscreen";
-		const notice = (ui.widgets.get("gentle-shell-dev-binary") as (tui: unknown, theme: ShellBarTheme) => Component)(tui, plainTheme);
-		assert.match(notice.render(100).map(stripAnsi).join("\n"), /dev binary override/, "hidden Status keeps the separate startup notice without showing Status");
 		const header = sidebarState(tui as unknown as TUI).parts.get("header")!;
 		assert.match(header.render(160).join("\n"), /⧗ 1 job/);
 		assert.doesNotMatch(component.render(160).join("\n"), /1 job/, "the hidden fullscreen footer does not duplicate the topbar count");
@@ -775,7 +701,7 @@ test("hidden Status leaves only a jobs count in regular bottom and fullscreen he
 	} finally { component.dispose(); await fire(handlers, "session_shutdown", ctx); }
 });
 
-test("the fullscreen Status rail carries a live digest so a profile switch refreshes it", async () => {
+test("the fullscreen Status rail and header refresh the effective agent profile together", async () => {
 	const { pi, handlers } = fakePi();
 	let profile: string | undefined = "team";
 	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, { activeProfile: () => profile });
@@ -793,13 +719,20 @@ test("the fullscreen Status rail carries a live digest so a profile switch refre
 		assert.equal(typeof rail.digest, "function", "the Status card paints live state and must declare a digest");
 		assert.doesNotMatch(rail.render(46).join("\n"), /gpt-5\.5/, "model now lives in the header, not the Status card");
 
-		assert.match(rail.render(46).join("\n"), /Profile.*team/);
-		const beforeProfile = live();
+		// Integrations exposes the same effective agent profile as the header.
+		const header = sidebarState(tui as unknown as TUI).parts.get("header") as SidebarRail;
+		assert.match(rail.render(46).join("\n"), /Agent profile: team/);
+		assert.match(header.render(160).join("\n"), /team/);
+		const beforeProfile = header.digest?.();
+		const beforeRailProfile = live();
 		profile = "other";
-		assert.notEqual(live(), beforeProfile);
-		assert.match(rail.render(46).join("\n"), /Profile.*other/);
+		assert.notEqual(header.digest?.(), beforeProfile, "a profile switch changes the header digest");
+		assert.notEqual(live(), beforeRailProfile, "a profile switch changes the Status digest");
+		assert.match(header.render(160).join("\n"), /other/);
+		assert.match(rail.render(46).join("\n"), /Agent profile: other/);
 		profile = undefined;
-		assert.doesNotMatch(rail.render(46).join("\n"), /Profile/);
+		assert.doesNotMatch(header.render(160).join("\n"), /team|other/);
+		assert.doesNotMatch(rail.render(46).join("\n"), /Agent profile:/);
 
 		const beforeStatus = live();
 		statuses.set("mcp", "MCP: 3 servers enabled");
@@ -866,7 +799,6 @@ test("clicking the header's usage segment opens the usage panel; other header cl
 		const line = header.render(160).join("");
 		const usageAt = line.indexOf("usage");
 		assert.ok(usageAt >= 0, "the header shows a standing usage segment");
-		assert.ok(sidebarState(tui as unknown as TUI).parts.has("usage"), "the rail also carries the Limits card");
 
 		const click = (x: number) => header.handleMouse?.({ type: "click", button: "left", x, y: 0, screenX: x, screenY: 0, width: 160, height: 1, shift: false, alt: false, ctrl: false } as TuiMouseEvent);
 		assert.equal(click(0), undefined, "a click on the brand does not open the panel");
@@ -877,101 +809,6 @@ test("clicking the header's usage segment opens the usage panel; other header cl
 		ui.closeOverlay?.();
 	} finally {
 		component.dispose();
-		assert.equal(sidebarState(tui as unknown as TUI).parts.has("usage"), false, "disposing the footer removes the Limits rail card");
-	}
-});
-
-test("the pinned rail header keeps a long model, shows usage, and opens the panel only from the usage row", async () => {
-	const { pi, handlers } = fakePi();
-	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" });
-	const { ctx, ui } = fakeContext();
-	await fire(handlers, "session_start", ctx);
-	(ctx.model as { id: string }).id = "claude-opus-5-5-extended-context-preview-build-with-a-very-long-suffix";
-
-	const liveFooterData = { getGitBranch: () => "main", getExtensionStatuses: () => new Map(), getAvailableProviderCount: () => 1, onBranchChange: () => () => {} };
-	const tui = { terminal: { rows: 40, columns: 160 }, requestRender() {} };
-	const factory = ui.footerFactory as (tui: unknown, theme: ShellBarTheme, footerData: unknown) => { render(width: number): string[]; dispose(): void };
-	const component = factory(tui, plainTheme, liveFooterData);
-	try {
-		const header = sidebarState(tui as unknown as TUI).parts.get("header") as SidebarHeaderRail;
-		const pinned = header.pinned!;
-		assert.ok(pinned, "the header declares a rail-width pinned form");
-		const lines = pinned.render(50).map(stripAnsi);
-		assert.ok(lines.every((line) => visibleWidth(line) <= 50), "every pinned row fits the rail");
-		assert.match(lines.map((line) => line.slice(1).trimEnd()).join(""), /claude-opus-5-5-extended-context-preview-build-with-a-very-long-suffix/, "a long model wraps instead of being dropped");
-		assert.match(lines.join("\n"), /ctx/);
-		const usageY = lines.findIndex((line) => /^ ◔ usage/.test(line));
-		assert.ok(usageY > 0, "usage stays visible in the pinned header");
-		const click = (x: number, y: number) => pinned.handleMouse?.({ type: "click", button: "left", x, y, screenX: 110 + x, screenY: y, width: 50, height: lines.length, shift: false, alt: false, ctrl: false } as TuiMouseEvent);
-		assert.equal(click(2, 0), undefined, "the brand row is decorative");
-		assert.equal(click(2, lines.length - 1), undefined, "the rule is decorative");
-		assert.equal(click(0, usageY), undefined, "the inset blank before usage is inert");
-		assert.equal(click(lines[usageY]!.trimEnd().length + 1, usageY), undefined, "blank space after usage is inert");
-		assert.equal(click(2, usageY)?.handled, true);
-		await new Promise((resolve) => setTimeout(resolve, 0));
-		assert.match(ui.overlayView!.render(90).join("\n"), /Subscriptions/);
-		ui.closeOverlay?.();
-	} finally {
-		component.dispose();
-	}
-});
-
-async function railActions(env: NodeJS.ProcessEnv) {
-	const { pi, handlers, sentMessages } = fakePi();
-	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off", ...env });
-	const { ctx, ui } = fakeContext();
-	await fire(handlers, "session_start", ctx);
-	const liveFooterData = { getGitBranch: () => "main", getExtensionStatuses: () => new Map(), getAvailableProviderCount: () => 1, onBranchChange: () => () => {} };
-	const tui = { terminal: { rows: 40, columns: 160 }, requestRender() {} };
-	const factory = ui.footerFactory as (tui: unknown, theme: ShellBarTheme, footerData: unknown) => { render(width: number): string[]; dispose(): void };
-	const component = factory(tui, plainTheme, liveFooterData);
-	const pinned = (sidebarState(tui as unknown as TUI).parts.get("header") as SidebarHeaderRail).pinned!;
-	const lines = pinned.render(50).map(stripAnsi);
-	const click = (x: number, y: number) => pinned.handleMouse?.({ type: "click", button: "left", x, y, screenX: 110 + x, screenY: y, width: 50, height: lines.length, shift: false, alt: false, ctrl: false } as TuiMouseEvent);
-	return { lines, click, ui, component, sentMessages };
-}
-
-test("the rail commands row opens the command palette like alt+k and the usage row still opens usage", async () => {
-	const { lines, click, ui, component } = await railActions({});
-	try {
-		const commandsY = lines.findIndex((line) => /^ ≡ commands {3}\[alt\+k\]$/.test(line));
-		const usageY = lines.findIndex((line) => /^ ◔ usage {6}\[alt\+u\]$/.test(line));
-		assert.ok(commandsY > 0 && usageY === commandsY + 1, lines.join("\n"));
-		assert.equal(click(2, commandsY - 1), undefined, "the dotted rule is decorative");
-		assert.equal(click(0, commandsY), undefined, "the inset is inert");
-		assert.equal(click(40, commandsY), undefined, "blank space after the key hint is inert");
-		assert.equal(click(2, commandsY)?.handled, true);
-		await new Promise((resolve) => setTimeout(resolve, 0));
-		assert.match(ui.overlayView!.render(100).join("\n"), /Configuration/, "the palette opened");
-		assert.doesNotMatch(ui.overlayView!.render(100).join("\n"), /Subscriptions/);
-		ui.overlayView!.handleInput("\x1b");
-		await new Promise((resolve) => setTimeout(resolve, 0));
-		assert.equal(click(2, usageY)?.handled, true);
-		await new Promise((resolve) => setTimeout(resolve, 0));
-		assert.match(ui.overlayView!.render(90).join("\n"), /Subscriptions/);
-		ui.closeOverlay?.();
-	} finally {
-		component.dispose();
-	}
-});
-
-test("the rail action rows show remapped keys and no hint when a shortcut is disabled", async () => {
-	const remapped = await railActions({ GENTLE_PI_COMMANDS_KEY: "ctrl+p", GENTLE_PI_SHELL_USAGE_KEY: "ctrl+o" });
-	try {
-		assert.ok(remapped.lines.includes(" ≡ commands   [ctrl+p]"), remapped.lines.join("\n"));
-		assert.ok(remapped.lines.includes(" ◔ usage      [ctrl+o]"));
-	} finally {
-		remapped.component.dispose();
-	}
-	const off = await railActions({ GENTLE_PI_COMMANDS_KEY: "off", GENTLE_PI_SHELL_USAGE_KEY: "off" });
-	try {
-		assert.ok(off.lines.includes(" ≡ commands"), off.lines.join("\n"));
-		assert.ok(off.lines.includes(" ◔ usage"));
-		const y = off.lines.indexOf(" ≡ commands");
-		assert.equal(off.click(2, y)?.handled, true, "a disabled shortcut still has a clickable row");
-		assert.equal(off.click(12, y), undefined, "no key hint means no hit area past the label");
-	} finally {
-		off.component.dispose();
 	}
 });
 
@@ -1080,17 +917,17 @@ test("profile polling refreshes both fullscreen surfaces only on change and stop
 	try {
 		const timer = intervals.find((entry) => entry.delay === 2000);
 		assert.ok(timer, "UI session installs the 2000ms profile refresh");
-		assert.match(status(), /Profile.*team/);
+		assert.match(status(), /Agent profile: team/, "Integrations shows the effective agent profile");
 		assert.match(header(), /team/);
 		const before = tui.requestRender.mock.callCount();
 		timer.tick();
 		assert.equal(tui.requestRender.mock.callCount(), before, "unchanged poll does not render");
 		writeFileSync(local, JSON.stringify({ kind: "gentle-pi.agent_model_profile_pin", version: 1, profile: "other" }));
-		assert.match(status(), /Profile.*team/, "external edits do not read during render");
+		assert.match(header(), /team/, "external edits do not read during render");
 		timer.tick();
 		assert.equal(tui.requestRender.mock.callCount(), before + 1);
-		assert.match(status(), /Profile.*other \(local\)/);
 		assert.match(header(), /other \(local\)/);
+		assert.match(status(), /Agent profile: other \(local\)/, "profile polling also refreshes Integrations");
 		timer.tick();
 		assert.equal(tui.requestRender.mock.callCount(), before + 1);
 		const afterBind = resolutions;
@@ -1106,8 +943,9 @@ test("profile polling refreshes both fullscreen surfaces only on change and stop
 		assert.equal(tui.requestRender.mock.callCount(), before + 1, "old session cannot repaint");
 		await fire(handlers, "session_shutdown", second.ctx);
 		assert.equal(replacement.stopped, true);
+		const afterShutdown = tui.requestRender.mock.callCount();
 		replacement.tick();
-		assert.equal(tui.requestRender.mock.callCount(), before + 1);
+		assert.equal(tui.requestRender.mock.callCount(), afterShutdown, "a stopped poll cannot repaint after footer teardown");
 	} finally {
 		component.dispose();
 	}
@@ -1128,15 +966,170 @@ test("gentleShell stays out of the way without a UI or when disabled", () => {
 
 const fakeTui = { terminal: { rows: 40, columns: 120 }, requestRender() {} };
 const editorTheme = { borderColor: (text: string) => text, selectList: {} };
-// Marks every painted role so a frame reveals the working-label scan, which is
-// invisible under an identity theme now that the local frame has no flower.
-const markedTheme = {
-	...plainTheme,
-	fg(color: string, value: string) {
-		return `<${color}>${value}</${color}>`;
-	},
-};
 const fakeKeybindings = { matches: () => false };
+
+test("panel control owns its rendered mouse cells across top rows and Vim modes", () => {
+	for (const vim of [false, true]) {
+		const tui = fakeTui;
+		let opens = 0;
+		const fg = (role: string, text: string) => `\x1b[38;5;${role === "warning" ? 208 : role === "accent" ? 30 : 245}m${text}\x1b[39m`;
+		const topRows = vim ? ["work", "alert"] : [];
+		const editor = new GentlePromptEditor(tui as never, editorTheme as never, fakeKeybindings as never, {
+			fg, bold: (text) => text, requestRender() {}, pending: () => false, now: () => 0,
+			doubleEscCancelEnabled: () => false, dispatchQueuedText() {}, tuiVersion: () => INSTALLED_PI,
+			panelChrome: () => true, topRows: () => topRows, onPanelClick: () => { opens++; },
+		});
+		try {
+			if (vim) editor.setVimPolicy("on");
+			editor.setText("draft");
+			const before = editor.getCursor();
+			const rule = topRows.length;
+			const initial = editor.render(80);
+			const start = stripAnsi(initial[rule]!).indexOf("[ Panel ]");
+			assert.ok(start >= 0, "the no-work prompt always shows a Panel control");
+			if (vim) assert.match(stripAnsi(initial[rule]!), /\[ Panel \].*INSERT/);
+			const event = (type: TuiMouseEvent["type"], button: TuiMouseEvent["button"], x: number, y = rule): TuiMouseEvent => ({ type, button, x, y, screenX: x + 10, screenY: y + 20, width: 80, height: initial.length, shift: false, alt: false, ctrl: false });
+			editor.handleMouse(event("click", "right", start));
+			editor.handleMouse(event("click", "left", start - 1));
+			editor.handleMouse({ ...event("click", "left", start), width: 79 });
+			assert.equal(opens, 0);
+			assert.deepEqual(editor.getCursor(), before, "non-button rule clicks never move the editor");
+			editor.handleMouse(event("move", "none", start));
+			assert.ok(editor.render(80)[rule]!.includes("\x1b[38;5;208m[ Panel ]\x1b[39m"));
+			editor.handleMouse(event("move", "none", start - 1));
+			assert.ok(editor.render(80)[rule]!.includes("\x1b[38;5;30m[ Panel ]\x1b[39m"));
+			editor.handleMouse(event("move", "none", start));
+			editor.invalidate();
+			assert.ok(editor.render(80)[rule]!.includes("\x1b[38;5;30m[ Panel ]\x1b[39m"), "invalidation clears hover");
+			assert.equal(editor.handleMouse(event("press", "left", start))?.handled, true, "the native press owns the click gesture");
+			for (const x of [start, start + "[ Panel ]".length - 1]) editor.handleMouse(event("click", "left", x));
+			assert.equal(opens, 2, "both rendered bracket cells activate the control");
+			assert.deepEqual(editor.getCursor(), before, "button clicks never move the editor");
+		} finally { editor.dispose(); }
+	}
+	const regular = new GentlePromptEditor(fakeTui as never, editorTheme as never, fakeKeybindings as never, {
+		fg: (_role, text) => text, bold: (text) => text, requestRender() {}, pending: () => false, now: () => 0,
+		doubleEscCancelEnabled: () => false, dispatchQueuedText() {}, panelChrome: () => false, onPanelClick() { throw new Error("regular mode cannot open the button"); },
+	});
+	try { assert.doesNotMatch(regular.render(80).join("\n"), /\[ Panel \]/); }
+	finally { regular.dispose(); }
+});
+
+test("editor hover reports rendering on entry but not repeated motion", () => {
+	let renders = 0;
+	const editor = new GentlePromptEditor(fakeTui as never, editorTheme as never, fakeKeybindings as never, {
+		fg: (_role, text) => text, bold: (text) => text, requestRender() { renders++; }, pending: () => false, now: () => 0,
+		doubleEscCancelEnabled: () => false, dispatchQueuedText() {}, panelChrome: () => true,
+		topRows: () => ["work"], onPanelClick() {},
+	});
+	try {
+		const rows = editor.render(80);
+		const event = (x: number, y: number): TuiMouseEvent => ({ type: "move", button: "none", x, y, screenX: x, screenY: y, width: 80, height: rows.length, shift: false, alt: false, ctrl: false });
+		assert.deepEqual(editor.handleMouse(event(3, 0)), { handled: true, render: true }, "first work-row hover requests a render");
+		const afterWork = renders;
+		assert.deepEqual(editor.handleMouse(event(3, 0)), { handled: true });
+		assert.equal(renders, afterWork, "repeated work-row motion does not repaint");
+		const x = stripAnsi(rows[1]!).indexOf("[ Panel ]");
+		assert.deepEqual(editor.handleMouse(event(x, 1)), { handled: true, render: true }, "entering Panel requests a render");
+		const afterPanel = renders;
+		assert.deepEqual(editor.handleMouse(event(x, 1)), { handled: true });
+		assert.equal(renders, afterPanel, "repeated Panel motion does not repaint");
+	} finally { editor.dispose(); }
+});
+
+test("fullscreen mouse dispatch clears Panel hover after leaving the editor", () => {
+	let input: ((data: string) => void) | undefined;
+	const terminal: Terminal = {
+		start(onInput) { input = onInput; }, stop() {}, async drainInput() {}, write() {}, columns: 80, rows: 24, kittyProtocolActive: false,
+		moveBy() {}, hideCursor() {}, showCursor() {}, clearLine() {}, clearFromCursor() {}, clearScreen() {}, setTitle() {}, setProgress() {}, setProgramStatus() {},
+	};
+	const tui = new TuiAltScreen(terminal, false, undefined, { mouse: true });
+	const fg = (role: string, text: string) => `\x1b[38;5;${role === "warning" ? 208 : role === "accent" ? 30 : 245}m${text}\x1b[39m`;
+	let opens = 0;
+	const editor = new GentlePromptEditor(tui, editorTheme as never, fakeKeybindings as never, {
+		fg, bold: (text) => text, requestRender: () => tui.requestRender(), pending: () => false, now: () => 0,
+		doubleEscCancelEnabled: () => false, dispatchQueuedText() {}, panelChrome: () => true, onPanelClick() { opens++; },
+	});
+	const outside = { render: () => ["outside"], invalidate() {} };
+	tui.setLayoutRoot(new VStack([editor, outside]));
+	const uninstall = installSidebar(tui, plainTheme);
+	tui.start();
+	try {
+		tui.renderNow(true);
+		const x = stripAnsi(editor.render(80)[0]!).indexOf("[ Panel ]");
+		const cursor = editor.getCursor();
+		input?.(`\x1b[<0;${x + 1};1M`);
+		input?.(`\x1b[<0;${x + 1};1m`);
+		assert.equal(opens, 1, "native primary press and release open the panel");
+		assert.deepEqual(editor.getCursor(), cursor);
+		input?.(`\x1b[<35;${x + 1};1M`);
+		assert.ok(editor.render(80)[0]!.includes("\x1b[38;5;208m[ Panel ]\x1b[39m"), "native motion enters the control");
+		input?.("\x1b[<35;1;4M");
+		assert.ok(editor.render(80)[0]!.includes("\x1b[38;5;30m[ Panel ]\x1b[39m"), "native motion into a sibling clears hover");
+	} finally { uninstall(); editor.dispose(); tui.stop(); }
+});
+
+test("installed sidebar clears mobile Panel hover on unhandled native transcript motion", () => {
+	let input: ((data: string) => void) | undefined;
+	const terminal: Terminal = {
+		start(onInput) { input = onInput; }, stop() {}, async drainInput() {}, write() {}, columns: 80, rows: 24, kittyProtocolActive: false,
+		moveBy() {}, hideCursor() {}, showCursor() {}, clearLine() {}, clearFromCursor() {}, clearScreen() {}, setTitle() {}, setProgress() {}, setProgramStatus() {},
+	};
+	const tui = new TuiAltScreen(terminal, false, undefined, { mouse: true });
+	const fg = (role: string, text: string) => `\x1b[38;5;${role === "warning" ? 208 : role === "accent" ? 30 : 245}m${text}\x1b[39m`;
+	const editor = new GentlePromptEditor(tui, editorTheme as never, fakeKeybindings as never, {
+		fg, bold: (text) => text, requestRender: () => tui.requestRender(), pending: () => false, now: () => 0,
+		doubleEscCancelEnabled: () => false, dispatchQueuedText() {}, panelChrome: () => true, onPanelClick() {},
+	});
+	const outside = { render: () => ["transcript"], invalidate() {} };
+	tui.setLayoutRoot(new VStack([editor, outside]));
+	const uninstall = installSidebar(tui, plainTheme);
+	tui.start();
+	try {
+		tui.renderNow(true);
+		const x = stripAnsi(editor.render(80)[0]!).indexOf("[ Panel ]");
+		input?.(`\x1b[<35;${x + 1};1M`);
+		assert.ok(editor.render(80)[0]!.includes("\x1b[38;5;208m[ Panel ]\x1b[39m"));
+		input?.("\x1b[<35;1;4M");
+		assert.ok(editor.render(80)[0]!.includes("\x1b[38;5;30m[ Panel ]\x1b[39m"), "unhandled transcript motion clears the hover");
+	} finally { uninstall(); editor.dispose(); tui.stop(); }
+});
+
+test("installed fullscreen Panel button opens the panel sheet with no live work", async () => {
+	const previousStyle = cardStyle();
+	const { pi, handlers } = fakePi();
+	installGentleShell(pi, { GENTLE_PI_CONFIG_HOME: "/dev/null" }, {
+		activeProfile: () => undefined, resolveWorktree: () => undefined, rootExists: () => false,
+		gitRunner: () => async () => ({ stdout: "", stderr: "", code: 0 }),
+		fetch: async () => { throw new Error("network forbidden in test"); },
+	});
+	const { ctx, ui } = fakeContext();
+	const tui = { ...fakeTui, mode: "fullscreen", terminal: { rows: 24, columns: 80 } };
+	try {
+		await fire(handlers, "session_start", ctx);
+		const state = sidebarState(tui as unknown as TUI);
+		state.layoutAttached = () => true;
+		const factory = ui.editorFactory as (tui: unknown, theme: unknown, keybindings: unknown) => GentlePromptEditor;
+		const editor = factory(tui, editorTheme, fakeKeybindings);
+		try {
+			const rows = editor.render(80);
+			const x = stripAnsi(rows[0]!).indexOf("[ Panel ]");
+			assert.ok(x >= 0, "the button is visible without agents or todos");
+			editor.handleMouse({ type: "click", button: "left", x, y: 0, screenX: x, screenY: 0, width: 80, height: rows.length, shift: false, alt: false, ctrl: false });
+			assert.ok(ui.overlayView, "the click opens the panel sheet");
+			assert.match(stripAnsi(ui.overlayView!.render(80).join("\n")), /PANEL/i);
+			ui.closeOverlay?.();
+			tui.terminal.columns = 160;
+			state.active = true;
+			state.ownsHost = () => true;
+			const wide = editor.render(107);
+			assert.doesNotMatch(stripAnsi(wide[0]!), /\[ Panel \]/, "desktop editor must not offer the mobile Panel control");
+		} finally { editor.dispose(); }
+	} finally {
+		await fire(handlers, "session_shutdown", ctx);
+		setCardStyle(previousStyle);
+	}
+});
 
 function installedPrompt(
 	ctx: ExtensionContext,
@@ -1205,7 +1198,7 @@ test("gentleShell frames the editor with the petal prompt and a hint while empty
 	assert.equal(ui.workingVisible, false, "pi's own Working row must be hidden");
 	editor.focused = true;
 	const lines = editor.render(60).map(stripAnsi);
-	assert.match(lines[0], /^╭─   ─+╮$/);
+	assert.match(lines[0], /^╭─ ✿ ─+╮$/);
 	assert.doesNotMatch(editor.render(60).join("\n"), /\x1b\[44m/, "prompt must not paint passive backgrounds");
 	assert.match(lines[1], /^│.*type, or \/ for commands +│$/);
 	assert.match(lines[lines.length - 1], /^╰─+╯$/);
@@ -2362,14 +2355,14 @@ test("gentleShell shows working while the agent runs and queued when messages wa
 	const editor = installedPrompt(ctx, ui, handlers);
 
 	for (const handler of handlers.get("agent_start") ?? []) handler({}, ctx);
-	assert.match(stripAnsi(editor.render(60)[0]), /^╭─   working… ─+╮$/);
+	assert.match(stripAnsi(editor.render(60)[0]), /^╭─ [✿❀❁✾] working… ─+╮$/);
 	pending.value = true;
-	assert.match(stripAnsi(editor.render(60)[0]), /^╭─   queued ─+╮$/);
+	assert.match(stripAnsi(editor.render(60)[0]), /^╭─ [✿❀❁✾] queued ─+╮$/);
 	for (const handler of handlers.get("agent_end") ?? []) handler({}, ctx);
 	assert.match(stripAnsi(editor.render(60)[0]), /queued/, "low-level run end is not settled");
 	pending.value = false;
 	for (const handler of handlers.get("agent_settled") ?? []) handler({}, ctx);
-	assert.match(stripAnsi(editor.render(60)[0]), /^╭─   ─+╮$/);
+	assert.match(stripAnsi(editor.render(60)[0]), /^╭─ ✿ ─+╮$/);
 	editor.dispose();
 });
 
@@ -2394,10 +2387,55 @@ test("visual customization and Vim register once and remain independently discov
 	await commands.get("gentle:vim")!.handler("enable", ctx);
 	const pending = commands.get("gentle:customize")!.handler("", ctx);
 	await overlayReady;
-	assert.ok(ui.overlayView!.render(90).some((row) => row.includes("Animations: quality")));
+	assert.ok(ui.overlayView!.render(90).some((row) => /Animations\s+● quality/.test(row)));
 	ui.overlayView!.handleInput("\x1b");
 	await pending;
 	assert.equal(JSON.parse(readFileSync(join(home, "vim.json"), "utf8")).policy, "on");
+});
+
+test("/gentle:customize forwards a mouse click through its command overlay", async (t) => {
+	const home = scopedDoubleEscCancelConfigHome(t);
+	const { pi, commands } = fakePi();
+	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home });
+	const { ctx, ui, overlayReady } = fakeContext();
+	const pending = commands.get("gentle:customize")!.handler("", ctx);
+	await overlayReady;
+	const view = ui.overlayView as unknown as { render(width: number): string[]; handleMouse(event: TuiMouseEvent): { handled?: boolean } | undefined; handleInput(data: string): void };
+	try {
+		const frame = view.render(100);
+		const y = frame.findIndex(row => row.includes("performance"));
+		assert.ok(y >= 0);
+		const x = visibleWidth(frame[y]!.slice(0, frame[y]!.indexOf("performance")));
+		assert.equal(resolveAnimationPolicy({ gentlePiConfigHome: home }).policy, "quality");
+		assert.equal(view.handleMouse({ type: "click", button: "left", x, y, screenX: x + 10, screenY: y + 5, width: 100, height: frame.length, shift: false, alt: false, ctrl: false })?.handled, true);
+		await new Promise<void>(resolve => setImmediate(resolve));
+		assert.equal(resolveAnimationPolicy({ gentlePiConfigHome: home }).policy, "performance");
+	} finally { view.handleInput("\x1b"); await pending; }
+});
+
+test("/gentle:customize has a Keymaps category that saves a key and reloads on request", async () => {
+	const home = mkdtempSync(join(tmpdir(), "gentle-shell-keymaps-"));
+	isolatedConfigHomes.push(home);
+	const { pi, commands } = fakePi();
+	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home });
+	const { ctx, ui, overlayReady } = fakeContext();
+	let reloads = 0;
+	(ctx as unknown as { reload(): Promise<void> }).reload = async () => { reloads += 1; };
+	const pending = commands.get("gentle:customize")!.handler("", ctx);
+	await overlayReady;
+	const view = ui.overlayView as unknown as { render(width: number): string[]; handleInput(data: string): void; focus(label: string): boolean };
+	assert.ok(view.focus("Command palette: alt+k"));
+	assert.match(view.render(100).join("\n"), /Enter assign · ⌫ disable · r default · Esc close/);
+	view.handleInput("\r");
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	view.handleInput("\x1bj");
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	assert.deepEqual(JSON.parse(readFileSync(join(home, "keymaps.json"), "utf8")).bindings, { commands: "alt+j" });
+	assert.equal(ui.notices.at(-1), "Command palette: alt+j. Run /reload to apply it.");
+	assert.ok(view.focus("Reload now to apply keymap changes"));
+	view.handleInput("\r");
+	await pending;
+	assert.equal(reloads, 1, "the customize card closes, then Pi reloads");
 });
 
 test(`actual Pi ${INSTALLED_PI} enables a live prompt and enters NORMAL without a compatibility fallback`, async () => {
@@ -3189,7 +3227,7 @@ test("potato repaints start/settle and shows queued state on the host's next ren
 	let before = renders.mock.callCount();
 	for (const handler of handlers.get("agent_start") ?? []) handler({}, ctx);
 	assert.ok(renders.mock.callCount() > before);
-	assert.match(stripAnsi(editor.render(60)[0]), /  working/);
+	assert.match(stripAnsi(editor.render(60)[0]), /✿ working/);
 	before = renders.mock.callCount();
 	pending.value = true;
 	assert.equal(renders.mock.callCount(), before, "changing the queue flag is not a Gentle repaint event");
@@ -3198,7 +3236,7 @@ test("potato repaints start/settle and shows queued state on the host's next ren
 	// this proves next-render visibility, not real Pi enqueue-to-paint latency.
 	fakeTui.requestRender();
 	assert.equal(renders.mock.callCount(), before + 1);
-	assert.match(stripAnsi(editor.render(60)[0]), /  queued/);
+	assert.match(stripAnsi(editor.render(60)[0]), /✿ queued/);
 	before = renders.mock.callCount();
 	for (const handler of handlers.get("agent_settled") ?? []) handler({}, ctx);
 	assert.ok(renders.mock.callCount() > before);
@@ -3296,27 +3334,24 @@ function recordIntervals(t: TestContext): RecordedInterval[] {
 	return intervals;
 }
 
-// The local prompt frame carries no decorative flower: the working animation
-// lives in the scanning label, so a frame advances when its painted ANSI
-// differs (the visible text stays the same).
-function workingFrameOf(editor: GentlePromptEditor): string {
-	return editor.render(60)[0] ?? "";
+function petalGlyphOf(editor: GentlePromptEditor): string {
+	return stripAnsi(editor.render(60)[0]).match(/[✿❀❁✾]/)?.[0] ?? "";
 }
 
-test("streaming frames advance the working label scan and the quality watchdog stays silent while renders flow", (t) => {
+test("streaming frames advance the working petal and the quality watchdog stays silent while renders flow", (t) => {
 	const configHome = scopedDoubleEscCancelConfigHome(t);
 	writeFileSync(join(configHome, "animations.json"), '{"schema":"gentle-pi.animations/v1","policy":"quality"}');
 	const intervals = recordIntervals(t);
 	const renders = t.mock.method(fakeTui, "requestRender", () => {});
 	const { pi, handlers } = fakePi();
 	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: configHome }, { now: () => 1_000_000 });
-	const { ctx, ui } = fakeContext({ theme: markedTheme });
+	const { ctx, ui } = fakeContext();
 	const editor = installedPrompt(ctx, ui, handlers);
 	for (const handler of handlers.get("agent_start") ?? []) handler({}, ctx);
 	const watchdog = intervals.find((entry) => entry.delay === 1000);
 	assert.ok(watchdog, "working installs the 1000ms silence watchdog");
-	const glyphs = [0, 1, 2, 3].map(() => workingFrameOf(editor));
-	assert.ok(new Set(glyphs).size > 1, `each streamed frame must advance the working label scan`);
+	const glyphs = [0, 1, 2, 3].map(() => petalGlyphOf(editor));
+	assert.ok(new Set(glyphs).size > 1, `each streamed frame must advance the petal, got ${glyphs.join("")}`);
 	const before = renders.mock.callCount();
 	watchdog!.tick();
 	assert.equal(renders.mock.callCount(), before, "renders are already flowing, so the watchdog must not force one");
@@ -3332,26 +3367,26 @@ test("silent working phases repaint only through the 1000ms watchdog window", (t
 	let clock = 1_000_000;
 	const { pi, handlers } = fakePi();
 	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: configHome }, { now: () => clock });
-	const { ctx, ui } = fakeContext({ theme: markedTheme });
+	const { ctx, ui } = fakeContext();
 	const editor = installedPrompt(ctx, ui, handlers);
 	for (const handler of handlers.get("agent_start") ?? []) handler({}, ctx);
 	const watchdog = intervals.find((entry) => entry.delay === 1000);
 	assert.ok(watchdog, "working installs the 1000ms silence watchdog");
-	const baseline = workingFrameOf(editor);
+	const baseline = petalGlyphOf(editor);
 	const before = renders.mock.callCount();
 	watchdog!.tick();
 	assert.equal(renders.mock.callCount(), before, "no frame painted within the window, but the window has not elapsed yet");
 	clock += 1000;
 	watchdog!.tick();
 	assert.equal(renders.mock.callCount(), before + 1, "silence past the window forces exactly one repaint");
-	assert.notEqual(workingFrameOf(editor), baseline, "the watchdog advanced the working tick");
+	assert.notEqual(petalGlyphOf(editor), baseline, "the watchdog advanced the petal tick");
 	const afterForced = renders.mock.callCount();
 	watchdog!.tick();
 	assert.equal(renders.mock.callCount(), afterForced, "the watchdog's own repaint counts as render traffic for the next window");
 	editor.dispose();
 });
 
-test("potato installs no working watchdog and the working frame never advances", (t) => {
+test("potato installs no working watchdog and the petal never advances", (t) => {
 	const configHome = scopedDoubleEscCancelConfigHome(t);
 	writeFileSync(join(configHome, "animations.json"), '{"schema":"gentle-pi.animations/v1","policy":"potato"}');
 	const intervals = recordIntervals(t);
@@ -3361,8 +3396,8 @@ test("potato installs no working watchdog and the working frame never advances",
 	const editor = installedPrompt(ctx, ui, handlers);
 	for (const handler of handlers.get("agent_start") ?? []) handler({}, ctx);
 	assert.ok(!intervals.some((entry) => entry.delay !== 2000), "potato must not animate: no watchdog interval at all");
-	const glyphs = [0, 1, 2].map(() => workingFrameOf(editor));
-	assert.equal(new Set(glyphs).size, 1, "potato keeps the working frame static");
+	const glyphs = [0, 1, 2].map(() => petalGlyphOf(editor));
+	assert.deepEqual(glyphs, ["✿", "✿", "✿"], "potato keeps the petal static");
 	editor.dispose();
 });
 
@@ -3420,6 +3455,13 @@ function scopedDoubleEscCancelConfigHome(t: { after(callback: () => void): void 
 
 function findCustomizeRow(ui: FakeUi, label: string, width = 90): boolean {
 	const view = ui.overlayView!;
+	// Choices of a setting apply on ←/→, so walking to one would apply it: focus selects without applying.
+	const focus = (view as unknown as { focus?(label: string): boolean }).focus;
+	if (typeof focus === "function") {
+		const found = focus.call(view, label);
+		view.render(width);
+		return found;
+	}
 	view.handleInput("\x1b[D");
 	for (let category = 0; category < 11; category++) {
 		view.handleInput("\x1b[C");
@@ -3472,12 +3514,15 @@ test("customize Notifications applies audio controls directly in the same overla
 		assert.equal(settled, false, "the overlay never closes to open a panel");
 		// Per-event exceptions stay folded until Advanced is expanded in the same overlay.
 		assert.ok(findCustomizeRow(ui, "Advanced:"), "Advanced toggle is a direct row");
+		ui.overlayView!.handleInput("\x1b[C");
 		assert.doesNotMatch(ui.overlayView!.render(90).join("\n"), /agent\.failed:/, "per-event rows stay folded by default");
 		ui.overlayView!.handleInput("\r");
 		// Let the toggle's busy microtask settle before activating a revealed row.
 		await new Promise<void>((resolve) => setImmediate(resolve));
 		const notices = ui.notices.length;
 		assert.ok(findCustomizeRow(ui, "agent.failed:"));
+		for (let i = 0; i < 3; i++) ui.overlayView!.handleInput("\x1b[C");
+		assert.equal(writes, 0, "navigation never saves a sound");
 		ui.overlayView!.handleInput("\r");
 		for (let attempt = 0; attempt < 100 && ui.notices.length === notices; attempt++) await new Promise<void>((resolve) => setTimeout(resolve, 5));
 		assert.ok(ui.notices.length > notices, "direct Enter action finished");
@@ -3525,7 +3570,7 @@ test("customize History rows persist prompt history capture and keep stored hist
 	const pending = commands.get("gentle:customize")!.handler("", ctx);
 	await overlayReady;
 	assert.ok(findCustomizeRow(ui, "Prompt history capture: enable"));
-	assert.match(ui.overlayView!.render(90).join("\n"), /History · 1\/2/);
+	assert.match(ui.overlayView!.render(90).join("\n"), /History · 1\/1/);
 	assert.match(ui.overlayView!.render(90).join("\n"), /Preview · Prompt history capture[\s\S]*preference: off · effective: off/i);
 	assert.equal(existsSync(join(home, "history-capture.json")), false, "highlighting never applies");
 	await customizeAction(ui, "Prompt history capture: enable");
@@ -3552,9 +3597,10 @@ test("customize Cards rows persist the card style and switch live conversation c
 	const pending = commands.get("gentle:customize")!.handler("", ctx);
 	await overlayReady;
 	assert.ok(findCustomizeRow(ui, "Card style: float (current)"));
-	assert.match(ui.overlayView!.render(90).join("\n"), /Cards · 2\/4/);
+	assert.match(ui.overlayView!.render(90).join("\n"), /Cards · 1\/2/, "Card style and Card content are one line each");
+	assert.match(ui.overlayView!.render(90).join("\n"), /Card style\s+○ neon\s+● float/);
 	assert.ok(findCustomizeRow(ui, "Card style: neon"));
-	assert.ok(!ui.overlayView!.render(90).some((line) => line.includes("▸ Card style: neon (current)")), "neon is not current without a saved preference");
+	assert.ok(ui.overlayView!.render(90).some((line) => /Card style\s+› neon\s+● float/.test(line)), "the cursor is on neon, but float stays current without a saved preference");
 	assert.equal(existsSync(join(home, "card-style.json")), false, "highlighting never applies");
 	const requestRender = fakeTui.requestRender;
 	let renders = 0;
@@ -3602,7 +3648,7 @@ test("customize Cards rows persist the card content level and switch the live qu
 	ui.overlayView!.handleInput("\x1b"); await pending;
 });
 
-test("T3 live style Cards action refreshes cached TODO, header, footer and prompt in both directions", async (t) => {
+test("T3 live style Cards action refreshes cached TODO and Status in both directions while the wide chrome stays", async (t) => {
 	const home = scopedDoubleEscCancelConfigHome(t);
 	const previous = cardStyle();
 	t.after(() => setCardStyle(previous));
@@ -3636,30 +3682,22 @@ test("T3 live style Cards action refreshes cached TODO, header, footer and promp
 	});
 	let frame = { header: "", rail: "", prompt: "" };
 	function paint() {
-		// Wide fullscreen: [transcript, right], the header pinned above the rail.
 		const layout = root[node]() as unknown as { entries: { component: { render(width: number): string[]; [node](): { entries: { component: { render(width: number): string[] } }[] } } }[] };
-		const right = layout.entries[1].component[node]();
 		frame = {
-			header: right.entries[0].component.render(50).join("\n"),
-			rail: right.entries[1].component.render(50).join("\n"),
+			header: layout.entries[0].component.render(160).join("\n"),
+			rail: layout.entries[1].component[node]().entries[1].component.render(50).join("\n"),
 			prompt: editor.render(100).join("\n"),
 		};
-	}
-	// Each card must be selected through the actual pinned tab control: hidden
-	// sections intentionally do not render when the style changes.
-	function selectRailTab(label: string) {
-		const layout = root[node]() as unknown as { entries: { component: { [node](): { entries: { component: Component }[] } } }[] };
-		const pinned = layout.entries[1]!.component[node]().entries[0]!.component;
-		const rows = pinned.render(50);
-		const y = rows.findIndex((row) => stripAnsi(row).includes("Activity") && stripAnsi(row).includes("Status"));
-		const x = stripAnsi(rows[y]!).indexOf(label);
-		assert.ok(y >= 0 && x >= 0);
-		assert.equal(pinned.handleMouse?.({ type: "click", button: "left", x, y, width: 50, height: rows.length, screenX: 110 + x, screenY: y, shift: false, alt: false, ctrl: false } as TuiMouseEvent)?.handled, true);
 	}
 	ready = true;
 	paint();
 	assert.equal(todoRenders, 1);
 	assert.match(frame.rail, /Cached task/);
+	// The wide chrome: the title row on top and one status bar row as the last layout entry.
+	const wide = root[node]() as unknown as { entries: { component: { render(width: number): string[] } }[] };
+	assert.equal(wide.entries.length, 3, "title row, transcript with the rail, status bar");
+	assert.match(stripAnsi(frame.header), /^ ✿ repo  \/repo .*team $/);
+	assert.match(stripAnsi(wide.entries[2]!.component.render(160).join("\n")), /^ main .*ctx .*usage/);
 	const neon = { ...frame };
 	paint();
 	assert.equal(todoRenders, 1, "unchanged frame uses cached TODO");
@@ -3669,11 +3707,8 @@ test("T3 live style Cards action refreshes cached TODO, header, footer and promp
 	t.mock.method(fakeTui, "requestRender", () => { overlayRenders++; });
 	for (const style of [CARD_STYLE.FLOAT, CARD_STYLE.NEON]) {
 		const before = { ...frame };
-		const beforeTodo = todoRenders;
-		selectRailTab("Status");
-		assert.match(frame.rail, /Status/);
-		const beforeStatusFrame = frame.rail;
 		const beforeHost = hostRenders;
+		const beforeTodo = todoRenders;
 		const beforeStatus = statusRenders;
 		const beforeOverlay = overlayRenders;
 		await customizeAction(ui, `Card style: ${style}`);
@@ -3681,14 +3716,12 @@ test("T3 live style Cards action refreshes cached TODO, header, footer and promp
 		assert.equal(cardStyle(), style);
 		assert.ok(hostRenders > beforeHost, "action requests the main render without another state change");
 		assert.ok(overlayRenders > beforeOverlay, "customize redraws too");
-		assert.equal(todoRenders, beforeTodo, "hidden TODO is not rendered");
-		assert.equal(statusRenders, beforeStatus + 1, "live style digest refreshes selected Status");
-		assert.notEqual(frame.rail, beforeStatusFrame, "Status changes immediately");
-		selectRailTab("Activity");
-		assert.equal(todoRenders, beforeTodo + 1, "reselected TODO reflects the new style");
-		assert.equal(statusRenders, beforeStatus + 1, "hidden Status is not rendered");
-		for (const key of ["rail", "prompt"] as const) assert.notEqual(frame[key], before[key], `${key} changes immediately`);
-		assert.match(frame.header, /Gentle Shell/, "the pinned rail header stays painted across the switch");
+		assert.equal(todoRenders, beforeTodo + 1, "revision invalidation refreshes digest-less TODO");
+		assert.equal(statusRenders, beforeStatus + 1, "live style digest refreshes cached Status");
+		assert.notEqual(frame.rail, before.rail, "rail changes immediately");
+		// The wide chrome's title row and panel editor are not cards: no card style changes them.
+		assert.equal(frame.header, before.header, "the title row is the same in every card style");
+		assert.equal(frame.prompt, before.prompt, "the panel editor is the same in every card style");
 		assert.match(ui.notices.at(-1)!, /Conversation cards and shell chrome redraw now/);
 		assert.match(ui.overlayView!.render(90).join("\n"), /prompt|shell chrome/i);
 		const rendered = { ...frame };
@@ -3908,18 +3941,18 @@ test("customize command updates displayed settings and applies layout immediatel
 	const { ctx, ui, overlayReady } = fakeContext();
 	const pending = commands.get("gentle:customize")!.handler("", ctx);
 	await overlayReady;
-	assert.match(ui.overlayView!.render(90).join("\n"), /Animations: quality.*current/);
+	assert.match(ui.overlayView!.render(90).join("\n"), /Animations\s+● quality/);
 	await customizeAction(ui, "Animations: performance");
 	assert.equal(resolveAnimationPolicy({ gentlePiConfigHome: home }).policy, "performance");
-	assert.match(ui.overlayView!.render(90).join("\n"), /Animations: performance.*current/);
+	assert.match(ui.overlayView!.render(90).join("\n"), /Animations\s+○ quality\s+● performance/);
 	assert.match(ui.notices.at(-1)!, /Prompt applies now.*banner.*next startup/i);
-	await customizeAction(ui, "Banner rose");
+	await customizeAction(ui, "Banner rose: off");
 	assert.equal((await readBannerConfig(home)).showRose, false);
-	assert.match(ui.overlayView!.render(90).join("\n"), /Banner rose: off/);
+	assert.match(ui.overlayView!.render(90).join("\n"), /Banner rose\s+○ on\s+● off/);
 	assert.match(ui.notices.at(-1)!, /next startup/i);
 	await customizeAction(ui, "Status placement: hidden");
 	assert.equal(resolveVisualSettings({ gentlePiConfigHome: home }).settings.statusPlacement, "hidden");
-	assert.match(ui.overlayView!.render(90).join("\n"), /Status placement: hidden.*current/);
+	assert.match(ui.overlayView!.render(90).join("\n"), /Status\s+○ auto\s+○ right\s+○ bottom\s+● hidden/);
 	assert.match(ui.notices.at(-1)!, /saved and applied/);
 	ui.overlayView!.handleInput("\x1b");
 	await pending;
@@ -4104,10 +4137,10 @@ test("T4d unified float footer uses one live owner and restores legacy Changes o
 		assert.deepEqual(footer.render(240), [""], "hidden float status retains exterior dock spacing");
 		assert.equal(header.render(240).length, 5);
 		assert.doesNotMatch(stripAnsi(header.render(240).join("\n")), /MCP updated/);
-		await customizeAction(ui, "Section changes: shown");
+		await customizeAction(ui, "Section changes: hidden");
 		assert.equal(header.render(240).length, 4);
 		assert.equal(ui.widgets.has("gentle-shell-changes"), false);
-		await customizeAction(ui, "Section changes: hidden");
+		await customizeAction(ui, "Section changes: shown");
 		await customizeAction(ui, "Header placement: top");
 		assert.deepEqual(header.render(240), []);
 		assert.equal(widget("gentle-shell-changes").render(240).length, 1, "top placement restores standalone Changes");
@@ -5142,11 +5175,11 @@ test("Changes lists the session root's Git state at turn end, never at startup",
  assert.match(renderFooter(ui),/main ±2/);
  const rail = sidebarState(fakeTui as unknown as TUI).parts.get("footer")!;
  const digest = rail.digest!();
- assert.match(rail.render(46).join("\n"), /2 files · \+2 −0/);
+ assert.match(rail.render(46).join("\n"), /2 files\n {2}\+2 −0/);
  await fire(handlers,"agent_end",ctx);
  await changesSettled();
  assert.notEqual(rail.digest!(), digest, "same-count line changes invalidate the unified Status");
- assert.match(rail.render(46).join("\n"), /2 files · \+3 −0/);
+ assert.match(rail.render(46).join("\n"), /2 files\n {2}\+3 −0/);
  assert.ok(gitStateOnly(git), JSON.stringify(git));
  assert.ok(git.every((args) => args[1] === "/repo"), "only the session's own root is scanned");
  await fire(handlers,"session_shutdown",ctx);
@@ -5653,7 +5686,7 @@ test("gentleShell shows the unsupported note for a provider with no built-in or 
 	const opened = commands.get("gentle:usage")!.handler("", ctx);
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	const plain = ui.overlayView!.render(90).map(stripAnsi);
-	assert.match(plain[1], /active acme-cloud · no subscription usage for this provider/);
+	assert.match(plain[1], /✿ acme-cloud · no subscription usage for this provider/);
 	ui.closeOverlay?.();
 	await opened;
 });
@@ -5722,7 +5755,7 @@ test("a registered source's rejecting fetch never crashes the shell or poisons t
 	const opened = commands.get("gentle:usage")!.handler("", ctx);
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	const plain = ui.overlayView!.render(90).map(stripAnsi);
-	assert.match(plain[1], /active acme-cloud · fetch failed · r to retry/);
+	assert.match(plain[1], /✿ acme-cloud · fetch failed · r to retry/);
 	ui.closeOverlay?.();
 	await opened;
 });
@@ -5773,7 +5806,7 @@ test("gentleShell leaves a generic failure note when a registered source resolve
 	const opened = commands.get("gentle:usage")!.handler("", ctx);
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	const plain = ui.overlayView!.render(90).map(stripAnsi);
-	assert.match(plain[1], /active acme-cloud · fetch failed · r to retry/);
+	assert.match(plain[1], /✿ acme-cloud · fetch failed · r to retry/);
 	ui.closeOverlay?.();
 	await opened;
 });
@@ -5832,6 +5865,46 @@ test("gentleShell records SSE rate-limit headers from provider responses", async
 	assert.doesNotMatch(renderFooter(ui), /codex/);
 });
 
+test("gentleShell prices claude-bridge turns at the Anthropic list price and labels them as subscription", async () => {
+	// pi-claude-bridge registers every model with a zero price, so without this
+	// the footer and stats always read $0 on a Claude subscription.
+	const { pi, handlers } = fakePi();
+	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, { fetch: fakeFetch({}, false).fetchFn, now: () => 0 });
+	const entries: unknown[] = [];
+	const { ctx, ui } = fakeContext({ entries, oauth: false });
+	(ctx as unknown as { model: { provider: string; id: string } }).model = { ...ctx.model!, provider: "claude-bridge", id: "claude-opus-5-5" };
+	(ctx.modelRegistry as unknown as { find: (provider: string, id: string) => unknown }).find = (provider, id) =>
+		provider === "anthropic" && id === "claude-opus-5-5" ? { cost: { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 } } : undefined;
+	await fire(handlers, "session_start", ctx);
+
+	const message = { role: "assistant", provider: "claude-bridge", model: "claude-opus-5-5",
+		usage: { input: 1_000_000, output: 100_000, cacheRead: 0, cacheWrite: 0, totalTokens: 1_100_000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+	const results = (handlers.get("message_end") ?? []).map((handler) => handler({ type: "message_end", message }, ctx));
+	const replaced = results.find((result) => result !== undefined) as { message: typeof message } | undefined;
+	assert.equal(replaced?.message.usage.cost.total, 6, "1M input at $4 plus 100k output at $20");
+
+	entries.push({ type: "message", message: replaced!.message });
+	for (const handler of handlers.get("turn_end") ?? []) await handler({}, ctx);
+	assert.match(renderFooter(ui), /\$6\.00 sub/);
+});
+
+test("gentleShell prices claude-bridge turns inside a subagent child, where the shell UI is off", () => {
+	// The parent sums each child's message_end cost over RPC, so a child that
+	// skipped the pricing hook made the Stats `agents` row read $0.000.
+	const { pi, handlers } = fakePi();
+	gentleShell(pi, { GENTLE_PI_AGENTS_CHILD: "1" }, { fetch: fakeFetch({}, false).fetchFn, now: () => 0 });
+	const { ctx } = fakeContext({ entries: [], oauth: false });
+	(ctx.modelRegistry as unknown as { find: (provider: string, id: string) => unknown }).find = (provider, id) =>
+		provider === "anthropic" && id === "claude-opus-5-5" ? { cost: { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 } } : undefined;
+
+	const message = { role: "assistant", provider: "claude-bridge", model: "claude-opus-5-5",
+		usage: { input: 1_000_000, output: 100_000, cacheRead: 0, cacheWrite: 0, totalTokens: 1_100_000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+	const results = (handlers.get("message_end") ?? []).map((handler) => handler({ type: "message_end", message }, ctx));
+	const replaced = results.find((result) => result !== undefined) as { message: typeof message } | undefined;
+	assert.equal(replaced?.message.usage.cost.total, 6, "1M input at $4 plus 100k output at $20");
+	assert.equal(handlers.has("model_select"), false, "the child still renders no shell UI");
+});
+
 test("gentleShell files header usage under the provider that served the response", async () => {
 	// pi-claude-bridge forwards Claude Code's usage as the Anthropic unified
 	// headers, so the headers alone name `anthropic` while the session runs on
@@ -5849,8 +5922,7 @@ test("gentleShell files header usage under the provider that served the response
 	const opened = commands.get("gentle:usage")!.handler("", ctx);
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	const plain = ui.overlayView!.render(90).map(stripAnsi).join("\n");
-	// The personal overlay names the provider without the decorative flower glyph.
-	assert.match(plain, /active claude-bridge ·/);
+	assert.match(plain, /✿ claude-bridge ·/);
 	assert.doesNotMatch(plain, /no subscription usage for this provider/);
 	ui.closeOverlay?.();
 	await opened;
@@ -5890,38 +5962,6 @@ test("gentleShell ignores incomplete Codex headers and retains the last real quo
 	}
 });
 
-test("Limits detail and rail share all registered provider data and refresh once per action", async (t) => {
-	const home=scopedDoubleEscCancelConfigHome(t), {pi,handlers,shortcuts}=fakePi(), {ctx,ui}=fakeContext();
-	const counts=new Map<string,number>(); const providers=["openai-codex","anthropic","cliproxyapi","nan"];
-	gentleShell(pi,{GENTLE_PI_CONFIG_HOME:home,GENTLE_PI_SHELL_CHANGES_WATCH_MS:"off"},{activeProfile:()=>"team",now:()=>1_788_600_000_000,fetch:async()=>{throw new Error("network forbidden");}});
-	for (const [index,provider] of providers.entries()) pi.events.emit(USAGE_SOURCE_EVENT,{
-		schema:USAGE_SOURCE_SCHEMA,provider,
-		fetch:async()=>{counts.set(provider,(counts.get(provider)??0)+1);return {provider,plan:`Plan${index}`,fetchedAt:1_788_600_000_000,limits:[{name:provider,limitReached:false,windows:[{label:"week",usedPercent:(index+1)*11,windowSeconds:604800,resetAt:null}]}]};},
-	});
-	await fire(handlers,"session_start",ctx); await settle();
-	const tui={mode:"fullscreen",terminal:{rows:40,columns:160},requestRender(){}};
-	const factory=ui.footerFactory as (tui:unknown,theme:ShellBarTheme,data:unknown)=>{dispose():void};
-	const component=factory(tui,plainTheme,{getGitBranch:()=>"main",getExtensionStatuses:()=>new Map(),getAvailableProviderCount:()=>1,onBranchChange:()=>()=>{}});
-	try {
-		const rail=sidebarState(tui as unknown as TUI).parts.get("usage")!; rail.digest?.(); await settle();
-		const railText=rail.render(48).map(stripAnsi).join("\n");
-		for(const pct of [11,22,33,44]) assert.match(railText,new RegExp(`${pct}%`));
-		for(const name of ["codex","claude","antigravity","nan"]) assert.match(railText,new RegExp(name,"i"));
-		const before=new Map(counts); const opened=shortcuts.get("alt+u")!.handler(ctx); await settle();
-		const detail=ui.overlayView!.render(120).map(stripAnsi).join("\n");
-		for(const provider of providers) {assert.match(detail,new RegExp(provider));assert.equal(counts.get(provider),(before.get(provider)??0)+1,`${provider} refreshes once`);}
-		for(const pct of [11,22,33,44]) assert.match(detail,new RegExp(`${pct}%`));
-		ui.overlayView!.render(120); ui.overlayView!.render(120); await settle();
-		for(const provider of providers) assert.equal(counts.get(provider),(before.get(provider)??0)+1,"rendering does not refetch");
-		ui.closeOverlay?.(); await opened;
-		const beforeClick=new Map(counts);
-		assert.equal(rail.handleMouse?.({type:"click",button:"left",x:2,y:1,width:48,height:10,screenX:2,screenY:1,shift:false,alt:false,ctrl:false} as TuiMouseEvent)?.handled,true);
-		await settle(); const clicked=ui.overlayView!.render(120).map(stripAnsi).join("\n");
-		for(const provider of providers) { assert.match(clicked,new RegExp(provider)); assert.equal(counts.get(provider),(beforeClick.get(provider)??0)+1,`${provider} refreshes once on click`); }
-		ui.closeOverlay?.(); await settle();
-	} finally { component.dispose(); await fire(handlers,"session_shutdown",ctx); }
-});
-
 test("gentleShell registers /gentle:usage and opens the subscriptions overlay", async () => {
 	const { pi, handlers, commands } = fakePi();
 	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, { fetch: fakeFetch().fetchFn, now: () => 1_788_600_000_000 });
@@ -5931,7 +5971,7 @@ test("gentleShell registers /gentle:usage and opens the subscriptions overlay", 
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	const plain = ui.overlayView!.render(90).map(stripAnsi);
 	assert.match(plain[0], /Subscriptions/);
-	assert.match(plain[1], /active openai-codex · pro/);
+	assert.match(plain[1], /✿ openai-codex · pro/);
 	ui.closeOverlay?.();
 	await opened;
 });
@@ -5976,7 +6016,7 @@ test("gentleShell draws the review preflight message as a Gentle card", (t) => {
 		assert.doesNotMatch(renderer(message, { expanded }, sentinelTheme).render(80).join("\n"), /\x1b\[44m/);
 	}
 	const expanded = renderer(message, { expanded: true }, plainTheme).render(80).map(stripAnsi);
-	assert.match(expanded[0], /^╭─   Gentle AI · review preflight ─+ .*collapse ╮$/);
+	assert.match(expanded[0], /^╭─ ✿ Gentle AI · review preflight ─+ .*collapse ╮$/);
 	assert.match(expanded[1], /^│ Receipt-driven development is enabled\. +│$/);
 	assert.ok(expanded.some((line) => line.includes("gentle_review")));
 	const collapsed = renderer({ ...message, content: [{ type: "text", text: message.content }] }, { expanded: false }, plainTheme).render(80).map(stripAnsi);
@@ -5999,7 +6039,7 @@ test("the review preflight card paints the rose INFO frame (border) and title (a
 	const message = { customType: "gentle-pi.review-preflight", content: "Receipt-driven development is enabled." };
 	const lines = renderer(message, { expanded: true }, taggedTheme).render(60);
 	assert.match(lines[0]!, /^<border>╭<\/border>/);
-	assert.match(lines[0]!, /<accent>  Gentle AI<\/accent>/);
+	assert.match(lines[0]!, /<accent>✿ Gentle AI<\/accent>/);
 });
 
 test("gentleShell keeps a dev-binary override visible above the editor for the whole session", async (t) => {
@@ -6014,7 +6054,7 @@ test("gentleShell keeps a dev-binary override visible above the editor for the w
 	const factory = ui.widgets.get("gentle-shell-dev-binary") as (tui: unknown, theme: unknown) => { render(width: number): string[] };
 	assert.ok(factory, "dev binary widget missing");
 	const lines = factory(fakeTui, plainTheme).render(100).map(stripAnsi);
-	assert.match(lines[0], /^╭─    gentle-ai · dev binary override · field-test only ─+╮$/u, "the override notice keeps the reserved glyph cells");
+	assert.match(lines[0], /^╭─ \u{1F339} gentle-ai · dev binary override · field-test only ─+╮$/u, "the override notice carries the Gentle AI rose");
 	assert.match(lines[1], /^│ \/Users\/me\/go\/bin\/gentle-ai · sha256:6e53bfc6305a3949 +│$/);
 	assert.match(lines[2], /^╰─+╯$/);
 	assert.equal(lines[3], "", "a blank line keeps the card off the prompt frame");
@@ -6023,11 +6063,6 @@ test("gentleShell keeps a dev-binary override visible above the editor for the w
 	assert.equal(painted[1], lines[1], "body interior remains transparent");
 	assert.equal(painted[2], lines[2], "bottom frame cells have no background");
 	assert.equal(painted[3], "", "external spacer has no background");
-	const foldable = { ...fakeTui, terminal: { rows: 40, columns: 160 } };
-	sidebarState(foldable as unknown as TUI).railAvailable = () => true;
-	assert.deepEqual(factory(foldable, plainTheme).render(100), [], "a folded rail hides the notice too");
-	sidebarState(foldable as unknown as TUI).railAvailable = () => false;
-	assert.match(stripAnsi(factory(foldable, plainTheme).render(100)[0]!), /dev binary override/);
 	await fire(handlers, "agent_start", ctx);
 	assert.equal(ui.widgets.has("gentle-shell-dev-binary"), false, "the startup notice leaves with the first prompt");
 
@@ -6039,40 +6074,8 @@ test("gentleShell keeps a dev-binary override visible above the editor for the w
 
 	const invalid = devBinaryCard({ state: "invalid", reason: "binary missing" });
 	assert.equal(invalid.tone, "error");
-	assert.equal(invalid.glyph, "  ", "the invalid override notice keeps the reserved glyph cells");
+	assert.equal(invalid.glyph, "\u{1F339}", "the invalid override notice keeps the rose too");
 	assert.deepEqual(factory(fakeTui, plainTheme).render(0), [""], "zero width keeps only the spacer");
-});
-
-test("gentleShell moves the dev-binary notice into the rail Status card while the rail shows it", async (t) => {
-	const found = cardStyle();
-	t.after(() => setCardStyle(found));
-	setCardStyle(CARD_STYLE.NEON);
-	const { pi, handlers } = fakePi();
-	const path = "/home/pablo/.pi/gentle-ai/main/gentle-ai/66bf3e12e338df8ad038de512e8a9fbc82dd6fa1/gentle-ai";
-	const deps = { fetch: fakeFetch({}, false).fetchFn, now: () => 0, devBinary: () => ({ state: "active" as const, path, sha256: "0dac40684a053f2b00" }) };
-	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, deps);
-	const { ctx, ui } = fakeContext();
-	await fire(handlers, "session_start", ctx);
-	const factory = ui.widgets.get("gentle-shell-dev-binary") as (tui: unknown, theme: unknown) => { render(width: number): string[] };
-	const wide = { ...fakeTui, terminal: { rows: 40, columns: 160 } };
-	const state = sidebarState(wide as unknown as TUI);
-	state.ownsHost = () => true;
-	assert.deepEqual(factory(wide, plainTheme).render(100), [], "the rail Status card carries the override, not a card above the editor");
-	state.ownsHost = () => false;
-	assert.match(stripAnsi(factory(wide, plainTheme).render(100)[0]!), /dev binary override/, "no rail (narrow terminal) keeps the startup card");
-	assert.match(stripAnsi(factory(fakeTui, plainTheme).render(100)[0]!), /dev binary override/);
-});
-
-test("gentleShell invalid dev-binary override keeps its error card even with the rail visible", async () => {
-	const { pi, handlers } = fakePi();
-	const deps = { fetch: fakeFetch({}, false).fetchFn, now: () => 0, devBinary: () => ({ state: "invalid" as const, reason: "binary missing" }) };
-	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, deps);
-	const { ctx, ui } = fakeContext();
-	await fire(handlers, "session_start", ctx);
-	const factory = ui.widgets.get("gentle-shell-dev-binary") as (tui: unknown, theme: unknown) => { render(width: number): string[] };
-	const wide = { ...fakeTui, terminal: { rows: 40, columns: 160 } };
-	sidebarState(wide as unknown as TUI).ownsHost = () => true;
-	assert.match(stripAnsi(factory(wide, plainTheme).render(100).join("\n")), /dev binary override invalid[\s\S]*binary missing/);
 });
 
 test("gentle:commands registers alt+k by default", () => {
@@ -6093,6 +6096,40 @@ test("GENTLE_PI_COMMANDS_KEY=off registers no command-palette shortcut", () => {
 	gentleShell(pi, { GENTLE_PI_COMMANDS_KEY: "off" });
 	assert.equal(shortcuts.has("alt+k"), false);
 	assert.ok(shortcuts.has("alt+g"), "the unrelated changes shortcut still registers");
+});
+
+test("saved keymaps replace the shell shortcuts, bind palette commands, and the environment still wins", async () => {
+	const home = mkdtempSync(join(tmpdir(), "gentle-shell-keymaps-"));
+	isolatedConfigHomes.push(home);
+	writeFileSync(join(home, "keymaps.json"), JSON.stringify({ schema: 1, bindings: { commands: "alt+j", changes: null, usage: "alt+y", preset: "alt+p", "jobs.collapse": "alt+b", "command:gentle:profiles": "alt+o", "command:gentle:design": "alt+d" } }));
+	const { pi, shortcuts, sentMessages } = fakePi();
+	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home });
+	for (const key of ["alt+j", "alt+y", "alt+p", "alt+b", "alt+o", "alt+d"]) assert.ok(shortcuts.has(key), key);
+	for (const key of ["alt+k", "alt+g", "alt+u", "alt+l", "ctrl+shift+j"]) assert.equal(shortcuts.has(key), false, key);
+	const { ctx, ui } = fakeContext();
+	await shortcuts.get("alt+o")!.handler(ctx);
+	assert.deepEqual(sentMessages.at(-1), { content: "/gentle:profiles", options: { expandPromptTemplates: true } });
+	await shortcuts.get("alt+d")!.handler(ctx);
+	assert.equal(sentMessages.length, 1, "a key bound to a command that is not registered runs nothing");
+	assert.deepEqual(ui.notices.at(-1), "alt+d runs /gentle:design, which is not available in this session.");
+	const envWins = fakePi();
+	gentleShell(envWins.pi, { GENTLE_PI_CONFIG_HOME: home, GENTLE_PI_COMMANDS_KEY: "ctrl+p" });
+	assert.ok(envWins.shortcuts.has("ctrl+p"));
+	assert.equal(envWins.shortcuts.has("alt+j"), false);
+});
+
+test("a malformed keymaps.json keeps every default key and is reported once at startup", async () => {
+	const home = mkdtempSync(join(tmpdir(), "gentle-shell-keymaps-"));
+	isolatedConfigHomes.push(home);
+	writeFileSync(join(home, "keymaps.json"), "{");
+	const { pi, shortcuts, handlers } = fakePi();
+	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home });
+	assert.ok(shortcuts.has("alt+k") && shortcuts.has("alt+g"));
+	const { ctx, ui } = fakeContext();
+	for (const handler of handlers.get("session_start") ?? []) await handler({}, ctx);
+	for (const handler of handlers.get("session_start") ?? []) await handler({}, ctx);
+	assert.deepEqual(ui.notices.filter((notice) => notice.includes("keymaps.json")), [`Keymaps: ${join(home, "keymaps.json")} is unreadable or malformed; using the default keys.`]);
+	assert.equal(readFileSync(join(home, "keymaps.json"), "utf8"), "{");
 });
 
 test("/gentle:commands shows only curated, registered commands, grouped, by their labels", async () => {
@@ -6119,6 +6156,41 @@ test("/gentle:commands shows only curated, registered commands, grouped, by thei
 	assert.match(changesLine ?? "", /alt\+g/, "expected the configured alt+g shortcut hint next to Browse changes");
 	ui.overlayView!.handleInput("\x1b");
 	await opened;
+});
+
+test("the palette shows saved keys, marks ones waiting for a reload, and assigns a key with tab", async () => {
+	const home = mkdtempSync(join(tmpdir(), "gentle-shell-keymaps-"));
+	isolatedConfigHomes.push(home);
+	const { pi, commands } = fakePi();
+	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home });
+	writeFileSync(join(home, "keymaps.json"), JSON.stringify({ schema: 1, bindings: { "command:gentle:profiles": "alt+o" } }));
+	const { ctx, ui, overlayReady } = fakeContext();
+	const opened = commands.get("gentle:commands")!.handler("", ctx);
+	await overlayReady;
+	const lines = ui.overlayView!.render(100);
+	assert.match(lines.find((line) => line.includes("Models and profiles")) ?? "", /alt\+o \(reload\)/);
+	assert.match(lines.find((line) => line.includes("Browse changes")) ?? "", /alt\+g/);
+	for (const char of "Gentle AI status") ui.overlayView!.handleInput(char);
+	ui.overlayView!.handleInput("\t");
+	ui.overlayView!.handleInput("\x1bx");
+	await opened;
+	assert.deepEqual(JSON.parse(readFileSync(join(home, "keymaps.json"), "utf8")).bindings, { "command:gentle:profiles": "alt+o", "command:gentle:status": "alt+x" });
+	assert.equal(ui.notices.at(-1), "/gentle:status: alt+x. Run /reload to apply it.");
+});
+
+test("assigning a typing key from the palette is refused and saves nothing", async () => {
+	const home = mkdtempSync(join(tmpdir(), "gentle-shell-keymaps-"));
+	isolatedConfigHomes.push(home);
+	const { pi, commands } = fakePi();
+	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home });
+	const { ctx, ui, overlayReady } = fakeContext();
+	const opened = commands.get("gentle:commands")!.handler("", ctx);
+	await overlayReady;
+	ui.overlayView!.handleInput("\t");
+	ui.overlayView!.handleInput("a");
+	await opened;
+	assert.equal(existsSync(join(home, "keymaps.json")), false);
+	assert.match(ui.notices.at(-1) ?? "", /a is needed for typing/);
 });
 
 test("selecting a command from the palette by its label sends the underlying command as a slash message", async () => {
@@ -6519,7 +6591,7 @@ test("the panel keeps a headers-only subagent provider pending instead of a fals
 	await opened;
 });
 
-test("after a profile switch cached provider usage remains visible without being marked active", async (t) => {
+test("after a profile switch the panel stops presenting the old profile's provider", async (t) => {
 	const home = mkdtempSync(join(tmpdir(), "shell-usage-switch-"));
 	t.after(() => rmSync(home, { recursive: true, force: true }));
 	writeProfilesStore(home, { team: { reviewer: { model: "nan/glm5.3" } }, solo: {} }, "team");
@@ -6539,10 +6611,7 @@ test("after a profile switch cached provider usage remains visible without being
 	t.after(() => resetSessionProfileBindingsForTesting());
 	const reopened = commands.get("gentle:usage")!.handler("", ctx);
 	await settle();
-	const switched = ui.overlayView!.render(90).map(stripAnsi);
-	assert.ok(switched.some((line) => /^│ nan ·/.test(line)), "the rail's cached subscription remains visible in detail");
-	assert.equal(switched.some((line) => /active nan/.test(line)), false, "the old route is never marked as the active provider");
-	assert.ok(switched.some((line) => /active openai-codex/.test(line)), "the current provider remains explicitly active");
+	assert.equal(ui.overlayView!.render(90).map(stripAnsi).some((line) => line.includes("nan")), false, "a provider recorded under the previous profile's routing is not current scope");
 	ui.closeOverlay?.();
 	await reopened;
 });
@@ -6572,9 +6641,9 @@ test("an open session keeps its frozen profile in the status and Usage scope whe
 	const tui = { terminal: { rows: 40, columns: 160 }, requestRender() {} };
 	const component = factory(tui, plainTheme, { getGitBranch: () => "main", getExtensionStatuses: () => new Map(), getAvailableProviderCount: () => 1, onBranchChange: () => () => {} });
 	try {
-		const status = (sidebarState(tui as unknown as TUI).parts.get("footer") as SidebarRail).render(60).join("\n");
-		assert.match(status, /Profile.*team/, "the status keeps the bare global name of the frozen profile");
-		assert.doesNotMatch(status, /solo/);
+		const header = (sidebarState(tui as unknown as TUI).parts.get("header") as SidebarRail).render(160).join("\n");
+		assert.match(header, /team/, "the header keeps the bare global name of the frozen profile");
+		assert.doesNotMatch(header, /solo/);
 	} finally {
 		component.dispose();
 	}
@@ -6721,13 +6790,13 @@ test("a valid response-header snapshot clears a prior refresh failure", async (_
 	await settle();
 	const opened = commands.get("gentle:usage")!.handler("", ctx);
 	await settle();
-	assert.ok(openPanelLines(ui).some((line) => line.includes("active openai-codex · fetch failed")), "the failed refresh is visible first");
+	assert.ok(openPanelLines(ui).some((line) => line.includes("✿ openai-codex · fetch failed")), "the failed refresh is visible first");
 
 	for (const handler of handlers.get("after_provider_response") ?? []) {
 		handler({ status: 200, headers: { "x-codex-primary-used-percent": "10", "x-codex-primary-window-minutes": "300" } }, ctx);
 	}
 	const lines = openPanelLines(ui);
-	assert.ok(lines.some((line) => line.includes("active openai-codex · updated just now")), "the header snapshot is recorded");
+	assert.ok(lines.some((line) => line.includes("✿ openai-codex · updated just now")), "the header snapshot is recorded");
 	assert.ok(lines.some((line) => line.includes("10%")), "the header snapshot's window renders");
 	assert.equal(lines.some((line) => line.includes("fetch failed")), false, "a valid header snapshot clears the failure");
 	ui.closeOverlay?.();
@@ -6783,12 +6852,12 @@ test("an older overlapping refresh cannot mark a provider failed after a newer o
 	await settle();
 	const opened = commands.get("gentle:usage")!.handler("", ctx);
 	await settle();
-	assert.ok(openPanelLines(ui).some((line) => line.includes("active openai-codex · pro")), "the newer refresh's snapshot is showing");
+	assert.ok(openPanelLines(ui).some((line) => line.includes("✿ openai-codex · pro")), "the newer refresh's snapshot is showing");
 
 	releaseStaleFailure();
 	await settle();
 	const lines = openPanelLines(ui);
-	assert.ok(lines.some((line) => line.includes("active openai-codex")), "the newer refresh's snapshot stands");
+	assert.ok(lines.some((line) => line.includes("✿ openai-codex")), "the newer refresh's snapshot stands");
 	assert.equal(lines.some((line) => line.includes("fetch failed")), false, "the older refresh's late failure must not mark the provider failed");
 	ui.closeOverlay?.();
 	await opened;
@@ -6862,216 +6931,6 @@ test("an explicit session binding routes the Usage scope ahead of the pin and th
 	}
 });
 
-// C3: the editor border's `≡ commands` label exists only while the rail is not
-// visible, and only a clean click on it opens the palette.
-
-async function paletteEditor(env: NodeJS.ProcessEnv = {}, options: { columns?: number; mode?: string; rail?: boolean } = {}) {
-	const { pi, handlers } = fakePi();
-	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off", ...env });
-	const { ctx, ui } = fakeContext();
-	await fire(handlers, "session_start", ctx);
-	const tui = { mode: options.mode ?? "fullscreen", terminal: { rows: 40, columns: options.columns ?? 100 }, requestRender() {} };
-	// The real layout publishes this on the terminal; the label reads it per render.
-	const state = sidebarState(tui as unknown as TUI);
-	state.active = options.rail ?? true;
-	state.ownsHost = () => tui.terminal.columns >= 140;
-	const factory = ui.editorFactory as (tui: unknown, theme: unknown, keybindings: unknown) => GentlePromptEditor;
-	const editor = factory(tui, editorTheme, fakeKeybindings);
-	editor.focused = true;
-	const mouse = (type: string, x: number, y: number, width = tui.terminal.columns) =>
-		editor.handleMouse({ type, button: "left", x, y, screenX: x, screenY: y, width, height: 3, shift: false, alt: false, ctrl: false } as TuiMouseEvent);
-	const opened = async () => { await new Promise((resolve) => setTimeout(resolve, 0)); return ui.overlayView?.render(100).join("\n").includes("Configuration") ?? false; };
-	return { editor, tui, mouse, opened, ui, ctx };
-}
-
-const topBorder = (editor: GentlePromptEditor, width: number) => stripAnsi(editor.render(width)[0]!);
-
-test("editor border shows the commands label only while the rail is hidden, across the 140 column breakpoint", async () => {
-	const { editor, tui } = await paletteEditor({}, { columns: 100 });
-	try {
-		assert.match(topBorder(editor, 100), /^╭─   ≡ commands · alt\+k ─+╮$/);
-		assert.equal(visibleWidth(editor.render(100)[0]!), 100);
-		tui.terminal.columns = 139;
-		assert.match(topBorder(editor, 139), /≡ commands · alt\+k/, "139 columns: no rail yet");
-		tui.terminal.columns = 140;
-		assert.doesNotMatch(topBorder(editor, 112), /commands/, "140 columns: the rail card carries it");
-		assert.match(topBorder(editor, 112), /^╭─   ─+╮$/);
-		tui.terminal.columns = 120;
-		assert.match(topBorder(editor, 120), /≡ commands/, "shrinking back restores the label");
-	} finally { editor.dispose(); }
-});
-
-test("editor border label honors a remapped key and drops the hint when the shortcut is disabled", async () => {
-	const remapped = await paletteEditor({ GENTLE_PI_COMMANDS_KEY: "ctrl+p" });
-	const off = await paletteEditor({ GENTLE_PI_COMMANDS_KEY: "off" });
-	try {
-		assert.match(topBorder(remapped.editor, 100), /^╭─   ≡ commands · ctrl\+p ─+╮$/);
-		assert.match(topBorder(off.editor, 100), /^╭─   ≡ commands ─+╮$/);
-		assert.equal(off.mouse("click", 7, 0)?.handled, true, "a disabled shortcut still has the clickable label");
-		assert.equal(await off.opened(), true);
-	} finally { remapped.editor.dispose(); off.editor.dispose(); }
-});
-
-test("editor border omits the label outside fullscreen, where mouse never reaches Pi, and without a sidebar host", async () => {
-	const regular = await paletteEditor({}, { mode: "regular" });
-	const bare = await paletteEditor({}, { rail: false });
-	try {
-		assert.doesNotMatch(topBorder(regular.editor, 100), /commands/);
-		assert.match(topBorder(bare.editor, 100), /≡ commands/, "fullscreen with no rail owner still shows it");
-	} finally { regular.editor.dispose(); bare.editor.dispose(); }
-});
-
-test("only a click on the label cells opens the palette; every other event falls through", async () => {
-	const { editor, mouse, opened, ui } = await paletteEditor();
-	const reference = (await paletteEditor({}, { rail: true, columns: 140 }));
-	try {
-		editor.render(100);
-		reference.editor.render(100);
-		// `≡ commands` spans columns 5..14 on row 0; the ` · alt+k` hint (15..22) is not clickable.
-		for (const x of [0, 2, 3, 4, 15, 17, 19, 22, 23, 24, 60, 99]) assert.deepEqual(mouse("click", x, 0), reference.mouse("click", x, 0), `border cell ${x} stays native`);
-		for (const type of ["press", "drag", "release", "move", "scroll"]) assert.deepEqual(mouse(type, 8, 0), reference.mouse(type, 8, 0), `${type} on the label is native`);
-		for (const y of [1, 2]) for (const x of [5, 8, 20]) assert.deepEqual(mouse("click", x, y), reference.mouse("click", x, y), `input row ${y} stays native`);
-		assert.equal(await opened(), false, "none of those opened the palette");
-		assert.equal(editor.getText(), "");
-		for (const x of [5, 6, 8, 14]) {
-			assert.equal(mouse("click", x, 0)?.handled, true, `label cell ${x}`);
-			assert.equal(await opened(), true);
-			ui.overlayView!.handleInput("\x1b");
-			await new Promise((resolve) => setTimeout(resolve, 0));
-		}
-	} finally { editor.dispose(); reference.editor.dispose(); }
-});
-
-test("a stale label span is not clickable once the rail takes over", async () => {
-	const { editor, tui, mouse, opened } = await paletteEditor();
-	try {
-		editor.render(100);
-		tui.terminal.columns = 140;
-		editor.render(112);
-		mouse("click", 8, 0, 112);
-		assert.equal(await opened(), false);
-	} finally { editor.dispose(); }
-});
-
-test("float hint row carries the label and the same click rules", async () => {
-	const previous = cardStyle();
-	const { editor, mouse, opened, ctx } = await paletteEditor({}, { columns: 100 });
-	const themeHost = ctx.ui as unknown as MutablePromptThemeHost;
-	const originalTheme = themeHost.theme;
-	try {
-		themeHost.theme = { ...plainTheme, bg: (_role: string, text: string) => `\x1b[44m${text}\x1b[49m` } as unknown as typeof ctx.ui.theme;
-		setCardStyle(CARD_STYLE.FLOAT);
-		editor.render(100);
-		const row = stripAnsi(editor.render(100)[0]!);
-		assert.match(row, /^ ▎   ≡ commands · alt\+k/, row);
-		mouse("click", 4, 0);
-		mouse("click", 24, 0);
-		mouse("click", 8, 1);
-		assert.equal(await opened(), false);
-		assert.equal(mouse("click", 8, 0)?.handled, true);
-		assert.equal(await opened(), true);
-	} finally { themeHost.theme = originalTheme; setCardStyle(previous); editor.dispose(); }
-});
-
-// S13 (odd/tasks/palette-button.md): palette sub-menus answer the mouse only
-// while Gentle Shell's TUI is fullscreen; the footer publishes that probe.
-test("palette sub-menus use the mouse-capable select only while the footer's TUI is fullscreen", async (t) => {
-	const home = mkdtempSync(join(tmpdir(), "gentle-vim-mouse-"));
-	t.after(() => rmSync(home, { recursive: true, force: true }));
-	const { pi, handlers, commands } = fakePi();
-	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home, GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" });
-	const selects: string[][] = [];
-	const { ctx, ui } = fakeContext({ select: async (_title, options) => { selects.push(options); return undefined; } });
-	await fire(handlers, "session_start", ctx);
-	const liveFooterData = { getGitBranch: () => "main", getExtensionStatuses: () => new Map(), getAvailableProviderCount: () => 1, onBranchChange: () => () => {} };
-	const tui = { mode: "regular", terminal: { rows: 40, columns: 160 }, requestRender() {} };
-	const factory = ui.footerFactory as (tui: unknown, theme: ShellBarTheme, footerData: unknown) => { render(width: number): string[]; dispose(): void };
-	const component = factory(tui, plainTheme, liveFooterData);
-	const command = commands.get("gentle:vim")!;
-	try {
-		await command.handler("", ctx);
-		assert.equal(selects.length, 1, "regular mode keeps Pi's native select");
-		tui.mode = "fullscreen";
-		const pending = command.handler("", ctx);
-		await new Promise((resolve) => setTimeout(resolve, 0));
-		assert.equal(selects.length, 1, "fullscreen does not open the native select");
-		const view = ui.overlayView as { render(width: number): string[]; handleMouse?(event: Record<string, unknown>): unknown };
-		const lines = view.render(80);
-		const y = lines.findIndex((line) => line.includes("status"));
-		view.handleMouse?.({ type: "click", button: "left", x: 3, y, screenX: 3, screenY: y, width: 80, height: lines.length, shift: false, alt: false, ctrl: false });
-		await pending;
-		assert.match(ui.notices.at(-1)!, /vim: off/, "a click on `status` ran the status branch");
-	} finally {
-		component.dispose();
-	}
-	await command.handler("", ctx);
-	assert.equal(selects.length, 2, "after dispose the probe is released and the native select returns");
-});
-
-// S14 (odd/tasks/palette-button.md): alt+h, /gentle:panel and the editor's
-// `« panel · key` fold and unfold the rail; the choice survives sessions.
-async function panelShell(t: test.TestContext, env: NodeJS.ProcessEnv = {}) {
-	const home = mkdtempSync(join(tmpdir(), "gentle-panel-"));
-	t.after(() => rmSync(home, { recursive: true, force: true }));
-	const { pi, handlers, commands, shortcuts } = fakePi(undefined, [...DEFAULT_COMMANDS, { name: "gentle:panel", description: "Fold or unfold the right side panel", source: "extension", sourceInfo: FAKE_SOURCE_INFO }]);
-	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off", GENTLE_PI_CONFIG_HOME: home, ...env });
-	const { ctx, ui } = fakeContext();
-	await fire(handlers, "session_start", ctx);
-	const tui = { mode: "fullscreen", terminal: { rows: 40, columns: 160 }, requestRender() {} };
-	const state = sidebarState(tui as unknown as TUI);
-	const factory = ui.editorFactory as (tui: unknown, theme: unknown, keybindings: unknown) => GentlePromptEditor;
-	const editor = factory(tui, editorTheme, fakeKeybindings);
-	editor.focused = true;
-	t.after(() => editor.dispose());
-	const railFile = () => { try { return JSON.parse(readFileSync(join(home, "rail.json"), "utf8")); } catch { return undefined; } };
-	return { pi, commands, shortcuts, ctx, ui, tui, state, editor, home, railFile };
-}
-
-test("/gentle:panel and alt+h fold and unfold the rail and remember it", async (t) => {
-	const { commands, shortcuts, ctx, railFile } = await panelShell(t);
-	assert.ok(commands.has("gentle:panel"));
-	assert.ok(shortcuts.has("alt+h"), "alt+h is registered by default");
-	await commands.get("gentle:panel")!.handler("", ctx);
-	assert.deepEqual(railFile(), { schema: "gentle-pi.rail/v1", collapsed: true });
-	await shortcuts.get("alt+h")!.handler(ctx);
-	assert.deepEqual(railFile(), { schema: "gentle-pi.rail/v1", collapsed: false });
-});
-
-test("the panel shortcut follows GENTLE_PI_PANEL_KEY and off removes it", async (t) => {
-	const remapped = await panelShell(t, { GENTLE_PI_PANEL_KEY: "ctrl+alt+p" });
-	assert.ok(remapped.shortcuts.has("ctrl+alt+p"));
-	assert.ok(!remapped.shortcuts.has("alt+h"));
-	const off = await panelShell(t, { GENTLE_PI_PANEL_KEY: "off" });
-	assert.ok(!off.shortcuts.has("alt+h"));
-	assert.ok(off.commands.has("gentle:panel"), "the command stays even without a shortcut");
-});
-
-test("a folded rail shows `« panel · alt+h` on the editor border, and a click on it unfolds", async (t) => {
-	const { editor, state, railFile, commands, ctx } = await panelShell(t);
-	await commands.get("gentle:panel")!.handler("", ctx);
-	state.active = false;
-	state.railAvailable = () => true;
-	const top = stripAnsi(editor.render(160)[0]!);
-	assert.match(top, /^╭─   ≡ commands · alt\+k ─+ « panel · alt\+h ─╮$/);
-	const x = top.indexOf("«");
-	const event = (type: string, at: number) => ({ type, button: "left", x: at, y: 0, screenX: at, screenY: 0, width: 160, height: 3, shift: false, alt: false, ctrl: false } as TuiMouseEvent);
-	editor.handleMouse(event("press", x));
-	editor.handleMouse(event("click", x + "« panel".length + 2));
-	assert.deepEqual(railFile(), { schema: "gentle-pi.rail/v1", collapsed: true }, "the key hint and presses do nothing");
-	assert.equal(editor.handleMouse(event("click", x))?.handled, true);
-	assert.deepEqual(railFile(), { schema: "gentle-pi.rail/v1", collapsed: false });
-	state.railAvailable = () => false;
-	assert.doesNotMatch(stripAnsi(editor.render(160)[0]!), /panel/, "no label when there is no rail to unfold");
-});
-
-test("the palette lists Toggle side panel with its shortcut", async (t) => {
-	const { commands, ctx, ui } = await panelShell(t);
-	void commands.get("gentle:commands")!.handler("", ctx);
-	await new Promise((resolve) => setTimeout(resolve, 0));
-	const row = ui.overlayView!.render(100).map(stripAnsi).find((line) => line.includes("Toggle side panel"));
-	assert.ok(row, "the palette has the entry");
-	assert.match(row!, /◨ Toggle side panel +alt\+h/);
-});
 // S9: the config home each of these reads resolves, per case. The OS home is
 // a temporary folder in every case, so no case can reach the real one.
 // "unset" and "empty" both name ~/.pi/gentle-ai: an empty GENTLE_PI_CONFIG_HOME
@@ -7139,29 +6998,6 @@ for (const kind of ["unset", "empty", "bundled"] as const) {
 	});
 }
 
-test("a left click on the rail's Limits card opens the usage panel; other clicks do not", async (t) => {
-	const home = scopedDoubleEscCancelConfigHome(t);
-	const { pi, handlers } = fakePi();
-	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home, GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" });
-	const { ctx, ui } = fakeContext();
-	await fire(handlers, "session_start", ctx);
-	const tui = { mode: "fullscreen", terminal: { rows: 40, columns: 160 }, requestRender() {} };
-	const footer = (ui.footerFactory as (tui: unknown, theme: ShellBarTheme, data: unknown) => SidebarRail & { dispose(): void })(tui, plainTheme, {
-		getGitBranch: () => "main", getExtensionStatuses: () => new Map(), getAvailableProviderCount: () => 1, onBranchChange: () => () => {},
-	});
-	const limits = sidebarState(tui as unknown as TUI).parts.get("usage")!;
-	const click = (button: "left" | "right", type = "click"): TuiMouseEvent => ({ type, button, x: 3, y: 2, screenX: 3, screenY: 2, width: 48, height: 9, shift: false, alt: false, ctrl: false } as TuiMouseEvent);
-	try {
-		assert.equal(limits.handleMouse?.(click("right")), undefined, "only the left button");
-		assert.equal(limits.handleMouse?.(click("left", "press")), undefined, "only a clean click");
-		assert.equal(ui.overlayView, undefined);
-		assert.equal(limits.handleMouse?.(click("left"))?.handled, true);
-		await new Promise((resolve) => setTimeout(resolve, 0));
-		assert.match(ui.overlayView!.render(90).join("\n"), /Subscriptions/, "the same panel alt+u opens");
-		ui.closeOverlay?.();
-	} finally { footer.dispose(); }
-});
-
 // gentle-shell#2464: a pasted image is an atomic chip in the draft and a real
 // image attachment on submit, never a temp-file path the model must `read`.
 const CHIP_PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01]);
@@ -7228,160 +7064,566 @@ test("pasted image chips warn instead of sending images a text-only model reject
 	assert.ok(ui.notices.some((notice) => /1 pasted image was not sent: the current model does not accept images/.test(notice)));
 });
 
-// Folded-rail bottom band (odd/tasks/folded-band.md): wiring of the Sesión + Breaks widget.
-const BAND_KEY = "gentle-shell-folded-band";
-async function bandFixture(t: TestContext, options: { breaks?: boolean; statuses?: Array<[string, string]> } = {}) {
-	const home = scopedDoubleEscCancelConfigHome(t);
+test("the installed editor draws the panel frame in the wide and mobile IDE chrome and the frame in regular mode", () => {
+	const previous = cardStyle();
 	const { pi, handlers } = fakePi();
-	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home, GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" });
-	const { ctx, ui, overlayReady } = fakeContext();
-	await fire(handlers, "session_start", ctx);
-	const tui = { mode: "fullscreen", terminal: { rows: 40, columns: 160 }, requestRender() {} };
-	const statuses = new Map<string, string>(options.statuses ?? [["mcp", "MCP ready"], ["yolo", "\u{1F680} YOLO ON \u{1F525} — destructive confirmations remain"]]);
-	const footer = (ui.footerFactory as (tui: unknown, theme: ShellBarTheme, data: unknown) => { render(width: number): string[]; dispose(): void })(tui, plainTheme, {
-		getGitBranch: () => "main", getExtensionStatuses: () => statuses, getAvailableProviderCount: () => 1, onBranchChange: () => () => {},
-	});
-	const state = sidebarState(tui as unknown as TUI);
-	const wellness = { renders: 0, digest: "d1", clicks: [] as Array<{ x: number; y: number; width: number }> };
-	if (options.breaks !== false) {
-		state.parts.set("wellness", {
-			digest: () => wellness.digest,
-			render: (width: number) => { wellness.renders++; return Array.from({ length: 6 }, (_, i) => `BREAKS${i}`.padEnd(width, "·")); },
-			invalidate() {},
-			handleMouse: (event) => { wellness.clicks.push({ x: event.x, y: event.y, width: event.width }); return { handled: true, render: true }; },
-		});
+	gentleShell(pi, {});
+	const { ctx, ui } = fakeContext();
+	const editor = installedPrompt(ctx, ui, handlers);
+	const state = sidebarState(fakeTui as unknown as TUI);
+	const owned = { active: state.active, ownsHost: state.ownsHost };
+	const host = fakeTui as { mode?: string };
+	try {
+		setCardStyle(CARD_STYLE.NEON);
+		host.mode = "fullscreen";
+		state.active = true;
+		state.ownsHost = () => true;
+		const rows = editor.render(80).map(stripAnsi);
+		assert.match(rows[0]!, /^─ ✿ waiting for input ─+─$/, "a titled rule replaces the frame");
+		assert.match(rows[1]!, /^› /, "the input sits behind the prompt");
+		assert.doesNotMatch(rows.join("\n"), /[╭╮╰╯│]/u);
+		for (const row of rows) assert.equal(visibleWidth(row), 80);
+		// An agent question sits right above the rule, inside the editor, so no widget can land between.
+		const agents = sidebarPart(fakeTui as unknown as TUI, "agents", { render: (_width: number) => [], invalidate() {}, dispose() {} }, { render: () => [], alert: () => [" ? explore asked: Which file?"], invalidate() {} });
+		const asked = editor.render(80).map(stripAnsi);
+		assert.match(asked[0]!, /explore asked: Which file\?/);
+		assert.match(asked[1]!, /^─ ✿ waiting for input/);
+		assert.deepEqual(editor.handleMouse?.({ type: "move", button: "none", x: 2, y: 0, screenX: 2, screenY: 0, width: 80, height: asked.length, shift: false, alt: false, ctrl: false }), { handled: true, render: true }, "the shell owns the alert row's pointer events; they never reach Pi's editor");
+		agents.dispose();
+		state.active = false;
+		state.layoutAttached = () => true;
+		assert.match(stripAnsi(editor.render(80)[0]!), /^─ ✿ waiting for input/, "a narrow fullscreen terminal (mobile) keeps the panel editor");
+		state.layoutAttached = undefined;
+		assert.match(stripAnsi(editor.render(80)[0]!), /^╭/, "without the fullscreen layout installed the framed editor stays");
+		delete host.mode;
+		assert.match(stripAnsi(editor.render(80)[0]!), /^╭/, "regular mode keeps the framed editor");
+	} finally {
+		delete host.mode;
+		state.active = owned.active;
+		state.ownsHost = owned.ownsHost;
+		setCardStyle(previous);
+		editor.dispose();
 	}
-	state.foldedBand = () => true;
-	const widget = (ui.widgets.get(BAND_KEY) as (tui: unknown, theme: ShellBarTheme) => SidebarRail)(tui, plainTheme);
-	const click = (x: number, y: number, width = 160): TuiMouseEvent => ({ type: "click", button: "left", x, y, screenX: x, screenY: y, width, height: 6, shift: false, alt: false, ctrl: false } as TuiMouseEvent);
-	return { tui, ui, footer, state, widget, wellness, click, statuses, overlayReady, ctx, handlers };
-}
-
-test("S3: the band widget paints Sesión left and the registered Breaks lines at the right edge", async (t) => {
-	const f = await bandFixture(t);
-	try {
-		const rows = f.widget.render(160).map(stripAnsi);
-		assert.equal(rows.length, 6);
-		assert.ok(rows.every((row) => visibleWidth(row) === 160));
-		assert.match(rows[0]!, /Sesión/);
-		assert.match(rows[1]!, /main/);
-		assert.match(rows[4]!, /YOLO ON .* destructive confirmations remain/, "the YOLO status lives in the Sesión card");
-		assert.match(rows[3]!, /MCP ready/);
-		rows.forEach((row, i) => assert.equal(row.slice(110), `BREAKS${i}`.padEnd(50, "·"), `row ${i} Breaks`));
-	} finally { f.footer.dispose(); }
 });
 
-test("S1: outside the folded band the widget paints nothing, and disposing removes it", async (t) => {
-	const f = await bandFixture(t);
+test("mobile folds live work into one row above the editor that opens /gentle:panel as a sheet", async () => {
+	const { pi, handlers, commands } = fakePi();
+	gentleShell(pi, {});
+	const { ctx, ui } = fakeContext();
+	await fire(handlers, "session_start", ctx);
+	const tui = { mode: "fullscreen", terminal: { rows: 34, columns: 56 }, requestRender() {} };
+	const factory = ui.footerFactory as (tui: unknown, theme: ShellBarTheme, data: unknown) => { dispose(): void };
+	const footer = factory(tui, plainTheme, { getGitBranch: () => "main", getExtensionStatuses: () => new Map(), getAvailableProviderCount: () => 1, onBranchChange: () => () => {} });
+	const state = sidebarState(tui as unknown as TUI);
+	state.layoutAttached = () => true; // installSidebar sets this on a real fullscreen root
+	const todoCard = sidebarPart(tui as unknown as TUI, "todo", { render: (_width: number) => ["TODO CARD"], invalidate() {}, dispose() {} }, {
+		render: (width: number) => ["▾ TODOS".padEnd(width), "  ◐ Run the suite".padEnd(width)],
+		summary: () => ({ left: "◐ Run the suite", right: "1/3", rightLabel: "todos" }),
+		invalidate() {},
+	});
 	try {
-		f.state.foldedBand = () => false;
-		assert.deepEqual(f.widget.render(160), []);
-		f.state.foldedBand = undefined;
-		assert.deepEqual(f.widget.render(160), []);
-	} finally { f.footer.dispose(); }
-	assert.equal(f.ui.widgets.has(BAND_KEY), false);
+		assert.equal(state.compactWork?.(), true, "a narrow fullscreen terminal folds live work");
+		assert.deepEqual(todoCard.render(56), [], "the Todos card steps aside for the work row");
+		// The work row is part of the panel editor, right above its rule.
+		assert.equal(ui.widgets.has("gentle-shell-work-row"), false, "no separate widget can land between the row and the editor");
+		const editor = (ui.editorFactory as (tui: unknown, theme: unknown, keybindings: unknown) => GentlePromptEditor)(tui, editorTheme, fakeKeybindings);
+		const editorRows = editor.render(56).map(stripAnsi);
+		assert.match(editorRows[0]!, /^ ▸ ◐ Run the suite +1\/3 $/);
+		assert.match(editorRows[1]!, /^─ ✿ waiting for input/, "the editor rule follows the work row directly");
+		assert.equal(editor.handleMouse?.({ type: "click", button: "left", x: 3, y: 0, screenX: 3, screenY: 0, width: 56, height: editorRows.length, shift: false, alt: false, ctrl: false })?.handled, true, "a tap on the work row is handled");
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.match(openPanelLines(ui)[0]!, /^ ✿ Panel/, "the tap opens the panel sheet");
+		(ui.overlayView as unknown as { handleInput(data: string): void }).handleInput("\x1b");
+		editor.dispose();
+		const header = state.parts.get("header")!;
+		assert.match(stripAnsi(header.render(56).join("\n")), /^ ✿ repo .*· /, "the mobile title row carries the model");
+		assert.match(stripAnsi(state.parts.get("statusbar")!.render(56).join("\n")), /^ main/, "the mobile status bar leads with the branch");
+		void commands.get("gentle:panel")!.handler("", ctx);
+		await new Promise((resolve) => setImmediate(resolve));
+		const sheet = openPanelLines(ui);
+		assert.match(sheet[0]!, /^ ✿ Panel +esc back $/);
+		assert.ok(sheet.some((line) => /▾ TODOS/.test(line)) && sheet.some((line) => /Run the suite/.test(line)), "the sheet shows the rail sections");
+		(ui.overlayView as unknown as { handleInput(data: string): void }).handleInput("\x1b");
+		tui.terminal.columns = 160;
+		assert.equal(state.compactWork?.(), false, "a wide terminal keeps the rail and the cards' rules");
+	} finally {
+		todoCard.dispose();
+		footer.dispose();
+	}
 });
 
-test("S3: without a Breaks part (wellness off) Sesión spans the whole width", async (t) => {
-	const f = await bandFixture(t, { breaks: false });
+test("a tap on a mobile work row led by an agent opens /gentle:agents instead of the panel sheet", async () => {
+	const { pi, handlers } = fakePi();
+	gentleShell(pi, {});
+	const { ctx, ui } = fakeContext();
+	await fire(handlers, "session_start", ctx);
+	const tui = { mode: "fullscreen", terminal: { rows: 34, columns: 56 }, requestRender() {} };
+	const factory = ui.footerFactory as (tui: unknown, theme: ShellBarTheme, data: unknown) => { dispose(): void };
+	const footer = factory(tui, plainTheme, { getGitBranch: () => "main", getExtensionStatuses: () => new Map(), getAvailableProviderCount: () => 1, onBranchChange: () => () => {} });
+	const state = sidebarState(tui as unknown as TUI);
+	state.layoutAttached = () => true;
+	let opened = 0;
+	const agentsCard = sidebarPart(tui as unknown as TUI, "agents", { render: (_width: number) => ["AGENTS CARD"], invalidate() {}, dispose() {} }, {
+		render: (width: number) => ["▾ AGENTS".padEnd(width), "  ◐ map lib modules".padEnd(width)],
+		summary: () => ({ left: "◐ map lib modules", right: "1", rightLabel: "running", priority: 1 }),
+		open: () => { opened += 1; },
+		invalidate() {},
+	});
 	try {
-		const rows = f.widget.render(160).map(stripAnsi);
-		assert.equal(rows.length, 6);
-		assert.ok(rows.every((row) => visibleWidth(row) === 160));
-		assert.match(rows[0]!, /^╭.*╮$/);
-	} finally { f.footer.dispose(); }
+		assert.equal(state.compactWork?.(), true, "a narrow fullscreen terminal folds live work");
+		const editor = (ui.editorFactory as (tui: unknown, theme: unknown, keybindings: unknown) => GentlePromptEditor)(tui, editorTheme, fakeKeybindings);
+		const editorRows = editor.render(56).map(stripAnsi);
+		assert.match(editorRows[0]!, /^ ▸ ◐ map lib modules +1 $/);
+		assert.equal(editor.handleMouse?.({ type: "click", button: "left", x: 3, y: 0, screenX: 3, screenY: 0, width: 56, height: editorRows.length, shift: false, alt: false, ctrl: false })?.handled, true, "a tap on the work row is handled");
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(opened, 1, "the tap opens the agents view");
+		assert.equal(ui.overlayView, undefined, "the tap never opens the panel sheet");
+		editor.dispose();
+	} finally {
+		agentsCard.dispose();
+		footer.dispose();
+	}
 });
 
-test("S2b: the bottom bar paints nothing while the band paints, and the f57d77722 statuses-only row survives without it", async (t) => {
-	const f = await bandFixture(t);
-	try {
-		f.state.headerOwnsIdentity = () => true;
-		f.state.railAvailable = () => true;
-		assert.equal(stripAnsi(f.footer.render(160).join("")).trim(), "", "no status row while the band paints");
-		f.state.foldedBand = () => false;
-		const statusesOnly = stripAnsi(f.footer.render(160).join("\n"));
-		assert.match(statusesOnly, /MCP ready/);
-		assert.doesNotMatch(statusesOnly, /\bmain\b|ctx/, "statuses only, as in f57d77722");
-		f.state.headerOwnsIdentity = () => false;
-		assert.match(stripAnsi(f.footer.render(160).join("\n")), /\bmain\b/, "without the band or the header the bottom bar keeps the whole row");
-	} finally { f.footer.dispose(); }
-});
-
-test("S2: the below-input header widget stays silent while the band paints", async (t) => {
+test("customize presets set density and visibility together, mark the current one, and keep the placements", async (t) => {
 	const home = scopedDoubleEscCancelConfigHome(t);
-	writeVisualSettings({ ...resolveVisualSettings({ gentlePiConfigHome: home }).settings, headerPlacement: "below-input" }, { gentlePiConfigHome: home });
+	const { pi, commands } = fakePi();
+	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home });
+	const { ctx, ui, overlayReady } = fakeContext();
+	const pending = commands.get("gentle:customize")!.handler("", ctx);
+	await overlayReady;
+	await customizeAction(ui, "Header placement: below-input");
+	assert.match(ui.overlayView!.render(90).join("\n"), /Preset\s+○ Light\s+● Neutral\s+○ Power user/, "the default density and visibility are the Neutral preset");
+	await customizeAction(ui, "Preset: Light");
+	const light = resolveVisualSettings({ gentlePiConfigHome: home }).settings;
+	assert.equal(light.density, "minimal");
+	assert.equal(light.visibility.todo, false);
+	assert.equal(light.visibility.changes, false);
+	assert.equal(light.headerPlacement, "below-input", "the preset keeps the chosen header placement");
+	assert.equal(light.statusPlacement, "bottom", "Light is the minimal edition without the rail");
+	assert.match(ui.overlayView!.render(90).join("\n"), /Preset\s+● Light/);
+	await customizeAction(ui, "Preset: Power user");
+	assert.equal(resolveVisualSettings({ gentlePiConfigHome: home }).settings.density, "comfortable", "Power user keeps Neutral's spacing");
+	assert.equal(resolveVisualSettings({ gentlePiConfigHome: home }).settings.visibility.stats, true, "and adds Stats");
+	assert.match(ui.overlayView!.render(90).join("\n"), /Preset\s+○ Light\s+○ Neutral\s+● Power user/);
+	await customizeAction(ui, "Section stats: hidden");
+	assert.ok(findCustomizeRow(ui, "Preset: Neutral"));
+	assert.match(ui.overlayView!.render(90).join("\n"), /Preset\s+○ Light\s+● Neutral/, "Power user without Stats is Neutral again");
+	await customizeAction(ui, "Density: minimal");
+	assert.match(ui.overlayView!.render(90).join("\n"), /Preset\s+○ Light\s+○ Neutral\s+○ Power user/, "a hand-tuned mix matches no preset");
+	ui.overlayView!.handleInput("\x1b");
+	await pending;
+});
+
+test("customize presets survive session switches and a fresh extension with the same config home", async (t) => {
+	const shared = { ...DEFAULT_VISUAL_SETTINGS, headerPlacement: "below-input" as const };
+	const cases = [
+		{ name: "Light", actions: ["Preset: Light"], settings: { ...shared, statusPlacement: "bottom" as const, density: DENSITY.MINIMAL, visibility: { ...shared.visibility, changes: false, todo: false } }, marker: /Preset\s+● Light\s+○ Neutral\s+○ Power user/ },
+		{ name: "Neutral after Light", actions: ["Preset: Light", "Preset: Neutral"], settings: { ...shared, visibility: { ...shared.visibility } }, marker: /Preset\s+○ Light\s+● Neutral\s+○ Power user/ },
+		{ name: "Power user", actions: ["Preset: Power user"], settings: { ...shared, visibility: { ...shared.visibility, stats: true } }, marker: /Preset\s+○ Light\s+○ Neutral\s+● Power user/ },
+		{ name: "Power user by arrow with launcher config home", actions: ["Preset: Power user"], settings: { ...shared, visibility: { ...shared.visibility, stats: true } }, marker: /Preset\s+○ Light\s+○ Neutral\s+● Power user/, launcher: true, move: true },
+		{ name: "manual override", actions: ["Preset: Power user", "Section todo: hidden"], settings: { ...shared, visibility: { ...shared.visibility, todo: false, stats: true } }, marker: /Preset\s+○ Light\s+○ Neutral\s+○ Power user/ },
+	];
+	for (const scenario of cases) await t.test(scenario.name, async (t) => {
+		const home = scopedDoubleEscCancelConfigHome(t);
+		// The helper treats an explicit empty override as isolated, while the
+		// production resolver treats it as unset and uses the launcher marker.
+		const launcher = "launcher" in scenario && scenario.launcher;
+		const env = { GENTLE_PI_CONFIG_HOME: launcher ? "" : home, ...(launcher ? { GENTLE_SHELL_CONFIG_HOME: home } : {}), GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" };
+		const session = (id: string) => {
+			const result = fakeContext({ entries: [assistantEntry({ input: 1000, output: 200, cost: 0.5 })] });
+			result.ctx.sessionManager.getSessionId = () => id;
+			return result;
+		};
+		const checkSaved = () => {
+			const resolved = resolveVisualSettings({ gentlePiConfigHome: home });
+			assert.equal(resolved.source, "global_file");
+			assert.equal(resolved.malformed, false);
+			assert.equal(resolved.readError, false);
+			assert.deepEqual(resolved.settings, scenario.settings);
+			assert.deepEqual(JSON.parse(readFileSync(join(home, "visual-customization.json"), "utf8")), { schema: VISUAL_SCHEMA, ...scenario.settings });
+		};
+		const checkRestored = async (shell: ReturnType<typeof fakePi>, current: ReturnType<typeof fakeContext>) => {
+			const { ctx, ui, overlayReady } = current;
+			const tui = { mode: "fullscreen", terminal: { rows: 40, columns: 180 }, requestRender() {} };
+			const footer = (ui.footerFactory as (tui: unknown, theme: ShellBarTheme, data: unknown) => { dispose(): void })(tui, plainTheme, {
+				getGitBranch: () => "main", getExtensionStatuses: () => new Map(), getAvailableProviderCount: () => 1, onBranchChange: () => () => {},
+			});
+			try {
+				const state = sidebarState(tui as unknown as TUI);
+				assert.equal(state.visibility?.todo, scenario.settings.visibility.todo, "the restored shell applies Todo visibility");
+				const rail = state.parts.get("footer")!.render(46).map(stripAnsi).join("\n");
+				assert.equal(/▾ STATS/.test(rail), scenario.settings.visibility.stats, "the restored shell applies Stats visibility");
+				const header = ui.widgets.get("gentle-shell-below-input-header") as (tui: unknown, theme: ShellBarTheme) => { render(width: number): string[] };
+				assert.match(stripAnsi(header(tui, plainTheme).render(180).join("\n")), /ctx.*45%/, "the restored shell keeps the below-input header");
+				const pending = shell.commands.get("gentle:customize")!.handler("", ctx);
+				await overlayReady;
+				try {
+					assert.ok(findCustomizeRow(ui, "Status placement: auto"));
+					assert.match(ui.overlayView!.render(90).join("\n"), scenario.marker);
+					checkSaved();
+				} finally {
+					ui.overlayView!.handleInput("\x1b");
+					await pending;
+				}
+			} finally { footer.dispose(); }
+		};
+		const original = fakePi();
+		gentleShell(original.pi, env);
+		let active = session("selection");
+		try {
+			await fire(original.handlers, "session_start", active.ctx);
+			const pending = original.commands.get("gentle:customize")!.handler("", active.ctx);
+			await active.overlayReady;
+			try {
+				await customizeAction(active.ui, "Header placement: below-input");
+				if ("move" in scenario && scenario.move) {
+					assert.ok(findCustomizeRow(active.ui, "Preset: Neutral"));
+					const notices = active.ui.notices.length;
+					active.ui.overlayView!.handleInput("\x1b[C");
+					for (let attempt = 0; attempt < 100 && active.ui.notices.length === notices; attempt++) await new Promise<void>((resolve) => setTimeout(resolve, 5));
+					assert.ok(active.ui.notices.length > notices, "moving to Power user finished applying");
+				} else {
+					for (const action of scenario.actions) await customizeAction(active.ui, action);
+				}
+			} finally {
+				active.ui.overlayView!.handleInput("\x1b");
+				await pending;
+			}
+			checkSaved();
+			active = session("switched");
+			await fire(original.handlers, "session_start", active.ctx);
+			await checkRestored(original, active);
+		} finally { await fire(original.handlers, "session_shutdown", active.ctx); }
+		const fresh = fakePi();
+		gentleShell(fresh.pi, env);
+		const restarted = session("restarted");
+		try {
+			await fire(fresh.handlers, "session_start", restarted.ctx);
+			await checkRestored(fresh, restarted);
+		} finally { await fire(fresh.handlers, "session_shutdown", restarted.ctx); }
+	});
+});
+
+// Verification blockers (odd/tasks/shell-ide-rework.md L22).
+test("without the top-header IDE chrome the rail keeps the permission mode and the session name", async () => {
+	const { pi, handlers } = fakePi();
+	gentleShell(pi, {});
+	const { ctx, ui } = fakeContext();
+	await fire(handlers, "session_start", ctx);
+	const statuses = new Map([["gentle:mode", "Permissions: AUTO"], ["mcp", "MCP: 3 servers"]]);
+	const tui = { mode: "fullscreen", terminal: { rows: 40, columns: 180 }, requestRender() {} };
+	const factory = ui.footerFactory as (tui: unknown, theme: ShellBarTheme, data: unknown) => { dispose(): void };
+	const footer = factory(tui, plainTheme, { getGitBranch: () => "main", getExtensionStatuses: () => statuses, getAvailableProviderCount: () => 1, onBranchChange: () => () => {} });
+	try {
+		// No layout owns the host here, so no title row or status bar draws: the rail must say it all.
+		const rail = stripAnsi(sidebarState(tui as unknown as TUI).parts.get("footer")!.render(46).join("\n"));
+		assert.match(rail, /Permissions: AUTO/, "the permission mode stays visible when no status bar shows it");
+		assert.match(rail, /▾ SESSION[\s\S]*Release notes/, "the session name stays visible when no title row shows it");
+		assert.match(rail, /MCP: 3 servers/);
+	} finally {
+		footer.dispose();
+	}
+});
+
+test("a hidden Todos section stays hidden in the mobile work row and the panel sheet, and the sheet leaves the editor visible", async () => {
+	const { pi, handlers, commands } = fakePi();
+	gentleShell(pi, {});
+	const { ctx, ui } = fakeContext();
+	await fire(handlers, "session_start", ctx);
+	const tui = { mode: "fullscreen", terminal: { rows: 34, columns: 56 }, requestRender() {} };
+	const factory = ui.footerFactory as (tui: unknown, theme: ShellBarTheme, data: unknown) => { dispose(): void };
+	const footer = factory(tui, plainTheme, { getGitBranch: () => "main", getExtensionStatuses: () => new Map(), getAvailableProviderCount: () => 1, onBranchChange: () => () => {} });
+	const state = sidebarState(tui as unknown as TUI);
+	state.layoutAttached = () => true; // installSidebar sets this on a real fullscreen root
+	const todo = sidebarPart(tui as unknown as TUI, "todo", { render: (_width: number) => ["TODO CARD"], invalidate() {}, dispose() {} }, {
+		render: (width: number) => ["▾ TODOS".padEnd(width), ...Array.from({ length: 40 }, (_, i) => `  ○ task ${i}`.padEnd(width))],
+		summary: () => ({ left: "◐ Secret plan task", right: "1/3", rightLabel: "todos" }),
+		invalidate() {},
+	});
+	const editor = (ui.editorFactory as (tui: unknown, theme: unknown, keybindings: unknown) => GentlePromptEditor)(tui, editorTheme, fakeKeybindings);
+	try {
+		const workRow = { render: (width: number) => editor.render(width).filter((row) => /▸/.test(stripAnsi(row))) };
+		assert.match(stripAnsi(workRow.render(56)[0]!), /Secret plan task/);
+		void commands.get("gentle:panel")!.handler("", ctx);
+		await new Promise((resolve) => setImmediate(resolve));
+		const sheet = ui.overlayView!.render(56);
+		const options = ui.customOptions!.at(-1) as { overlayOptions?: { anchor?: string } };
+		assert.equal(options.overlayOptions?.anchor, "top-center", "the sheet hangs from the top");
+		assert.ok(sheet.length <= 34 - 6, `the editor, the work row and the status bar keep their rows: ${sheet.length}`);
+		(ui.overlayView as unknown as { handleInput(data: string): void }).handleInput("\x1b");
+		state.visibility = { todo: false };
+		assert.deepEqual(workRow.render(56), [], "the work row honors the Todos switch");
+		void commands.get("gentle:panel")!.handler("", ctx);
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.doesNotMatch(stripAnsi(ui.overlayView!.render(56).join("\n")), /TODOS|Secret plan/, "the sheet honors the Todos switch");
+		(ui.overlayView as unknown as { handleInput(data: string): void }).handleInput("\x1b");
+	} finally {
+		state.visibility = undefined;
+		todo.dispose();
+		footer.dispose();
+		editor.dispose();
+	}
+});
+
+test("Status at the bottom with the header on top draws the minimal IDE chrome on a wide terminal, without the rail", async () => {
+	const { pi, handlers } = fakePi();
+	const home = mkdtempSync(join(tmpdir(), "shell-light-"));
+	try {
+		writeVisualSettings({ ...DEFAULT_VISUAL_SETTINGS, statusPlacement: "bottom" }, { gentlePiConfigHome: home });
+		gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home });
+		const { ctx, ui } = fakeContext();
+		await fire(handlers, "session_start", ctx);
+		const tui = { mode: "fullscreen", terminal: { rows: 40, columns: 180 }, requestRender() {} };
+		const factory = ui.footerFactory as (tui: unknown, theme: ShellBarTheme, data: unknown) => { render(width: number): string[]; dispose(): void };
+		const footer = factory(tui, plainTheme, { getGitBranch: () => "main", getExtensionStatuses: () => new Map(), getAvailableProviderCount: () => 1, onBranchChange: () => () => {} });
+		const state = sidebarState(tui as unknown as TUI);
+		state.layoutAttached = () => true; // installSidebar sets this on a real fullscreen root
+		const todo = sidebarPart(tui as unknown as TUI, "todo", { render: (_width: number) => ["TODO CARD"], invalidate() {}, dispose() {} }, {
+			render: (width: number) => ["▾ TODOS".padEnd(width)],
+			summary: () => ({ left: "◐ Run the suite", right: "1/3", rightLabel: "todos" }),
+			invalidate() {},
+		});
+		const editor = (ui.editorFactory as (tui: unknown, theme: unknown, keybindings: unknown) => GentlePromptEditor)(tui, editorTheme, fakeKeybindings);
+		try {
+			assert.equal(state.compactWork?.(), true, "the minimal edition folds live work like a phone");
+			assert.deepEqual(footer.render(180), [], "the old compact bottom bar steps aside for the status bar");
+			assert.deepEqual(todo.render(180), [], "the Todos card folds into the work row");
+			assert.match(stripAnsi(state.parts.get("header")!.render(180).join("\n")), /^ ✿ repo /, "the title row draws");
+			assert.match(stripAnsi(state.parts.get("statusbar")!.render(180).join("\n")), /^ main /, "the status bar draws");
+			assert.match(stripAnsi(editor.render(180)[0]!), /▸ ◐ Run the suite/, "the work row sits right above the editor");
+		} finally {
+			editor.dispose();
+			todo.dispose();
+			footer.dispose();
+		}
+	} finally {
+		rmSync(home, { recursive: true, force: true });
+	}
+});
+
+test("an agent question keeps its row above the framed editor while the rail hides the Agents card with the header below the input", async (t) => {
+	const home = scopedDoubleEscCancelConfigHome(t);
+	writeVisualSettings({ ...DEFAULT_VISUAL_SETTINGS, headerPlacement: "below-input" }, { gentlePiConfigHome: home });
+	const { pi, handlers } = fakePi();
+	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home });
+	const { ctx, ui } = fakeContext();
+	const editor = installedPrompt(ctx, ui, handlers);
+	const state = sidebarState(fakeTui as unknown as TUI);
+	const owned = { active: state.active, ownsHost: state.ownsHost };
+	const host = fakeTui as { mode?: string };
+	const agents = sidebarPart(fakeTui as unknown as TUI, "agents", { render: (_width: number) => [], invalidate() {}, dispose() {} }, { render: () => [], alert: () => [" ? explore asked: Which file?"], invalidate() {} });
+	try {
+		host.mode = "fullscreen";
+		state.active = true;
+		state.ownsHost = () => true;
+		const rows = editor.render(80).map(stripAnsi);
+		assert.match(rows[0]!, /explore asked: Which file\?/, "the question sits right above the editor");
+		assert.match(rows[1]!, /^╭/, "the below-input header keeps the framed editor");
+		state.active = false;
+		assert.doesNotMatch(editor.render(80).map(stripAnsi).join("\n"), /explore asked/, "without the rail the Agents card lists the question itself");
+	} finally {
+		agents.dispose();
+		delete host.mode;
+		state.active = owned.active;
+		state.ownsHost = owned.ownsHost;
+		editor.dispose();
+	}
+});
+
+test("rail Status sections fold on a header click and the Changes row opens /gentle:changes", async () => {
+	const { pi, handlers } = fakePi();
+	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" });
+	const { ctx, ui } = fakeContext();
+	await fire(handlers, "session_start", ctx);
+	const tui = { mode: "fullscreen", terminal: { rows: 40, columns: 180 }, requestRender() {} };
+	const factory = ui.footerFactory as (tui: unknown, theme: ShellBarTheme, data: unknown) => { dispose(): void };
+	const footer = factory(tui, plainTheme, { getGitBranch: () => "main", getExtensionStatuses: () => new Map([["mcp", "MCP: 3 servers"]]), getAvailableProviderCount: () => 1, onBranchChange: () => () => {} });
+	try {
+		const rail = sidebarState(tui as unknown as TUI).parts.get("footer")!;
+		const rows = () => rail.render(46).map((line) => stripAnsi(line).trimEnd());
+		const click = (y: number, type: "click" | "move" = "click") => rail.handleMouse?.({ type, button: type === "click" ? "left" : "none", x: 2, y, screenX: 2, screenY: y, width: 46, height: rows().length, shift: false, alt: false, ctrl: false });
+		const header = rows().findIndex((line) => /^▾ INTEGRATIONS/.test(line));
+		assert.ok(header >= 0);
+		const before = rail.digest?.();
+		assert.deepEqual(click(header, "move"), { handled: true, render: true }, "the header is hoverable");
+		assert.notEqual(rail.digest?.(), before, "hover repaints the cached section");
+		assert.equal(click(header)?.handled, true);
+		assert.ok(rows().some((line) => /^▸ INTEGRATIONS/.test(line)) && !rows().some((line) => /MCP: 3 servers/.test(line)), "a click folds the section");
+		click(rows().findIndex((line) => /^▸ INTEGRATIONS/.test(line)));
+		assert.ok(rows().some((line) => /MCP: 3 servers/.test(line)), "a second click unfolds it");
+		const changesRow = rows().findIndex((line) => /\/gentle:changes/.test(line));
+		const notices = ui.notices.length;
+		assert.equal(click(changesRow)?.handled, true, "the Changes row is clickable");
+		for (let i = 0; i < 5 && !ui.overlayView && ui.notices.length === notices; i++) await new Promise((resolve) => setTimeout(resolve, 10));
+		assert.ok(ui.overlayView || ui.notices.length > notices, "the click runs /gentle:changes (its view, or its note when nothing changed)");
+		(ui.overlayView as unknown as { handleInput?(data: string): void } | undefined)?.handleInput?.("\x1b");
+	} finally {
+		footer.dispose();
+	}
+});
+
+test("the work row reacts to hover and the panel sheet closes from a click on esc back and scrolls with the wheel", async () => {
+	const { pi, handlers, commands } = fakePi();
+	gentleShell(pi, {});
+	const { ctx, ui } = fakeContext();
+	await fire(handlers, "session_start", ctx);
+	const tui = { mode: "fullscreen", terminal: { rows: 20, columns: 56 }, requestRender() {} };
+	const footer = (ui.footerFactory as (tui: unknown, theme: ShellBarTheme, data: unknown) => { dispose(): void })(tui, plainTheme, { getGitBranch: () => "main", getExtensionStatuses: () => new Map(), getAvailableProviderCount: () => 1, onBranchChange: () => () => {} });
+	const state = sidebarState(tui as unknown as TUI);
+	state.layoutAttached = () => true;
+	const todo = sidebarPart(tui as unknown as TUI, "todo", { render: (_width: number) => [], invalidate() {}, dispose() {} }, {
+		render: (width: number) => ["▾ TODOS".padEnd(width), ...Array.from({ length: 30 }, (_, i) => `  ○ task ${i}`.padEnd(width))],
+		summary: () => ({ left: "◐ Run the suite", right: "1/3", rightLabel: "todos" }),
+		invalidate() {},
+	});
+	const editor = (ui.editorFactory as (tui: unknown, theme: unknown, keybindings: unknown) => GentlePromptEditor)(tui, editorTheme, fakeKeybindings);
+	const pointer = (type: "move" | "click" | "wheel", x: number, y: number, extra: Record<string, unknown> = {}) => ({ type, button: type === "click" ? "left" : "none", x, y, screenX: x, screenY: y, width: 56, height: 6, shift: false, alt: false, ctrl: false, ...extra }) as never;
+	try {
+		editor.render(56);
+		assert.deepEqual(editor.handleMouse?.(pointer("move", 3, 0)), { handled: true, render: true }, "hovering the work row repaints it as clickable");
+		const opened = commands.get("gentle:panel")!.handler("", ctx);
+		await new Promise((resolve) => setImmediate(resolve));
+		const sheet = ui.overlayView as unknown as { render(width: number): string[]; handleMouse(event: unknown): unknown };
+		const first = stripAnsi(sheet.render(56)[1]!);
+		assert.deepEqual(sheet.handleMouse(pointer("wheel", 10, 5, { wheelDelta: 1 })), { handled: true, render: true });
+		assert.notEqual(stripAnsi(sheet.render(56)[1]!), first, "the wheel scrolls the sheet");
+		assert.deepEqual(sheet.handleMouse(pointer("move", 52, 0)), { handled: true, render: true }, "esc back is hoverable");
+		assert.equal((sheet.handleMouse(pointer("click", 52, 0)) as { handled?: boolean }).handled, true);
+		await opened;
+	} finally {
+		editor.dispose();
+		todo.dispose();
+		footer.dispose();
+	}
+});
+
+test("a render of the Status part at another width never moves the rail's click targets", async (t) => {
+	const home = scopedDoubleEscCancelConfigHome(t);
+	// Below the input the rail keeps the Session section, whose row wraps at a narrow width.
+	writeVisualSettings({ ...DEFAULT_VISUAL_SETTINGS, headerPlacement: "below-input" }, { gentlePiConfigHome: home });
 	const { pi, handlers } = fakePi();
 	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home, GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" });
 	const { ctx, ui } = fakeContext();
 	await fire(handlers, "session_start", ctx);
-	const tui = { mode: "fullscreen", terminal: { rows: 40, columns: 160 }, requestRender() {} };
-	const footer = (ui.footerFactory as (tui: unknown, theme: ShellBarTheme, data: unknown) => { dispose(): void })(tui, plainTheme, {
-		getGitBranch: () => "main", getExtensionStatuses: () => new Map(), getAvailableProviderCount: () => 1, onBranchChange: () => () => {},
-	});
+	const tui = { mode: "fullscreen", terminal: { rows: 40, columns: 180 }, requestRender() {} };
+	const footer = (ui.footerFactory as (tui: unknown, theme: ShellBarTheme, data: unknown) => { dispose(): void })(tui, plainTheme, { getGitBranch: () => "main", getExtensionStatuses: () => new Map(), getAvailableProviderCount: () => 1, onBranchChange: () => () => {} });
 	try {
-		const header = (ui.widgets.get("gentle-shell-below-input-header") as (tui: unknown, theme: ShellBarTheme) => { render(width: number): string[] })(tui, plainTheme);
-		const state = sidebarState(tui as unknown as TUI);
-		assert.notDeepEqual(header.render(160), [], "without the band the below-input header paints");
-		state.foldedBand = () => true;
-		assert.deepEqual(header.render(160), []);
-	} finally { footer.dispose(); }
+		const rail = sidebarState(tui as unknown as TUI).parts.get("footer")!;
+		const at = (width: number) => rail.render(width).map((line) => stripAnsi(line).trimEnd());
+		const wide = at(46);
+		const header = wide.findIndex((line) => /^▾ CHANGES/.test(line));
+		assert.ok(header > 0, "the rail shows Session above Changes");
+		const narrow = at(12);
+		assert.notEqual(narrow.findIndex((line) => /^▾ CHANGES/.test(line)), header, "the narrow render moves the Changes header");
+		// The click arrives at the rail's width with no render in between.
+		const notices = ui.notices.length;
+		const result = rail.handleMouse?.({ type: "click", button: "left", x: 2, y: header, screenX: 2, screenY: header, width: 46, height: wide.length, shift: false, alt: false, ctrl: false });
+		assert.equal(result?.handled, true, "the click lands on the rail's own Changes header");
+		assert.ok(at(46).some((line) => /^▸ CHANGES/.test(line)), "the click folds Changes");
+		assert.equal(ui.notices.length, notices, "the click runs nothing else");
+	} finally {
+		footer.dispose();
+	}
 });
 
-test("S7: the band re-renders only when its inputs change", async (t) => {
-	const f = await bandFixture(t);
-	try {
-		const first = f.widget.render(160);
-		for (let i = 0; i < 5; i++) assert.deepEqual(f.widget.render(160), first);
-		assert.equal(f.wellness.renders, 1, "Breaks rendered once for six identical frames");
-		f.wellness.digest = "d2";
-		f.widget.render(160);
-		assert.equal(f.wellness.renders, 2, "a Breaks digest change repaints");
-		f.widget.render(170);
-		assert.equal(f.wellness.renders, 3, "a resize repaints");
-		f.statuses.set("mcp", "MCP busy");
-		assert.match(stripAnsi(f.widget.render(170).join("\n")), /MCP busy/, "a status change repaints Sesión");
-		assert.equal(f.wellness.renders, 4);
-		f.widget.render(170);
-		assert.equal(f.wellness.renders, 4);
-	} finally { f.footer.dispose(); }
+test("alt+l cycles the visual presets Light → Neutral → Power user → Light and saves each pick", async (t) => {
+	const home = scopedDoubleEscCancelConfigHome(t);
+	const { pi, handlers, shortcuts } = fakePi();
+	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home, GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" });
+	const { ctx, ui } = fakeContext();
+	await fire(handlers, "session_start", ctx);
+	const shortcut = shortcuts.get("alt+l");
+	assert.ok(shortcut, "alt+l not registered");
+	const preset = () => visualPresetOf(resolveVisualSettings({ gentlePiConfigHome: home }).settings);
+	assert.equal(preset(), VISUAL_PRESET.NEUTRAL, "a fresh install starts on Neutral");
+	const seen: (string | undefined)[] = [];
+	for (let i = 0; i < 3; i++) {
+		await shortcut.handler(ctx);
+		seen.push(preset());
+	}
+	assert.deepEqual(seen, [VISUAL_PRESET.POWER_USER, VISUAL_PRESET.LIGHT, VISUAL_PRESET.NEUTRAL]);
+	assert.match(ui.notices.at(-1) ?? "", /Preset: Neutral/);
+	// A hand-tuned mix starts the cycle from Neutral.
+	writeVisualSettings({ ...DEFAULT_VISUAL_SETTINGS, density: DENSITY.MINIMAL }, { gentlePiConfigHome: home });
+	await shortcut.handler(ctx);
+	assert.equal(preset(), VISUAL_PRESET.NEUTRAL);
+
+	const silent = fakePi();
+	gentleShell(silent.pi, { GENTLE_PI_SHELL_PRESET_KEY: "off" });
+	assert.equal(silent.shortcuts.has("alt+l"), false, "GENTLE_PI_SHELL_PRESET_KEY=off drops the shortcut");
+	const moved = fakePi();
+	gentleShell(moved.pi, { GENTLE_PI_SHELL_PRESET_KEY: "alt+o" });
+	assert.ok(moved.shortcuts.has("alt+o"));
 });
 
-test("S6: a click on `usage` opens the usage overlay; other cells of Sesión are inert", async (t) => {
-	const f = await bandFixture(t);
-	try {
-		const rows = f.widget.render(160).map(stripAnsi);
-		const x = rows[2]!.indexOf("usage");
-		assert.equal(f.widget.handleMouse?.(f.click(x, 1)), undefined, "wrong row");
-		assert.equal(f.widget.handleMouse?.(f.click(2, 2)), undefined, "ctx cell");
-		assert.equal(f.widget.handleMouse?.({ ...f.click(x, 2), button: "right" } as TuiMouseEvent), undefined);
-		assert.equal(f.widget.handleMouse?.(f.click(x, 2))?.handled, true);
-		await f.overlayReady;
-		f.ui.closeOverlay?.();
-	} finally { f.footer.dispose(); }
+test("the Stats section (Power user) follows its visibility switch, at any density", async (t) => {
+	const home = scopedDoubleEscCancelConfigHome(t);
+	const render = async (stats: boolean, density: (typeof DENSITY)[keyof typeof DENSITY] = DENSITY.COMFORTABLE) => {
+		writeVisualSettings({ ...DEFAULT_VISUAL_SETTINGS, density, visibility: { ...DEFAULT_VISUAL_SETTINGS.visibility, stats } }, { gentlePiConfigHome: home });
+		const { pi, handlers } = fakePi();
+		gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home, GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" });
+		const { ctx, ui } = fakeContext({ entries: [assistantEntry({ input: 1000, output: 200, cost: 0.5 }), assistantEntry({ input: 500, output: 100, cost: 0.25 })] });
+		await fire(handlers, "session_start", ctx);
+		const tui = { mode: "fullscreen", terminal: { rows: 40, columns: 180 }, requestRender() {} };
+		const footer = (ui.footerFactory as (tui: unknown, theme: ShellBarTheme, data: unknown) => { dispose(): void })(tui, plainTheme, { getGitBranch: () => "main", getExtensionStatuses: () => new Map(), getAvailableProviderCount: () => 1, onBranchChange: () => () => {} });
+		try {
+			return sidebarState(tui as unknown as TUI).parts.get("footer")!.render(46).map((line) => stripAnsi(line).trimEnd()).join("\n");
+		} finally {
+			footer.dispose();
+		}
+	};
+	const power = await render(true);
+	assert.match(power, /▾ STATS\s+\$0\.750 sub/, "a subscription marks the cost like the status bar");
+	assert.match(power, /spent\s+\$0\.750 sub\s+2 turns/);
+	assert.doesNotMatch(await render(false), /STATS/, "Neutral leaves it off");
+	assert.doesNotMatch(await render(false, DENSITY.COMPACT), /STATS/, "compact density alone no longer adds it");
+	assert.match(await render(true, DENSITY.COMPACT), /▾ STATS/);
 });
 
-test("S6: clicks on the right card reach the Breaks part with card-local coordinates", async (t) => {
-	const f = await bandFixture(t);
+test("Stats reads what subagents spent from the Agents rail section", async (t) => {
+	const home = scopedDoubleEscCancelConfigHome(t);
+	writeVisualSettings({ ...DEFAULT_VISUAL_SETTINGS, visibility: { ...DEFAULT_VISUAL_SETTINGS.visibility, stats: true } }, { gentlePiConfigHome: home });
+	const { pi, handlers } = fakePi();
+	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home, GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" });
+	const { ctx, ui } = fakeContext({ entries: [assistantEntry({ input: 1000, output: 200, cost: 0.5 })] });
+	await fire(handlers, "session_start", ctx);
+	const tui = { mode: "fullscreen", terminal: { rows: 40, columns: 180 }, requestRender() {} };
+	const footer = (ui.footerFactory as (tui: unknown, theme: ShellBarTheme, data: unknown) => { dispose(): void })(tui, plainTheme, { getGitBranch: () => "main", getExtensionStatuses: () => new Map(), getAvailableProviderCount: () => 1, onBranchChange: () => () => {} });
+	let spend: { runs: number; tokens: number; cost: number } | undefined = { runs: 2, tokens: 4200, cost: 0.3 };
+	const agents = sidebarPart(tui as unknown as TUI, "agents", { render: (_width: number) => [], invalidate() {}, dispose() {} }, { surface: "panel", render: () => [], spend: () => spend, invalidate() {} });
 	try {
-		f.widget.render(160);
-		assert.equal(f.widget.handleMouse?.(f.click(110 + 36, 2))?.handled, true);
-		assert.deepEqual(f.wellness.clicks, [{ x: 36, y: 2, width: 50 }]);
-		assert.equal(f.widget.handleMouse?.(f.click(108, 2)), undefined, "the gap is inert");
-		assert.equal(f.wellness.clicks.length, 1);
-	} finally { f.footer.dispose(); }
+		const rail = sidebarState(tui as unknown as TUI).parts.get("footer")!;
+		const text = () => rail.render(46).map((line) => stripAnsi(line).trimEnd()).join("\n");
+		const before = rail.digest?.();
+		assert.match(text(), /agents\s+2 runs · 4\.2k · \$0\.300 sub/);
+		spend = { runs: 3, tokens: 5000, cost: 0.4 };
+		assert.notEqual(rail.digest?.(), before, "new subagent spend repaints the cached section");
+		assert.match(text(), /agents\s+3 runs/);
+	} finally {
+		agents.dispose();
+		footer.dispose();
+	}
 });
 
-test("S6: hits are honoured only against the geometry last painted", async (t) => {
-	const f = await bandFixture(t);
-	try {
-		const rows = f.widget.render(160).map(stripAnsi);
-		const x = rows[2]!.indexOf("usage");
-		assert.equal(f.widget.handleMouse?.(f.click(150, 2, 150)), undefined, "a different width than the last paint");
-		f.wellness.digest = "d2";
-		assert.equal(f.widget.handleMouse?.(f.click(110 + 36, 2)), undefined, "inputs changed since the last paint");
-		f.widget.render(160);
-		f.state.foldedBand = () => false;
-		assert.equal(f.widget.handleMouse?.(f.click(x, 2)), undefined, "band no longer painting");
-		assert.equal(f.wellness.clicks.length, 0);
-	} finally { f.footer.dispose(); }
+
+test("Customize groups every setting like Layout while navigation keeps stores unchanged", async (t) => {
+ const home = scopedDoubleEscCancelConfigHome(t);
+ const { pi, commands } = fakePi();
+ gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home });
+ const { ctx, ui, overlayReady } = fakeContext();
+ const pending = commands.get("gentle:customize")!.handler("", ctx);
+ await overlayReady;
+ const snapshot = () => JSON.stringify(readdirSync(home).sort().map(name => [name, readFileSync(join(home, name), "utf8")]));
+ const before = snapshot();
+ for (const [label, setting] of [["Banner rose:", "Banner rose"], ["Banner text logo:", "Banner text logo"], ["Theme:", "Theme"], ["Vim:", "Vim"], ["YOLO:", "YOLO"], ["Session permissions:", "Session permissions"], ["Default permissions:", "Default permissions"], ["Prompt history capture:", "History capture"], ["Audio notifications:", "Enabled"], ["Success:", "Success"], ["Section changes:", "changes"]]) {
+  assert.ok(findCustomizeRow(ui, label), label);
+  const lines = ui.overlayView!.render(180);
+  assert.equal(lines.filter(line => line.split("│").some(part => part.trimStart().replace(/^▸\s*/, "").startsWith(`${setting} `) && /[●○]/.test(part))).length, 1, `${setting} has one options line`);
+ }
+ assert.ok(findCustomizeRow(ui, "Prompt history capture: enable"));
+ ui.overlayView!.render(120); ui.overlayView!.handleInput("\x1b[C");
+ await new Promise<void>(resolve => setImmediate(resolve));
+ assert.equal(snapshot(), before, "browsing an off/on option cannot write a preference");
+ ui.overlayView!.handleInput("\x1b"); await pending;
 });

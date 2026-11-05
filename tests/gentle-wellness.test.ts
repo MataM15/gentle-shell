@@ -36,40 +36,27 @@ async function fixture(t: TestContext) {
 }
 const flush = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); };
 
-test("S2d: the standalone below-editor Breaks paint steps aside while the folded band owns it", async (t) => {
+test("S2d: the standalone below-editor Breaks paint stays up with no band to hand off to", async (t) => {
 	const f = await fixture(t);
-	assert.ok(f.widget.render(160).length > 0, "no band: the fallback paints as before");
-	f.state.foldedBand = () => true;
-	assert.deepEqual(f.widget.render(160), [], "the band paints Breaks itself");
-	assert.ok(f.raw().render(50).length > 0, "the registered rail part still renders for the band to read");
-	f.state.foldedBand = () => false;
-	assert.ok(f.widget.render(160).length > 0);
+	assert.ok(f.widget.render(160).length > 0, "the fallback paints");
+	assert.ok(f.raw().render(50).length > 0, "the registered part still renders");
 });
 
-test("the registered part paints ↻ glyphs in the rail and in the folded band alike", async (t) => {
+test("the registered part paints ↻ glyphs", async (t) => {
 	const f = await fixture(t);
 	const rail = f.raw().render(50);
-	assert.equal((rail.join("\n").match(/↻/g) ?? []).length, 3, "the rail card keeps the reset affordance visible");
-	f.state.foldedBand = () => true;
-	const lines = f.raw().render(50);
-	assert.equal((lines.join("\n").match(/↻/g) ?? []).length, 3);
-	assert.ok(lines.every((line) => visibleWidth(line) === 50));
-	assert.deepEqual(lines, rail, "band and rail share one format");
+	assert.equal((rail.join("\n").match(/↻/g) ?? []).length, 3, "the card keeps the reset affordance visible");
 });
 
-test("S7: toggling between band and rail keeps the digest stable while nothing changes", async (t) => {
+test("S7: the digest is stable while nothing changes", async (t) => {
 	const f = await fixture(t);
 	f.raw().render(50);
 	const rail = f.raw().digest!();
-	f.state.foldedBand = () => true;
-	assert.equal(f.raw().digest!(), rail, "same format, same digest");
-	f.state.foldedBand = () => false;
 	assert.equal(f.raw().digest!(), rail);
 });
 
 test("S6: a click on the ↻ glyph or the label resets that reminder through the registered part", async (t) => {
 	const f = await fixture(t);
-	f.state.foldedBand = () => true;
 	const lines = f.raw().render(50);
 	const click = (x: number, y: number) => f.raw().handleMouse?.({ type: "click", button: "left", x, y, screenX: x, screenY: y, width: 50, height: lines.length, shift: false, alt: false, ctrl: false } as never);
 	const glyph = visibleWidth(lines[2]!.slice(0, lines[2]!.indexOf("↻")));
@@ -83,12 +70,10 @@ test("S6: a click on the ↻ glyph or the label resets that reminder through the
 	assert.equal(click(glyph, 4), undefined, "Cena is inert");
 });
 
-test("a rail click on the ↻ glyph resets that reminder after leaving the band too", async (t) => {
+test("a click on the ↻ glyph resets that reminder after the part repainted elsewhere", async (t) => {
 	const f = await fixture(t);
-	f.state.foldedBand = () => true;
 	const glyphLines = f.raw().render(50);
 	const glyph = visibleWidth(glyphLines[1]!.slice(0, glyphLines[1]!.indexOf("↻")));
-	f.state.foldedBand = () => false;
 	f.raw().render(50);
 	const result = f.raw().handleMouse?.({ type: "click", button: "left", x: glyph, y: 1, screenX: glyph, screenY: 1, width: 50, height: 6, shift: false, alt: false, ctrl: false } as never);
 	await flush();

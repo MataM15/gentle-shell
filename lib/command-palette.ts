@@ -1,4 +1,6 @@
 import { isKeyRelease, matchesKey, truncateToWidth, visibleWidth, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
+import { effectiveKey, type KeymapBindings } from "./keymaps.ts";
+import { paintHoverable } from "./shell-hover.ts";
 import { stripAnsi } from "./terminal-theme.ts";
 
 // Command palette: a pure, curated, grouped overlay component for
@@ -14,18 +16,15 @@ export interface CommandPaletteItem {
 	label: string;
 	description?: string;
 	shortcut?: string;
-	/** One-cell glyph drawn in the entry's two-cell left gutter: dim, rose when selected. */
-	icon?: string;
 }
 
 export interface CommandPaletteGroup {
 	title: string;
 	items: CommandPaletteItem[];
-	/** One-cell glyph drawn rose before the group title. */
-	icon?: string;
 }
 
-export type CommandPaletteResult = { type: "run"; name: string } | { type: "close" };
+/** `bind` carries the raw key pressed after Tab, for the caller to assign to `name`. */
+export type CommandPaletteResult = { type: "run"; name: string } | { type: "bind"; name: string; data: string } | { type: "close" };
 
 export interface CommandPaletteTheme {
 	fg(color: string, text: string): string;
@@ -74,7 +73,7 @@ function rankItem(item: CommandPaletteItem, lowerQuery: string): number | undefi
  */
 export function rankPaletteGroups(groups: readonly CommandPaletteGroup[], query: string): CommandPaletteGroup[] {
 	const trimmed = query.trim();
-	if (!trimmed) return groups.map((group) => ({ ...group, items: [...group.items] }));
+	if (!trimmed) return groups.map((group) => ({ title: group.title, items: [...group.items] }));
 	const lower = trimmed.toLowerCase();
 	const result: CommandPaletteGroup[] = [];
 	for (const group of groups) {
@@ -85,12 +84,12 @@ export function rankPaletteGroups(groups: readonly CommandPaletteGroup[], query:
 		}
 		if (ranked.length === 0) continue;
 		ranked.sort((a, b) => a.rank - b.rank);
-		result.push({ ...group, items: ranked.map((entry) => entry.item) });
+		result.push({ title: group.title, items: ranked.map((entry) => entry.item) });
 	}
 	return result;
 }
 
-type Tone = "border" | "muted" | "text" | "title" | "accent" | "dim" | "rose";
+type Tone = "border" | "muted" | "text" | "title" | "accent";
 
 const TONE_COLOR: Record<Tone, string> = {
 	border: "border",
@@ -98,8 +97,6 @@ const TONE_COLOR: Record<Tone, string> = {
 	text: "text",
 	title: "accent",
 	accent: "accent",
-	dim: "dim",
-	rose: "borderAccent",
 };
 
 // Two border glyphs ("│ " and " │") plus the padding space on each side.
@@ -139,24 +136,27 @@ const MIN_TOTAL_ROWS = 12;
 const HEIGHT_RATIO = 0.85;
 const DEFAULT_ROWS = 40;
 
-type PaletteRow = { kind: "title"; text: string; icon?: string } | { kind: "blank" } | { kind: "item"; item: CommandPaletteItem; itemIndex: number };
+type PaletteRow = { kind: "title"; text: string } | { kind: "blank" } | { kind: "item"; item: CommandPaletteItem; itemIndex: number };
 
-// What a body line does under a clean left click: close (on its `esc` span
-// only) or run its command (anywhere on the row). Lines without one are inert.
-type PaletteHit = { kind: "close"; start: number; end: number } | { kind: "run"; command: string };
-type BodyLine = { text: string; hit?: PaletteHit };
-// Body lines sit one row below the card's top border and two cells in ("│ ").
-const CARD_TOP_ROWS = 1;
-const CARD_LEFT_CELLS = 2;
-const FOOTER_HINT = "type to search • ↑/↓ move • enter/click run • esc close";
-const FOOTER_CLOSE = "esc close";
+interface PalettePointerHit {
+	y: number;
+	itemIndex: number;
+}
+
+interface PalettePointerFrame {
+	width: number;
+	height: number;
+	availableRows: number;
+	modelKey: string;
+	hits: PalettePointerHit[];
+}
 
 function buildRows(groups: readonly CommandPaletteGroup[]): PaletteRow[] {
 	const rows: PaletteRow[] = [];
 	let itemIndex = 0;
 	groups.forEach((group, groupIndex) => {
 		if (groupIndex > 0) rows.push({ kind: "blank" });
-		rows.push({ kind: "title", text: group.title, icon: group.icon });
+		rows.push({ kind: "title", text: group.title });
 		for (const item of group.items) {
 			rows.push({ kind: "item", item, itemIndex });
 			itemIndex += 1;
@@ -182,12 +182,17 @@ export class CommandPalette {
 	private query = "";
 	private selected = 0;
 	private completed = false;
+	private disposed = false;
+	private capturing: CommandPaletteItem | undefined;
+	private hovered: number | undefined;
+	private pointerFrame: PalettePointerFrame | undefined;
+	private renderedWidth: number | undefined;
+	private renderedRows: number | undefined;
+	private renderedModelKey: string | undefined;
 	private readonly groups: readonly CommandPaletteGroup[];
 	private readonly done: (result: CommandPaletteResult) => void;
 	private readonly theme: CommandPaletteTheme | undefined;
 	private readonly rowsFn: () => number;
-	// The geometry of the last render; a click against any other size is stale.
-	private layout: { width: number; height: number; hits: Array<PaletteHit | undefined> } | undefined;
 
 	constructor(groups: readonly CommandPaletteGroup[], done: (result: CommandPaletteResult) => void, theme?: CommandPaletteTheme, rows: () => number = () => DEFAULT_ROWS) {
 		this.groups = groups;
@@ -197,39 +202,65 @@ export class CommandPalette {
 	}
 
 	invalidate(): void {
-		this.layout = undefined;
+		this.pointerFrame = undefined;
+		this.hovered = undefined;
+		this.renderedWidth = undefined;
 	}
 
-	/**
-	 * Fullscreen mouse: a clean left click on `esc` (header) or `esc close`
-	 * (footer) closes, on a command row runs it; the wheel moves the
-	 * selection. Presses, drags and clicks against a stale render do nothing.
-	 */
+	dispose(): void {
+		this.disposed = true;
+		this.invalidate();
+	}
+
+	/** Mouse events are local to the last painted card, including its borders. */
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
-		if (this.completed) return undefined;
-		if (event.type === "wheel") {
-			const delta = Math.sign(event.wheelDelta ?? 0);
-			if (delta === 0) return undefined;
-			this.moveSelection(delta);
+		if (this.completed || this.disposed || this.capturing) return undefined;
+		const frame = this.pointerFrame;
+		if (!frame || frame.width !== event.width || frame.height !== event.height ||
+			frame.availableRows !== this.rowsFn() || frame.modelKey !== this.modelKey()) {
+			this.pointerFrame = undefined;
+			const changed = this.setHover(undefined);
+			return changed && event.type === "move" && event.button === "none" ? { handled: true, render: true } : undefined;
+		}
+		const inside = event.x >= 2 && event.x < frame.width - 2 && event.y >= 0 && event.y < frame.height;
+		const hit = inside ? frame.hits.find((candidate) => candidate.y === event.y) : undefined;
+		if (event.type === "move" && event.button === "none") {
+			return { handled: true, render: this.setHover(hit?.itemIndex) };
+		}
+		if (event.type === "wheel" && inside && event.wheelDelta) {
+			const before = this.selected;
+			this.moveSelection(Math.sign(event.wheelDelta));
+			const changed = this.selected !== before;
+			const hoverChanged = this.setHover(undefined);
+			if (changed) this.pointerFrame = undefined;
+			return { handled: true, render: changed || hoverChanged };
+		}
+		if (event.button !== "left" || !hit) return undefined;
+		if (event.type === "press") return { handled: true, render: false };
+		if (event.type === "click") {
+			this.selected = hit.itemIndex;
+			this.pointerFrame = undefined;
+			this.runSelected();
 			return { handled: true, render: true };
 		}
-		if (event.type !== "click" || event.button !== "left") return undefined;
-		const layout = this.layout;
-		if (!layout || event.width !== layout.width || event.height !== layout.height) return undefined;
-		const hit = layout.hits[event.y - CARD_TOP_ROWS];
-		const x = event.x - CARD_LEFT_CELLS;
-		if (!hit || x < 0) return undefined;
-		if (hit.kind === "close") {
-			if (x < hit.start || x >= hit.end) return undefined;
-			this.finish({ type: "close" });
-		} else {
-			this.finish({ type: "run", name: hit.command });
-		}
-		return { handled: true, render: true };
+		return undefined;
 	}
 
 	handleInput(data: string): void {
-		if (this.completed || isKeyRelease(data)) return;
+		if (this.completed || this.disposed || isKeyRelease(data)) return;
+		this.pointerFrame = undefined;
+		this.hovered = undefined;
+		// After Tab the next key is the one to assign, whatever it is; esc only cancels.
+		if (this.capturing) {
+			const item = this.capturing;
+			this.capturing = undefined;
+			if (!matchesKey(data, "escape")) this.finish({ type: "bind", name: item.command, data });
+			return;
+		}
+		if (matchesKey(data, "tab")) {
+			this.capturing = itemAt(this.matches(), this.selected);
+			return;
+		}
 		// A bare line feed ("\n") is both ctrl+j and, on non-Kitty terminals,
 		// a synonym for Enter: check the scroll/move keys first so ctrl+j
 		// always scrolls instead of running the highlighted command (same
@@ -247,8 +278,7 @@ export class CommandPalette {
 			return;
 		}
 		if (matchesKey(data, "enter") || matchesKey(data, "return")) {
-			const item = itemAt(this.matches(), this.selected);
-			if (item) this.finish({ type: "run", name: item.command });
+			this.runSelected();
 			return;
 		}
 		if (matchesKey(data, "backspace")) {
@@ -263,12 +293,23 @@ export class CommandPalette {
 	}
 
 	render(width: number): string[] {
+		const availableRows = this.rowsFn();
+		const modelKey = this.modelKey();
+		if (this.renderedWidth !== width || this.renderedRows !== availableRows || this.renderedModelKey !== modelKey) this.hovered = undefined;
+		this.renderedWidth = width;
+		this.renderedRows = availableRows;
+		this.renderedModelKey = modelKey;
 		const innerWidth = Math.max(1, width - CARD_PADDING);
-		const maxTotalLines = Math.max(MIN_TOTAL_ROWS, Math.floor(this.rowsFn() * HEIGHT_RATIO));
-		const body = this.renderBody(innerWidth, maxTotalLines);
-		const lines = renderPaletteCard(body.map((line) => line.text), width, this.theme);
-		this.layout = { width, height: lines.length, hits: body.map((line) => line.hit) };
-		return lines;
+		const maxTotalLines = Math.max(MIN_TOTAL_ROWS, Math.floor(availableRows * HEIGHT_RATIO));
+		const hits: PalettePointerHit[] = [];
+		const frame = renderPaletteCard(this.renderBody(innerWidth, maxTotalLines, hits), width, this.theme);
+		// showCommandPalette caps the overlay at 85% even when the card's
+		// minimum height is larger. Only the actually visible prefix can act.
+		const visibleHeight = Math.min(frame.length, Math.max(1, Math.floor(availableRows * HEIGHT_RATIO)));
+		this.pointerFrame = this.disposed || this.completed || width <= CARD_PADDING ? undefined : {
+			width, height: visibleHeight, availableRows, modelKey, hits,
+		};
+		return frame;
 	}
 
 	/**
@@ -299,30 +340,44 @@ export class CommandPalette {
 		return rankPaletteGroups(this.groups, this.query);
 	}
 
+	private modelKey(): string {
+		return JSON.stringify(this.groups.map((group) => [group.title, group.items.map((item) => [item.command, item.label, item.description, item.shortcut])]));
+	}
+
+	private setHover(index: number | undefined): boolean {
+		if (this.hovered === index) return false;
+		this.hovered = index;
+		return true;
+	}
+
+	private runSelected(): void {
+		const item = itemAt(this.matches(), this.selected);
+		if (item) this.finish({ type: "run", name: item.command });
+	}
+
 	private finish(result: CommandPaletteResult): void {
-		if (this.completed) return;
+		if (this.completed || this.disposed) return;
 		this.completed = true;
+		this.pointerFrame = undefined;
+		this.hovered = undefined;
 		this.done(result);
 	}
 
-	private renderBody(width: number, maxTotalLines: number): BodyLine[] {
-		const lines: BodyLine[] = [];
-		// `esc` is right-aligned on the header row, so it ends at the last column.
-		lines.push({ text: this.renderHeaderRow(width), hit: width > 4 ? { kind: "close", start: width - 3, end: width } : undefined });
-		lines.push({ text: this.query.length > 0 ? this.renderLine(`› ${this.query}`, width) : this.renderLine("› Search", width, "muted") });
-		lines.push({ text: "" });
+	private renderBody(width: number, maxTotalLines: number, hits: PalettePointerHit[]): string[] {
+		const lines: string[] = [];
+		lines.push(this.renderHeaderRow(width));
+		lines.push(this.query.length > 0 ? this.renderLine(`› ${this.query}`, width) : this.renderLine("› Search", width, "muted"));
+		lines.push("");
 		const groups = this.matches();
 		if (groups.length === 0) {
-			lines.push({ text: this.renderLine(`No commands match "${this.query}"`, width, "muted") });
+			lines.push(this.renderLine(`No commands match "${this.query}"`, width, "muted"));
 		} else {
 			const budget = Math.max(1, maxTotalLines - CARD_BORDER_ROWS - CHROME_ROWS);
-			lines.push(...this.renderGroups(groups, width, budget));
+			lines.push(...this.renderGroups(groups, width, budget, hits));
 		}
-		lines.push({ text: "" });
-		// `esc close` is clickable only while the footer is shown untruncated.
-		const closeAt = FOOTER_HINT.indexOf(FOOTER_CLOSE);
-		const footerFits = visibleWidth(FOOTER_HINT) <= width;
-		lines.push({ text: this.renderLine(FOOTER_HINT, width, "muted"), hit: footerFits ? { kind: "close", start: visibleWidth(FOOTER_HINT.slice(0, closeAt)), end: visibleWidth(FOOTER_HINT) } : undefined });
+		lines.push("");
+		if (this.capturing) lines.push(this.renderLine(`Press the new key for ${this.capturing.label} · esc cancel`, width, "accent"));
+		else lines.push(this.renderLine("↑/↓ move • enter run • tab set key • esc close", width, "muted"));
 		return lines;
 	}
 
@@ -332,44 +387,60 @@ export class CommandPalette {
 		return this.justifyToWidth(left, right, width);
 	}
 
-	private renderGroups(groups: CommandPaletteGroup[], width: number, budget: number): BodyLine[] {
+	private renderGroups(groups: CommandPaletteGroup[], width: number, budget: number, hits: PalettePointerHit[]): string[] {
 		const rows = buildRows(groups);
 		const selected = Math.max(0, Math.min(countItems(groups) - 1, this.selected));
-		const line = (row: PaletteRow): BodyLine => ({ text: this.renderRow(row, width, selected), hit: row.kind === "item" ? { kind: "run", command: row.item.command } : undefined });
-		if (rows.length <= budget) return rows.map(line);
+		const result: string[] = [];
+		const appendRow = (row: PaletteRow) => {
+			if (row.kind === "item" && this.itemFits(row.item, width)) {
+				// Border + header, query and blank precede the grouped rows.
+				hits.push({ y: 4 + result.length, itemIndex: row.itemIndex });
+			}
+			result.push(this.renderRow(row, width, selected));
+		};
+		if (rows.length <= budget) {
+			for (const row of rows) appendRow(row);
+			return result;
+		}
 		const windowSize = Math.max(1, budget - SCROLL_INDICATOR_ROWS);
 		const selectedRowIndex = Math.max(0, rows.findIndex((row) => row.kind === "item" && row.itemIndex === selected));
 		const start = Math.max(0, Math.min(selectedRowIndex - Math.floor(windowSize / 2), Math.max(0, rows.length - windowSize)));
 		const end = Math.min(rows.length, start + windowSize);
-		const result: BodyLine[] = [];
-		if (start > 0) result.push({ text: this.renderLine(`  ↑ ${start} more`, width, "muted") });
+		if (start > 0) result.push(this.renderLine(`  ↑ ${start} more`, width, "muted"));
 		for (let i = start; i < end; i++) {
 			const row = rows[i];
-			if (row) result.push(line(row));
+			if (row) appendRow(row);
 		}
-		if (end < rows.length) result.push({ text: this.renderLine(`  ↓ ${rows.length - end} more`, width, "muted") });
+		if (end < rows.length) result.push(this.renderLine(`  ↓ ${rows.length - end} more`, width, "muted"));
 		return result;
+	}
+
+	private itemFits(item: CommandPaletteItem, width: number): boolean {
+		const label = sanitizeTerminalText(item.label);
+		const shortcut = item.shortcut ? sanitizeTerminalText(item.shortcut) : "";
+		return label.trim().length > 0 && 2 + visibleWidth(label) + (shortcut ? 1 + visibleWidth(shortcut) : 0) <= width;
 	}
 
 	private renderRow(row: PaletteRow, width: number, selected: number): string {
 		if (row.kind === "blank") return "";
-		if (row.kind === "title") {
-			if (!row.icon) return this.renderLine(row.text, width, "accent");
-			return `${this.renderText(row.icon, "rose")} ${this.renderLine(row.text, Math.max(1, width - 2), "accent")}`;
-		}
-		return this.renderItemRow(row.item, row.itemIndex === selected, width);
+		if (row.kind === "title") return this.renderLine(row.text, width, "accent");
+		return this.renderItemRow(row.item, row.itemIndex === selected, width, this.hovered === row.itemIndex);
 	}
 
-	private renderItemRow(item: CommandPaletteItem, focused: boolean, width: number): string {
+	private renderItemRow(item: CommandPaletteItem, focused: boolean, width: number, hovered: boolean): string {
 		const canHighlightBg = focused && this.theme?.bg !== undefined;
 		const label = sanitizeTerminalText(item.label);
 		const shortcut = item.shortcut ? sanitizeTerminalText(item.shortcut) : "";
 		if (canHighlightBg) {
-			const gutter = item.icon ? this.renderText(item.icon, "rose") : " ";
-			const plainRow = this.justifyToWidth(`${gutter} ${label}`, shortcut, width);
-			return this.theme?.bg?.("selectedBg", plainRow) ?? plainRow;
+			const plainRow = this.justifyToWidth(`  ${label}`, shortcut, width);
+			const text = this.theme ? paintHoverable(this.theme, plainRow, hovered) : plainRow;
+			return this.theme?.bg?.("selectedBg", text) ?? text;
 		}
-		const prefix = focused ? this.renderText("▸ ", "accent") : item.icon ? `${this.renderText(item.icon, "dim")} ` : "  ";
+		if (hovered && this.theme) {
+			const prefix = focused ? "▸ " : "  ";
+			return paintHoverable(this.theme, prefix + this.justifyToWidth(label, shortcut, Math.max(0, width - 2)), true);
+		}
+		const prefix = focused ? this.renderText("▸ ", "accent") : "  ";
 		const prefixWidth = visibleWidth(stripAnsi(prefix));
 		const availableWidth = Math.max(0, width - prefixWidth);
 		const labelStyled = this.renderText(label, "text");
@@ -407,11 +478,9 @@ export class CommandPalette {
  * defaults to "alt+k" (ctrl+k is reserved by Pi's editor for
  * delete-to-line-end, so an extension shortcut on it is skipped); an empty
  * value or "off" (case-insensitive) disables the shortcut; anything else is
- * used as-is (trimmed). Same shape as changesShortcut in
- * extensions/gentle-shell.ts.
+ * used as-is (trimmed). Unset, a key saved in keymaps.json wins over the
+ * default (lib/keymaps.ts).
  */
-export function commandsKey(env: NodeJS.ProcessEnv = process.env): string | undefined {
-	const value = env.GENTLE_PI_COMMANDS_KEY?.trim();
-	if (value === undefined) return "alt+k";
-	return value === "" || value.toLowerCase() === "off" ? undefined : value;
+export function commandsKey(env: NodeJS.ProcessEnv = process.env, bindings: KeymapBindings = {}): string | undefined {
+	return effectiveKey("commands", env, bindings);
 }

@@ -33,6 +33,8 @@ export interface UsageLimit {
 	// Compact layout: the account this limit belongs to and its model family.
 	account?: string;
 	family?: UsageFamily;
+	/** "provider" when the limit covers every model of the provider (Codex's main limit). */
+	scope?: "provider";
 }
 
 export interface UsageUnavailable {
@@ -151,7 +153,7 @@ const PENDING_NOTE: Record<string, string> = {
 	[ANTHROPIC_PROVIDER]: "usage arrives with the first response",
 };
 const UNSUPPORTED_NOTE = "no subscription usage for this provider";
-const ACTIVE_MARK = "active";
+const ACTIVE_MARK = "✿";
 // What a targeted provider with no snapshot says after a refresh actually ran
 // and answered nothing. Generic on purpose: it names no endpoint, key, or
 // account detail, exactly like the other notes here.
@@ -344,7 +346,7 @@ export function parseCodexUsage(payload: unknown, now: number): ProviderUsage {
 	const raw = (payload ?? {}) as RawCodexUsage;
 	const limits: UsageLimit[] = [];
 	const main = parseRateLimit(CODEX_MAIN_LIMIT, raw.rate_limit, now);
-	if (main) limits.push(main);
+	if (main) limits.push({ ...main, scope: "provider" });
 	for (const extra of raw.additional_rate_limits ?? []) {
 		const limit = parseRateLimit(extra.limit_name ?? "limit", extra.rate_limit, now);
 		if (limit) limits.push(limit);
@@ -366,7 +368,7 @@ export function parseCodexHeaders(headers: Record<string, string>, now: number):
 	const windows = [headerWindow(headers, "primary"), headerWindow(headers, "secondary")].filter((window): window is UsageWindow => window !== undefined);
 	if (windows.length === 0) return undefined;
 	const reached = headers[`${HEADER_PREFIX}rate-limit-reached-type`];
-	return { provider: CODEX_PROVIDER, plan: undefined, limits: [{ name: CODEX_MAIN_LIMIT, windows, limitReached: Boolean(reached) }], fetchedAt: now };
+	return { provider: CODEX_PROVIDER, plan: undefined, limits: [{ name: CODEX_MAIN_LIMIT, windows, limitReached: Boolean(reached), scope: "provider" }], fetchedAt: now };
 }
 
 // Claude Pro/Max sends utilization as a 0..1 fraction per window and reset
@@ -946,8 +948,16 @@ export function renderUsageCard(usages: readonly ProviderUsage[], theme: UsageTh
 export class UsageStore {
 	private readonly usages = new Map<string, ProviderUsage>();
 
+	private readonly onRecord: ((usage: ProviderUsage) => void) | undefined;
+
+	/** `onRecord` hears every reading, e.g. the model fallback cooldown. */
+	constructor(onRecord?: (usage: ProviderUsage) => void) {
+		this.onRecord = onRecord;
+	}
+
 	record(usage: ProviderUsage): void {
 		this.usages.set(usage.provider, usage);
+		try { this.onRecord?.(usage); } catch { /* A listener never breaks the usage panel. */ }
 	}
 
 	get(provider: string): ProviderUsage | undefined {

@@ -6,7 +6,8 @@ import { join } from "node:path";
 import { captureReviewSessionIdentity, grantReviewSessionPermission, hasReviewSessionPermission, revokeReviewSessionPermission } from "../lib/review-session-standing-permission.ts";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createGentleAiExtension } from "../extensions/gentle-ai.ts";
-import { YOLO_STATUS_TEXT } from "../lib/yolo-session-policy.ts";
+import { YOLO_STATUS_TEXT, yoloBannerContent } from "../lib/yolo-session-policy.ts";
+import { sidebarState } from "../lib/shell-sidebar.ts";
 
 const ON_TEXT = "🚀 YOLO ON 🔥 — destructive confirmations remain";
 const USAGE = "Use /gentle:yolo enable|disable|status. State unchanged.";
@@ -72,36 +73,20 @@ test("only /gentle:yolo is registered and the ON text carries the rocket and fir
 	assert.equal(YOLO_STATUS_TEXT, ON_TEXT);
 });
 
-// The widget is a component factory since the folded band (odd/tasks/folded-band.md S2c).
-function yoloWidgetRows(widget: unknown, tui: object): string[] | undefined {
-	if (widget === undefined) return undefined;
-	return (widget as (tui: object, theme: object) => { render(width: number): string[] })(tui, {}).render(120);
-}
-
-test("S2c: the YOLO line stays silent while the folded band paints it inside Sesión", async () => {
-	const h = harness();
-	await h.command("enable");
-	const widget = h.widgets.get("gentle:yolo");
-	assert.equal(typeof widget, "function", "a state-gated component, not a static line");
-	const state = { terminal: {}, foldedBand: undefined as (() => boolean) | undefined };
-	const symbol = Symbol.for("gentle-pi.experimental-sidebar.state");
-	const tui = { terminal: { [symbol]: state } };
-	assert.deepEqual(yoloWidgetRows(widget, tui), [ON_TEXT], "no band");
-	state.foldedBand = () => true;
-	assert.deepEqual(yoloWidgetRows(widget, tui), [], "band painting");
-	state.foldedBand = () => false;
-	assert.deepEqual(yoloWidgetRows(widget, tui), [ON_TEXT], "band gone");
-	assert.deepEqual(yoloWidgetRows(widget, {}), [ON_TEXT], "a host without a terminal keeps the line");
-	assert.equal(h.statuses.get("gentle:yolo"), ON_TEXT, "the status itself, which feeds the Sesión card, is untouched");
-});
-
 test("human command enable/disable/status/invalid and status/widget clearing", async () => {
 	const h = harness();
 	assert.equal(h.tools.some((name) => name.includes("yolo")), false);
 	await h.command("status"); assert.match(h.notices.at(-1)!, /OFF/);
 	await h.command("enable");
 	assert.equal(h.statuses.get("gentle:yolo"), ON_TEXT);
-	assert.deepEqual(yoloWidgetRows(h.widgets.get("gentle:yolo"), {}), [ON_TEXT], "outside the folded band the line paints as before");
+	// The banner is a component: it paints the notice, and steps aside while
+	// the IDE chrome's status bar already shows the permission mode.
+	const banner = h.widgets.get("gentle:yolo") as (tui: unknown, theme: unknown) => { render(width: number): string[] };
+	const tui = { terminal: { columns: 80, rows: 24 }, requestRender() {} };
+	assert.match(banner(tui, {}).render(80).join("\n"), new RegExp(ON_TEXT.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+	sidebarState(tui as never).statusBarShowsMode = () => true;
+	assert.deepEqual(banner(tui, {}).render(80), [], "no banner while the status bar shows the mode");
+	assert.match(banner({ requestRender() {} }, {}).render(80).join("\n"), /YOLO ON/, "a host without terminal state keeps the banner");
 	for (const invalid of ["invalid", "on", "off", "toggle"]) {
 		await h.command(invalid);
 		assert.equal(h.notices.at(-1), USAGE);
@@ -332,4 +317,10 @@ test("monitor goes through the same command confirmation and YOLO waiver as bash
 	await h.command("enable");
 	assert.equal(await call("git push origin main"), undefined);
 	assert.ok(await call("git push origin main && rm -rf ./data"), "YOLO never waives a destructive command");
+});
+
+test("the YOLO banner stays a plain string widget outside the terminal UI, so RPC hosts still receive it", () => {
+	assert.deepEqual(yoloBannerContent("rpc", ON_TEXT), [ON_TEXT], "RPC forwards only string widgets");
+	assert.deepEqual(yoloBannerContent(undefined, ON_TEXT), [ON_TEXT]);
+	assert.equal(typeof yoloBannerContent("tui", ON_TEXT), "function", "the terminal UI gets the component that can step aside");
 });

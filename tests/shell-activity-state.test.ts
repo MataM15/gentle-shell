@@ -43,21 +43,15 @@ test('wait event receiver rejects legacy and foreign payloads, clears, and reset
  receiver.reset(); assert.equal(receiver.current(),undefined); assert.equal(changes,6);
  receiver.dispose();
 });
-test('scoped waits event feeds the tabbed background rows and never the header', t => {
+test('scoped waits event feeds the receiver, never a foreign session, and clears on replacement', t => {
  const listeners=new Map<string,(value:unknown)=>void>(); const events={on:(name:string,fn:(value:unknown)=>void)=>{listeners.set(name,fn);return ()=>listeners.delete(name);},emit:(name:string,value:unknown)=>listeners.get(name)?.(value)};
- let session='one'; const root={render:()=>[],invalidate(){},[Symbol.for('@earendil-works/pi-tui/layout-node')]:()=>({type:'vstack',entries:[]})};
- const tui={mode:'fullscreen',terminal:{columns:160},layoutRoot:root,requestRender(){}} as unknown as TUI;
- const receiver=createWaitsReceiver(events,()=>session,()=>tui.requestRender());
- sidebarHeader(tui,{digest:()=> 'header',render:()=>['MODEL'],invalidate(){}});
- sidebarPart(tui,'footer',{digest:()=> 'status',render:()=>['STATUS'],invalidate(){}});
- sidebarPart(tui,'activity',{digest:()=>JSON.stringify(receiver.current()),waitsCount:()=>receiver.current()?.length,render:()=>commandRows([],120001,receiver.current()),invalidate(){}});
- t.after(installSidebar(tui,{fg:(_c,s)=>s,bold:s=>s},()=> 'auto',()=> 'top',undefined,undefined,{tabs:true})); t.after(()=>receiver.dispose());
- const frame=()=>renderLayoutFrame(root,160,20,()=>{}).lines.join('\n');
- events.emit('background-waits:pending',{waits:[]}); assert.match(frame(),/Waits unavailable/);
- events.emit('background-waits:pending',{sessionId:'one',waits:[{id:'w',label:'CI check',startedAt:1}]}); assert.match(frame(),/Wait · CI check · 2m/); assert.doesNotMatch(frame(),/Waits \d/, 'the count stays in the card');
- events.emit('background-waits:pending',{sessionId:'other',waits:[]}); assert.match(frame(),/CI check/);
- events.emit('background-waits:pending',{sessionId:'one',waits:[]}); assert.match(frame(),/No local waits/);
- session='two'; assert.match(frame(),/Waits unavailable/);
+ let session='one';
+ const receiver=createWaitsReceiver(events,()=>session,()=>{}); t.after(()=>receiver.dispose());
+ events.emit('background-waits:pending',{waits:[]}); assert.equal(receiver.current(), undefined);
+ events.emit('background-waits:pending',{sessionId:'one',waits:[{id:'w',label:'CI check',startedAt:1}]}); assert.deepEqual(receiver.current(),[{id:'w',label:'CI check',startedAt:1}]);
+ events.emit('background-waits:pending',{sessionId:'other',waits:[]}); assert.match(JSON.stringify(receiver.current()),/CI check/, 'a foreign session cannot clear the local waits');
+ events.emit('background-waits:pending',{sessionId:'one',waits:[]}); assert.deepEqual(receiver.current(),[]);
+ session='two'; assert.equal(receiver.current(), undefined, 'a replacement session starts empty');
 });
 test('default labels never publish the raw command', () => {
  assert.equal(safeJobLabel('long command', 'long command'), 'Background command');

@@ -1,20 +1,16 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Text, type TUI } from "@earendil-works/pi-tui";
+import { sidebarState } from "./shell-sidebar.ts";
 import { appendSystemPromptOnce, type AppendableSystemPromptOptions } from "./append-system-prompt.ts";
 import { sameReviewSessionIdentity, resolveCanonicalGitRepositoryIdentity, type ReviewSessionIdentity } from "./review-session-standing-permission.ts";
 import { realpath } from "node:fs/promises";
 import { gentlePiConfigHome } from "./agent-home.ts";
-import { sidebarState } from "./shell-sidebar.ts";
-import type { TUI } from "@earendil-works/pi-tui";
 import { isPermissionMode, resolvePermissionModePolicy, writePermissionModePolicy, type PermissionMode } from "./permission-mode-policy.ts";
 export type { PermissionMode } from "./permission-mode-policy.ts";
 export const MODE_STATUS_KEY = "gentle:mode";
 export const AUTO_MODE_NOTICE = "Auto uses additional model calls with separate usage accounting; hard safety and independent consent remain.";
 
 export const YOLO_STATUS_KEY = "gentle:yolo";
-/** Whether the folded rail's bottom band is painting, and so owns the YOLO line. */
-function foldedBandPainting(tui: unknown): boolean {
-	try { return (tui as TUI | undefined)?.terminal !== undefined && sidebarState(tui as TUI).foldedBand?.() === true; } catch { return false; }
-}
 export const YOLO_STATUS_TEXT = "🚀 YOLO ON 🔥 — destructive confirmations remain";
 export const SUPER_YOLO_STATUS_TEXT = "💥 SUPER YOLO ON — no permission prompts; private paths stay blocked";
 export const SUPER_YOLO_DIRECTIVE = `<gentle-super-yolo-session>
@@ -98,6 +94,27 @@ export function discoverYoloUiAdapter(pi: ExtensionAPI, context: ExtensionContex
 		catch { settled = true; clearTimeout(timer); resolve(undefined); }
 	});
 }
+/**
+ * The above-editor YOLO banner: the same padded text Pi draws for a string
+ * widget, painted nothing while the IDE chrome's status bar already shows the
+ * permission mode (sidebarState(tui).statusBarShowsMode).
+ */
+/**
+ * The banner as a widget: the terminal UI gets the component that steps aside
+ * behind the status bar; every other host (RPC forwards only string widgets,
+ * e.g. the desktop app) keeps the plain string widget.
+ */
+export function yoloBannerContent(mode: string | undefined, text: string): string[] | ReturnType<typeof yoloBanner> {
+	return mode === "tui" ? yoloBanner(text) : [text];
+}
+
+function yoloBanner(text: string) {
+	return (tui: TUI) => {
+		const banner = new Text(text, 1, 0);
+		const quiet = () => Boolean((tui as { terminal?: unknown }).terminal && sidebarState(tui).statusBarShowsMode?.());
+		return { render: (width: number) => (quiet() ? [] : banner.render(width)), invalidate: () => banner.invalidate() };
+	};
+}
 export interface YoloSessionController {
 	active(context: ExtensionContext): Promise<boolean>;
 	superActive(context: ExtensionContext): Promise<boolean>;
@@ -159,8 +176,11 @@ export function registerYoloSessionPolicy(pi: ExtensionAPI, env: NodeJS.ProcessE
 		if (previous && previous.yolo === yolo && previous.modeText === modeText) return;
 		let painted = true;
 		try { ctx.ui.setStatus(YOLO_STATUS_KEY, yolo); } catch { painted = false; /* display only */ }
-		// A component, not a static line: the folded band paints this status inside its Sesión card.
-		try { ctx.ui.setWidget(YOLO_STATUS_KEY, yolo ? (tui: unknown) => ({ render: () => foldedBandPainting(tui) ? [] : [yolo], invalidate() {} }) : undefined); } catch { painted = false; /* display only */ }
+		try {
+			const banner = yolo ? yoloBannerContent(ctx.mode, yolo) : undefined;
+			if (typeof banner === "function") ctx.ui.setWidget(YOLO_STATUS_KEY, banner);
+			else ctx.ui.setWidget(YOLO_STATUS_KEY, banner);
+		} catch { painted = false; /* display only */ }
 		try { ctx.ui.setStatus(MODE_STATUS_KEY, modeText); } catch { painted = false; /* display only */ }
 		if (painted) published.set(ctx, { yolo, modeText });
 	};

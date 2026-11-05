@@ -4,22 +4,18 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import { DEFAULT_VISUAL_SETTINGS } from "../lib/visual-customization-policy.ts";
 import {
 	buildShellHeaderModel,
-	devBinaryShortId,
 	formatCost,
 	formatTokens,
 	gaugeTone,
 	renderGauge,
 	renderShellBar,
 	renderShellBottomOnlyBar,
-	renderShellStatusesOnlyBar,
 	renderShellBelowInputFloat,
 	renderShellHeaderBar,
 	renderShellHeaderChrome,
 	renderShellHeaderRule,
-	renderShellRailHeader,
 	renderShellSidebarBar,
 	shellEnabled,
-	shellHeaderCommandsHit,
 	shellHeaderUsageHit,
 	type ShellBarModel,
 	type ShellBarTheme,
@@ -107,11 +103,11 @@ test("visual visibility hides only selected optional status segments", () => {
 	const settings = { ...DEFAULT_VISUAL_SETTINGS, visibility: { ...DEFAULT_VISUAL_SETTINGS.visibility, changes: false, modelDetails: false, usageCost: false } };
 	const data = model({ changes: { files: 2, added: 1, deleted: 1 } });
 	assert.doesNotMatch(renderShellBar(data, plainTheme, 160, settings).join(""), /gpt-5\.5|ctx|\$9\.49/);
-	assert.doesNotMatch(renderShellSidebarBar(data, plainTheme, 50, settings).join(""), /Changes|2 files/);
+	assert.doesNotMatch(renderShellSidebarBar(data, plainTheme, 50, settings).join(""), /CHANGES|2 files/);
 	assert.doesNotMatch(renderShellHeaderBar(buildShellHeaderModel(data), plainTheme, 160, undefined, settings).text, /gpt-5\.5|ctx|\$9\.49|usage/);
 });
 
-test("Status keeps RDD beside structured groups while running jobs moved to their own card", () => {
+test("Status keeps the Review section beside Changes while running jobs live in their own section", () => {
 	const data = model({ jobs: [
 		{ id: "job-2", label: "CI for PR 1860", startedAt: 2 },
 		{ id: "job-1", label: "Build runtime", startedAt: 1 },
@@ -119,10 +115,10 @@ test("Status keeps RDD beside structured groups while running jobs moved to thei
 	for (const width of [30, 60]) {
 		const lines = renderShellSidebarBar(data, plainTheme, width);
 		const text = lines.join("\n");
-		// Running jobs live in their own sidebar card; the Status card never
-		// prints them, so the two surfaces cannot duplicate one job.
-		assert.doesNotMatch(text, /Jobs|CI for PR 1860|Build runtime/);
-		assert.match(text, /   RDD/);
+		// Running jobs live in their own rail section; Status never prints
+		// them, so the two surfaces cannot duplicate one job.
+		assert.doesNotMatch(text, /JOBS|CI for PR 1860|Build runtime/);
+		assert.match(text, /▾ REVIEW/);
 		assert.ok(lines.every((line) => visibleWidth(line) <= width));
 	}
 });
@@ -139,98 +135,6 @@ test("header shows only the running job count when requested and preserves it at
 	assert.doesNotMatch(renderShellHeaderBar(buildShellHeaderModel(model({ jobs: [] }), true), plainTheme, 160).text, /jobs?/);
 });
 
-test("rail header drops location and profile (the Status card carries them) and keeps model, ctx/cost and actions", () => {
-	const chrome = renderShellRailHeader(buildShellHeaderModel(model({ profile: "openai" }), true), plainTheme, 50, "alt+u", undefined, "alt+k");
-	const text = chrome.rows.map(stripAnsi).join("\n");
-	assert.doesNotMatch(text, /gentle-pi|\bmain\b|openai/, text);
-	assert.match(text, /gentle shell/i);
-	assert.match(text, /gpt-5\.5 · medium/);
-	assert.match(text, /ctx/);
-	assert.match(text, /≡ commands/);
-});
-
-test("rail header action rows: dotted rule, aligned icon/label/key columns, resolved keys", () => {
-	const data = buildShellHeaderModel(model({}), true);
-	const rows = (usageHint?: string, commandsHint?: string, presentation?: never) => renderShellRailHeader(data, plainTheme, 50, usageHint, presentation, commandsHint);
-	const chrome = rows("alt+u", "alt+k");
-	const plain = chrome.rows.map(stripAnsi);
-	assert.equal(plain[chrome.commandsRow! - 1], " " + "┄".repeat(48));
-	assert.equal(plain[chrome.commandsRow!], " ≡ commands   [alt+k]");
-	assert.equal(plain[chrome.headerRow], " ◔ usage      [alt+u]");
-	const keyCell = (row: string) => visibleWidth(row.slice(0, row.indexOf("[")));
-	assert.equal(keyCell(plain[chrome.commandsRow!]!), keyCell(plain[chrome.headerRow]!), "the key column aligns in terminal cells");
-	const labelCell = (row: string, label: string) => visibleWidth(row.slice(0, row.indexOf(label)));
-	assert.equal(labelCell(plain[chrome.commandsRow!]!, "commands"), labelCell(plain[chrome.headerRow]!, "usage"), "the label column aligns in terminal cells");
-	assert.deepEqual(["≡", "◔", "┄"].map((glyph) => visibleWidth(glyph)), [1, 1, 1], "every action glyph is one cell, so terminals and Pi agree on columns");
-	const remapped = rows("ctrl+shift+u", "ctrl+p").rows.map(stripAnsi);
-	assert.match(remapped.join("\n"), /≡ commands {3}\[ctrl\+p\]/);
-	assert.match(remapped.join("\n"), /◔ usage {6}\[ctrl\+shift\+u\]/);
-	const noKeys = rows(undefined, undefined);
-	assert.equal(stripAnsi(noKeys.rows[noKeys.commandsRow!]!), " ≡ commands");
-	assert.equal(stripAnsi(noKeys.rows[noKeys.headerRow]!), " ◔ usage");
-	assert.deepEqual(noKeys.commandsSpan, { start: 1, end: 1 + visibleWidth("≡ commands") });
-	const noUsage = rows("alt+u", "alt+k", { density: "comfortable", visibility: { usageCost: false, modelDetails: true } } as never);
-	assert.equal(noUsage.headerRow, -1);
-	assert.equal(noUsage.usageSpan, undefined);
-	assert.match(stripAnsi(noUsage.rows[noUsage.commandsRow!]!), /^ ≡ commands {3}\[alt\+k\]$/);
-	assert.doesNotMatch(noUsage.rows.map(stripAnsi).join("\n"), /usage|ctx/);
-	assert.ok(noUsage.rows.every((row) => visibleWidth(row) <= 50));
-});
-
-test("rail header action rows use rose (borderAccent) labels and dim hints/rule", () => {
-	const roles: string[] = [];
-	const spy: ShellBarTheme = { fg: (color, text) => { roles.push(`${color}:${text}`); return text; }, bold: (text) => text };
-	renderShellRailHeader(buildShellHeaderModel(model({}), true), spy, 50, "alt+u", undefined, "alt+k");
-	assert.ok(roles.includes("borderAccent:≡ commands"));
-	assert.ok(roles.includes("borderAccent:◔ usage"));
-	assert.ok(roles.includes("dim:[alt+k]"));
-	assert.ok(roles.includes("dim:[alt+u]"));
-	assert.ok(roles.includes(`dim:${"┄".repeat(48)}`));
-});
-
-test("rail header action rows degrade at narrow rails without overflowing", () => {
-	for (const width of [3, 12, 20, 30]) {
-		const chrome = renderShellRailHeader(buildShellHeaderModel(model({}), true), plainTheme, width, "alt+u", undefined, "alt+k");
-		assert.ok(chrome.rows.every((row) => visibleWidth(row) <= width), `width ${width}`);
-	}
-});
-
-test("pinned rail header groups the running job count with context/cost and keeps it when usage/cost is hidden", () => {
-	const jobs = buildShellHeaderModel(model({ jobs: [{ id: "job-1", label: "CI for PR 1860", startedAt: 1 }] }), true);
-	const none = buildShellHeaderModel(model({ jobs: [] }), true);
-	const shown = renderShellRailHeader(jobs, plainTheme, 50, "alt+u");
-	const absent = renderShellRailHeader(none, plainTheme, 50, "alt+u");
-	const withJobs = shown.rows.map(stripAnsi);
-	assert.equal(withJobs.filter((row) => /⧗ 1 job/.test(row)).length, 1);
-	assert.doesNotMatch(withJobs.join("\n"), /CI for PR/);
-	assert.doesNotMatch(absent.rows.join("\n"), /jobs?\b/);
-	assert.equal(shown.rows.length, absent.rows.length);
-	assert.equal(shown.headerRow, absent.headerRow);
-	assert.deepEqual(shown.usageSpan, absent.usageSpan);
-	assert.ok(shown.rows.every((row) => visibleWidth(row) <= 50));
-	const hidden = { density: "comfortable", visibility: { usageCost: false, modelDetails: true } } as never;
-	const hiddenJobs = renderShellRailHeader(jobs, plainTheme, 50, "alt+u", hidden);
-	assert.match(hiddenJobs.rows.join("\n"), /⧗ 1 job/);
-	assert.doesNotMatch(hiddenJobs.rows.join("\n"), /ctx|usage|alt\+u/);
-	assert.equal(hiddenJobs.headerRow, -1);
-	assert.equal(hiddenJobs.usageSpan, undefined);
-	assert.doesNotMatch(renderShellRailHeader(none, plainTheme, 50, "alt+u", hidden).rows.join("\n"), /jobs?\b/);
-});
-
-// Folded rail at full width: the top header already carries the identity, so
-// the bottom bar keeps only what the header leaves out (jobs and statuses).
-test("the statuses-only bar drops the identity the top header already paints", () => {
-	const data = model({ statuses: ["MCP connected", "Permissions: YOLO"], jobs: [{ id: "job-1", label: "CI for PR 1860", startedAt: 1 }] });
-	const lines = renderShellStatusesOnlyBar(data, plainTheme, 80).map(stripAnsi);
-	assert.equal(lines.length, 1);
-	assert.match(lines[0]!, /⧗ 1 job/);
-	assert.match(lines[0]!, /MCP connected/);
-	assert.match(lines[0]!, /Permissions: YOLO/);
-	assert.doesNotMatch(lines[0]!, /gentle-pi|gpt-5\.5|ctx|\$/);
-	assert.ok(visibleWidth(renderShellStatusesOnlyBar(data, plainTheme, 20)[0]!) <= 20, "overflow truncates instead of wrapping");
-	assert.deepEqual(renderShellStatusesOnlyBar(model({ statuses: [] }), plainTheme, 80), [], "nothing left over paints no row");
-});
-
 test("bottom-only and hidden below-input chrome retain a compact jobs count", (t) => {
 	const data = model({ jobs: [{ id: "job-1", label: "CI for PR 1860", startedAt: 1 }] });
 	assert.match(renderShellBottomOnlyBar(data, plainTheme, 80).join("\n"), /⧗ 1 job/);
@@ -243,33 +147,33 @@ test("bottom-only and hidden below-input chrome retain a compact jobs count", (t
 	assert.ok(rows.every((line) => visibleWidth(line) <= 80));
 });
 
-test("Status title stays plain without an active review", () => {
+test("Status opens with Changes and shows no Review section without an active review", () => {
 	const lines = renderShellSidebarBar(model(), plainTheme, 60);
-	assert.match(lines[0], /^╭─ Status ─+╮$/);
-	assert.doesNotMatch(lines.slice(1).join("\n"), /   RDD/);
+	assert.match(lines[0], /^▾ CHANGES/);
+	assert.doesNotMatch(lines.slice(1).join("\n"), /REVIEW/);
 });
 
-test("Status title stays plain above the review lifecycle block", () => {
+test("the Review section lists the lifecycle state and the candidate scope", () => {
 	const lines = renderShellSidebarBar(model({ review: { state: "reviewing", scope: "first.ts +2 files" } }), plainTheme, 60);
-	assert.match(lines[0], /^╭─ Status ─+╮$/);
-	assert.match(lines.slice(1).join("\n"), /   RDD[\s\S]*Reviewers running…[\s\S]*first\.ts \+2 files/);
+	assert.match(lines[0], /^▾ CHANGES/);
+	assert.match(lines.slice(1).join("\n"), /▾ REVIEW[\s\S]*Reviewers running…[\s\S]*first\.ts \+2 files/);
 });
 
 test("review lifecycle block omits the scope line when the candidate scope is unknown", () => {
 	const known = renderShellSidebarBar(model({ review: { state: "checking", scope: "first.ts" } }), plainTheme, 60);
 	const unknown = renderShellSidebarBar(model({ review: { state: "checking", scope: REVIEW_SCOPE_UNAVAILABLE } }), plainTheme, 60);
 	const text = unknown.join("\n");
-	assert.match(text, /   RDD[\s\S]*Updating…/);
+	assert.match(text, /▾ REVIEW[\s\S]*Updating…/);
 	assert.doesNotMatch(text, /Candidate scope unavailable/);
 	assert.equal(unknown.length, known.length - 1);
 });
 
 test("rdd visibility hides only the review lifecycle block", () => {
 	const data = model({ review: { state: "reviewing", scope: "first.ts +2" }, changes: { files: 2, added: 1, deleted: 1 } });
-	assert.match(renderShellSidebarBar(data, plainTheme, 60, DEFAULT_VISUAL_SETTINGS).join("\n"), /   RDD[\s\S]*Reviewers running…/);
+	assert.match(renderShellSidebarBar(data, plainTheme, 60, DEFAULT_VISUAL_SETTINGS).join("\n"), /▾ REVIEW[\s\S]*Reviewers running…/);
 	const hidden = renderShellSidebarBar(data, plainTheme, 60, { ...DEFAULT_VISUAL_SETTINGS, visibility: { ...DEFAULT_VISUAL_SETTINGS.visibility, rdd: false } }).join("\n");
-	assert.doesNotMatch(hidden, /   RDD|Reviewers running|first\.ts \+2 files/);
-	assert.match(hidden, /Changes[\s\S]*2 files/);
+	assert.doesNotMatch(hidden, /REVIEW|Reviewers running|first\.ts \+2 files/);
+	assert.match(hidden, /CHANGES[\s\S]*2 files/);
 });
 
 test("Status and review lifecycle block respect terminal width", () => {
@@ -277,7 +181,7 @@ test("Status and review lifecycle block respect terminal width", () => {
 		for (const review of [undefined, { state: "reviewing" as const, scope: "first.ts +2 files" }, { state: "approved" as const, scope: REVIEW_SCOPE_UNAVAILABLE }]) {
 			const lines = renderShellSidebarBar(model({ review }), plainTheme, width);
 			for (const line of lines) assert.ok(visibleWidth(line) <= width, `${width}: ${line}`);
-			if (width >= 20) assert.match(lines[0], /^╭─ Status ─+╮$/);
+			if (width >= 20) assert.match(lines[0], /^▾ CHANGES/);
 		}
 	}
 });
@@ -311,7 +215,7 @@ test("renderShellBar renders one line with the segments in order", () => {
 	assert.equal(rest.length, 0);
 	assert.equal(
 		line,
-		"  gentle shell ⟡ ~/work/gentle-pi main ⟡ gpt-5.5 · medium ⟡ ctx ▰▰▰▰▱▱▱▱ 45% ⟡ $9.49 sub",
+		"✿ gentle shell ⟡ ~/work/gentle-pi main ⟡ gpt-5.5 · medium ⟡ ctx ▰▰▰▰▱▱▱▱ 45% ⟡ $9.49 sub",
 	);
 });
 
@@ -324,7 +228,7 @@ test("renderShellBar paints the context gauge with the given gauge roles", () =>
 
 test("renderShellBar colors the brand, model, effort, and gauge by role", () => {
 	const [line] = renderShellBar(model(), taggedTheme, 400);
-	assert.match(line, /<accent>  gentle shell<\/accent>/);
+	assert.match(line, /<accent>✿ gentle shell<\/accent>/);
 	assert.match(line, /<text>gpt-5\.5<\/text>/);
 	assert.match(line, /<syntaxFunction>medium<\/syntaxFunction>/);
 	assert.match(line, /<accent>▰▰▰▰<\/accent><border>▱▱▱▱<\/border>/);
@@ -429,7 +333,7 @@ test("renderShellBar drops the session name, then trailing segments, before trun
 
 	const [atFifty] = renderShellBar(wide, plainTheme, 50);
 	assert.ok(visibleWidth(atFifty) <= 50, `line overflowed: ${visibleWidth(atFifty)}`);
-	assert.match(atFifty, /^  gentle shell/);
+	assert.match(atFifty, /^✿ gentle shell/);
 });
 
 test("shellEnabled stays off inside a Gentle Agents child", () => {
@@ -443,49 +347,91 @@ test("shellEnabled honors GENTLE_PI_SHELL=0", () => {
 	assert.equal(shellEnabled({ GENTLE_PI_SHELL: "false" }), false);
 });
 
-test("renderShellSidebarBar paints the Status card frame with border and the title with accent", () => {
-	const lines = renderShellSidebarBar(model(), taggedTheme, 46);
-	assert.match(lines[0], /^<border>╭<\/border>/);
-	assert.match(lines[0], /<borderAccent>Status<\/borderAccent>/);
-	assert.match(lines[lines.length - 1], /^<border>╰<\/border>/);
+test("renderShellSidebarBar draws panel section headers, never a card frame", () => {
+	const lines = renderShellSidebarBar(model(), taggedTheme, 160);
+	assert.match(lines[0], /^<muted>▾<\/muted> <text>.*CHANGES.*<\/text>/);
+	assert.doesNotMatch(lines.join("\n"), /[╭╮╰╯│]/u);
 });
 
-test("sidebar unifies project, captured changes and integrations in one frame", () => {
+test("the rail Status orders Changes before Integrations and keeps the location out", () => {
 	const data = model({ changes: { files: 2, added: 7, deleted: 3 }, statuses: ["MCP connected"] });
 	const lines = renderShellSidebarBar(data, plainTheme, 46);
 	const text = lines.join("\n");
-	assert.equal(lines.filter((line) => line.startsWith("╭")).length, 1);
 	let previous = -1;
-	for (const heading of ["Status", "Project", "Changes", "Integrations"]) {
+	for (const heading of ["CHANGES", "INTEGRATIONS"]) {
 		const index = text.indexOf(heading);
 		assert.ok(index > previous, heading);
 		previous = index;
 	}
-	assert.match(text, /2 files.*\+7.*−3/);
+	assert.match(text, /2 files/);
+	assert.match(text, /\+7 −3/);
 	assert.match(text, /\/gentle:changes/);
-	assert.match(text, /main/);
+	assert.match(text, /MCP connected/);
+	assert.doesNotMatch(text, /main|Branch|Project/, "location lives in the header row, once");
 	for (const width of [1, 8, 24, 46]) assert.ok(renderShellSidebarBar(data, plainTheme, width).every((line) => visibleWidth(line) <= width));
 	const empty = renderShellSidebarBar(model(), plainTheme, 46).join("\n");
-	assert.match(empty, /No captured changes/);
-	assert.match(empty, /Integrations/);
+	assert.match(empty, /no captured changes/);
+	assert.match(empty, /INTEGRATIONS/);
 });
 
-test("sidebar profile truncates long names on one row without changing the compact bar", () => {
-	const profile = "team-" + "x".repeat(59);
+test("Integrations shows the effective agent profile without changing its count or status order", () => {
+	const data = model({
+		profile: "alpha (session)",
+		permission: { mode: "AUTO", detail: "confirm before action" },
+		statuses: ["compact status"],
+		integrations: ["MCP connected", "Engram ready"],
+	});
+	const rows = () => renderShellSidebarBar(data, plainTheme, 60).map((line) => line.trimEnd());
+	const initial = rows();
+	const at = initial.findIndex((line) => line.startsWith("▾ INTEGRATIONS"));
+	assert.match(initial[at]!, /INTEGRATIONS\s+3$/);
+	assert.deepEqual(initial.slice(at + 1), [
+		"  Agent profile: alpha (session)",
+		"  - permissions confirm before action",
+		"  - MCP connected",
+		"  - Engram ready",
+	]);
+	data.profile = "beta (repo)";
+	const updated = rows().join("\n");
+	assert.match(updated, /INTEGRATIONS[\s\S]*Agent profile: beta \(repo\)/);
+	assert.doesNotMatch(updated, /alpha \(session\)/);
+
+	data.profile = undefined;
+	const absent = rows();
+	const absentAt = absent.findIndex((line) => line.startsWith("▾ INTEGRATIONS"));
+	assert.match(absent[absentAt]!, /INTEGRATIONS\s+3$/);
+	assert.deepEqual(absent.slice(absentAt + 1), ["  - permissions confirm before action", "  - MCP connected", "  - Engram ready"]);
+	for (const profile of ["", " \t\n", "\x1b[31m\x1b[0m"]) {
+		data.profile = profile;
+		assert.deepEqual(rows(), absent, "an empty sanitized profile leaves prior output unchanged");
+	}
+	const onlyProfile = renderShellSidebarBar(model({ profile: "solo (local)" }), plainTheme, 60).map((line) => line.trimEnd());
+	const onlyAt = onlyProfile.findIndex((line) => line.startsWith("▾ INTEGRATIONS"));
+	assert.match(onlyProfile[onlyAt]!, /INTEGRATIONS\s+none$/);
+	assert.deepEqual(onlyProfile.slice(onlyAt + 1), ["  Agent profile: solo (local)", "  no status reported"]);
+});
+
+test("the rail wraps and sanitizes long agent profiles, leaving the compact bar unchanged", () => {
+	const profile = `team-${"x".repeat(59)}\x1b[31m\nops\t界unit\x07\x1b[0m (repo)`;
 	const base = model();
 	const active = model({ profile });
-	for (const width of [24, 46]) {
-		const lines = renderShellSidebarBar(active, plainTheme, width);
+	const settings = { ...DEFAULT_VISUAL_SETTINGS, visibility: { ...DEFAULT_VISUAL_SETTINGS.visibility, changes: false } };
+	for (const width of [16, 24, 46]) {
+		const lines = renderShellSidebarBar(active, plainTheme, width, settings);
 		assert.ok(lines.every((line) => visibleWidth(line) <= width));
-		assert.match(lines.join("\n"), /Profile/);
-		const row = lines.find((line) => line.includes("Profile"))!;
-		assert.match(row, /…/, "a value that cannot fit ends in an ellipsis instead of wrapping");
-		assert.equal(lines.filter((line) => line.includes("xxx")).length, 1, "the profile occupies a single row");
+		assert.ok(lines.every((line) => !/[\x00-\x1f\x7f-\x9f]/.test(line)), "profile controls must not reach the terminal");
+		const text = lines.slice(1).join("").replace(/\s/g, "");
+		assert.ok(text.includes(`Agentprofile:team-${"x".repeat(59)}ops界unit(repo)`), "the complete sanitized profile survives wrapping");
 	}
+	const ansiTheme = { ...plainTheme, fg: (role: string, value: string) => `\x1b[${role === "muted" ? 90 : 37}m${value}\x1b[0m` };
+	const colored = renderShellSidebarBar(active, ansiTheme, 24, settings);
+	assert.ok(colored.every((line) => visibleWidth(line) <= 24));
+	assert.match(colored.join(""), /\x1b\[90mAgent profile:\x1b\[0m/);
+	assert.ok(colored.slice(1).map(stripAnsi).join("").replace(/\s/g, "").includes(`Agentprofile:team-${"x".repeat(59)}ops界unit(repo)`));
 	assert.deepEqual(renderShellBar(active, plainTheme, 120), renderShellBar(base, plainTheme, 120));
 });
 
-test("sidebar Status card drops Model, Effort, Context, Cost and Usage, keeping Project, Changes and Integrations", () => {
+test("the rail Status drops model, usage and session identity, keeping Changes and Integrations", () => {
 	const usage = {
 		provider: "openai-codex",
 		plan: "pro",
@@ -494,17 +440,8 @@ test("sidebar Status card drops Model, Effort, Context, Cost and Usage, keeping 
 	};
 	const data = model({ profile: "team", sessionName: "session", usage, changes: { files: 1, added: 2, deleted: 1 }, statuses: ["MCP connected"] });
 	const text = renderShellSidebarBar(data, plainTheme, 60).join("\n");
-	assert.doesNotMatch(text, /Usage/);
-	assert.doesNotMatch(text, /Model/);
-	assert.doesNotMatch(text, /Effort/);
-	assert.doesNotMatch(text, /Context/);
-	assert.doesNotMatch(text, /Cost/);
-	assert.doesNotMatch(text, /\$9\.49/);
-	assert.doesNotMatch(text, /codex 5h/);
-	for (const heading of ["Status", "Project", "Changes", "Integrations"]) assert.match(text, new RegExp(heading));
-	assert.match(text, /Branch.*main/);
-	assert.match(text, /Session.*session/);
-	assert.match(text, /Profile.*team/);
+	for (const absent of [/Usage/, /Model/, /Effort/, /Context/, /Cost/, /\$9\.49/, /codex 5h/, /Branch/, /Session/]) assert.doesNotMatch(text, absent);
+	for (const heading of ["CHANGES", "INTEGRATIONS"]) assert.match(text, new RegExp(heading));
 });
 
 // The live header row above the fullscreen rail: identity on the left (brand,
@@ -532,8 +469,8 @@ test("buildShellHeaderModel keeps only the header's fields from the bar model", 
 test("renderShellHeaderBar draws the brand, identity, and right-aligned counters (plus the standing usage segment) in one line", () => {
 	const header = buildShellHeaderModel(model({ profile: "team" }));
 	const { text: line } = renderShellHeaderBar(header, plainTheme, 120);
-	const left = "  Gentle Shell ⟡ ~/work/gentle-pi main ⟡ gpt-5.5 · medium · team";
-	const right = "ctx ▰▰▰▰▱▱▱▱ 45% ⟡ $9.49 sub ⟡ ◔ usage";
+	const left = "✿ Gentle Shell ⟡ ~/work/gentle-pi main ⟡ gpt-5.5 · medium · team";
+	const right = "ctx ▰▰▰▰▱▱▱▱ 45% ⟡ $9.49 sub ⟡ usage";
 	assert.equal(line, left + " ".repeat(120 - visibleWidth(left) - visibleWidth(right)) + right);
 	assert.equal(visibleWidth(line), 120);
 });
@@ -549,7 +486,7 @@ test("renderShellHeaderBar colors the brand bold and by role", () => {
 	const bolding = { fg: (color: string, text: string) => `<${color}>${text}</${color}>`, bold: (text: string) => `**${text}**` };
 	const header = buildShellHeaderModel(model());
 	const { text: line } = renderShellHeaderBar(header, bolding, 120);
-	assert.match(line, /<accent>\*\*  Gentle Shell\*\*<\/accent>/);
+	assert.match(line, /<accent>\*\*✿ Gentle Shell\*\*<\/accent>/);
 });
 
 test("renderShellHeaderBar drops the profile, then the effort, then the whole location before the right group", () => {
@@ -557,7 +494,7 @@ test("renderShellHeaderBar drops the profile, then the effort, then the whole lo
 	const { text: wide } = renderShellHeaderBar(withProfile, plainTheme, 120);
 	assert.match(wide, /gpt-5\.5 · medium · team/);
 	assert.match(wide, /~\/work\/gentle-pi main/);
-	assert.match(wide, /ctx ▰▰▰▰▱▱▱▱ 45% ⟡ \$9\.49 sub ⟡ ◔ usage$/);
+	assert.match(wide, /ctx ▰▰▰▰▱▱▱▱ 45% ⟡ \$9\.49 sub ⟡ usage$/);
 
 	// 100 cols: the profile no longer fits, but effort and location still do.
 	const { text: noProfile } = renderShellHeaderBar(withProfile, plainTheme, 100);
@@ -578,8 +515,8 @@ test("renderShellHeaderBar drops the profile, then the effort, then the whole lo
 	const { text: noLocation } = renderShellHeaderBar(withProfile, plainTheme, 82);
 	assert.doesNotMatch(noLocation, /~\/work\/gentle-pi/);
 	assert.match(noLocation, /gpt-5\.5/);
-	assert.match(noLocation, /  Gentle Shell/);
-	assert.match(noLocation, /ctx ▰▰▰▰▱▱▱▱ 45% ⟡ \$9\.49 sub ⟡ ◔ usage$/);
+	assert.match(noLocation, /✿ Gentle Shell/);
+	assert.match(noLocation, /ctx ▰▰▰▰▱▱▱▱ 45% ⟡ \$9\.49 sub ⟡ usage$/);
 	assert.equal(visibleWidth(noLocation), 82);
 
 	// 60 cols: even the standing usage segment is gone now; brand+model and ctx/cost survive.
@@ -587,14 +524,14 @@ test("renderShellHeaderBar drops the profile, then the effort, then the whole lo
 	assert.doesNotMatch(noUsage, /~\/work\/gentle-pi/);
 	assert.doesNotMatch(noUsage, /usage/);
 	assert.match(noUsage, /gpt-5\.5/);
-	assert.match(noUsage, /  Gentle Shell/);
+	assert.match(noUsage, /✿ Gentle Shell/);
 	assert.match(noUsage, /ctx ▰▰▰▰▱▱▱▱ 45% ⟡ \$9\.49 sub$/);
 	assert.equal(visibleWidth(noUsage), 60);
 });
 
 test("renderShellHeaderBar returns an empty string only once the brand itself cannot fit", () => {
 	assert.equal(renderShellHeaderBar(buildShellHeaderModel(model()), plainTheme, 3).text, "");
-	assert.match(renderShellHeaderBar(buildShellHeaderModel(model()), plainTheme, 40).text, /  Gentle Shell/);
+	assert.match(renderShellHeaderBar(buildShellHeaderModel(model()), plainTheme, 40).text, /✿ Gentle Shell/);
 });
 
 // T8: the usage segment. It rides after cost in the right group, shows every
@@ -614,24 +551,22 @@ const USAGE_TWO_WINDOWS = {
 test("renderShellHeaderBar shows every usage window with its gauge and the shortcut hint, after cost", () => {
 	const header = buildShellHeaderModel(model({ usage: USAGE_TWO_WINDOWS }));
 	const { text, usageSpan } = renderShellHeaderBar(header, plainTheme, 140, "alt+u");
-	assert.match(text, /\$9\.49 sub ⟡ ◔ usage 5h ▰▰▱▱▱▱▱▱ 26% · week ▰▱▱▱▱▱▱▱ 12% alt\+u$/);
+	assert.match(text, /\$9\.49 sub ⟡ usage 5h ▰▰▱▱▱▱▱▱ 26% · week ▰▱▱▱▱▱▱▱ 12% · alt\+u$/);
 	assert.ok(usageSpan);
-	assert.equal(text.slice(usageSpan.start, usageSpan.end), "◔ usage 5h ▰▰▱▱▱▱▱▱ 26% · week ▰▱▱▱▱▱▱▱ 12% alt+u");
+	assert.equal(text.slice(usageSpan.start, usageSpan.end), "usage 5h ▰▰▱▱▱▱▱▱ 26% · week ▰▱▱▱▱▱▱▱ 12% · alt+u");
 });
 
 test("header retains effort without location when it fits beside full usage windows", () => {
 	const header = buildShellHeaderModel(model({ cwd: "~/work/" + "x".repeat(80), profile: "current", usage: USAGE_TWO_WINDOWS }));
 	for (const density of ["minimal", "compact", "comfortable"] as const) {
 		const settings = { ...DEFAULT_VISUAL_SETTINGS, density };
-		// The personal header labels usage "◔ usage" and drops the dot before the key.
-		const right = "ctx ▰▰▰▰▱▱▱▱ 45% ⟡ $9.49 sub ⟡ ◔ usage 5h ▰▰▱▱▱▱▱▱ 26% · week ▰▱▱▱▱▱▱▱ 12% alt+u";
-		// The personal header drops the decorative flower glyph before the brand.
-		const left = density === "minimal" ? "gpt-5.5 · medium" : "  Gentle Shell ⟡ gpt-5.5 · medium";
+		const right = "ctx ▰▰▰▰▱▱▱▱ 45% ⟡ $9.49 sub ⟡ usage 5h ▰▰▱▱▱▱▱▱ 26% · week ▰▱▱▱▱▱▱▱ 12% · alt+u";
+		const left = density === "minimal" ? "gpt-5.5 · medium" : "✿ Gentle Shell ⟡ gpt-5.5 · medium";
 		const width = visibleWidth(left) + 2 + visibleWidth(right);
 		const result = renderShellHeaderBar(header, plainTheme, width, "alt+u", settings);
 		assert.equal(result.text, left + "  " + right, density);
 		assert.ok(result.usageSpan);
-		assert.equal(result.text.slice(result.usageSpan.start, result.usageSpan.end), right.slice(right.indexOf("◔ usage")));
+		assert.equal(result.text.slice(result.usageSpan.start, result.usageSpan.end), right.slice(right.indexOf("usage")));
 
 		const narrower = renderShellHeaderBar(header, plainTheme, width - 1, "alt+u", settings).text;
 		assert.match(narrower, /gpt-5\.5/);
@@ -646,21 +581,12 @@ test("header retains effort without location when it fits beside full usage wind
 	}
 });
 
-test("renderShellHeaderBar shows '◔ usage <shortcut>' with no data, and drops the hint when the shortcut is disabled", () => {
+test("renderShellHeaderBar shows 'usage · <shortcut>' with no data, and drops the hint when the shortcut is disabled", () => {
 	const withHint = renderShellHeaderBar(buildShellHeaderModel(model({ usage: undefined })), plainTheme, 140, "alt+u");
-	assert.match(withHint.text, /◔ usage alt\+u$/);
-	assert.doesNotMatch(withHint.text, /usage ·/, "no dot before the key hint, like the rail action rows");
+	assert.match(withHint.text, /usage · alt\+u$/);
 	const noHint = renderShellHeaderBar(buildShellHeaderModel(model({ usage: undefined })), plainTheme, 140, undefined);
-	assert.match(noHint.text, /◔ usage$/);
+	assert.match(noHint.text, /usage$/);
 	assert.doesNotMatch(noHint.text, /alt\+u/);
-});
-
-test("renderShellHeaderBar paints the usage label rose (borderAccent) and its key dim, like the rail action rows", () => {
-	const roles: string[] = [];
-	const spy: ShellBarTheme = { fg: (color, text) => { roles.push(`${color}:${text}`); return text; }, bold: (text) => text };
-	renderShellHeaderBar(buildShellHeaderModel(model({ usage: undefined })), spy, 140, "alt+u");
-	assert.ok(roles.includes("borderAccent:◔ usage"), roles.join("\n"));
-	assert.ok(roles.includes("dim:alt+u"));
 });
 
 test("renderShellHeaderBar degrades the usage segment (gauges, then secondary windows, then the whole segment) before touching ctx/cost", () => {
@@ -672,13 +598,13 @@ test("renderShellHeaderBar degrades the usage segment (gauges, then secondary wi
 	// (a positive match on the bare "5h 26% · week 12%" run rules out any
 	// gauge glyph sneaking in between them; ctx's own gauge is unrelated).
 	const noGauges = renderShellHeaderBar(header, plainTheme, 100, "alt+u").text;
-	assert.match(noGauges, /◔ usage 5h 26% · week 12% alt\+u$/);
+	assert.match(noGauges, /usage 5h 26% · week 12% · alt\+u$/);
 	assert.match(noGauges, /ctx ▰▰▰▰▱▱▱▱ 45% ⟡ \$9\.49 sub/, "ctx/cost are untouched while usage still degrades");
 	assert.equal(visibleWidth(noGauges), 100);
 
 	// 80 cols: only the first window remains.
 	const primaryOnly = renderShellHeaderBar(header, plainTheme, 80, "alt+u").text;
-	assert.match(primaryOnly, /◔ usage 5h 26% alt\+u$/);
+	assert.match(primaryOnly, /usage 5h 26% · alt\+u$/);
 	assert.doesNotMatch(primaryOnly, /week/);
 	assert.match(primaryOnly, /ctx ▰▰▰▰▱▱▱▱ 45% ⟡ \$9\.49 sub/);
 	assert.equal(visibleWidth(primaryOnly), 80);
@@ -695,7 +621,7 @@ test("renderShellHeaderBar's usage span always points at the usage text, not ctx
 	for (const width of [140, 100, 90]) {
 		const { text, usageSpan } = renderShellHeaderBar(header, plainTheme, width, "alt+u");
 		if (!usageSpan) continue;
-		assert.match(text.slice(usageSpan.start, usageSpan.end), /^◔ usage/);
+		assert.match(text.slice(usageSpan.start, usageSpan.end), /^usage/);
 		assert.equal(usageSpan.end, visibleWidth(text), "the usage segment always ends at the right edge");
 	}
 });
@@ -707,16 +633,14 @@ test("renderShellHeaderRule paints one full-width line in the editor frame color
 	assert.equal(renderShellHeaderRule(plainTheme, -3), "", "negative widths clamp to an empty rule");
 });
 
-test("the sidebar Status card in the float style is a float panel two rows taller than neon, with a separator row after the header", (t) => {
+test("the rail Status is the same panel in the neon and float card styles", (t) => {
+	// Card styles dress transcript cards; the rail panel has its own surface.
 	const theme = withBackground(plainTheme);
-	const neon = renderShellSidebarBar(model({ review: { state: "reviewing", scope: "first.ts +2 files" } }), theme, 60);
+	const data = model({ review: { state: "reviewing", scope: "first.ts +2 files" } });
+	const neon = renderShellSidebarBar(data, theme, 60);
 	useCardStyle(t, CARD_STYLE.FLOAT);
-	const float = renderShellSidebarBar(model({ review: { state: "reviewing", scope: "first.ts +2 files" } }), theme, 60);
-	assert.equal(float.length, neon.length + 2);
-	assert.equal(stripAnsi(float[1]!), ` ▎ Status${" ".repeat(51)}`);
-	assert.equal(stripAnsi(float[2]!), ` ▎${" ".repeat(57)} `, "a blank separator row follows the header");
-	assertFloatRows(float, 60);
-	assert.deepEqual(float.slice(3, -1).map(bodyText), neon.slice(1, -1).map(bodyText));
+	assert.deepEqual(renderShellSidebarBar(data, theme, 60), neon);
+	assert.match(stripAnsi(neon[0]!), /^▾ CHANGES/);
 });
 
 // The float top bar has full-width painted padding above and below its
@@ -758,7 +682,7 @@ test("renderShellHeaderBar shifts the float usage span past its two-column inset
 		assert.deepEqual(usageSpan, neonInner.usageSpan && { start: neonInner.usageSpan.start + FLOAT_HEADER_OFFSET, end: neonInner.usageSpan.end + FLOAT_HEADER_OFFSET });
 		if (!usageSpan) continue;
 		const plain = stripAnsi(text);
-		assert.match(plain.slice(usageSpan.start, usageSpan.end), /^◔ usage/);
+		assert.match(plain.slice(usageSpan.start, usageSpan.end), /^usage/);
 		assert.equal(usageSpan.end, visibleWidth(plain) - FLOAT_HEADER_OFFSET, "the usage segment ends before the right inset");
 	}
 });
@@ -813,7 +737,7 @@ test("float header chrome shares padded geometry with usage hit-testing", (t) =>
 			assert.equal(shellHeaderUsageHit(chrome, 0, 1), false, "hidden usage never clicks");
 			continue;
 		}
-		assert.match(stripAnsi(chrome.rows[chrome.headerRow]!).slice(span.start, span.end), /^◔ usage/);
+		assert.match(stripAnsi(chrome.rows[chrome.headerRow]!).slice(span.start, span.end), /^usage/);
 		for (const y of [-1, 0, 2, 3, 4]) assert.equal(shellHeaderUsageHit(chrome, span.start, y), false, `decorative row ${y}`);
 		assert.equal(shellHeaderUsageHit(chrome, span.start - 1, 1), false);
 		assert.equal(shellHeaderUsageHit(chrome, span.start, 1), true);
@@ -1008,76 +932,4 @@ test("the narrow-layout bottom-only bar stays unchanged in the float style", (t)
 	const neon = renderShellBottomOnlyBar(data, theme, 100, "alt+u");
 	useCardStyle(t, CARD_STYLE.FLOAT);
 	assert.deepEqual(renderShellBottomOnlyBar(data, theme, 100, "alt+u"), neon);
-});
-
-test("dev-binary short id prefers the 40-hex commit directory and falls back to the digest", () => {
-	const commit = "66bf3e12e338df8ad038de512e8a9fbc82dd6fa1";
-	assert.equal(devBinaryShortId(`/home/pablo/.pi/gentle-ai/main/gentle-ai/${commit}/gentle-ai`, "0dac40684a053f2b"), "66bf3e1");
-	assert.equal(devBinaryShortId(`/x/${commit.toUpperCase()}/gentle-ai`, "0dac40684a053f2b"), "66bf3e1", "case-insensitive hex");
-	assert.equal(devBinaryShortId("/Users/me/go/bin/gentle-ai", "6e53bfc6305a3949"), "6e53bfc");
-	assert.equal(devBinaryShortId(`/x/${commit}0/gentle-ai`, "abcdef0123"), "abcdef0", "41 hex chars is not a commit directory");
-});
-
-test("sidebar Integrations carries the dev-binary line only while the override is active", () => {
-	const active = renderShellSidebarBar(model({ statuses: ["MCP connected"], devBinary: "66bf3e1" }), plainTheme, 60).map(stripAnsi);
-	const text = active.join("\n");
-	assert.match(text, /MCP connected/);
-	assert.match(text, /Build +gentle-ai dev · 66bf3e1 · field-test/);
-	assert.ok(text.indexOf("MCP connected") < text.indexOf("gentle-ai dev"), "the line sits after the Engram/status lines");
-	const bare = renderShellSidebarBar(model({ statuses: ["MCP connected"] }), plainTheme, 60).join("\n");
-	assert.doesNotMatch(bare, /gentle-ai dev/);
-	const only = renderShellSidebarBar(model({ devBinary: "66bf3e1" }), plainTheme, 60).join("\n");
-	assert.doesNotMatch(only, /No status reported/, "the line replaces the empty placeholder");
-	for (const width of [1, 8, 24, 30, 46]) {
-		const lines = renderShellSidebarBar(model({ statuses: ["MCP connected"], devBinary: "66bf3e1" }), plainTheme, width);
-		assert.ok(lines.every((line) => visibleWidth(line) <= width), `fits ${width}`);
-	}
-	const narrow = renderShellSidebarBar(model({ devBinary: "66bf3e1" }), plainTheme, 40).map(stripAnsi).filter((line) => line.includes("Build"));
-	assert.equal(narrow.length, 1, "the build value never wraps");
-	assert.match(narrow[0]!, /Build +dev · 66bf3e1 · field-test/, "a shorter wording is chosen before anything is cut");
-});
-
-// S4: the Status card reads as two blocks — where this session runs together
-// with what it changed, then the system facts — with dim keys, normal-weight
-// values and the two identity facts (branch, profile) still strong.
-
-const boldTheme: ShellBarTheme = {
-	fg(color: string, value: string) {
-		return `<${color}>${value}</${color}>`;
-	},
-	bold(value: string) {
-		return `<bold>${value}</bold>`;
-	},
-};
-
-test("sidebar Status keeps location and the captured changes in one block, the system facts in the next", () => {
-	const data = model({ profile: "team", changes: { files: 2, added: 7, deleted: 3 }, statuses: ["\u{1F9E0} proyectos", "Permissions: YOLO", "\u{1F680} YOLO ON \u{1F525} — destructive confirmations remain"] });
-	const rows = renderShellSidebarBar(data, plainTheme, 60).map(bodyText);
-	const at = (label: string) => rows.findIndex((row) => row.trimStart().startsWith(`${label} `));
-	assert.equal(at("Branch"), at("Path") + 1);
-	assert.equal(at("Profile"), at("Branch") + 1);
-	assert.equal(at("Changes"), at("Profile") + 1, `captured changes belong to the location block: ${rows.join("|")}`);
-	assert.match(rows[at("Changes") + 1]!, /^\s*\/gentle:changes/, "the hint stays under its row");
-	assert.equal(rows[at("Changes") + 2], "", "one blank row separates the two blocks");
-	assert.equal(rows[at("Changes") + 3]!.trim(), "Integrations", "the system block opens right after the blank row");
-	assert.equal(at("Memory"), at("Changes") + 4);
-	assert.equal(at("Perms"), at("Memory") + 1);
-	assert.equal(at("YOLO"), at("Perms") + 1);
-});
-
-test("sidebar Status dims its keys and keeps only Branch and Profile bold", () => {
-	const data = model({ profile: "team", statuses: ["Permissions: YOLO"] });
-	const tagged = renderShellSidebarBar(data, boldTheme, 200).join("\n");
-	assert.match(tagged, /<dim>Path {3}<\/dim> {2}<text>~\/work\/gentle-pi<\/text>/, "Path is a plain value under a dim key");
-	assert.match(tagged, /<dim>Branch <\/dim> {2}<text><bold>main<\/bold><\/text>/);
-	assert.match(tagged, /<dim>Profile<\/dim> {2}<text><bold>team<\/bold><\/text>/);
-	assert.doesNotMatch(tagged, /<bold>~\.\/work|<bold>YOLO|<bold>No status/, "only the identity rows carry weight");
-});
-
-test("sidebar Status keeps the captured-change colors and its muted placeholder rows", () => {
-	const tagged = renderShellSidebarBar(model({ changes: { files: 2, added: 7, deleted: 3 } }), taggedTheme, 200).join("\n");
-	assert.match(tagged, /2 files · <success>\+7<\/success> <error>−3<\/error>/, "the change counts keep their colors at normal weight");
-	assert.doesNotMatch(tagged, /<bold>2 files/);
-	assert.match(tagged, /<muted>\/gentle:changes<\/muted>/);
-	assert.match(renderShellSidebarBar(model(), taggedTheme, 200).join("\n"), /<muted>No captured changes<\/muted>/);
 });
