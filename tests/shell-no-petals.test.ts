@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { readdirSync, readFileSync } from "node:fs";
+import fs from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import test from "node:test";
 import { TASK_STATUS, type TaskRecord } from "../lib/agents-protocol.ts";
@@ -14,6 +16,9 @@ import { stripAnsi } from "../lib/terminal-theme.ts";
 
 // S16 (odd/tasks/shell-personal-rework.md): the owner's shell has no petal or rose
 // decoration anywhere. Their glyph slots stay blank, as in d6fb874a5.
+
+// The banner reads process.env directly; a suite launched from a delegated child must still exercise the parent paths.
+delete process.env.GENTLE_PI_AGENTS_CHILD;
 
 const PETALS = /[\u273f\u2740\u2741\u273e\u{1F339}\u{1F338}]/u;
 const plain = { fg: (_role: string, text: string) => text, bold: (text: string) => text };
@@ -79,4 +84,41 @@ test("no source file of the shell carries a petal or rose in code", () => {
 		return PETALS.test(code) ? [`${file}:${index + 1}`] : [];
 	}));
 	assert.deepEqual(offenders, []);
+});
+
+test("the startup banner draws the Gentle Shell title and no rose art, at every width", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+	t.mock.method(fs, "readFile", async () => JSON.stringify({ showRose: true, showTextLogo: true, color: "pink" }));
+	t.mock.method(fs, "readdir", async () => [] as never);
+	syncBuiltinESMExports();
+	t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+	const argv = process.argv;
+	process.argv = ["node"];
+	t.after(() => { process.argv = argv; });
+	for (const [key, value] of [["rows", 40], ["columns", 160]] as const) {
+		const descriptor = Object.getOwnPropertyDescriptor(process.stdout, key);
+		Object.defineProperty(process.stdout, key, { configurable: true, writable: true, value });
+		t.after(() => descriptor ? Object.defineProperty(process.stdout, key, descriptor) : Reflect.deleteProperty(process.stdout, key));
+	}
+	let start: Function;
+	let shutdown: Function;
+	let header: { render(width: number): string[]; dispose(): void };
+	const { default: startup } = await import(new URL("../extensions/startup-banner.ts?no-petals", import.meta.url).href) as typeof import("../extensions/startup-banner.ts");
+	startup({ on: (name: string, fn: Function) => {
+		if (name === "session_start") start = fn;
+		if (name === "session_shutdown") shutdown = fn;
+	}, registerCommand() {}, getCommands: () => [], getAllTools: () => [] } as never);
+	t.mock.method(process.stdout, "write", () => true);
+	await start!({}, { hasUI: true, cwd: "/fixture", ui: { setHeader: (factory: Function) => { header = factory({ requestRender() {} }, { fg: (_role: string, text: string) => text }); } } });
+	t.mock.timers.tick(200);
+	for (let i = 0; i < 5; i++) await Promise.resolve();
+	try {
+		for (const width of [40, 80, 160, 200]) {
+			const text = stripAnsi(header!.render(width).join("\n"));
+			assert.doesNotMatch(text, PETALS, `banner at ${width}`);
+			assert.doesNotMatch(text, /[\u2800-\u28ff]/, `no braille rose art at ${width}`);
+			assert.match(text, /GIT:/, "the info block stays");
+			if (width >= 160) assert.match(text, /[▒▄▀█]/, "the Gentle Shell title stays");
+		}
+	} finally { shutdown!(); }
 });

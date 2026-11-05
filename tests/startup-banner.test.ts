@@ -201,7 +201,7 @@ test("animation modes retain banner lifetime policy, final artwork and approxima
 		assert.equal(active, false, "potato starts no animation interval");
 		const staticArt = stripAnsi(header!.render(200).join("\n"));
 		assert.match(staticArt, /[▄▀█]/);
-		assert.match(staticArt, /[\u2800-\u28ff]/);
+		assert.doesNotMatch(staticArt, /[\u2800-\u28ff]/, "no rose art (S16)");
 		header!.dispose();
 		let qualityDuration = 0;
 		let qualityPaints = 0;
@@ -282,7 +282,7 @@ for (const showRose of [false, true]) for (const showTextLogo of [false, true]) 
 				assert.doesNotMatch(text, /phases\b/i, "historical SDD files never appear as active phases");
 				assert.match(text, /AGENTS:\s+1 agents/, "only the installed background agent is counted");
 				if (width >= 160) {
-					assert.equal(/[\u2800-\u28ff]/.test(text), showRose);
+					assert.equal(/[\u2800-\u28ff]/.test(text), false, "the rose art is never drawn (S16), whatever the stored setting");
 					assert.equal(/[▒▄▀█]/.test(text), showTextLogo);
 				} else if (width === 80 && showTextLogo) {
 					assert.match(text, / {2}Gentle Shell {2}/, "narrow terminal shows graceful fallback branding");

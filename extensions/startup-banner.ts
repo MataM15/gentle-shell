@@ -667,7 +667,8 @@ export default function (pi: ExtensionAPI) {
 
     // Pi has already started its renderer. Let setHeader schedule the paint;
     // clearing stdout here would leave its previous-frame cache out of sync.
-    const bannerConfig = await readBannerConfig();
+    // The owner's build never draws the rose art (S16); the stored setting is kept so the toggles still round-trip.
+    const bannerConfig = { ...(await readBannerConfig()), showRose: false };
     const palette = BANNER_PALETTES[bannerConfig.color];
     const roseBase = padLines(normalizeAscii(ROSE_LARGE_RAW));
     const logoBase = padLines(TEXT_LOGO);
