@@ -42,6 +42,7 @@
 	],
 	"scripts": {
 		"check:provider-contract": "node scripts/check-provider-contract.mjs",
+		"check:unused": "node scripts/check-unused.mjs",
 		"postinstall": "node scripts/install-gentle-ai.mjs",
 		"test": "node scripts/run-test-suite.mjs",
 		"test:harness": "node --experimental-strip-types tests/runtime-harness.mjs",
@@ -51,8 +52,8 @@
 		"build:runtime-modules": "node scripts/build-runtime-modules.mjs --write",
 		"check:runtime-modules": "node scripts/build-runtime-modules.mjs --check",
 		"test:packed-package": "node scripts/test-packed-runner.mjs",
-		"prepack": "pnpm test && pnpm run check:runtime-modules && node scripts/verify-package-files.mjs",
-		"prepublishOnly": "pnpm test && pnpm run check:runtime-modules && node scripts/verify-package-files.mjs && pnpm run test:packed-package",
+		"prepack": "pnpm test && pnpm run check:unused && pnpm run check:runtime-modules && node scripts/verify-package-files.mjs",
+		"prepublishOnly": "pnpm test && pnpm run check:unused && pnpm run check:runtime-modules && node scripts/verify-package-files.mjs && pnpm run test:packed-package",
 		"typecheck": "node scripts/check-types.mjs"
 	},
 	"pi": {

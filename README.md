@@ -350,7 +350,7 @@ Save `/gentle:mode default auto` or `/gentle:mode default yolo` to use either op
 | Model, effort, persona, and profile controls | Explicit knobs for how Pi routes and presents work. |
 | Safety boundaries | Guards around destructive operations and sensitive-path handling. |
 | Optional companion packages | Extra capabilities you may choose to add; persistent memory is **not** bundled with `gentle-pi`. |
-| Fullscreen workspace layout | Header row plus a scrolling Status → Changes → TODO rail on wide terminals. |
+| Fullscreen workspace layout | Title row plus a rail with a pinned header and Breaks card, and tabs (Activity, Sessions, Resources, Status) holding the sections as cards, on wide terminals. |
 | Live status bar and prompt petal | One-line gauge, cost, and statuses; the petal shows `working` and `queued`. |
 | Parent ↔ subagent communication | Delegate, steer, reply, and cross-session notification within your local profile. |
 | Native interactive tools | Built-in questions, choices, and review captures — no third-party dependency. |

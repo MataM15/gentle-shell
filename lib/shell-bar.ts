@@ -4,7 +4,7 @@ import { renderUsageBar, selectUsageLimit, type ProviderUsage, type UsageWindow 
 import { sanitizeTerminalText } from "./terminal-theme.ts";
 import { HOVER_ROLE } from "./shell-hover.ts";
 import { renderStatsRows, type SessionStats } from "./shell-stats.ts";
-import { CARD_TONE, floatRows, paintSurfaceRow, panelInnerWidth, renderCard, surfaceOpener } from "./shell-card.ts";
+import { CARD_TONE, floatRows, paintSurfaceRow, surfaceOpener } from "./shell-card.ts";
 import { clipPanelText, fitPanelLine, PANEL_ROW_INDENT, PANEL_SURFACE_ROLE, renderPanelHeader, renderPanelRow } from "./shell-panel.ts";
 import { REVIEW_SCOPE_UNAVAILABLE, REVIEW_SIDEBAR_LABELS, type ReviewSidebarSnapshot } from "./review-sidebar-state.ts";
 import type { VisualSettings } from "./visual-customization-policy.ts";

@@ -68,29 +68,29 @@ In regular mode the terminal owns mouse input, so use the keyboard instead. Revi
 At 140 columns or wider, fullscreen with the header on top draws an IDE inside the terminal (design: [`design/shell-rework`](../design/shell-rework/02-proposal.html)), driven by [`lib/shell-sidebar-layout.ts`](../lib/shell-sidebar-layout.ts):
 
 ```text
- ✿ gentle-pi  ~/work/gentle-pi                                            fleet adopt · claude (session)
+ gentle-pi  ~/work/gentle-pi                                              fleet adopt · claude (session)
  … transcript …                                          ▾ TODOS                                    2/6
                                                            ✓ 2 done
                                                            ◐ Run the full suite
                                                              └ job-1
- ─ ✿ waiting for input ───────────────── INSERT ─        ▾ AGENTS              3 running · 1 waiting
+ ─ waiting for input ─────────────────── INSERT ─        ▾ AGENTS              3 running · 1 waiting
  › type, or / for commands                                 …
  main ±3 │ SUPER-YOLO                 gpt-5.5 · medium │ ctx ▰▰▰▰▱▱▱▱ 45% │ $9.49 sub │ usage · alt+u
 ```
 
 - **Title row.** The project name and path once, and the session name and profile on the right; when space runs out the path gives way first, so the profile always shows.
 - **Page.** With a light theme (`appearance: "light"`) the fullscreen frame is painted on a paper background with the theme's text color, so a dark terminal never shows through the conversation, the gaps or the column beside the rail. Dark themes keep the terminal background. In Ghostty, set `window-padding-color = extend` so the window padding takes the same color.
-- **Rail.** One tinted panel (the theme's `customMessageBg`) that runs to the bottom of the screen, not a stack of cards. Sections have a one-row header (`▾ NAME … count`, a click on it collapses the section) and dense rows, live work first: **Todos → Jobs → Agents → Changes → Review → Integrations**, then the key hints (`ctrl+shift+t todos · alt+u usage · / commands`). Finished todos fold into `✓ N done`; the task in progress (or blocked) wraps its title and note in full, the note hanging under it (`└ job-1`); other tasks take one clipped row. Agents list one row per agent with the task first, the agent kind, tokens and elapsed, ordered by what needs you (asking, running, queued, failed), finished agents folded into `✓ N done · /gentle:agents`, at most eight rows before `… N more`; a click on an agent row opens `/gentle:agents`. Every section header folds its section on a click (Changes, Review and Integrations too), and the Changes row opens `/gentle:changes`; hovering a control paints it in the shared hover role. Changes shows `N files` with `+added −deleted` or `clean`; Review appears only with current-session RDD evidence and says `needs you` on consent; With the `stats` section on (the Power user preset turns it on; Customize → Sections toggles it), a **Stats** section sits before Integrations: what the session spent, input/output tokens, cache hit rate and reads, tool calls with failures, what started subagents spent (runs · tokens · cost, from the Agents section), the span from the first to the last entry, and one row per model (turns · tokens · cost), most expensive first, with the numbers on their own row when the rail is too narrow. Integrations lists other extensions' statuses and says what the permission mode means without repeating it. An idle section keeps one muted row with the command that opens it. The panel is the same in every card style; `neon` and `float` dress transcript cards.
-- **Status bar.** One full-width row under the transcript and the rail: branch and dirty count, a non-default permission mode once, then model · effort, the context gauge, cost and the subscription usage (clicking `usage` opens `/gentle:usage`). When space runs out, usage gives way first (gauges, secondary windows, the segment), then the model.
-- **Editor.** A titled rule `─ ✿ <state> ──── <vim mode or esc hint> ─` above the input, which sits behind a `›` prompt with no frame; the state scans while the agent works and shows the ODD phase. In mobile/minimal fullscreen chrome, `[ Panel ]` appears on that rule and opens `/gentle:panel` even without live work or Vim; it and individual agent rows use the shared hover role to signal their click targets. Owned shell controls and unhandled transcript or blank-space motion clear the previous shell hover; arbitrary handled third-party components do not guarantee a leave notification. Row count, cursor, selection, autocomplete and mouse geometry stay native. When a subagent asks you a question (a dialog relayed to this session), a row above the editor says so: `? explore asked: Which file? … /gentle:agents`.
+- **Rail.** Pinned at the top, the rail header (model · effort, the context gauge and cost, then `≡ commands [alt+k]` and `◔ usage [alt+u]`, both clickable), the yellow **Breaks** card (water, rest and stretch rows with their `↻` resets, the dinner countdown, the clock and the date) and the tab row `Activity · Sessions · Resources · Status` (the active tab is accent, bold and underlined; a click switches, the choice stays until the next click), then a pinned voice line while recording. The selected tab scrolls underneath, and the last row is `» hide panel · alt+h`. Each section is a rounded rose card (the `neon` style) with `▾ TITLE` and its count inset in the top border; a click on the header collapses it. **Activity** holds Agents, Jobs and Todos; **Sessions** holds *Otras sesiones* (the other live sessions of the profile: name, age, agent count, `+N inactivas (más de 6 h)`, `visto hace … · lista parcial`; a click on the tab rescans once); **Resources** holds the **Limits** card (one block per provider with its 5h and week windows, `updated Nm ago · alt+u`, a click opens `/gentle:usage`; the Claude account is one block even when claude-bridge files its own header snapshot); **Status** holds Changes, Review, Stats and Integrations. Finished todos fold into `✓ N done`; the task in progress (or blocked) wraps its title and note in full, the note hanging under it (`└ job-1`); other tasks take one clipped row. Agents list one row per agent with the task first, the agent kind, tokens and elapsed, ordered by what needs you (asking, running, queued, failed), finished agents folded into `✓ N done · /gentle:agents`, at most eight rows before `… N more`; a click on an agent row opens `/gentle:agents`. Every section header folds its section on a click (Changes, Review and Integrations too), and the Changes row opens `/gentle:changes`; hovering a control paints it in the shared hover role. Changes shows `N files` with `+added −deleted` or `clean`; Review appears only with current-session RDD evidence and says `needs you` on consent; With the `stats` section on (the Power user preset turns it on; Customize → Sections toggles it), a **Stats** section sits before Integrations: what the session spent, input/output tokens, cache hit rate and reads, tool calls with failures, what started subagents spent (runs · tokens · cost, from the Agents section), the span from the first to the last entry, and one row per model (turns · tokens · cost), most expensive first, with the numbers on their own row when the rail is too narrow. Integrations lists other extensions' statuses and says what the permission mode means without repeating it. An idle section keeps one muted row with the command that opens it. The panel is the same in every card style; `neon` and `float` dress transcript cards.
+- **Status bar.** One full-width row under the transcript and the rail: branch and dirty count, the permission mode and the weekly usage gauge (clicking it opens `/gentle:usage`). Model, effort, context and cost are shown once, in the rail header. When space runs out the branch gives way first.
+- **Editor.** A titled rule `─ <state> ──── <vim mode or esc hint> ─` above the input, which sits behind a `›` prompt with no frame; the state scans while the agent works and shows the ODD phase. With the rail folded or absent, the rule carries `≡ commands · alt+k` (opens the command palette) and `« panel · alt+h` (brings the rail back); `/gentle:panel` opens the sections as a sheet at any width. The labels and individual agent rows use the shared hover role to signal their click targets. Owned shell controls and unhandled transcript or blank-space motion clear the previous shell hover; arbitrary handled third-party components do not guarantee a leave notification. Row count, cursor, selection, autocomplete and mouse geometry stay native. When a subagent asks you a question (a dialog relayed to this session), a row above the editor says so: `? explore asked: Which file? … /gentle:agents`.
 - The sidebar reuses its last frame until something it paints changes, so silent frames stay cheap; a per-section cache means one section's changing digest (or the header's) never forces an unrelated section to redraw.
-- **Mobile and minimal.** Below 140 columns, or at any width with Status at the bottom (the **Light** preset), fullscreen with the header on top keeps the same split without the rail (design: [`05-mobile`](../design/shell-rework/05-mobile.html)): the title row carries the model, the status bar keeps branch, permission mode, running jobs (`⧗ 1 job`), context and cost, and the editor keeps its titled rule. Live work folds into one row drawn inside the editor, right above its rule — the current todo with `done/planned`, or the agents while they run (`◐ 3 agents · ? 1 waiting · ✗ 1 … 2/6 todos`) — replacing the Todos and Agents cards. Tapping that row opens `/gentle:agents` while the agents lead it (a subagent running or failed); otherwise the tap, like `/gentle:panel` at any width, opens the rail's sections as a full-width sheet hanging from the top; it leaves the bottom rows to the work row, the editor and the status bar, shows only the sections the rail would show (the Todos switch included), and holds the keyboard while open: `↑`/`↓` (or `j`/`k`) or the wheel scroll it, and `esc` (or `q`, or a click on `esc back`) closes it. The work row's `▸` lights up under the pointer to show it is clickable. A subagent question keeps its row above the editor on a phone too.
+- **Mobile and minimal.** Below 140 columns, or at any width with Status at the bottom (the **Light** preset), fullscreen with the header on top keeps the same split without the rail (design: [`05-mobile`](../design/shell-rework/05-mobile.html)): the top bar carries the project, then the model with context and cost, then `◔ usage 5h … · week … alt+u`; the status row keeps branch and permission mode; the yellow Breaks card sits below the editor, and at 43 columns or fewer (phone-sized) it is not painted at all. Live work folds into one row drawn inside the editor, right above its rule — the current todo with `done/planned`, or the agents while they run (`◐ 3 agents · ? 1 waiting · ✗ 1 … 2/6 todos`) — replacing the Todos and Agents cards. Tapping that row opens `/gentle:agents` while the agents lead it (a subagent running or failed); otherwise the tap, like `/gentle:panel` at any width, opens the rail's sections as a full-width sheet hanging from the top; it leaves the bottom rows to the work row, the editor and the status bar, shows only the sections the rail would show (the Todos switch included), and holds the keyboard while open: `↑`/`↓` (or `j`/`k`) or the wheel scroll it, and `esc` (or `q`, or a click on `esc back`) closes it. The work row's `▸` lights up under the pointer to show it is clickable. A subagent question keeps its row above the editor on a phone too.
 - Header placement is configurable. Below input, the header keeps its previous chrome, and the rail adds a Session section and keeps the permission mode in Integrations, since no title row or status bar shows them: the float footer groups Changes (when the session's roots have uncommitted work), header data, and locally owned integration statuses under one upper edge; it never duplicates statuses owned by the rail. Without a top header, or with Status hidden, a narrow fullscreen terminal keeps the bottom bar and the Agents and TODO cards above the editor. Regular mode keeps the compact one-line bottom bar and the above-editor Agents widget, without a fullscreen header or sidebar.
 
 The regular-mode compact bar replaces pi's three-line footer with a single line of segments:
 
 ```text
-✿ gentle shell ⟡ ~/work/gentle-pi main ⟡ gpt-5.5 · medium ⟡ ctx ▰▰▰▰▱▱▱▱ 45% ⟡ $9.49 sub ⟡ MCP: 3 servers enabled        Release notes
+gentle shell ⟡ ~/work/gentle-pi main ⟡ gpt-5.5 · medium ⟡ ctx ▰▰▰▰▱▱▱▱ 45% ⟡ $9.49 sub ⟡ MCP: 3 servers enabled        Release notes
 ```
 
 - Context is a gauge, not a number. It turns amber at 80% and red at 95%; after compaction it shows `?%` until the next response.
@@ -102,7 +102,7 @@ The regular-mode compact bar replaces pi's three-line footer with a single line 
 Outside the fullscreen IDE chrome, the prompt follows the selected card style. `neon` keeps pi's editor in its rounded frame:
 
 ```text
-╭─ ✿ working ──────────────────────────────────────────╮
+╭─ working ──────────────────────────────────────────╮
 │ type, or / for commands                              │
 ╰──────────────────────────────────────────────────────╯
 ```
@@ -206,13 +206,13 @@ To use `ctrl+p` like OpenCode, rebind Pi's `app.model.cycleForward` in `~/.pi/ag
 Subscription usage shows in the bar after the cost, and `/gentle:usage` opens a panel with one row per window of every provider: the limit name, its meter, its percentage and, when that window reports one, its reset, all on one line. Codex, Claude and NaN all read the same way. In fullscreen mode, clicking the header's `usage` segment opens this same panel. The panel's own footer hints (`r refresh`, `esc close`) are clickable too, not just keyboard shortcuts, and hovering either one paints it in the shell's shared hover role while a refresh already in flight ignores a repeated click. The panel opens immediately: it draws whatever snapshots the store already holds and says `refreshing…` while the open refresh runs underneath it, repainting as answers land.
 
 ```text
-✿ gentle shell ⟡ … ⟡ $9.49 sub ⟡ codex 5h ▰▰▰▰▰▱▱▱ 62% · week 31%
+gentle shell ⟡ … ⟡ $9.49 sub ⟡ codex 5h ▰▰▰▰▰▱▱▱ 62% · week 31%
 ```
 
 The panel rows a provider reports its windows with:
 
 ```text
-✿ nan · updated just now
+nan · updated just now
   deepseek-v4-flash ▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱  26% · resets in 12d 17h
   glm5.3-flash      ▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱  11% · resets in 12d 17h
 ```
@@ -243,7 +243,7 @@ The panel rows a provider reports its windows with:
 Gentle notices follow the selected card style. In `neon`, informational cards use the rounded frame in the theme's border role and an accent title; warning, error, and success cards use their own tone colors. In `float`, notices use the tone-background panel described below. The following example shows `neon`:
 
 ```text
-╭─ ✿ Gentle AI · review preflight ─────────────────────────────────────╮
+╭─ Gentle AI · review preflight ─────────────────────────────────────╮
 │ Receipt-driven development is enabled, and this worktree holds an    │
 │ unreviewed candidate (target sha256:…). First determine whether the  │
 │ user explicitly left this exact target unreviewed. If yes, do not    │
@@ -251,9 +251,9 @@ Gentle notices follow the selected card style. In `neon`, informational cards us
 ```
 
 - Quiet tools use the selected card style with their actual name in the heading (`read`, `bash`, `grep`, `find`, `ls`, `edit`, `write`); bash keeps its command visible. Collapsed results show up to three physical preview rows, including search/list entries or changed diff lines alongside useful totals. Expand with the configured key shown in the top rule for complete available output and image handling. Expanded successful `write` cards show the complete written content; collapsed cards keep their concise confirmation. Failed writes show the error instead.
-- Every call into the gentle-ai binary and every `gentle_review` tool draws a rose card titled like the quiet `read` card: the colored 🌹 emoji, a short name, then the operation (`🌹 rdd inspect`, `🌹 gentle-ai version`), with `running`/`preparing`/`failed` shown until the call completes (`🌹 rdd running · start`). The rail uses the existing theme roles: warning while running/partial, success on completion, error on failure. Collapsed results show up to three useful physical rows, not just a line count. A JSON envelope instead collapses to one summary line of its key fields (status, outcome, risk, action, reason code, diagnostic message, e.g. `blocked · start · fresh_target_ready`) and expands as pretty-printed JSON. The expand key sits in the top rule once finished, and elapsed timing stays on the closing rule. Reviewer captures name their lens (`rdd capture · risk`; the group lists all four).
+- Every call into the gentle-ai binary and every `gentle_review` tool draws a rose-framed card titled like the quiet `read` card, with no glyph: a short name, then the operation (`rdd inspect`, `gentle-ai version`), with `running`/`preparing`/`failed` shown until the call completes (`rdd running · start`). The rail uses the existing theme roles: warning while running/partial, success on completion, error on failure. Collapsed results show up to three useful physical rows, not just a line count. A JSON envelope instead collapses to one summary line of its key fields (status, outcome, risk, action, reason code, diagnostic message, e.g. `blocked · start · fresh_target_ready`) and expands as pretty-printed JSON. The expand key sits in the top rule once finished, and elapsed timing stays on the closing rule. Reviewer captures name their lens (`rdd capture · risk`; the group lists all four).
 - The review preflight reminder renders as a card in the transcript with the expand key in its top rule. Collapsed, it previews up to three non-blank physical rows of the reminder; expanded, it shows the full text.
-- An active dev-binary override shows above the editor at startup as a 🌹 gentle-ai card, in amber, naming the binary and its digest, and leaves with the first prompt; an invalid override shows in red with the reason.
+- An active dev-binary override shows above the editor at startup as a `gentle-ai` card, in amber, naming the binary and its digest, and leaves with the first prompt; an invalid override shows in red with the reason.
 - Subagents draw their own card; see Gentle Agents below.
 
 ### Card style
@@ -273,7 +273,7 @@ Pick the conversation-card and shell-chrome style in `/gentle:customize` → **C
  ▎
 ```
 
-- `float` applies to tool, Code and 🌹 cards, agent tool cards, Agent answer and stale cards, the review preflight reminder, the dev-binary notice, and the Agents, Todos and Status panels. The prompt and fullscreen header/footer use their specialized float chrome described above. The regular-mode one-line Status bar is unchanged.
+- `float` applies to tool, Code and Gentle AI cards, agent tool cards, Agent answer and stale cards, the review preflight reminder, the dev-binary notice, and the Agents, Todos and Status panels. The prompt and fullscreen header/footer use their specialized float chrome described above. The regular-mode one-line Status bar is unchanged.
 - A theme without a tool background, or a card narrower than 10 columns, falls back to `neon`. A malformed `card-style.json` reads as `float` and the panel refuses to overwrite it.
 
 ### Card content
@@ -412,7 +412,7 @@ Expanded cards reserve at most one third of the terminal height (up to 16 rows, 
 `/gentle:stats` opens a full-terminal panel over your local usage history, read from the session files Pi already writes. It combines the active home's `sessions` directory with your regular Pi home's (`~/.pi/agent/sessions`, or the custom `PI_CODING_AGENT_DIR` that `gentle-shell` recorded as `GENTLE_SHELL_USER_PI_HOME` before isolating). The same directory reached twice counts once, and a session present in both homes counts once (the copy with more usage records, then the most recent one). Nothing new is stored. Subscription limits stay in `/gentle:usage`.
 
 ```text
-╭─ ✿ Stats ─────────────────────────────────────── [×] ─╮
+╭─ Stats ─────────────────────────────────────── [×] ─╮
 │ [Overview]  Models   Session                 │
 │     May Jun       Jul     Aug       Sep      │
 │ Mon · · · · · · · · · · · · · · · · · · · █  │
@@ -420,7 +420,7 @@ Expanded cards reserve at most one third of the terminal height (up to 16 rows, 
 │     Less · ░ ▒ ▓ █ More                      │
 │ Favorite model  claude-opus-5-5              │
 │ Total tokens    2.8k                         │
-│ ✿ That's ~0.5% of the tokens in Don Quixote. │
+│ That's ~0.5% of the tokens in Don Quixote. │
 ```
 
 - **Overview**: a weekday-by-week heatmap (up to 52 weeks for all time), favorite model, total tokens, sessions, longest session, active days, longest and current streak, most active day, the input/output/cache breakdown, and cost.

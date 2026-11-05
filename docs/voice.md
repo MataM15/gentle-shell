@@ -43,7 +43,7 @@ download, native load or microphone recording has been exercised through it.
 Hold Space in the editor to record; release it to stop. The transcript is
 pasted at the cursor and never sent. Esc cancels while recording or
 transcribing. A one-line footer status shows preparing, recording and
-transcribing; no overlay opens, so the editor keeps the focus. In a wide fullscreen sidebar, a pinned voice line shows preparing, listening, or transcribing while active. It uses session-scoped voice events and hides when idle; listening is published after recording starts. The indicator is tested with simulated sessions, not a real microphone or keypress.
+transcribing; no overlay opens, so the editor keeps the focus. In a wide fullscreen sidebar, a voice line pinned under the rail's tabs, on every tab, shows preparing, listening, or transcribing while active. It uses session-scoped voice events and hides when idle; listening is published after recording starts. The indicator is tested with simulated sessions, not a real microphone or keypress.
 
 | Topic | Behavior |
 |-------|----------|

@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { shellEnabled } from "../lib/shell-bar.ts";
-import { isPhoneWidth, sidebarPart, sidebarState } from "../lib/shell-sidebar.ts";
+import { isPhoneWidth, sidebarPart } from "../lib/shell-sidebar.ts";
 import { invalidateSidebar } from "../lib/shell-sidebar-layout.ts";
 import { parseWellnessConfig, WellnessSession, WELLNESS_LABELS, WELLNESS_LABELS_ES, WELLNESS_NOTICES_ES, type Reminder, type WellnessConfig } from "../lib/shell-wellness.ts";
 import { WellnessStateStore, type WellnessState } from "../lib/wellness-state.ts";
