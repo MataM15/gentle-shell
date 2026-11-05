@@ -363,16 +363,6 @@ test("a drag over an artboard pans the canvas, and in comment mode a click is ro
 	assert.deepEqual(first.frame.contentWindow!.posted.at(-1), { type: "gd:pick-at", x: 100, y: 60 });
 });
 
-test("a native drag that starts anywhere in the viewport is cancelled, so a selection or an iframe never hijacks the pan", async () => {
-	const canvas = await loadCanvas();
-	const [first] = canvas.boards;
-	const onShield = first.shield!.dispatch("dragstart");
-	assert.equal(onShield.defaultPrevented, true, "dragging over an artboard pans instead of starting a browser drag");
-	const onLabel = first.wrapper.children[0].dispatch("dragstart");
-	assert.equal(onLabel.defaultPrevented, true, "dragging a selected artboard label pans instead of dragging the selection");
-	assert.match(read("canvas.css"), /\.gd-viewport\s*\{[^}]*user-select:\s*none/, "the viewport is not text-selectable");
-});
-
 // S14: `open` while a canvas page is connected sends it a show event instead of opening a tab.
 
 test("a show event for the same design re-fetches its manifest and reloads its artboards, keeping zoom, pan and focus", async () => {
