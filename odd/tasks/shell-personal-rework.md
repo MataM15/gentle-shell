@@ -20,7 +20,7 @@ Worktree: `/home/pablo/proyectos/gentle-shell-worktrees/integrate-main-20261105`
 - T2 [S3,S7] Rail header + status bar de-duplication. Route: visual-opus (Sonnet 5.5). Commit: 1dcd2a628.
 - T3 [S4,S7] Breaks card pinned in the wide rail. Route: visual-opus. Commit: 3415bd3e1.
 - T4 [S5,S7] Neon card frames for rail sections + hide panel row. Route: visual-opus. Commit: 0cf0ed8fa.
-- T5 [S6,S7] Narrow layout: top bar, commands label in editor border, Breaks below editor. Route: visual-opus. Commit: pending.
+- T5 [S6,S7] Narrow layout: top bar, commands label in editor border, Breaks below editor. Route: visual-opus. Commit: 83e5177a3 (+ gap-row fix, see below).
 - T6 Full suite on integration vs pristine, DESIGN vs AFTER sheet at wide and portrait, fast-forward `personal/main`, push to `personal`, delete stale local `main`, owner restarts Pi. Route: parent.
 
 ## Log

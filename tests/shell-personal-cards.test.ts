@@ -191,3 +191,26 @@ test("a folded rail returns the native layout and the editor can offer `« panel
 	assert.equal(state.railAvailable?.(), true, "the rail could show again");
 	assert.notEqual((f.root[NODE]() as Node).type, "hstack");
 });
+
+test("the gap between two cards of one section is a full-width painted row and never an empty row inside a card (S5)", (t) => {
+	const found = cardStyle();
+	t.after(() => setCardStyle(found));
+	setCardStyle(CARD_STYLE.NEON);
+	const painted = { ...plain, bg: (_role: string, text: string) => `\x1b[48;5;22m${text}\x1b[49m` };
+	const f = fixture(180);
+	sidebarPart(f.tui, "footer", { render: () => [], invalidate() {} }, {
+		surface: "panel", digest: () => "footer", invalidate() {},
+		// Comfortable density: Status puts its own blank row between sections.
+		render: (width: number) => renderShellStatusSections(status, painted, width, { density: "comfortable", visibility }, undefined).lines,
+	} as never);
+	const dispose = installSidebar(f.tui, painted, () => "auto", () => "top", () => "comfortable");
+	t.after(dispose);
+	const frame = renderLayoutFrame(f.root, 180, 40, () => {}).lines;
+	const text = frame.map(stripAnsi);
+	const bottom = text.findIndex((line) => /╰─+╯/.test(line));
+	const nextTop = text.findIndex((line, y) => y > bottom && /╭─ ▾ INTEGRATIONS/.test(line));
+	assert.ok(bottom > 0 && nextTop === bottom + 2, "exactly one gap row between the cards");
+	assert.match(frame[bottom + 1]!, /\x1b\[48;5;22m {50}/, "the gap row is painted across the whole rail width");
+	const changes = text.findIndex((line) => /╭─ ▾ CHANGES/.test(line));
+	assert.equal(bottom - changes, 2, "the card is header, one body row and the bottom border: no blank row inside");
+});

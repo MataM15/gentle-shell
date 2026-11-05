@@ -152,10 +152,13 @@ function frameSection(lines: string[], inner: number, theme: ShellBarTheme): { l
 		const origin = index;
 		let end = index + 1;
 		while (end < lines.length && !isPanelFrameTop(lines[end]!)) end++;
-		if (blocks.length > 0) out.push("");
+		if (blocks.length > 0) out.push(" ".repeat(inner + PANEL_FRAME_COLUMNS));
 		const start = out.length;
 		out.push(lines[origin]!);
-		for (const row of lines.slice(origin + 1, end)) {
+		// A blank row between two sections of one render belongs to neither card.
+		let bodyEnd = end;
+		while (bodyEnd > origin + 1 && lines[bodyEnd - 1]!.trim() === "") bodyEnd--;
+		for (const row of lines.slice(origin + 1, bodyEnd)) {
 			const fitted = visibleWidth(row) > inner ? clipPanelText(row, inner) : row;
 			out.push(`${edge("│")} ${fitted}${" ".repeat(Math.max(0, inner - visibleWidth(fitted)))} ${edge("│")}`);
 		}
