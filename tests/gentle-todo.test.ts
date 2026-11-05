@@ -83,24 +83,27 @@ function fakeContext(branch: unknown[] = [], hasUI = true) {
 	return { ctx, widgets, widget, widgetComponent };
 }
 
-test("phone width hides only Todo presentation while updates and progress continue", async () => {
+test("folded live work hides only Todo presentation while updates and progress continue", async () => {
 	const {pi,tools,fire,shortcuts}=fakePi(); const emitted: unknown[]=[];
 	Object.assign(pi,{events:{emit:(name:string,value:unknown)=>{if(name===TODO_PROGRESS_EVENT) emitted.push(value);},on:()=>()=>{}}});
 	gentleTodo(pi,{}); const {ctx,widgets}=fakeContext(); await fire("session_start",ctx);
 	await tools.get("todo")!.execute("w",{action:"write",tasks:[{title:"First",status:"in_progress"}]},undefined,undefined,ctx);
 	await fire("tool_execution_end",ctx,{toolName:"todo"});
+	// A narrow fullscreen terminal folds live work into the work line (state.compactWork).
+	let folded=false;
 	const tui={terminal:{columns:61,rows:30},requestRender(){}};
+	sidebarState(tui as unknown as TUI).compactWork=()=>folded;
 	let bottom=widgets.get("gentle-todo")!(tui,plainTheme); const rail=sidebarState(tui as unknown as TUI).parts.get("todo")!;
 	assert.match(bottom.render(61).join("\n"),/First/);
-	tui.terminal.columns=60; assert.deepEqual(bottom.render(60),[]); assert.match(rail.render(60).join("\n"),/First/);
-	assert.equal(bottom.handleMouse?.({type:"click",button:"left",x:1,y:0,width:60,height:1,screenX:1,screenY:0,shift:false,alt:false,ctrl:false}),undefined);
+	folded=true; tui.terminal.columns=40; assert.deepEqual(bottom.render(40),[]); assert.match(rail.render(40).join("\n"),/First/);
+	assert.equal(bottom.handleMouse?.({type:"click",button:"left",x:1,y:0,width:40,height:1,screenX:1,screenY:0,shift:false,alt:false,ctrl:false}),undefined);
 	await tools.get("todo")!.execute("a",{action:"add",title:"Second"},undefined,undefined,ctx); await fire("tool_execution_end",ctx,{toolName:"todo"});
-	bottom=widgets.get("gentle-todo")!(tui,plainTheme); assert.deepEqual(bottom.render(60),[]); assert.ok(emitted.length>=2);
+	bottom=widgets.get("gentle-todo")!(tui,plainTheme); assert.deepEqual(bottom.render(40),[]); assert.ok(emitted.length>=2);
 	const list=await tools.get("todo")!.execute("l",{action:"list"},undefined,undefined,ctx); assert.match(JSON.stringify(list.details),/Second/);
-	await shortcuts.get("ctrl+shift+t")!.handler(ctx); assert.deepEqual(bottom.render(60),[]);
-	tui.terminal.columns=61; assert.match(bottom.render(61).join("\n"),/Expand/);
+	await shortcuts.get("ctrl+shift+t")!.handler(ctx); assert.deepEqual(bottom.render(40),[]);
+	folded=false; tui.terminal.columns=61; assert.match(bottom.render(61).join("\n"),/Expand/);
 	await shortcuts.get("ctrl+shift+t")!.handler(ctx); assert.match(bottom.render(61).join("\n"),/Second/);
-	tui.terminal.columns=60; assert.deepEqual(bottom.render(60),[]);
+	folded=true; tui.terminal.columns=40; assert.deepEqual(bottom.render(40),[]);
 });
 
 test("long Todo widgets stay bounded, scroll, resize and keep their collapse control in mobile and sidebar", async (t) => {
@@ -114,7 +117,7 @@ test("long Todo widgets stay bounded, scroll, resize and keep their collapse con
 		const note = "description ".repeat(150);
 		const result = await tools.get("todo")!.execute("write", { action: "write", tasks: [{ title, note, status: "in_progress" }, { title: "LAST TASK" }] }, undefined, undefined, ctx);
 		await fire("tool_execution_end", ctx, { toolName: "todo" });
-		// Above the 60-column phone breakpoint: the compact widget has its own test below.
+		// Wide enough that live work is not folded; the folded widget has its own test below.
 		const tui = { requestRender() {}, terminal: { rows: 30, columns: 80 } };
 		const theme = { ...plainTheme, bg: (_color: string, text: string) => `\x1b[48;5;22m${text}\x1b[49m` };
 		const bottom = widgets.get("gentle-todo")!(tui, theme);
@@ -852,7 +855,8 @@ test("a list left with only dropped tasks open finishes and clears; a blocked-on
 	assert.match(widget()![2], /⊘ Deploy · waiting for an admin/);
 });
 
-// Phone-width terminals hide only the above-editor Todos widget.
+// Folded live work (narrow fullscreen chrome) hides only the above-editor Todos widget.
+const FOLDED_COLUMNS = 43;
 async function compactFixture(columns: number) {
 	const { pi, tools, fire, shortcuts } = fakePi();
 	gentleTodo(pi, {});
@@ -862,6 +866,8 @@ async function compactFixture(columns: number) {
 	await fire("tool_execution_end", ctx, { toolName: "todo" });
 	const terminal = { columns };
 	const tui = { terminal, requestRender() {} };
+	// Folded live work is a fullscreen narrow-chrome state; model it by the width this fixture drives.
+	sidebarState(tui as never).compactWork = () => terminal.columns <= FOLDED_COLUMNS;
 	const theme = { ...plainTheme, bg: (_color: string, text: string) => `\x1b[48;5;22m${text}\x1b[49m` };
 	const component = widgets.get("gentle-todo")!(tui, theme);
 	const pointer = (type: "move" | "click", y: number, width = terminal.columns) => ({
@@ -871,17 +877,17 @@ async function compactFixture(columns: number) {
 	return { terminal, component, pointer, rows, shortcuts, ctx };
 }
 
-test("neon: phone hides Todos while 61 columns restores the same collapse state", async () => {
-	const f = await compactFixture(60);
-	for (const width of [60, 40]) {
+test("neon: folded live work hides Todos while 44 columns restores the same collapse state", async () => {
+	const f = await compactFixture(FOLDED_COLUMNS);
+	for (const width of [43, 40]) {
 		f.terminal.columns = width;
 		assert.deepEqual(f.rows(), [], `hidden at ${width}`);
 		assert.equal(f.component.handleMouse?.(f.pointer("click", 0)), undefined, "hidden card has no pointer target");
 	}
-	// 61 columns: the original outlined card (box, spacer row), clickable on row 0.
-	f.terminal.columns = 61;
+	// 44 columns: the original outlined card (box, spacer row), clickable on row 0.
+	f.terminal.columns = 44;
 	const wide = f.rows();
-	assert.match(wide[0]!, /^╭─ Todos ▾ Collapse · 0 of 3 ─+ ctrl\+shift\+t collapse ╮$/u);
+	assert.match(wide[0]!, /^╭─ Todos ▾ Collapse · 0 of 3 ─+(?: ctrl\+shift\+t collapse)?─*╮$/u);
 	assert.match(wide[1]!, /^│ ◐ Implementar la vista angosta compacta +│$/u);
 	assert.equal(wide.at(-1), "", "the spacer row is back");
 	assert.equal(wide.length, 6);
@@ -889,38 +895,38 @@ test("neon: phone hides Todos while 61 columns restores the same collapse state"
 	assert.equal(f.component.handleMouse?.(f.pointer("click", 0))?.handled, true);
 	assert.equal(f.rows().length, 4, "collapsed box is 3 rows plus the spacer");
 	// Back down: hidden; the keyboard still changes state without painting.
-	f.terminal.columns = 60;
+	f.terminal.columns = 43;
 	assert.deepEqual(f.rows(), []);
 	await f.shortcuts.get("ctrl+shift+t")!.handler(f.ctx);
 	assert.deepEqual(f.rows(), []);
-	f.terminal.columns = 61;
+	f.terminal.columns = 44;
 	assert.match(f.rows()[0]!, /Todos ▾ Collapse/);
 });
 
-test("float: phone hides Todos and 61 columns retains padded header control", async (t) => {
+test("float: folded live work hides Todos and 44 columns retains padded header control", async (t) => {
 	const found = cardStyle();
 	t.after(() => setCardStyle(found));
-	const f = await compactFixture(60);
+	const f = await compactFixture(FOLDED_COLUMNS);
 	setCardStyle(CARD_STYLE.FLOAT);
-	f.terminal.columns = 61;
+	f.terminal.columns = 44;
 	const wide = f.rows();
-	assert.match(wide[0]!, /^ ▎ +$/, "above 60: padding row first");
+	assert.match(wide[0]!, /^ ▎ +$/, "above 43: padding row first");
 	assert.match(wide[1]!, /^ ▎ Todos ▾ Collapse/);
 	assert.equal(wide.at(-1), "");
-	assert.equal(f.component.handleMouse?.(f.pointer("click", 0)), undefined, "above 60: the padding row is not the control");
-	for (const width of [60, 40, 30]) {
+	assert.equal(f.component.handleMouse?.(f.pointer("click", 0)), undefined, "above 43: the padding row is not the control");
+	for (const width of [43, 40, 30]) {
 		f.terminal.columns = width;
 		assert.deepEqual(f.rows(), [], `hidden at ${width}`);
 		assert.equal(f.component.handleMouse?.(f.pointer("click", 0)), undefined);
 	}
 	// Back above the breakpoint: header returns to row 1.
-	f.terminal.columns = 61;
+	f.terminal.columns = 44;
 	assert.match(f.rows()[1]!, /^ ▎ Todos ▾ Collapse/);
 	assert.equal(f.component.handleMouse?.(f.pointer("click", 0)), undefined);
 	assert.equal(f.component.handleMouse?.(f.pointer("click", 1))?.handled, true);
 });
 
-test("hidden phone widget leaves the registered rail scrollable in both card styles", async (t) => {
+test("hidden folded widget leaves the registered rail scrollable in both card styles", async (t) => {
 	t.after(() => setCardStyle(CARD_STYLE.NEON));
 	for (const style of [CARD_STYLE.NEON, CARD_STYLE.FLOAT]) {
 		setCardStyle(style);
@@ -935,6 +941,7 @@ test("hidden phone widget leaves the registered rail scrollable in both card sty
 		const theme = { ...plainTheme, bg: (_color: string, text: string) => `\x1b[48;5;22m${text}\x1b[49m` };
 		const bottom = widgets.get("gentle-todo")!(tui, theme);
 		const rail = sidebarState(tui as never).parts.get("todo")!;
+		sidebarState(tui as never).compactWork = () => true;
 		assert.deepEqual(bottom.render(40), [], `${style}: bottom is hidden`);
 		const before = rail.render(40).map(stripAnsi);
 		assert.ok(before.length <= 10, `${style}: rail retains its height cap`);
@@ -942,7 +949,7 @@ test("hidden phone widget leaves the registered rail scrollable in both card sty
 		rail.handleMouse?.({ type: "wheel", button: "none", wheelDelta: 10000, x: 5, y: 2, screenX: 5, screenY: 2, width: 40, height: before.length, shift: false, alt: false, ctrl: false });
 		const after = rail.render(40).map(stripAnsi);
 		assert.match(after.join("\n"), /TASK29/, `${style}: every task remains reachable`);
-		assert.match(after[0]!, style === CARD_STYLE.FLOAT ? /^ ▎ +$/u : /^╭─/u, `${style}: rail retains its full card`);
+		assert.match(after[0]!, /^▾ TODOS +0\/30$/u, `${style}: rail keeps its panel section header`);
 	}
 });
 

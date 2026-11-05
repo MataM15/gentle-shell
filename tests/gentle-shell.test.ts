@@ -1095,9 +1095,9 @@ test("installed sidebar clears mobile Panel hover on unhandled native transcript
 	} finally { uninstall(); editor.dispose(); tui.stop(); }
 });
 
-test("installed fullscreen Panel button opens the panel sheet with no live work", async () => {
+test("installed narrow fullscreen offers commands in the editor rule and keeps the panel sheet reachable with no live work", async () => {
 	const previousStyle = cardStyle();
-	const { pi, handlers } = fakePi();
+	const { pi, handlers, commands } = fakePi();
 	installGentleShell(pi, { GENTLE_PI_CONFIG_HOME: "/dev/null" }, {
 		activeProfile: () => undefined, resolveWorktree: () => undefined, rootExists: () => false,
 		gitRunner: () => async () => ({ stdout: "", stderr: "", code: 0 }),
@@ -1113,17 +1113,20 @@ test("installed fullscreen Panel button opens the panel sheet with no live work"
 		const editor = factory(tui, editorTheme, fakeKeybindings);
 		try {
 			const rows = editor.render(80);
-			const x = stripAnsi(rows[0]!).indexOf("[ Panel ]");
-			assert.ok(x >= 0, "the button is visible without agents or todos");
-			editor.handleMouse({ type: "click", button: "left", x, y: 0, screenX: x, screenY: 0, width: 80, height: rows.length, shift: false, alt: false, ctrl: false });
-			assert.ok(ui.overlayView, "the click opens the panel sheet");
+			const rule = stripAnsi(rows[0]!);
+			assert.match(rule, /≡ commands · alt\+k/, "the narrow editor rule offers the commands action");
+			assert.doesNotMatch(rule, /\[ Panel \]/, "the Panel button was replaced by the commands label");
+			// With no agents or todos the work row is empty; the sheet stays reachable by command.
+			void commands.get("gentle:panel")!.handler("", ctx);
+			await new Promise((resolve) => setImmediate(resolve));
+			assert.ok(ui.overlayView, "/gentle:panel opens the panel sheet with no live work");
 			assert.match(stripAnsi(ui.overlayView!.render(80).join("\n")), /PANEL/i);
 			ui.closeOverlay?.();
 			tui.terminal.columns = 160;
 			state.active = true;
 			state.ownsHost = () => true;
 			const wide = editor.render(107);
-			assert.doesNotMatch(stripAnsi(wide[0]!), /\[ Panel \]/, "desktop editor must not offer the mobile Panel control");
+			assert.doesNotMatch(stripAnsi(wide[0]!), /\[ Panel \]|≡ commands/, "desktop editor must not offer the mobile commands label");
 		} finally { editor.dispose(); }
 	} finally {
 		await fire(handlers, "session_shutdown", ctx);
@@ -3682,10 +3685,13 @@ test("T3 live style Cards action refreshes cached TODO and Status in both direct
 	});
 	let frame = { header: "", rail: "", prompt: "" };
 	function paint() {
-		const layout = root[node]() as unknown as { entries: { component: { render(width: number): string[]; [node](): { entries: { component: { render(width: number): string[] } }[] } } }[] };
+		const layout = root[node]() as unknown as { entries: { component: { render(width: number): string[]; [node](): { entries: { component: { render(width: number): string[]; [node]?(): { entries: { grow?: number; component: { render(width: number): string[] } }[] } } }[] } } }[] };
+		// The rail is the scrolling sections; with the header or hide-panel row pinned it sits in a column between them.
+		const railEntry = layout.entries[1].component[node]().entries[1]!.component;
+		const scrolling = railEntry[node]?.().entries.find((entry) => entry.grow === 1)?.component ?? railEntry;
 		frame = {
 			header: layout.entries[0].component.render(160).join("\n"),
-			rail: layout.entries[1].component[node]().entries[1].component.render(50).join("\n"),
+			rail: scrolling.render(50).join("\n"),
 			prompt: editor.render(100).join("\n"),
 		};
 	}
@@ -3697,7 +3703,10 @@ test("T3 live style Cards action refreshes cached TODO and Status in both direct
 	const wide = root[node]() as unknown as { entries: { component: { render(width: number): string[] } }[] };
 	assert.equal(wide.entries.length, 3, "title row, transcript with the rail, status bar");
 	assert.match(stripAnsi(frame.header), /^ ✿ repo  \/repo .*team $/);
-	assert.match(stripAnsi(wide.entries[2]!.component.render(160).join("\n")), /^ main .*ctx .*usage/);
+	// The owner's rail header carries model/ctx/cost once, so the wide status bar keeps only the branch (and mode, usage gauge when known).
+	const statusRow = stripAnsi(wide.entries[2]!.component.render(160).join("\n"));
+	assert.match(statusRow, /^ main/);
+	assert.doesNotMatch(statusRow, /ctx|\$\d/, "the wide status bar no longer repeats ctx or cost");
 	const neon = { ...frame };
 	paint();
 	assert.equal(todoRenders, 1, "unchanged frame uses cached TODO");
@@ -5686,7 +5695,7 @@ test("gentleShell shows the unsupported note for a provider with no built-in or 
 	const opened = commands.get("gentle:usage")!.handler("", ctx);
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	const plain = ui.overlayView!.render(90).map(stripAnsi);
-	assert.match(plain[1], /✿ acme-cloud · no subscription usage for this provider/);
+	assert.match(plain[1], /active acme-cloud · no subscription usage for this provider/);
 	ui.closeOverlay?.();
 	await opened;
 });
@@ -5755,7 +5764,7 @@ test("a registered source's rejecting fetch never crashes the shell or poisons t
 	const opened = commands.get("gentle:usage")!.handler("", ctx);
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	const plain = ui.overlayView!.render(90).map(stripAnsi);
-	assert.match(plain[1], /✿ acme-cloud · fetch failed · r to retry/);
+	assert.match(plain[1], /active acme-cloud · fetch failed · r to retry/);
 	ui.closeOverlay?.();
 	await opened;
 });
@@ -5806,7 +5815,7 @@ test("gentleShell leaves a generic failure note when a registered source resolve
 	const opened = commands.get("gentle:usage")!.handler("", ctx);
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	const plain = ui.overlayView!.render(90).map(stripAnsi);
-	assert.match(plain[1], /✿ acme-cloud · fetch failed · r to retry/);
+	assert.match(plain[1], /active acme-cloud · fetch failed · r to retry/);
 	ui.closeOverlay?.();
 	await opened;
 });
@@ -5922,7 +5931,7 @@ test("gentleShell files header usage under the provider that served the response
 	const opened = commands.get("gentle:usage")!.handler("", ctx);
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	const plain = ui.overlayView!.render(90).map(stripAnsi).join("\n");
-	assert.match(plain, /✿ claude-bridge ·/);
+	assert.match(plain, /active claude-bridge ·/);
 	assert.doesNotMatch(plain, /no subscription usage for this provider/);
 	ui.closeOverlay?.();
 	await opened;
@@ -5971,7 +5980,7 @@ test("gentleShell registers /gentle:usage and opens the subscriptions overlay", 
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	const plain = ui.overlayView!.render(90).map(stripAnsi);
 	assert.match(plain[0], /Subscriptions/);
-	assert.match(plain[1], /✿ openai-codex · pro/);
+	assert.match(plain[1], /active openai-codex · pro/);
 	ui.closeOverlay?.();
 	await opened;
 });
@@ -6016,7 +6025,7 @@ test("gentleShell draws the review preflight message as a Gentle card", (t) => {
 		assert.doesNotMatch(renderer(message, { expanded }, sentinelTheme).render(80).join("\n"), /\x1b\[44m/);
 	}
 	const expanded = renderer(message, { expanded: true }, plainTheme).render(80).map(stripAnsi);
-	assert.match(expanded[0], /^╭─ ✿ Gentle AI · review preflight ─+ .*collapse ╮$/);
+	assert.match(expanded[0], /^╭─ {3}Gentle AI · review preflight ─+ .*collapse ╮$/);
 	assert.match(expanded[1], /^│ Receipt-driven development is enabled\. +│$/);
 	assert.ok(expanded.some((line) => line.includes("gentle_review")));
 	const collapsed = renderer({ ...message, content: [{ type: "text", text: message.content }] }, { expanded: false }, plainTheme).render(80).map(stripAnsi);
@@ -6039,7 +6048,7 @@ test("the review preflight card paints the rose INFO frame (border) and title (a
 	const message = { customType: "gentle-pi.review-preflight", content: "Receipt-driven development is enabled." };
 	const lines = renderer(message, { expanded: true }, taggedTheme).render(60);
 	assert.match(lines[0]!, /^<border>╭<\/border>/);
-	assert.match(lines[0]!, /<accent>✿ Gentle AI<\/accent>/);
+	assert.match(lines[0]!, /<accent>  Gentle AI<\/accent>/);
 });
 
 test("gentleShell keeps a dev-binary override visible above the editor for the whole session", async (t) => {
@@ -6790,13 +6799,13 @@ test("a valid response-header snapshot clears a prior refresh failure", async (_
 	await settle();
 	const opened = commands.get("gentle:usage")!.handler("", ctx);
 	await settle();
-	assert.ok(openPanelLines(ui).some((line) => line.includes("✿ openai-codex · fetch failed")), "the failed refresh is visible first");
+	assert.ok(openPanelLines(ui).some((line) => line.includes("active openai-codex · fetch failed")), "the failed refresh is visible first");
 
 	for (const handler of handlers.get("after_provider_response") ?? []) {
 		handler({ status: 200, headers: { "x-codex-primary-used-percent": "10", "x-codex-primary-window-minutes": "300" } }, ctx);
 	}
 	const lines = openPanelLines(ui);
-	assert.ok(lines.some((line) => line.includes("✿ openai-codex · updated just now")), "the header snapshot is recorded");
+	assert.ok(lines.some((line) => line.includes("active openai-codex · updated just now")), "the header snapshot is recorded");
 	assert.ok(lines.some((line) => line.includes("10%")), "the header snapshot's window renders");
 	assert.equal(lines.some((line) => line.includes("fetch failed")), false, "a valid header snapshot clears the failure");
 	ui.closeOverlay?.();
@@ -6852,12 +6861,12 @@ test("an older overlapping refresh cannot mark a provider failed after a newer o
 	await settle();
 	const opened = commands.get("gentle:usage")!.handler("", ctx);
 	await settle();
-	assert.ok(openPanelLines(ui).some((line) => line.includes("✿ openai-codex · pro")), "the newer refresh's snapshot is showing");
+	assert.ok(openPanelLines(ui).some((line) => line.includes("active openai-codex · pro")), "the newer refresh's snapshot is showing");
 
 	releaseStaleFailure();
 	await settle();
 	const lines = openPanelLines(ui);
-	assert.ok(lines.some((line) => line.includes("✿ openai-codex")), "the newer refresh's snapshot stands");
+	assert.ok(lines.some((line) => line.includes("active openai-codex")), "the newer refresh's snapshot stands");
 	assert.equal(lines.some((line) => line.includes("fetch failed")), false, "the older refresh's late failure must not mark the provider failed");
 	ui.closeOverlay?.();
 	await opened;
@@ -7136,7 +7145,7 @@ test("mobile folds live work into one row above the editor that opens /gentle:pa
 		(ui.overlayView as unknown as { handleInput(data: string): void }).handleInput("\x1b");
 		editor.dispose();
 		const header = state.parts.get("header")!;
-		assert.match(stripAnsi(header.render(56).join("\n")), /^ ✿ repo .*· /, "the mobile title row carries the model");
+		assert.match(stripAnsi(header.render(56).join("\n")), /^ ✿ repo[^\n]*\n gpt-5\.5 · medium +ctx /, "the mobile top bar carries the model and context");
 		assert.match(stripAnsi(state.parts.get("statusbar")!.render(56).join("\n")), /^ main/, "the mobile status bar leads with the branch");
 		void commands.get("gentle:panel")!.handler("", ctx);
 		await new Promise((resolve) => setImmediate(resolve));
