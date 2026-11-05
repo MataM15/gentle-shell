@@ -29,7 +29,7 @@ Worktree: `/home/pablo/proyectos/gentle-shell-worktrees/integrate-main-20261105`
 - T4 [S5,S7] Neon card frames for rail sections + hide panel row. Route: visual-opus. Commit: 0cf0ed8fa.
 - T5 [S6,S7] Narrow layout: top bar, commands label in editor border, Breaks below editor. Route: visual-opus. Commit: 83e5177a3, 7d9c6180b (gap-row fix).
 - T6 Full suite on integration vs pristine, DESIGN vs AFTER sheet at wide and portrait, fast-forward `personal/main`, push to `personal`, delete stale local `main`, owner restarts Pi. Route: parent.
-- T7 [S13,S9,S12,S7] Rail tabs back with upstream sections distributed into them; "Otras sesiones" in Sessions. Route: visual-opus. Commit: pending.
+- T7 [S13,S9,S12,S7] Rail tabs back with upstream sections distributed into them; "Otras sesiones" in Sessions. Route: visual-opus. Commit: c868372ff.
 - T8 [S10,S7] AGENTS frame + stray block; voice line in the wide rail. Route: visual-opus. Commit: pending.
 - T9 [S11] Dead code, stale docs, unused-import check. Route: visual-opus. Commit: pending.
 

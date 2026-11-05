@@ -18,16 +18,21 @@ export const PANEL_FRAME_COLUMNS = 4;
 // a render runs inside `withPanelFrame` their header becomes the card's top
 // border and their rows lose the indent the frame now provides.
 const FRAME_ROLE = "accent";
-let framed = false;
+// Pi loads every extension with its own copy of lib/, so the switch lives on
+// globalThis under a Symbol.for key: the shell turns it on, and the Agents or
+// Todos extension (another copy of this module) reads it.
+const FRAME_STATE = Symbol.for("gentle-pi.shell-panel.frame");
+const frameState = (): { depth: number } => ((globalThis as Record<symbol, { depth: number }>)[FRAME_STATE] ??= { depth: 0 });
+const isFramed = () => frameState().depth > 0;
 
 /** Runs `render` with section headers drawn as rounded top borders and rows unindented. */
 export function withPanelFrame<T>(render: () => T): T {
-	const previous = framed;
-	framed = true;
+	const state = frameState();
+	state.depth++;
 	try {
 		return render();
 	} finally {
-		framed = previous;
+		state.depth--;
 	}
 }
 
@@ -95,7 +100,7 @@ function renderFramedHeader(theme: PanelTheme, width: number, header: PanelHeade
 }
 
 export function renderPanelHeader(theme: PanelTheme, width: number, header: PanelHeader): string {
-	if (framed) return renderFramedHeader(theme, width, header);
+	if (isFramed()) return renderFramedHeader(theme, width, header);
 	const glyph = paintHoverable(theme, header.open ? "▾" : "▸", header.hovered ?? false, "muted");
 	const name = header.title.toUpperCase();
 	const title = theme.fg("text", theme.bold ? theme.bold(name) : name);
@@ -106,7 +111,7 @@ export function renderPanelHeader(theme: PanelTheme, width: number, header: Pane
 /** One section row, indented under the header, with an optional right column. */
 export function renderPanelRow(width: number, left: string, right = "", indent = PANEL_ROW_INDENT): string {
 	// Inside a card the frame is the indent; a nested row keeps only its extra columns.
-	const columns = framed ? Math.max(0, indent - PANEL_ROW_INDENT) : indent;
+	const columns = isFramed() ? Math.max(0, indent - PANEL_ROW_INDENT) : indent;
 	return fitPanelLine(`${" ".repeat(columns)}${left}`, right, width);
 }
 

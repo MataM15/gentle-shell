@@ -214,3 +214,45 @@ test("the gap between two cards of one section is a full-width painted row and n
 	const changes = text.findIndex((line) => /╭─ ▾ CHANGES/.test(line));
 	assert.equal(bottom - changes, 2, "the card is header, one body row and the bottom border: no blank row inside");
 });
+
+// T8 (S10): the AGENTS section is its own extension, and Pi loads each extension with its own
+// copy of lib/, so the frame switch must not live in a module variable.
+test("a section rendered by another copy of shell-panel is still drawn as a neon card (S10)", async (t) => {
+	const found = cardStyle();
+	t.after(() => setCardStyle(found));
+	const other = await import(new URL("../lib/shell-panel.ts?agents-copy", import.meta.url).href) as typeof import("../lib/shell-panel.ts");
+	assert.notEqual(other.renderPanelHeader, renderPanelHeader, "a distinct module instance");
+	assert.match(withPanelFrame(() => other.renderPanelHeader(plain, 43, { title: "Agents", count: "idle", open: true })), /^╭─ ▾ AGENTS ─+ idle ─╮$/);
+	assert.match(other.withPanelFrame(() => renderPanelHeader(plain, 43, { title: "Agents", count: "idle", open: true })), /^╭─ ▾ AGENTS /);
+	const columns = 180;
+	setCardStyle(CARD_STYLE.NEON);
+	const f = fixture(columns);
+	sidebarPart(f.tui, "agents", { render: () => [], invalidate() {} }, {
+		surface: "panel", digest: () => "agents", invalidate() {},
+		render: (width: number) => [other.renderPanelHeader(plain, width, { title: "Agents", count: "idle", open: true }), other.renderPanelRow(width, "none running · /gentle:agents history")],
+	} as never);
+	const dispose = installSidebar(f.tui, plain, () => "auto", () => "top", () => "minimal");
+	t.after(dispose);
+	const lines = railOf(screen(f, columns), columns);
+	const top = lines.findIndex((line) => /^ ?╭─ ▾ AGENTS/.test(line));
+	assert.ok(top >= 0, lines.join("\n"));
+	assert.match(lines[top + 1]!, /^ ?│ none running · \/gentle:agents history +│$/);
+	assert.match(lines[top + 2]!, /^ ?╰─+╯$/);
+	for (const line of lines) assert.ok(visibleWidth(line) <= 50, line);
+});
+
+test("a panel section that ignores the frame is drawn flat at the full rail width, never short beside a tinted block (S10)", (t) => {
+	const found = cardStyle();
+	t.after(() => setCardStyle(found));
+	setCardStyle(CARD_STYLE.NEON);
+	const f = fixture(180);
+	const widths: number[] = [];
+	sidebarPart(f.tui, "agents", { render: () => [], invalidate() {} }, {
+		surface: "panel", digest: () => "flat", invalidate() {},
+		render: (width: number) => { widths.push(width); return ["▾ AGENTS".padEnd(width), "  none running"]; },
+	} as never);
+	t.after(installSidebar(f.tui, plain, () => "auto", () => "top", () => "minimal"));
+	const lines = railOf(screen(f, 180), 180);
+	assert.ok(lines.some((line) => line.includes("▾ AGENTS")));
+	assert.deepEqual(widths.slice(-2), [44, 48], "rendered framed (four columns short), then again at the card width");
+});

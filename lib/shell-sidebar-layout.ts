@@ -441,6 +441,14 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 					while (rendered.length && rendered[rendered.length - 1]?.trim() === "") rendered.pop();
 					if (!framed) return { lines: rendered, blocks: [], sectionHeight: rendered.length };
 					const drawn = frameSection(rendered, contentWidth - RAIL_PADDING * 2 - PANEL_FRAME_COLUMNS, theme);
+					if (drawn.blocks.length === 0) {
+						// A section that never drew a framed header (its own render path ignored the
+						// frame) was laid out four columns short; draw it flat at the full rail width
+						// rather than leave a narrow tinted block beside it.
+						const flat = [...(component.render(contentWidth - RAIL_PADDING * 2) ?? [])];
+						while (flat.length && flat[flat.length - 1]?.trim() === "") flat.pop();
+						return { lines: flat, blocks: [], sectionHeight: flat.length };
+					}
 					return { lines: drawn.lines, blocks: drawn.blocks, sectionHeight: rendered.length };
 				})();
 				sectionCache.set(key, { component, digest, revision: cache.revision, contentWidth, cardStyle: style, theme, themeSignature: signature, ...entry });
@@ -496,6 +504,13 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 				pinnedRows.push(markerStart < markerEnd
 					? theme.fg("dim", rule.slice(0, markerStart)) + theme.fg("accent", rule.slice(markerStart, markerEnd)) + theme.fg("dim", rule.slice(markerEnd))
 					: theme.fg("dim", rule));
+			}
+			// The voice line (preparing, listening, transcribing) is the last pinned row
+			// under the tabs, so it shows on every tab and is gone when idle.
+			const voicePart = state.parts.get("voice");
+			if (voicePart) {
+				const voice = [...(voicePart.render(RAIL_WIDTH - RAIL_PADDING * 2) ?? [])].filter((line) => line.trim() !== "");
+				pinnedRows.push(...voice.map((line) => " ".repeat(RAIL_PADDING) + line));
 			}
 			const fitPinned = (row: string) => paintSurfaceRow(visibleWidth(row) < RAIL_WIDTH ? row + " ".repeat(RAIL_WIDTH - visibleWidth(row)) : row, surface);
 			if (sections.length && branding.length) {

@@ -21,6 +21,7 @@ import { CHANGE_STATUS, DIFF_MAX_BYTES, DIFF_MAX_LINES, DIFF_TOO_LARGE } from ".
 import { renderLayoutFrame } from "@earendil-works/pi-tui/dist/layout.js";
 import { sidebarPart, sidebarState, type SidebarRail } from "../lib/shell-sidebar.ts";
 import { SESSION_REFRESH_EVENT, SESSION_SNAPSHOT_EVENT } from "../lib/shell-session-state.ts";
+import { createVoiceStatePublisher, VOICE_STATE_EVENT, VOICE_STATE_SCHEMA } from "../lib/voice-status-event.ts";
 import { installSidebar } from "../lib/shell-sidebar-layout.ts";
 import { renderTodoCard } from "../lib/shell-todo.ts";
 import type { ShellBarTheme } from "../lib/shell-bar.ts";
@@ -7667,7 +7668,7 @@ function tabbedRail(handlers: Map<string, Array<(event: unknown, ctx: ExtensionC
 		assert.deepEqual(pinned.handleMouse!({ type: "click", button: "left", x: x + 1, y, screenX: x + 1, screenY: y, width: 50, height: rows.length, shift: false, alt: false, ctrl: false } as TuiMouseEvent), { handled: true, render: true });
 		return screen().join("\n");
 	};
-	return { tui, screen, select, dispose: () => component.dispose() };
+	return { tui, screen, select, pinned: () => column().entries[0]!.component, dispose: () => component.dispose() };
 }
 
 test("Sessions selection requests the snapshot, the extension produces it and Otras sesiones paints only validated data", async (t) => {
@@ -7734,5 +7735,27 @@ test("the Resources tab carries the Limits card, one block per provider, a claud
 		assert.match(text, /updated .*· alt\+u/);
 		// The header gauge still reads the bridge snapshot of the model that answers.
 		assert.match(renderFooter(ui), /week .*4%/);
+	} finally { rail.dispose(); await fire(handlers, "session_shutdown", ctx); }
+});
+
+test("scoped voice events paint the pinned voice line of the wide rail and clear on idle and replacement (S10)", async (t) => {
+	const home = scopedDoubleEscCancelConfigHome(t);
+	const { pi, handlers } = fakePi();
+	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home, GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, { activeProfile: () => "team" });
+	const { ctx, ui } = fakeContext();
+	await fire(handlers, "session_start", ctx);
+	const rail = tabbedRail(handlers, ctx, ui);
+	const voice = createVoiceStatePublisher(pi, ctx);
+	const pinned = () => { rail.screen(); return rail.pinned().render(50).map(stripAnsi).join("\n"); };
+	const badge = /● (Preparando|Escuchando|Transcribiendo) /;
+	try {
+		assert.doesNotMatch(pinned(), badge);
+		voice.publish("preparing"); assert.match(pinned(), /● Preparando /);
+		voice.publish("listening"); assert.match(pinned(), /● Escuchando /);
+		pi.events.emit(VOICE_STATE_EVENT, { schema: VOICE_STATE_SCHEMA, sessionId: "foreign", state: "transcribing" });
+		assert.match(pinned(), /● Escuchando /, "another session's event is ignored");
+		rail.select("Resources"); assert.match(pinned(), /● Escuchando /, "the line follows every tab");
+		voice.publish("transcribing"); assert.match(pinned(), /● Transcribiendo /);
+		voice.publish("idle"); assert.doesNotMatch(pinned(), badge);
 	} finally { rail.dispose(); await fire(handlers, "session_shutdown", ctx); }
 });

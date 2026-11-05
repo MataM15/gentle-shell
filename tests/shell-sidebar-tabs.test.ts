@@ -24,7 +24,7 @@ const visibility = { changes: true, rdd: true, agents: true, todo: true, usageCo
 type Node = { type: string; entries: Array<{ component: Component & { [NODE]?: () => Node } }> };
 const click = (x: number, y: number, width = 50, height = 12): TuiMouseEvent => ({ type: "click", button: "left", x, y, screenX: x, screenY: y, width, height, shift: false, alt: false, ctrl: false });
 
-function install(columns: number, onTabSelect?: (tab: string) => void) {
+function install(columns: number, onTabSelect?: (tab: string) => void, voice?: () => string[]) {
 	setCardStyle(CARD_STYLE.NEON);
 	const original = () => ({ type: "vstack", entries: [] });
 	const root = { render: () => ["transcript"], invalidate() {}, [NODE]: original };
@@ -38,6 +38,7 @@ function install(columns: number, onTabSelect?: (tab: string) => void) {
 	const card = (title: string, count: string, ...rows: string[]) => (width: number) => [renderPanelHeader(plain, width, { title, count, open: true }), ...rows.map((row) => renderPanelRow(width, row))];
 	sidebarRailHeader(tui, { render: () => ["claude-fable-5-1 · low", "━".repeat(50)], invalidate() {} });
 	sidebarPart(tui, "wellness", { render: () => ["Breaks"], invalidate() {} });
+	if (voice) sidebarPart(tui, "voice", { render: () => [], invalidate() {} }, { digest: () => voice().join("|"), render: voice, invalidate() {} });
 	part("todo", card("Todos", "2/6", "✓ 2 done"));
 	part("jobs", card("Jobs", "1 running", "● job-1 pnpm test"));
 	part("agents", card("Agents", "idle", "none running"));
@@ -139,4 +140,24 @@ test("below 140 columns there is no rail and so no tab row (S6)", (t) => {
 	const f = install(56);
 	t.after(f.dispose);
 	assert.doesNotMatch(f.screen().join("\n"), /Activity|Resources/);
+});
+
+test("the voice line is pinned under the tabs while recording and gone when idle, on every tab (S10)", (t) => {
+	const found = cardStyle();
+	t.after(() => setCardStyle(found));
+	let state: string[] = [];
+	const f = install(180, undefined, () => state);
+	t.after(f.dispose);
+	const pinnedText = () => { f.screen(); return f.pinned().render(50).map(stripAnsi); };
+	assert.ok(!pinnedText().some((row) => row.includes("listening")));
+	state = [" ● listening "];
+	let rows = pinnedText();
+	const tabRow = rows.findIndex((row) => row.includes("Resources"));
+	assert.match(rows[tabRow + 1]!, /^─+$/);
+	assert.match(rows[tabRow + 2]!, /^ +● listening +$/, "the line sits right under the tab rule");
+	assert.ok(rows.every((row) => visibleWidth(row) === 50));
+	f.pinned().handleMouse!(click(26, tabRow));
+	assert.ok(pinnedText().some((row) => row.includes("listening")), "still shown on the Resources tab");
+	state = [];
+	assert.ok(!pinnedText().some((row) => row.includes("listening")), "idle hides it");
 });
