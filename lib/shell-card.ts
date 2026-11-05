@@ -80,7 +80,7 @@ export interface CardRenderOptions {
 	compact?: boolean;
 }
 
-export const CARD_GLYPH = "✿";
+export const CARD_GLYPH = " ";
 // Frame and title paint with the same role for every tone except INFO, whose
 // rounded frame stays in the theme's plain border role while its title
 // carries the accent role — the rose look every informational card (sidebar,
@@ -140,12 +140,17 @@ function rule(length: number): string {
 	return chrome.rule.repeat(Math.max(0, length));
 }
 
+const RAIL_TITLE_ROLE = "borderAccent";
+
 // The glyph and title in the title role, then any pre-styled suffix. The
 // width counts the unstyled title, so a theme's own escapes never shift it.
 function titleHead(card: Card, theme: CardTheme): { styled: string; width: number } {
-	const head = `${card.glyph ?? CARD_GLYPH} ${card.title}`;
+	const glyph = card.glyph ?? CARD_GLYPH;
+	const plain = card.rail ? card.title : `${glyph} ${card.title}`;
+	const role = card.rail && card.tone === CARD_TONE.INFO ? RAIL_TITLE_ROLE : TITLE_ROLE[card.tone];
+	const title = theme.fg(role, card.rail && theme.bold ? theme.bold(plain) : plain);
 	const suffix = card.titleSuffix ? ` ${card.titleSuffix}` : "";
-	return { styled: theme.fg(TITLE_ROLE[card.tone], head) + suffix, width: visibleWidth(head) + visibleWidth(suffix) };
+	return { styled: title + suffix, width: visibleWidth(plain) + visibleWidth(suffix) };
 }
 
 function titleText(card: Card, theme: CardTheme): { styled: string; width: number } {

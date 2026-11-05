@@ -356,10 +356,20 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 					pinnedRows.push(...rendered);
 				}
 			}
+			// Breaks: the yellow card pinned under the header, one gap row above it.
+			const breaksPart = state.parts.get("wellness");
+			if (breaksPart) {
+				const breaks = [...(breaksPart.render(RAIL_WIDTH - RAIL_PADDING * 2) ?? [])];
+				if (breaks.some((line) => line.trim() !== "")) {
+					if (pinnedRows.length > 0) pinnedRows.push("");
+					pinnedTopHits.push({ key: "wellness", component: breaksPart, startY: pinnedRows.length, height: breaks.length, width: RAIL_WIDTH - RAIL_PADDING * 2, xOffset: RAIL_PADDING });
+					pinnedRows.push(...breaks.map((line) => " ".repeat(RAIL_PADDING) + line + " ".repeat(RAIL_PADDING)));
+				}
+			}
 			const fitPinned = (row: string) => paintSurfaceRow(visibleWidth(row) < RAIL_WIDTH ? row + " ".repeat(RAIL_WIDTH - visibleWidth(row)) : row, surface);
 			if (sections.length && branding.length) {
 				railLines.push(...branding.map((line) => " ".repeat(RAIL_PADDING) + line + " ".repeat(RAIL_PADDING)));
-			} else if (sections.length && headerActive && (headerPlacement() === "top" || (density() === "comfortable" && style === CARD_STYLE.NEON))) {
+			} else if (sections.length && (pinnedRows.length > 0 || (headerActive && (headerPlacement() === "top" || (density() === "comfortable" && style === CARD_STYLE.NEON))))) {
 				// Pad the first section beneath the header without breaking its surface.
 				// Keep neon's existing comfortable gap for below-input headers too.
 				railLines.push((sections[0].component as SidebarRail).surface === "panel" ? paintSurfaceRow(" ".repeat(contentWidth), surface) : "");
