@@ -36,7 +36,7 @@ Worktree: `/home/pablo/proyectos/gentle-shell-worktrees/integrate-main-20261105`
 - T8 [S10,S7] AGENTS frame + stray block; voice line in the wide rail. Route: visual-opus. Commit: 86b8e190a (AGENTS frame, voice line); S16 petals: bc6846e49, rose art: see the next commit.
 - T9 [S11] Dead code, stale docs, unused-import check. Route: visual-opus. Commit: 11f2d0a0c.
 - T10 [S17,S12,S16,S7] Merge origin/main 895f353ca applying the S17 table; transparent rail; titles in the owner's style. Route: visual-opus. Commit: 7b2d7c54d (merge with the conflict resolution, the card titles, Limits/Otras sesiones as framed sections, profile in the rail header); sheet C:\Users\pablo\Pictures\pagub-review\shell-rework\round2.png.
-- T11 [S18,S12,S16,S7] Restore the folded-rail band and editor labels. Route: visual-opus. Commit: pending.
+- T11 [S18,S12,S16,S7] Restore the folded-rail band and editor labels. Route: visual-opus. Commit: b7e25bc42 (framed editor labels, Sesión + Breaks band); sheet C:\Users\pablo\Pictures\pagub-review\shell-rework\folded-after.png. Not restored on purpose: the dev-binary notice stays above the editor while folded (the rail Status no longer carries it).
 
 ## Log
 
