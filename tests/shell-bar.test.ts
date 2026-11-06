@@ -1077,3 +1077,19 @@ test("fullscreen bars outside the rail never list the integrations: they live on
 	const float = renderShellBelowInputFloat(data, painted as never, 120, "alt+u", presentation)!;
 	assert.doesNotMatch(float.rows.map(stripAnsi).join("\n"), /gentle-pi · ready|MCP connected/, "no integrations under the input");
 });
+
+// shell-personal-rework S20: the dev-binary override is one `Build` line in the warning color.
+test("renderDevBuildLine keeps the whole line and shortens its value to the room it gets", async () => {
+	const { renderDevBuildLine } = await import("../lib/shell-bar.ts");
+	const { stripAnsi } = await import("../lib/terminal-theme.ts");
+	const painted = (room: number) => {
+		const roles: string[] = [];
+		const line = renderDevBuildLine({ fg: (role, text) => { roles.push(role); return text; } }, room, "6e53bfc6305a3949");
+		return { line, roles };
+	};
+	assert.equal(painted(60).line, "Build  gentle-ai dev · 6e53bfc6305a3949 · field-test");
+	assert.equal(painted(46).line, "Build  dev · 6e53bfc6305a3949 · field-test");
+	assert.equal(painted(30).line, "Build  dev · 6e53bfc6305a3949");
+	assert.equal(stripAnsi(painted(20).line), "Build  dev · 6e53bf…", "last resort clips with an ellipsis");
+	assert.deepEqual(painted(60).roles, ["warning"], "theme role only");
+});

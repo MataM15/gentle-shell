@@ -3745,9 +3745,11 @@ test("T3 live style Cards action refreshes cached TODO and Status in both direct
 		// Status lives on its own rail tab (S13): while Activity is selected it is neither rendered nor digested.
 		assert.equal(statusRenders, beforeStatus, "a Status section on another tab is not rendered");
 		assert.notEqual(frame.rail, before.rail, "rail changes immediately");
-		// The wide chrome's title row and panel editor are not cards: no card style changes them.
+		// The wide chrome's title row is not a card: no card style changes it. The editor follows the style (S21):
+		// neon draws the owner's framed box, float keeps upstream's panel rule.
 		assert.equal(frame.header, before.header, "the title row is the same in every card style");
-		assert.equal(frame.prompt, before.prompt, "the panel editor is the same in every card style");
+		assert.notEqual(frame.prompt, before.prompt, "the editor changes with the card style");
+		assert.match(frame.prompt, style === CARD_STYLE.NEON ? /^╭─/ : /^─ +waiting for input/, `${style}: framed box for neon, panel rule for float`);
 		assert.match(ui.notices.at(-1)!, /Conversation cards and shell chrome redraw now/);
 		assert.match(ui.overlayView!.render(90).join("\n"), /prompt|shell chrome/i);
 		const rendered = { ...frame };
@@ -7320,15 +7322,22 @@ test("the installed editor draws the panel frame in the wide and mobile IDE chro
 		state.active = true;
 		state.ownsHost = () => true;
 		const rows = editor.render(80).map(stripAnsi);
-		assert.match(rows[0]!, /^─   waiting for input ─+─$/, "a titled rule replaces the frame");
-		assert.match(rows[1]!, /^› /, "the input sits behind the prompt");
-		assert.doesNotMatch(rows.join("\n"), /[╭╮╰╯│]/u);
+		assert.match(rows[0]!, /^╭─[ ─]*╮$/, "neon with the rail open draws the owner's framed box (S21)");
+		assert.match(rows[1]!, /^│.*│$/, "the input sits inside the frame");
+		assert.match(rows[rows.length - 1]!, /^╰─+╯$/);
 		for (const row of rows) assert.equal(visibleWidth(row), 80);
+		// Float keeps upstream's titled rule with the `›` prompt.
+		setCardStyle(CARD_STYLE.FLOAT);
+		const floated = editor.render(80).map(stripAnsi);
+		setCardStyle(CARD_STYLE.NEON);
+		assert.match(floated[0]!, /^─   waiting for input ─+─$/, "a titled rule replaces the frame in float");
+		assert.match(floated[1]!, /^› /);
+		assert.doesNotMatch(floated.join("\n"), /[╭╮╰╯│]/u);
 		// An agent question sits right above the rule, inside the editor, so no widget can land between.
 		const agents = sidebarPart(fakeTui as unknown as TUI, "agents", { render: (_width: number) => [], invalidate() {}, dispose() {} }, { render: () => [], alert: () => [" ? explore asked: Which file?"], invalidate() {} });
 		const asked = editor.render(80).map(stripAnsi);
 		assert.match(asked[0]!, /explore asked: Which file\?/);
-		assert.match(asked[1]!, /^─   waiting for input/);
+		assert.match(asked[1]!, /^╭─/, "the framed box opens right under the alert row");
 		assert.deepEqual(editor.handleMouse?.({ type: "move", button: "none", x: 2, y: 0, screenX: 2, screenY: 0, width: 80, height: asked.length, shift: false, alt: false, ctrl: false }), { handled: true, render: true }, "the shell owns the alert row's pointer events; they never reach Pi's editor");
 		agents.dispose();
 		state.active = false;
@@ -8312,15 +8321,15 @@ test("on a transparent rail hovering a section card's title paints it in the hov
 // border, and a Sesión + Breaks band below it, with no bar repeating what the band shows.
 const FOLDED_BAND_KEY = "gentle-shell-folded-band";
 const FOLDED_AT = Date.parse("2026-11-05T19:46:00Z");
-async function foldedShell(t: TestContext, columns: number, rows: number, theme: typeof plainTheme = plainTheme) {
+async function foldedShell(t: TestContext, columns: number, rows: number, theme: typeof plainTheme = plainTheme, extra: { folded?: boolean; devBinary?: () => { state: "active"; path: string; sha256: string } | undefined; cardStyle?: CardStyle } = {}) {
 	const home = scopedDoubleEscCancelConfigHome(t);
 	const previous = cardStyle();
 	t.after(() => setCardStyle(previous));
-	writeRailCollapsed(true, { gentlePiConfigHome: home });
-	writeCardStyle(CARD_STYLE.NEON, { gentlePiConfigHome: home });
+	writeRailCollapsed(extra.folded ?? true, { gentlePiConfigHome: home });
+	writeCardStyle(extra.cardStyle ?? CARD_STYLE.NEON, { gentlePiConfigHome: home });
 	writeVisualSettings({ ...DEFAULT_VISUAL_SETTINGS, headerPlacement: "top", statusPlacement: "right", density: "minimal" }, { gentlePiConfigHome: home });
-	const { pi, handlers } = fakePi();
-	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home, GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, { activeProfile: () => "team" });
+	const { pi, handlers, commands } = fakePi();
+	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home, GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, { activeProfile: () => "team", devBinary: extra.devBinary ?? (() => undefined) });
 	const { ctx, ui, overlayReady } = fakeContext({ theme });
 	await fire(handlers, "session_start", ctx);
 	const node = Symbol.for("@earendil-works/pi-tui/layout-node");
@@ -8351,7 +8360,7 @@ async function foldedShell(t: TestContext, columns: number, rows: number, theme:
 	const editor = (ui.editorFactory as (tui: unknown, theme: unknown, keybindings: unknown) => GentlePromptEditor)(tui, editorTheme, fakeKeybindings);
 	t.after(() => editor.dispose());
 	const click = (x: number, y: number, width: number, height = 6): TuiMouseEvent => ({ type: "click", button: "left", x, y, screenX: x, screenY: y, width, height, shift: false, alt: false, ctrl: false } as TuiMouseEvent);
-	return { home, tui: tui as unknown as TUI, ui, root, footer, standaloneBreaks, widget, editor, resets, click, overlayReady, handlers, ctx, session };
+	return { home, tui: tui as unknown as TUI, ui, root, footer, standaloneBreaks, widget, editor, resets, click, overlayReady, handlers, commands, ctx, session };
 }
 
 for (const [columns, rows] of [[180, 50], [140, 40]] as const) {
@@ -8409,3 +8418,96 @@ for (const [columns, rows] of [[180, 50], [140, 40]] as const) {
 		assert.deepEqual(f.widget(FOLDED_BAND_KEY).render(columns), [], "the band paints only while the rail is folded");
 	});
 }
+
+// T13 (odd/tasks/shell-personal-rework.md S20, S21, S12, S7): the dev-binary override is one `Build` line in the
+// rail (638eacaf4, 48e315f1d, f57d77722), never a card above the editor, and the wide editor with the rail open
+// is the owner's framed box again.
+const DEV_BINARY_KEY = "gentle-shell-dev-binary";
+const DEV_SHA = "6e53bfc6305a3949deadbeef";
+const activeOverride = () => ({ state: "active" as const, path: "/Users/me/go/bin/gentle-ai", sha256: DEV_SHA });
+const devCardRows = (f: Awaited<ReturnType<typeof foldedShell>>, columns: number) => {
+	const factory = f.ui.widgets.get(DEV_BINARY_KEY) as ((tui: unknown, theme: unknown) => { render(width: number): string[] }) | undefined;
+	return factory ? factory(f.tui, plainTheme).render(columns).map(stripAnsi).filter((row) => row.trim() !== "") : [];
+};
+const railColumn = (f: Awaited<ReturnType<typeof foldedShell>>, columns: number, rows: number) =>
+	renderLayoutFrame(f.root as never, columns, rows, () => {}).lines.map((line) => stripAnsi(line).slice(columns - 50).trimEnd()).join("\n");
+
+for (const tab of ["Activity", "Sessions", "Resources", "Status"]) {
+	test(`S20: with the rail open at 180x50 the ${tab} tab carries one Build line and no card renders above the editor`, async (t) => {
+		const f = await foldedShell(t, 180, 50, plainTheme, { folded: false, devBinary: activeOverride });
+		selectRailTab(f.root, tab);
+		const column = railColumn(f, 180, 50);
+		const lines = column.split("\n").filter((row) => /Build/.test(row));
+		assert.equal(lines.length, 1, `${tab}: exactly one Build line`);
+		assert.match(lines[0]!, /^[│ ]*Build {2}(gentle-ai )?dev · 6e53bfc6305a3949 · field-test *│?$/);
+		assert.doesNotMatch(lines[0]!, /sha256|\/Users\/me/, "the path and the sha256 label stay out of the line");
+		assert.deepEqual(devCardRows(f, 180), [], "no dev-binary card above the editor");
+		const frame = renderLayoutFrame(f.root as never, 180, 50, () => {}).lines.map(stripAnsi).join("\n");
+		assert.doesNotMatch(frame, /dev binary override|field-test only/);
+	});
+}
+
+test("S20: the Build line stays on Status under Integrations, in the warning color, with width variants", async (t) => {
+	const roles: string[] = [];
+	const spyTheme = { ...plainTheme, fg: (role: string, text: string) => { if (/Build|dev ·/.test(text)) roles.push(role); return text; } };
+	const f = await foldedShell(t, 180, 50, spyTheme, { folded: false, devBinary: activeOverride });
+	selectRailTab(f.root, "Status");
+	const column = railColumn(f, 180, 50);
+	assert.match(column, /Integrations/);
+	assert.ok(column.indexOf("Build") > column.indexOf("Integrations"), "inside Integrations");
+	assert.ok(roles.includes("warning"), "warning color");
+});
+
+for (const [columns, rows, folded] of [[180, 50, true], [98, 40, true]] as const) {
+	test(`S20: ${columns}x${rows} without the rail draws no card above the editor and keeps the Build line in the panel sheet Status`, async (t) => {
+		const f = await foldedShell(t, columns, rows, plainTheme, { folded, devBinary: activeOverride });
+		assert.deepEqual(devCardRows(f, columns), [], "no dev-binary card above the editor");
+		const frame = renderLayoutFrame(f.root as never, columns, rows, () => {}).lines.map(stripAnsi).join("\n");
+		assert.doesNotMatch(frame, /dev binary override|field-test only/);
+		void f.commands.get("gentle:panel")!.handler("", f.ctx);
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.ok(f.ui.overlayView, "/gentle:panel opens the sheet");
+		const sheet = f.ui.overlayView!.render(columns).map(stripAnsi).join("\n");
+		assert.match(sheet, /Build {2}(gentle-ai )?dev · 6e53bfc6305a3949 · field-test/, "Status → Integrations carries the line");
+		f.ui.closeOverlay?.();
+	});
+}
+
+test("S20: without an override nothing appears, and an invalid override keeps its error card", async (t) => {
+	const clean = await foldedShell(t, 180, 50, plainTheme, { folded: false });
+	for (const tab of ["Activity", "Status"]) {
+		selectRailTab(clean.root, tab);
+		assert.doesNotMatch(railColumn(clean, 180, 50), /Build|field-test|dev binary/);
+	}
+	assert.deepEqual(devCardRows(clean, 180), []);
+	void clean.commands.get("gentle:panel")!.handler("", clean.ctx);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.doesNotMatch(clean.ui.overlayView!.render(180).map(stripAnsi).join("\n"), /Build/);
+	clean.ui.closeOverlay?.();
+	const invalid = await foldedShell(t, 180, 50, plainTheme, { folded: false, devBinary: (() => ({ state: "invalid", reason: "binary missing" })) as never });
+	assert.match(devCardRows(invalid, 180).join("\n"), /dev binary override invalid[\s\S]*binary missing/);
+});
+
+test("S20: the override line never paints a petal and takes theme roles only", async (t) => {
+	const f = await foldedShell(t, 180, 50, plainTheme, { folded: false, devBinary: activeOverride });
+	assert.doesNotMatch(railColumn(f, 180, 50), /[✿❀❁\u{1F338}\u{1F339}\u{1F3F5}]/u);
+});
+
+test("S21: the editor with the rail open at 180x50 is the rose framed box, without the commands and panel labels the rail already shows", async (t) => {
+	const f = await foldedShell(t, 180, 50, plainTheme, { folded: false, devBinary: activeOverride });
+	renderLayoutFrame(f.root as never, 180, 50, () => {});
+	const rows = f.editor.render(130).map(stripAnsi);
+	assert.match(rows[0]!, /^╭─[ ─]*╮$/, "a plain rose top border: the rail header already carries commands");
+	assert.match(rows[1]!, /^│.*│$/);
+	assert.match(rows[rows.length - 1]!, /^╰─+╯$/);
+	for (const row of rows) assert.equal(visibleWidth(row), 130);
+	assert.doesNotMatch(rows.join("\n"), /waiting for input|›|≡ commands|« panel|✿|🌸|🌹/);
+});
+
+test("S21: the float style keeps upstream's panel rule with the rail open", async (t) => {
+	const f = await foldedShell(t, 180, 50, plainTheme, { folded: false, cardStyle: CARD_STYLE.FLOAT });
+	renderLayoutFrame(f.root as never, 180, 50, () => {});
+	const rows = f.editor.render(130).map(stripAnsi);
+	assert.doesNotMatch(rows.join("\n"), /^╭/m, "no neon frame");
+	assert.match(rows.join("\n"), /›/, "the panel prompt");
+});

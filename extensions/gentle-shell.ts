@@ -14,7 +14,7 @@ import { profilesFilePath, profileRoleEntries, readProfilesFileResult } from "..
 import { resolveSessionProfile, sessionProfileLabel, sessionProfileModelProfiles } from "../lib/session-profile-freeze.ts";
 import * as os from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { BAND_RIGHT_WIDTH, buildShellHeaderModel, renderFoldedBand, renderShellBar, renderShellBelowInputFloat, renderShellBottomOnlyBar, renderShellHeaderChrome, renderShellNarrowTopBar, renderShellRailHeader, renderShellStatusBar, renderShellStatusSections, renderShellChromeBar, renderShellChromePad, renderShellTitleRow, type StatusSection, type StatusTarget, keepNativeWorkingRow, shellEnabled, shellHeaderCommandsHit, shellHeaderUsageHit, shellJobsCount, shellSessionUsageHit, type FoldedBand, type ShellBarModel, type ShellBarTheme } from "../lib/shell-bar.ts";
+import { BAND_RIGHT_WIDTH, buildShellHeaderModel, renderDevBuildLine, renderFoldedBand, renderShellBar, renderShellBelowInputFloat, renderShellBottomOnlyBar, renderShellHeaderChrome, renderShellNarrowTopBar, renderShellRailHeader, renderShellStatusBar, renderShellStatusSections, renderShellChromeBar, renderShellChromePad, renderShellTitleRow, type StatusSection, type StatusTarget, keepNativeWorkingRow, shellEnabled, shellHeaderCommandsHit, shellHeaderUsageHit, shellJobsCount, shellSessionUsageHit, type FoldedBand, type ShellBarModel, type ShellBarTheme } from "../lib/shell-bar.ts";
 import { CHANGE_STATUS, DIFF_MAX_BYTES, DIFF_MAX_LINES, DIFF_TOO_LARGE, WorktreeChangesTracker, changesDigest, renderChangesWidget, type ChangedFile, type ChangesModel, type FileRevision, type GitRunner, type LineCounter, type WorktreeChanges } from "../lib/shell-changes.ts";
 import { WorktreeChangesView } from "../lib/shell-changes-view.ts";
 import { createNativeFullscreenInteraction } from "../lib/native-fullscreen-interaction.ts";
@@ -439,7 +439,7 @@ export function createFooterStatusMemo(deps: FooterStatusMemoDeps): { key(): str
 			ctx.sessionManager.getSessionName(),
 			ctx.sessionManager.getCwd(),
 			[...footerData.getExtensionStatuses()].sort(([a], [b]) => a.localeCompare(b)),
-			(() => { const n = deps.devBinary?.(); return n?.state === "active" ? n.path : null; })(),
+			(() => { const n = deps.devBinary?.(); return n?.state === "active" ? `${n.path}|${n.sha256}` : null; })(),
 			deps.usage(),
 			deps.jobs(),
 			deps.review(),
@@ -459,6 +459,7 @@ export function createFooterStatusMemo(deps: FooterStatusMemoDeps): { key(): str
 			...buildShellBarModel(pi, ctx, footerData, { dirty: tracker.model.files.length, usage: deps.usage(), profile: deps.profile(), profileTier: deps.profileTier?.(), jobs: deps.jobs() }),
 			changes: { files: tracker.model.files.length, added: tracker.model.added, deleted: tracker.model.deleted },
 			review: deps.review(),
+			...(() => { const notice = deps.devBinary?.(); return notice?.state === "active" ? { devBinary: notice.sha256.slice(0, SHA_PREFIX_LENGTH) } : {}; })(),
 		};
 		cache = { key: k, model: built };
 		return built;
@@ -3007,6 +3008,13 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 				],
 				invalidate() {},
 			});
+			// An active dev-binary override is one `Build` line pinned in the rail on every tab but Status (S20);
+			// the Status tab lists it under Integrations and the panel sheet's Status carries it too.
+			const buildPart = sidebarPart(tui, "build", { render: () => [], invalidate() {}, dispose() {} }, {
+				digest: () => (devNotice?.state === "active" ? devNotice.sha256 : ""),
+				render: (width) => (devNotice?.state === "active" ? [renderDevBuildLine(theme, width, devNotice.sha256.slice(0, SHA_PREFIX_LENGTH))] : []),
+				invalidate() {},
+			});
 			const uninstall = installSidebar(tui, theme, () => visualSettings.statusPlacement, () => visualSettings.headerPlacement, () => visualSettings.density, { collapsed: () => railCollapsed, toggle: () => toggleRail(), hint: () => railPanelKey(env) }, {
 				tabs: true, onTabSelect: (tab) => { const id = sessionId(); if (tab === "sessions" && id) pi.events.emit(SESSION_REFRESH_EVENT, { sessionId: id }); },
 			});
@@ -3096,6 +3104,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 				clearInterval(jobsTimer);
 				jobsPart.dispose();
 				voicePart.dispose?.();
+				buildPart.dispose?.();
 				limitsPart.dispose?.();
 				sessionsPart.dispose?.();
 				ctx.ui.setWidget(HEADER_WIDGET_KEY, undefined);
@@ -3145,7 +3154,12 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			{ now: () => deps.now(), doubleEscCancelEnabled: () => doubleEscCancelPolicy === "on", dispatchQueuedText: (text) => { pendingQueuedText = pendingQueuedText === undefined ? text : `${pendingQueuedText}\n\n${text}`; }, vimRuntimeVersion: deps.vimRuntimeVersion, attachments: imageAttachments, readClipboardImage: () => (deps.readClipboardImage ?? readClipboardImage)(),
 				// The editor joins the wide IDE chrome while the rail owns the host with the header on top.
 				// The narrow chrome draws the owner's framed editor (S19); only the float style keeps the panel rule there.
-				panelChrome: (tui) => (chromeMode(tui) === "narrow" ? cardStyle() === CARD_STYLE.FLOAT : chromeMode(tui) !== undefined) || chromeBarsShown(tui, true),
+				// With the rail open at full width the neon editor is the owner's framed box too (S21); float keeps the panel rule.
+				panelChrome: (tui) => {
+					const railOpen = Boolean(tui.terminal && sidebarState(tui).active && sidebarState(tui).ownsHost?.() && chromeMode(tui) !== "narrow");
+					if (railOpen || chromeMode(tui) === "narrow") return cardStyle() === CARD_STYLE.FLOAT;
+					return chromeMode(tui) !== undefined || chromeBarsShown(tui, true);
+				},
 				// Without the rail, [ Panel ] opens the Status sections: the mobile chrome,
 				// and a wide terminal with Status at the bottom.
 				panelButton: (tui) => chromeMode(tui) === "narrow" || (visualSettings.statusPlacement === "bottom" && chromeBarsShown(tui, true)),
@@ -3172,10 +3186,17 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		// Inside Herdr the row stays: its native Pi detection reads it.
 		if (ownsPrompt && !keepNativeWorkingRow(env)) ctx.ui.setWorkingVisible(false);
 		const notice = devNotice;
+		// An active override lives in the rail's `Build` line and the panel sheet's Status whenever the
+		// fullscreen shell can show them (S20); the card above the editor is the fallback for hosts
+		// without that chrome, and an invalid override keeps its error card.
 		ctx.ui.setWidget(
 			DEV_BINARY_WIDGET_KEY,
 			notice
-				? (_tui, theme) => spaced(cardComponent(devBinaryCard(notice), theme, { expanded: true, previewRows: 3 }))
+				? (tui, theme) => {
+					const card = spaced(cardComponent(devBinaryCard(notice), theme, { expanded: true, previewRows: 3 }));
+					const railLine = () => notice.state === "active" && Boolean(tui.terminal) && (tui as TUI & { mode?: string }).mode === "fullscreen";
+					return { render: (width: number) => (railLine() ? [] : card.render(width)), invalidate: () => card.invalidate() };
+				}
 				: undefined,
 		);
 		if (changes !== tracker) return;

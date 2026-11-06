@@ -420,7 +420,7 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 		// With tabs, a section on another tab is not painted, so its digest (a
 		// ticking clock, a refresh it would trigger) must neither be read nor
 		// invalidate the rail.
-		const visibleKeys = options?.tabs ? new Set(["header", "railheader", "statusbar", "wellness", "voice", ...sidebarTabSections(selectedTab)]) : undefined;
+		const visibleKeys = options?.tabs ? new Set(["header", "railheader", "statusbar", "wellness", "build", "voice", ...sidebarTabSections(selectedTab)]) : undefined;
 		const digests = parts.map(([key, rail]) => !visibleKeys || visibleKeys.has(key) ? railDigest(rail) : undefined);
 		const signature = themeSignature(theme);
 		const unchanged = prepared?.revision === cache.revision && prepared.tab === selectedTab &&
@@ -522,6 +522,13 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 				pinnedRows.push(markerStart < markerEnd
 					? theme.fg("dim", rule.slice(0, markerStart)) + theme.fg("accent", rule.slice(markerStart, markerEnd)) + theme.fg("dim", rule.slice(markerEnd))
 					: theme.fg("dim", rule));
+			}
+			// An active dev-binary override is one `Build` line pinned under the tabs on every tab
+			// but Status, which already lists it under Integrations (shell-personal-rework S20).
+			const buildPart = selectedTab === "status" ? undefined : state.parts.get("build");
+			if (buildPart) {
+				const build = [...(buildPart.render(RAIL_WIDTH - RAIL_PADDING * 2) ?? [])].filter((line) => line.trim() !== "");
+				pinnedRows.push(...build.map((line) => " ".repeat(RAIL_PADDING) + line));
 			}
 			// The voice line (preparing, listening, transcribing) is the last pinned row
 			// under the tabs, so it shows on every tab and is gone when idle.

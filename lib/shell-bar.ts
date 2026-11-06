@@ -46,6 +46,20 @@ export interface ShellBarModel {
 	permission?: { mode: string; detail?: string };
 	/** Statuses for the rail's Integrations: `statuses` without the permission keys. */
 	integrations?: string[];
+	/** First 16 hex of the active dev-binary override's sha256; set only while an override is active (shell-personal-rework S20). */
+	devBinary?: string;
+}
+
+/**
+ * The owner's compact dev-binary line (638eacaf4): `Build  gentle-ai dev · <sha16> · field-test` in the warning
+ * color, with shorter value variants that keep the whole line inside `room` columns before it is ever clipped.
+ */
+export function renderDevBuildLine(theme: Pick<ShellBarTheme, "fg">, room: number, sha: string): string {
+	const id = sanitizeStatus(sha);
+	const key = "Build  ";
+	const values = [`gentle-ai dev · ${id} · field-test`, `dev · ${id} · field-test`, `dev · ${id}`];
+	const fitting = values.find((value) => visibleWidth(key + value) <= room) ?? truncateToWidth(values[values.length - 1]!, Math.max(1, room - key.length), "…");
+	return theme.fg("warning", key + fitting);
 }
 
 // The live header row above the fullscreen rail: session identity plus the
@@ -293,11 +307,12 @@ export function renderShellStatusSections(model: ShellBarModel, theme: ShellBarT
 	const integrationRows = (text: string) => wrapTextWithAnsi(text, Math.max(1, width - PANEL_ROW_INDENT - 2))
 		.map((line, index) => renderPanelRow(width, `${label(index === 0 ? "- " : "  ")}${line}`));
 	const permission = model.permission?.detail ? integrationRows(`${label("permissions")} ${theme.fg(ROLE.STATUS, sanitizeStatus(model.permission.detail))}`) : [];
-	const count = integrations.length + (permission.length ? 1 : 0);
+	const build = model.devBinary ? [renderPanelRow(width, renderDevBuildLine(theme, Math.max(1, width - PANEL_ROW_INDENT), model.devBinary))] : [];
+	const count = integrations.length + (permission.length ? 1 : 0) + (build.length ? 1 : 0);
 	sections.push({
 		key: "integrations",
 		header: header("integrations", "Integrations", count ? String(count) : "none"),
-		rows: [...permission, ...(integrations.length ? integrations.flatMap((status) => integrationRows(theme.fg(ROLE.STATUS, sanitizeStatus(status)))) : permission.length ? [] : [renderPanelRow(width, label("no status reported"))])],
+		rows: [...permission, ...(integrations.length ? integrations.flatMap((status) => integrationRows(theme.fg(ROLE.STATUS, sanitizeStatus(status)))) : permission.length || build.length ? [] : [renderPanelRow(width, label("no status reported"))]), ...build],
 	});
 	// Minimal density keeps only the sections: the key hints row goes.
 	if (hints && presentation?.density !== "minimal") sections.push({ rows: [renderPanelRow(width, label(hints))] });
