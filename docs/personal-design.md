@@ -34,6 +34,7 @@ The owner, verbatim: "me gusta el diseño que tenemos, el estilo ... habría que
 | Limits | One block per provider in Resources; one Claude block (no duplicate `claude-bridge`) | `tests/shell-usage.test.ts`, `tests/shell-usage-card.test.ts` |
 | Otras sesiones | Other live sessions: name, age, agent count, inactive count, last seen | `tests/shell-session-state*.test.ts` |
 | Hide panel | `» hide panel · alt+h` as the last rail row | `tests/shell-personal-rail.test.ts` |
+| Folded rail | With the rail folded (alt+h, `« panel`) at full width: a framed editor with `≡ commands · alt+k` at the left and `« panel · alt+h` at the right of its top border; below it the Sesión card (path and branch, ctx, memory line, YOLO line, model · effort · profile, cost, `◔ usage`, `Permissions`) beside the Breaks card with its `↻` resets and clock. No top header, bottom status row, standalone Breaks or YOLO line repeats it; the Todos card stays hidden | `tests/shell-folded-band.test.ts`, `tests/gentle-shell.test.ts` (`S18`) |
 | Narrow layout | Top bar with model, ctx, cost and usage; work line above the editor; `≡ commands · alt+k` in the editor rule; Breaks below the editor; cards shown down to 43 columns | `tests/shell-personal-prompt.test.ts` |
 | Dead code gate | `pnpm run check:unused` fails on new unused imports or locals | `tests/check-unused.test.ts` |
 

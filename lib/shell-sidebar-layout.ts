@@ -156,7 +156,7 @@ function railDigest(rail: SidebarRail): string | undefined {
 // what changes, so the memo keys on that: a digest-only section (Status,
 // Agents, Todos) would otherwise keep the previous theme's colors.
 const THEME_SIGNATURE_ROLES = ["accent", "border", "borderAccent", "muted", "dim", "text", "success", "warning", "error"];
-function themeSignature(theme: ShellBarTheme): string {
+export function themeSignature(theme: ShellBarTheme): string {
 	try {
 		return THEME_SIGNATURE_ROLES.map((role) => theme.fg(role, "·")).join("") + theme.bold("·");
 	} catch {
@@ -240,6 +240,9 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 	const railPossible = () => !stopped && host.mode === "fullscreen" && tui.terminal.columns >= SIDEBAR_BREAKPOINT && (placement() === "auto" || placement() === "right") && !!host.layoutRoot && roots.has(host.layoutRoot);
 	state.ownsHost = () => railPossible() && !folded();
 	state.railAvailable = () => railPossible() && folded();
+	// Folded at full width the bottom band replaces the top header, the status bar and the
+	// standalone Breaks paint (shell-personal-rework S18).
+	state.foldedBand = () => railPossible() && folded();
 	// The panel surface runs to the bottom of the rail: below the last panel
 	// section, blank tinted rows fill what is left of the viewport. They are
 	// not content, so they never add scroll range or hit targets.
@@ -390,6 +393,10 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, placement: () => 
 			statusLines = [];
 			pinnedTop = [];
 			pinnedBottom = [];
+			if (state.foldedBand?.()) {
+				headerLines = [];
+				return false;
+			}
 			try {
 				const headerPart = state.parts.get("header");
 				headerLines = headerPlacement() !== "below-input" && headerPart

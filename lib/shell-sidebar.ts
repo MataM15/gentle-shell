@@ -24,6 +24,13 @@ export interface SidebarState {
 	/** True while the user folded the rail away (`» hide panel`, alt+h) and the layout could show it again. */
 	railAvailable?: () => boolean;
 	/**
+	 * True while the folded rail's bottom band owns the identity chrome: the rail
+	 * is folded at full width (the `railAvailable` condition). The top header, the
+	 * bottom Status bar, the standalone Breaks paint and the separate YOLO line all
+	 * step aside; the band paints Sesión and Breaks together instead.
+	 */
+	foldedBand?: () => boolean;
+	/**
 	 * Columns the fullscreen rail reserves at the right edge (rail plus gap)
 	 * while `active && ownsHost()`. Overlays read it to stay inside the editor
 	 * column (the prompt-history picker's right margin) without importing
@@ -96,13 +103,17 @@ export function releaseSidebarHover(tui: TUI, owner: object): void {
 	if (tui.terminal && sidebarState(tui).hover?.owner === owner) sidebarState(tui).hover = undefined;
 }
 
-/** Keep the original bottom component mounted, suppressing only its paint. */
+/**
+ * Keep the original bottom component mounted, suppressing only its paint. A folded rail
+ * (`railAvailable`) keeps the Todos card hidden rather than moving it above the prompt,
+ * and its band (`foldedBand`) replaces the footer and Breaks paints.
+ */
 export function sidebarPart<T extends Component & { dispose?(): void }>(tui: TUI, key: string, bottom: T, rail: SidebarRail = bottom): T {
 	// Minimal extension hosts cannot share terminal-owned layout state.
 	if (!tui.terminal) return bottom;
 	const state = sidebarState(tui);
 	state.parts.set(key, rail);
-	const hidden = () => (key === "todo" && state.visibility?.todo === false) || (key === "footer" && (state.statusHidden?.() || state.headerOwnsStatus?.() || state.compactWork?.())) || ((key === "todo" || key === "agents") && state.compactWork?.()) || (state.active && state.ownsHost?.());
+	const hidden = () => (key === "todo" && (state.visibility?.todo === false || state.railAvailable?.() === true)) || ((key === "footer" || key === "wellness") && state.foldedBand?.() === true) || (key === "footer" && (state.statusHidden?.() || state.headerOwnsStatus?.() || state.compactWork?.())) || ((key === "todo" || key === "agents") && state.compactWork?.()) || (state.active && state.ownsHost?.());
 	return {
 		...bottom,
 		render: (width: number) => hidden() ? [] : bottom.render(width),

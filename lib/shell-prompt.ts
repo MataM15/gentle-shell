@@ -66,14 +66,15 @@ export interface PromptFrameOptions {
 	workingLabel?: string;
 	/**
 	 * Present only while the user folded the rail away and it could show again:
-	 * paints `« panel · key` between the state and the mode in the panel rule.
+	 * paints `« panel · key` between the state and the mode in the panel rule, and
+	 * at the right end of the framed editor's top border (float: of its hint row).
 	 * `hint` is the resolved shortcut; absent when it is disabled.
 	 */
 	panelLabel?: { hint?: string };
 	/**
 	 * Present while the rail card does not carry the commands action (phone
 	 * chrome, folded rail): paints `≡ commands · key` between the state and the
-	 * mode. `hint` is the resolved shortcut; absent when it is disabled.
+	 * mode in the panel rule, or leading the framed editor's top border. `hint` is the resolved shortcut; absent when it is disabled.
 	 */
 	commandsLabel?: { hint?: string };
 	/** A working panel callback is available in fullscreen editor chrome. */
@@ -124,17 +125,43 @@ function stateLabel(options: PromptFrameOptions): string | undefined {
 	return STATE_LABEL[options.state];
 }
 
+const LABEL_SEPARATOR = " · ";
+
+// The owner's labels in the framed editor (the folded rail's look, shell-personal-rework S18):
+// `≡ commands · key` leads the top border and `« panel · key` closes it. Widths always come
+// from visibleWidth; a label that does not fit is dropped whole, never clipped.
+function frameLabel(options: PromptFrameOptions, which: "commands" | "panel"): { text: string; width: number } | undefined {
+	const spec = which === "commands" ? options.commandsLabel : options.panelLabel;
+	if (!spec) return undefined;
+	const name = which === "commands" ? COMMANDS_LABEL_TEXT : PANEL_LABEL_TEXT;
+	const hint = spec.hint ? LABEL_SEPARATOR + spec.hint : "";
+	return { text: options.fg(ACTION_NAME_ROLE, options.bold ? options.bold(name) : name) + (hint ? options.fg(ACTION_HINT_ROLE, hint) : ""), width: visibleWidth(name + hint) };
+}
+
+// The top rule's tail after `fill` rule cells: plain `─…─╮`, or with room `─…─ « panel · key ─╮`.
+function closeTopRule(width: number, fill: number, options: PromptFrameOptions): string {
+	const panel = frameLabel(options, "panel");
+	if (panel && fill - panel.width - 3 >= 1) return options.borderColor(` ${rule(fill - panel.width - 3)} `) + panel.text + options.borderColor(" ─╮");
+	return options.borderColor(` ${rule(fill)}╮`);
+}
+
 function topRule(width: number, options: PromptFrameOptions, indicator: string | undefined): string {
 	const label = indicator ?? stateLabel(options);
 	const scanning = options.state === PROMPT_STATE.WORKING;
 	const glyph = petalGlyph(options.state, options.tick);
 	const petal = options.fg(petalTone(options.state, options.tick), options.bold ? options.bold(glyph) : glyph);
 	const paintedLabel = label && scanning && !indicator ? scanWorkingText(label, options.tick, options.fg) : label ? options.fg(LABEL_ROLE, label) : "";
+	const commands = frameLabel(options, "commands");
+	const lead = visibleWidth(glyph) + (glyph ? 1 : 0);
+	if (commands) {
+		const fill = width - lead - commands.width - (label ? LABEL_SEPARATOR.length + visibleWidth(label) : 0) - 5;
+		if (fill >= 1) return options.borderColor("╭─ ") + (glyph ? petal + " " : "") + commands.text + (paintedLabel ? options.fg(HINT_ROLE, LABEL_SEPARATOR) + paintedLabel : "") + closeTopRule(width, fill, options);
+	}
 	const title = [petal, paintedLabel].filter(Boolean).join(" ");
 	const titleWidth = visibleWidth(glyph) + (label ? visibleWidth(label) + (glyph ? 1 : 0) : 0);
 	const fill = width - titleWidth - 5;
 	if (fill < 0) return options.borderColor(`╭${rule(width - 2)}╮`);
-	return options.borderColor("╭─ ") + title + options.borderColor(` ${rule(fill)}╮`);
+	return options.borderColor("╭─ ") + title + closeTopRule(width, fill, options);
 }
 
 function bottomRule(width: number, options: PromptFrameOptions, indicator: string | undefined): string {
@@ -226,7 +253,17 @@ function floatPromptHint(top: string, bottom: string, options: PromptFrameOption
 	const info = [scrollIndicator(top), options.escHint ?? scrollIndicator(bottom)]
 		.filter((text): text is string => Boolean(text))
 		.map((text) => options.fg(LABEL_ROLE, text));
-	const hint = truncateToWidth("  " + petal + (paintedLabel ? " " + paintedLabel : "") + (info.length ? " · " + info.join(" · ") : ""), width, "");
+	const tail = (separator: string) => (paintedLabel ? separator + paintedLabel : "") + (info.length ? " · " + info.join(" · ") : "");
+	// A label must end inside `width` (lead included); otherwise it is dropped whole.
+	const commands = frameLabel(options, "commands");
+	const leadWidth = 2 + visibleWidth(glyph) + 1;
+	const text = commands && leadWidth + commands.width <= width
+		? "  " + petal + " " + commands.text + tail(options.fg(HINT_ROLE, LABEL_SEPARATOR))
+		: "  " + petal + tail(" ");
+	const hint = truncateToWidth(text, width, "");
+	// `« panel · key` right-aligned with one cell to spare, only past a gap.
+	const panel = frameLabel(options, "panel");
+	if (panel && visibleWidth(hint) + 2 + panel.width + 1 <= width) return hint + " ".repeat(width - visibleWidth(hint) - panel.width - 1) + panel.text + " ";
 	return hint + " ".repeat(Math.max(0, width - visibleWidth(hint)));
 }
 

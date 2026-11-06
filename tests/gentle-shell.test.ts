@@ -19,6 +19,8 @@ afterEach(() => resetFrozenInheritedProfilesForTesting());
 import { buildCommandPaletteGroups } from "../lib/command-palette-catalog.ts";
 import { CHANGE_STATUS, DIFF_MAX_BYTES, DIFF_MAX_LINES, DIFF_TOO_LARGE } from "../lib/shell-changes.ts";
 import { renderLayoutFrame } from "@earendil-works/pi-tui/dist/layout.js";
+import { readRailCollapsed, writeRailCollapsed } from "../lib/rail-collapse.ts";
+import { parseWellnessConfig, WellnessSession } from "../lib/shell-wellness.ts";
 import { sidebarPart, sidebarState, type SidebarRail } from "../lib/shell-sidebar.ts";
 import { SESSION_REFRESH_EVENT, SESSION_SNAPSHOT_EVENT } from "../lib/shell-session-state.ts";
 import { createVoiceStatePublisher, VOICE_STATE_EVENT, VOICE_STATE_SCHEMA } from "../lib/voice-status-event.ts";
@@ -8271,3 +8273,106 @@ test("on a transparent rail hovering a section card's title paints it in the hov
 		await fire(handlers, "session_shutdown", ctx);
 	}
 });
+
+// T11 (odd/tasks/shell-personal-rework.md S18, S12, S16, S7): the folded rail brings back the owner's
+// previous look (fb717450e, f57d77722): a framed editor with `≡ commands` and `« panel` in its top
+// border, and a Sesión + Breaks band below it, with no bar repeating what the band shows.
+const FOLDED_BAND_KEY = "gentle-shell-folded-band";
+const FOLDED_AT = Date.parse("2026-11-05T19:46:00Z");
+async function foldedShell(t: TestContext, columns: number, rows: number, theme: typeof plainTheme = plainTheme) {
+	const home = scopedDoubleEscCancelConfigHome(t);
+	const previous = cardStyle();
+	t.after(() => setCardStyle(previous));
+	writeRailCollapsed(true, { gentlePiConfigHome: home });
+	writeCardStyle(CARD_STYLE.NEON, { gentlePiConfigHome: home });
+	writeVisualSettings({ ...DEFAULT_VISUAL_SETTINGS, headerPlacement: "top", statusPlacement: "right", density: "minimal" }, { gentlePiConfigHome: home });
+	const { pi, handlers } = fakePi();
+	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home, GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, { activeProfile: () => "team" });
+	const { ctx, ui, overlayReady } = fakeContext({ theme });
+	await fire(handlers, "session_start", ctx);
+	const node = Symbol.for("@earendil-works/pi-tui/layout-node");
+	const root = { render: () => ["transcript"], invalidate() {}, [node]: () => ({ type: "vstack", entries: [] }) };
+	const tui = { mode: "fullscreen", terminal: { rows, columns }, layoutRoot: root, requestRender() {} };
+	const statuses = new Map([["gentle-pi", "\u{1F9E0} proyectos · ✓ updated #23721"], ["gentle:mode", "Permissions: YOLO"], ["gentle:yolo", "\u{1F680} YOLO ON \u{1F525} — destructive confirmations remain"]]);
+	const footer = (ui.footerFactory as (tui: unknown, theme: ShellBarTheme, data: unknown) => { render(width: number): string[]; dispose(): void })(tui, theme, {
+		getGitBranch: () => "master", getExtensionStatuses: () => statuses, getAvailableProviderCount: () => 1, onBranchChange: () => () => {},
+	});
+	t.after(() => footer.dispose());
+	// The real Breaks card, registered as the wellness extension does.
+	const session = new WellnessSession(parseWellnessConfig({ enabled: true, language: "es", utcOffsetMinutes: -180 })!, FOLDED_AT);
+	const resets: string[] = [];
+	const breaks: SidebarRail = {
+		digest: () => "d1",
+		render: (width: number) => session.render(FOLDED_AT, width, theme, { resetGlyphs: true }),
+		invalidate() {},
+		handleMouse(event) {
+			const target = event.type === "click" ? session.resetTargetAt(event.x, event.y) : undefined;
+			if (!target) return undefined;
+			resets.push(target);
+			return { handled: true, render: true };
+		},
+	};
+	const standaloneBreaks = sidebarPart(tui as unknown as TUI, "wellness", breaks);
+	root[node]();
+	const widget = (key: string) => (ui.widgets.get(key) as (tui: unknown, theme: ShellBarTheme) => SidebarRail)(tui, theme);
+	const editor = (ui.editorFactory as (tui: unknown, theme: unknown, keybindings: unknown) => GentlePromptEditor)(tui, editorTheme, fakeKeybindings);
+	t.after(() => editor.dispose());
+	const click = (x: number, y: number, width: number, height = 6): TuiMouseEvent => ({ type: "click", button: "left", x, y, screenX: x, screenY: y, width, height, shift: false, alt: false, ctrl: false } as TuiMouseEvent);
+	return { home, tui: tui as unknown as TUI, ui, root, footer, standaloneBreaks, widget, editor, resets, click, overlayReady, handlers, ctx, session };
+}
+
+for (const [columns, rows] of [[180, 50], [140, 40]] as const) {
+	test(`S18: the folded rail at ${columns}x${rows} paints the framed editor with both labels, and the Sesión card beside Breaks`, async (t) => {
+		const f = await foldedShell(t, columns, rows);
+		assert.equal(sidebarState(f.tui).foldedBand?.(), true, "folded at full width");
+		const editor = f.editor.render(columns).map(stripAnsi);
+		assert.match(editor[0]!, /^╭─ {3}≡ commands · alt\+k ─+ « panel · alt\+h ─╮$/, "commands left, panel right, in the framed top border");
+		assert.equal(visibleWidth(editor[0]!), columns);
+		assert.match(editor[editor.length - 1]!, /^╰─+╯$/);
+		const band = f.widget(FOLDED_BAND_KEY).render(columns).map(stripAnsi);
+		assert.ok(band.every((row) => visibleWidth(row) === columns), "every band row spans the width");
+		assert.equal(band.length, 6, "frame, four Sesión rows, frame");
+		assert.match(band[0]!, /^╭─ Sesión ─+╮ {2}╭─ Breaks ─+╮$/, "Sesión and Breaks side by side");
+		assert.match(band[1]!, /^│ +\/repo master +◇ gpt-5\.5 · medium · team +│ {2}│ Agua /);
+		assert.match(band[2]!, /^│ +ctx ▰+▱* +45% +◇ \$0\.000 sub +◇ ◔ usage alt\+u +│ {2}│ Descanso /);
+		assert.match(band[3]!, /^│ +\u{1F9E0} proyectos · ✓ updated #23721 +◇ Permissions: YOLO +│ {2}│ Estirar /u);
+		assert.match(band[4]!, /^│ +\u{1F680} YOLO ON \u{1F525} — destructive confirmations remain +│ {2}│ Cena /u);
+		assert.equal(band.slice(1, 4).filter((row) => row.slice(columns - 50).includes("↻")).length, 3, "↻ on Agua, Descanso and Estirar");
+		assert.match(band[5]!, /^╰─+╯ {2}╰─+╯$/);
+	});
+
+	test(`S18: at ${columns}x${rows} « panel, ≡ commands, ◔ usage and the ↻ resets stay clickable`, async (t) => {
+		const f = await foldedShell(t, columns, rows);
+		const top = f.editor.render(columns).map(stripAnsi)[0]!;
+		const band = f.widget(FOLDED_BAND_KEY);
+		const painted = band.render(columns).map(stripAnsi);
+		const height = painted.length;
+		const usageAt = painted[2]!.indexOf("◔ usage");
+		assert.equal(band.handleMouse?.(f.click(usageAt, 2, columns, height))?.handled, true, "◔ usage opens the usage view");
+		await f.overlayReady;
+		f.ui.closeOverlay?.();
+		const glyph = (y: number) => visibleWidth(painted[y]!.slice(0, painted[y]!.lastIndexOf("↻")));
+		for (const y of [1, 2, 3]) assert.equal(band.handleMouse?.(f.click(glyph(y), y, columns, height))?.handled, true, `↻ on row ${y}`);
+		assert.deepEqual(f.resets, ["water", "break", "stretch"]);
+		assert.equal(band.handleMouse?.(f.click(glyph(1), 4, columns, height)), undefined, "Cena has no reset");
+		assert.equal(f.editor.handleMouse(f.click(top.indexOf("≡ commands"), 0, columns, 3))?.handled, true, "≡ commands");
+		assert.equal(readRailCollapsed({ gentlePiConfigHome: f.home }), true);
+		assert.equal(f.editor.handleMouse(f.click(top.indexOf("« panel"), 0, columns, 3))?.handled, true, "« panel");
+		assert.equal(readRailCollapsed({ gentlePiConfigHome: f.home }), false, "« panel unfolds the rail");
+	});
+
+	test(`S18: at ${columns}x${rows} no bar repeats what the band shows, nothing paints a petal`, async (t) => {
+		const f = await foldedShell(t, columns, rows);
+		const band = f.widget(FOLDED_BAND_KEY).render(columns);
+		assert.notDeepEqual(band, []);
+		assert.equal(f.footer.render(columns).map(stripAnsi).join("").trim(), "", "the bottom status row steps aside");
+		assert.deepEqual(f.widget("gentle-shell-below-input-header").render(columns), []);
+		assert.equal(f.standaloneBreaks.render(columns).join("").trim(), "", "the standalone Breaks card steps aside");
+		const frame = renderLayoutFrame(f.root as never, columns, rows, () => {}).lines.map(stripAnsi).join("\n");
+		assert.doesNotMatch(frame, /gpt-5\.5|ctx ▰|\$0\.000|week ▰|Permissions|master/, "no top header or status bar row repeats the band");
+		const everything = [...band, ...f.editor.render(columns), frame].map(stripAnsi).join("\n");
+		assert.doesNotMatch(everything, /[✿❀❁\u{1F338}\u{1F339}\u{1F3F5}]/u, "no petals (S16)");
+		sidebarState(f.tui).foldedBand = () => false;
+		assert.deepEqual(f.widget(FOLDED_BAND_KEY).render(columns), [], "the band paints only while the rail is folded");
+	});
+}
