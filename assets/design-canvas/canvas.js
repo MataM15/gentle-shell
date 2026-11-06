@@ -891,12 +891,18 @@
 		board.frame.src = `${boardUrl(board)}?v=${Date.now()}`;
 	}
 
-	/** The system board first, then the design's artboards. */
+	/**
+	 * The system board first, then the design's artboards. A board placed before the focused
+	 * one moves it inside the world, so the focused view is re-centered from its new offset.
+	 */
 	function placeBoards() {
 		const boards = allBoards();
 		els.world.replaceChildren(...boards.map((board) => board.wrapper));
 		if (state.focus && !boards.includes(state.focus)) exitFocus();
-		else applyFocusState();
+		else {
+			centerFocus();
+			applyFocusState();
+		}
 	}
 
 	/** Reads api/system and creates or drops the system board; true when it appeared or went away. */
@@ -1496,9 +1502,13 @@
 
 	window.addEventListener("resize", closePopover);
 	window.addEventListener("resize", layoutCompare);
-	// The viewport also changes size when the comments panel opens or closes.
-	if (typeof ResizeObserver === "function") new ResizeObserver(() => centerFocus()).observe(els.viewport);
-	else window.addEventListener("resize", () => centerFocus());
+	// The viewport also changes size when the comments panel opens or closes, and the world
+	// when a label reflows or a board before the focused one changes width.
+	if (typeof ResizeObserver === "function") {
+		const observer = new ResizeObserver(() => centerFocus());
+		observer.observe(els.viewport);
+		observer.observe(els.world);
+	} else window.addEventListener("resize", () => centerFocus());
 
 	setMode(state.mode);
 	start();

@@ -313,6 +313,21 @@ test("a taller artboard is top-aligned and clipped to the viewport while focused
 	assert.equal(first.frame.style.height, "1600px");
 });
 
+test("a world re-layout while focused re-centers the focused artboard", async () => {
+	const canvas = await loadCanvas();
+	const [first] = canvas.boards;
+	first.frame.parentElement!.offsetLeft = 480;
+	click(first.shield!, 200, 200);
+	assert.equal(canvas.world.style.transform, "translate(-180px, 200px) scale(1)");
+	// The system board appears before the design's artboards, so the focused box moves right in the world.
+	canvas.replies["/t/api/system"] = { exists: true, file: "system.html", width: 880, height: 600 };
+	first.frame.parentElement!.offsetLeft = 480 + 880 + 80;
+	await canvas.serverEvent("change", { slug: null, file: "system.html" });
+	assert.equal(canvas.world.children[0].classes.has("gd-system-board"), true, "the system board is placed first");
+	assert.equal(canvas.world.style.transform, "translate(-1140px, 200px) scale(1)", "the focused artboard stays centered");
+	assert.equal(first.shield!.hidden, true, "focus mode continues on the same artboard");
+});
+
 test("entering focus hides an open panel and exiting restores it; a closed panel stays closed", async () => {
 	const canvas = await loadCanvas();
 	const [first] = canvas.boards;
