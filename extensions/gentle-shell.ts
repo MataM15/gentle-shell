@@ -19,7 +19,7 @@ import { CHANGE_STATUS, DIFF_MAX_BYTES, DIFF_MAX_LINES, DIFF_TOO_LARGE, Worktree
 import { WorktreeChangesView } from "../lib/shell-changes-view.ts";
 import { createNativeFullscreenInteraction } from "../lib/native-fullscreen-interaction.ts";
 import { SessionWorktreeRegistry, resolveSessionWorktree, worktreeGitEnvironment, type WorktreeResolver, type WorktreeIdentity } from "../lib/session-worktree-registry.ts";
-import { CARD_STYLE, CARD_TONE, cardStyle, renderCard, setCardStyle, type Card, type CardTheme } from "../lib/shell-card.ts";
+import { cachedCard, CARD_STYLE, CARD_TONE, cardStyle, setCardStyle, type Card, type CardTheme } from "../lib/shell-card.ts";
 import { resolveCardStyle, writeCardStyle } from "../lib/card-style-policy.ts";
 import { CARD_CONTENT, resolveCardContent, setCardContent, writeCardContent } from "../lib/card-content-policy.ts";
 import { CommandPalette, commandsKey, type CommandPaletteResult } from "../lib/command-palette.ts";
@@ -1948,13 +1948,11 @@ interface CardComponentOptions {
 	hint?: string;
 }
 
-function cardComponent(card: Card, theme: CardTheme, options: CardComponentOptions) {
-	return {
-		render(width: number) {
-			return renderCard(card, theme, width, options);
-		},
-		invalidate() {},
-	};
+function cardComponent(card: Card, theme: CardTheme, options: CardComponentOptions, identity?: object) {
+	// The card never changes for one component, so the cache replays its rows
+	// across frames until pi rebuilds it (expanded toggle, theme invalidate);
+	// with an identity (the transcript message) it even survives rebuilds.
+	return cachedCard({ card: () => card, theme: () => theme, options: () => options, identity });
 }
 
 // Widgets above the editor sit flush against the prompt frame; a blank line
@@ -2310,7 +2308,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		const lines = messageText(message.content as string | Array<{ type: string; text?: string }>).split("\n");
 		const body = options.expanded ? lines : lines.filter((line) => line.trim() !== "");
 		const hint = keyHint("app.tools.expand", options.expanded ? "collapse" : "expand");
-		return cardComponent({ title: "Gentle AI", subtitle: "review preflight", body, tone: CARD_TONE.INFO }, theme, { expanded: options.expanded, previewRows: 3, hint });
+		return cardComponent({ title: "Gentle AI", subtitle: "review preflight", body, tone: CARD_TONE.INFO }, theme, { expanded: options.expanded, previewRows: 3, hint }, message);
 	});
 	// The attached narrow fullscreen layout owns the mobile editor and work row
 	// for every header placement. Wide split uses the IDE chrome beside the rail;

@@ -8511,3 +8511,32 @@ test("S21: the float style keeps upstream's panel rule with the rail open", asyn
 	assert.doesNotMatch(rows.join("\n"), /^╭/m, "no neon frame");
 	assert.match(rows.join("\n"), /›/, "the panel prompt");
 });
+
+
+test("the review preflight card replays one settled frame while its inputs hold still", (t) => {
+	const found = cardStyle();
+	t.after(() => setCardStyle(found));
+	const { pi } = fakePi();
+	gentleShell(pi, {});
+	setCardStyle(CARD_STYLE.NEON);
+	const renderer = renderers.get("gentle-pi.review-preflight")!;
+	const message = { customType: "gentle-pi.review-preflight", content: "Receipt-driven development is enabled.\n\nCall the gentle_review tool." };
+	let painted = 0;
+	const counting = { fg: (_role: string, text: string) => { painted++; return text; }, bg: (_role: string, text: string) => { painted++; return `\x1b[48;5;236m${text}\x1b[49m`; } };
+	const component = renderer(message, { expanded: false }, counting);
+	const first = component.render(98);
+	// The owner's build keeps the glyph slot blank (no petals, S16).
+	assert.match(stripAnsi(first[0]!), /^╭─ {3}Gentle AI · review preflight/);
+	for (let frame = 0; frame < 20; frame++) assert.equal(component.render(98), first, "warm frames return the same line-array instance (issue #2860)");
+	const warm = painted;
+	for (let frame = 0; frame < 20; frame++) component.render(98);
+	assert.equal(painted, warm, "warm frames do not rebuild decorated lines");
+	assert.notEqual(component.render(40), first, "width invalidates layout");
+	const expanded = renderer(message, { expanded: true }, counting).render(98);
+	assert.notDeepEqual(expanded, first, "expanded invalidates the body");
+	const expandedText = stripAnsi(expanded.join("\n"));
+	assert.match(expandedText, /Receipt-driven development is enabled\./);
+	assert.match(expandedText, /Call the gentle_review tool\./);
+	setCardStyle(CARD_STYLE.FLOAT);
+	assert.notDeepEqual(component.render(98), first, "style changes apply without host invalidation");
+});

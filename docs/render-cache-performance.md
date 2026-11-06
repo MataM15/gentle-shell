@@ -21,6 +21,8 @@ Default matrix: 100/1,000/5,000 tools × 100/160 columns × float/neon × pulse,
 - Stable cases use 50 measured frames after five warmup frames. Resize/theme deliberately invalidate caches and use at most eight frames; do not treat their tail percentile as statistically robust.
 - Heap/RSS snapshots use explicit GC outside timing, including a job boundary after teardown. They characterize retention for these fixtures, not all transient allocations or proof of absence of leaks.
 
+Settled conversation cards (agent answers, orchestrator messages, job notices, review preflight) carry their own row cache in `lib/shell-card.ts` (`cachedCard` / `CardFrameCache`): warm frames replay the previous line-array instance until width, expanded state, hint, theme identity, card style, presentation variant or card content moves, keyed on the transcript message so transcript rebuilds reuse it. Behavioral coverage lives in `tests/shell-render-cache.test.ts`, `tests/shell-render-cache-runtime.test.ts`, and the renderer suites; microbenchmarks in the reports above therefore measure the surrounding transcript machinery, not card rebuilding.
+
 ## Limits
 
 Reports must use a new path outside the source/harness/host roots; existing files and symlinks are rejected. Read only reports with a `finished` field after successful process exit: progress writes are not atomic.

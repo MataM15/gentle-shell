@@ -3,8 +3,10 @@ import test from "node:test";
 import { initTheme, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Container, TuiAltScreen } from "@earendil-works/pi-tui";
 import { createChatViewport } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/chat-viewport.js";
+import { CustomMessageComponent } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/components/custom-message.js";
 import { buildShellBarModel, type ShellFooterData } from "../extensions/gentle-shell.ts";
 import { createQuietToolRenderer } from "../extensions/quiet-tools.ts";
+import { cachedCard, CARD_TONE } from "../lib/shell-card.ts";
 
 initTheme("dark");
 
@@ -65,5 +67,60 @@ test("native fullscreen scroll frames reuse complete tool cards and session stat
 		assert.notEqual(screens[0], screens[1], "scroll really changes the visible transcript");
 		assert.equal(decoration, warmDecoration, "even the native frame path reuses settled chrome");
 		assert.deepEqual([scans, projections], [1, 1], "scroll/pulse-like frames do not rescan unchanged session state");
+	} finally { tui.stop(); }
+});
+
+test("native fullscreen frames reuse settled conversation cards too", () => {
+	let decoration = 0;
+	const theme = {
+		fg: (_color: string, text: string) => { decoration++; return text; },
+		bg: (_color: string, text: string) => { decoration++; return `\x1b[48;5;235m${text}\x1b[49m`; },
+		bold: (text: string) => text,
+	};
+	const renderer = (message: { content: string }, options: { expanded: boolean }) => cachedCard({
+		identity: message,
+		card: () => ({ title: "Agent answer", subtitle: `explore · ${message.content}`, body: [`${message.content} one`, `${message.content} two`, `${message.content} three`, `${message.content} four`], tone: CARD_TONE.INFO, glyph: "◆" }),
+		theme: () => theme as never,
+		options: () => ({ expanded: options.expanded, previewRows: 3, hint: "ctrl+o to expand" }),
+	});
+	const document = new Container();
+	for (let card = 0; card < 30; card++) {
+		document.addChild(new CustomMessageComponent(
+			{ customType: "gentle-agents.result", content: `result-${card}`, display: true, details: {} } as never,
+			renderer as never,
+		));
+	}
+	const viewport = createChatViewport({
+		document, pendingMessages: new Container(), status: new Container(), widgetsAbove: new Container(),
+		editor: { render: () => ["prompt"], invalidate() {} }, widgetsBelow: new Container(), footer: new Container(), scrollbar: "hidden",
+	});
+	const terminal = {
+		start() {}, stop() {}, async drainInput() {}, write() {}, columns: 100, rows: 24,
+		moveBy() {}, hideCursor() {}, showCursor() {}, clearLine() {}, clearFromCursor() {}, clearScreen() {},
+		setTitle() {}, setProgress() {}, kittyProtocolActive: false, getBufferedInput() { return ""; }, hasPendingInput() { return false; },
+	} as never;
+	const tui = new TuiAltScreen(terminal, false);
+	tui.setLayoutRoot(viewport.root);
+	const host = tui as unknown as { doRender(): void; previousScreen: string[] };
+	tui.start();
+	try {
+		host.doRender();
+		const warmDecoration = decoration;
+		let endScreen: string | undefined;
+		let topScreen: string | undefined;
+		for (let frame = 0; frame < 20; frame++) {
+			if (frame % 2) viewport.transcript.scrollToEnd();
+			else viewport.transcript.scrollTo(0, { disableFollow: true });
+			host.doRender();
+			const screen = host.previousScreen.join("\n");
+			if (frame % 2) {
+				endScreen ??= screen;
+				assert.equal(screen, endScreen, "an unchanged end-of-transcript frame stays byte-identical");
+			} else {
+				topScreen ??= screen;
+				assert.equal(screen, topScreen, "an unchanged top-of-transcript frame stays byte-identical");
+			}
+		}
+		assert.equal(decoration, warmDecoration, "even the native frame path replays settled conversation cards");
 	} finally { tui.stop(); }
 });

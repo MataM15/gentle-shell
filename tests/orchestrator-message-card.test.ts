@@ -188,3 +188,29 @@ test("pending, cancelled, failed, and recipient-selection results do not claim a
 	assert.match(thrownText, /Message not sent/);
 	assert.match(thrownText, /transport exception/);
 });
+
+test("settled orchestrator cards replay one frame until the style or shared state moves", () => {
+	const previous = cardStyle();
+	try {
+		setCardStyle(CARD_STYLE.NEON);
+		const incoming = incomingMessageCard(data, "model envelope", false, theme, "expand");
+		const first = incoming.render(150);
+		for (let frame = 0; frame < 10; frame++) assert.equal(incoming.render(150), first, "warm frames return the same line-array instance (issue #2860)");
+		setCardStyle(CARD_STYLE.FLOAT);
+		assert.notDeepEqual(incoming.render(150), first, "style changes apply without host invalidation");
+		setCardStyle(CARD_STYLE.NEON);
+		assert.deepEqual(incoming.render(150), first, "switching back redraws the outlined bytes");
+
+		const args = { message: "mutable argument" };
+		const context = { state: {} as Record<PropertyKey, unknown>, args, expanded: false, isPartial: false };
+		const call = outgoingMessageCall(args, theme, context, "expand");
+		const callRows = call.render(120);
+		assert.equal(call.render(120), callRows, "the call caches its settled frame");
+		const result = outgoingMessageResult({ content: [{ type: "text", text: "queued" }], details: { gentleAgents: { ...data } } }, false, false, theme, context);
+		const resultRows = result.render(120);
+		assert.equal(result.render(120), resultRows, "the result caches its settled frame");
+		assert.notEqual(call.render(120), callRows, "result arrival removes the call's closing rows");
+		assert.equal(call.render(120), call.render(120), "the new shared state caches too");
+		assert.deepEqual(call.render(120).map(stripAnsi), outgoingMessageCall(args, theme, context, "expand").render(120).map(stripAnsi), "the cached call draws the same bytes as a fresh one");
+	} finally { setCardStyle(previous); }
+});

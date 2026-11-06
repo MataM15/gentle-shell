@@ -68,7 +68,7 @@ import { createRpcActivityPublisher, type RpcActivityPublisher } from "../lib/ag
 import { isInteractiveRpcHost } from "../lib/rpc-host.ts";
 import { createNativeFullscreenInteraction } from "../lib/native-fullscreen-interaction.ts";
 import { AGENTS_GLYPH, agentsCardTone, agentsSpend, agentsSummary, renderAgentsAlert, renderAgentsCard, renderAgentsSection, widgetExpiryMs, widgetRows } from "../lib/agents-widget.ts";
-import { CARD_TONE, cardAwaitingResult, cardBodyRows, cardBottom, cardInnerWidth, cardRunningLine, cardTop, floatRows, headingFits, markCardResult, panelHeaderRow, panelInnerWidth, renderCard, type CardRowContext, type CardTheme, type CardTone } from "../lib/shell-card.ts";
+import { cachedCard, CARD_TONE, cardAwaitingResult, cardBodyRows, cardBottom, cardInnerWidth, cardRunningLine, cardTop, floatRows, headingFits, markCardResult, panelHeaderRow, panelInnerWidth, type CardRowContext, type CardTheme, type CardTone } from "../lib/shell-card.ts";
 import { openInExternalEditor } from "./gentle-shell.ts";
 import { gentlePiConfigHome } from "../lib/agent-home.ts";
 import { resolveAgentHomeDirectory } from "../lib/agent-model-resolution.ts";
@@ -1663,7 +1663,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 
 	pi.registerMessageRenderer(AGENTS_ORCHESTRATOR_MESSAGE_TYPE, (message, options, theme) => {
 		const details = (message.details as { gentleAgents?: OrchestratorMessageDetails } | undefined)?.gentleAgents ?? {};
-		return incomingMessageCard(details, messageText(message.content), options.expanded, theme, expandHint(options.expanded));
+		return incomingMessageCard(details, messageText(message.content), options.expanded, theme, expandHint(options.expanded), message);
 	});
 
 	pi.registerMessageRenderer(AGENTS_RESULT_TYPE, (message, options, theme) => {
@@ -1679,15 +1679,17 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		const chips = [details?.agent, modelChip(facts?.model), facts?.thinking ? sanitizeTerminalText(facts.thinking) : undefined];
 		const answer = options.expanded ? text.split("\n") : agentResultPreview(text).split("\n").filter((line) => line.trim() !== "");
 		const body = facts ? [statusCardRows(facts, t, false)[0], ...answer] : answer;
-		return {
-			render(width: number) {
+		return cachedCard({
+			identity: message,
+			card: (width) => {
 				// Same one-line heading budget as the tool cards: the answer card's
 				// inner columns are the style's, not the terminal's.
 				const subtitle = fitSubject({ title: "Agent answer", tone, glyph: ACTION_GLYPH.result }, hint, panelInnerWidth(theme, width, tone), chips);
-				return renderCard({ title: "Agent answer", subtitle, body, tone, glyph: ACTION_GLYPH.result }, t, width, { expanded: options.expanded, previewRows: 3, hint });
+				return { title: "Agent answer", subtitle, body, tone, glyph: ACTION_GLYPH.result };
 			},
-			invalidate() {},
-		};
+			theme: () => t,
+			options: () => ({ expanded: options.expanded, previewRows: 3, hint }),
+		});
 	});
 
 	// A stale completion is appended as a custom entry: durable transcript
@@ -1704,12 +1706,13 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			`Subagent ${sanitizeTerminalText(agent)} (task ${sanitizeTerminalText(taskId)}, "${sanitizeTerminalText(label)}") ${sanitizeTerminalText(status)} about ${age} ago, while the orchestrator was still busy.`,
 			"Marked stale: the result was not replayed into the conversation. It stays available through subagent_status and subagent_result.",
 		];
-		return {
-			render(width: number) {
-				return renderCard({ title: "Stale agent answer", subtitle: `${headingText(agent)} · task ${headingText(taskId)}`, body, tone: CARD_TONE.WARNING, glyph: ACTION_GLYPH.result }, agentTheme(theme, CARD_TONE.WARNING), width, { expanded: options.expanded, previewRows: 3, hint: expandHint(options.expanded) });
-			},
-			invalidate() {},
-		};
+		const staleTheme = agentTheme(theme, CARD_TONE.WARNING);
+		return cachedCard({
+			identity: entry,
+			card: () => ({ title: "Stale agent answer", subtitle: `${headingText(agent)} · task ${headingText(taskId)}`, body, tone: CARD_TONE.WARNING, glyph: ACTION_GLYPH.result }),
+			theme: () => staleTheme,
+			options: () => ({ expanded: options.expanded, previewRows: 3, hint: expandHint(options.expanded) }),
+		});
 	});
 
 	const isOwnedActive = (task: TaskRecord | undefined): task is TaskRecord => task !== undefined && ownedTaskIds.has(task.id) && !isFinished(task.status);

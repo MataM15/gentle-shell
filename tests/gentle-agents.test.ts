@@ -7561,3 +7561,49 @@ test("the orchestrator's usage limit moves the session to the profile's orchestr
 	const child = await run({ GENTLE_PI_AGENTS_CHILD: "1" });
 	assert.deepEqual(child.selected, [], "a child leaves its fallback to the parent's runner");
 });
+
+test("settled agent answer cards replay one frame while their inputs hold still", (t) => {
+	const found = cardStyle();
+	t.after(() => setCardStyle(found));
+	setCardStyle(CARD_STYLE.NEON);
+	const { pi, renderers } = fakePi();
+	gentleAgents(pi, {}, deps().deps);
+	let painted = 0;
+	const counting = { fg: (_color: string, text: string) => { painted++; return text; }, bg: (_role: string, text: string) => { painted++; return `\x1b[48;5;236m${text}\x1b[49m`; } };
+	const render = renderers.get("gentle-agents.result")!;
+	const message = { customType: "gentle-agents.result", content: "Subagent explore (task t1, \"x\") finished.\n\nAll done.", details: { gentleAgents: { taskId: "t1", agent: "explore", status: "completed" } } };
+	const component = render(message, { expanded: false }, counting);
+	const first = component.render(80);
+	assert.match(stripAnsi(first[0]!), /Agent answer/);
+	for (let frame = 0; frame < 20; frame++) assert.equal(component.render(80), first, "warm frames return the same line-array instance (issue #2860)");
+	const warm = painted;
+	for (let frame = 0; frame < 20; frame++) component.render(80);
+	assert.equal(painted, warm, "warm frames do not rebuild decorated lines");
+	assert.notEqual(component.render(40), first, "width invalidates layout");
+	const expanded = render(message, { expanded: true }, counting).render(80);
+	assert.notDeepEqual(expanded, first, "expanded invalidates the body");
+	setCardStyle(CARD_STYLE.FLOAT);
+	assert.notDeepEqual(component.render(80), first, "style changes apply without host invalidation");
+});
+
+test("stale answer cards and job notices replay their settled frames too", (t) => {
+	const found = cardStyle();
+	t.after(() => setCardStyle(found));
+	setCardStyle(CARD_STYLE.NEON);
+	const { pi, renderers, entryRenderers } = fakePi();
+	gentleAgents(pi, {}, deps().deps);
+	// A theme that can paint float surfaces, so a style switch really changes the bytes.
+	const paintedTheme = { fg: (_color: string, text: string) => text, bg: (_role: string, text: string) => `\x1b[48;5;236m${text}\x1b[49m` };
+	const stale = entryRenderers.get("gentle-agents.stale-result")!({ type: "custom", customType: "gentle-agents.stale-result", data: { taskId: "t9", agent: "explore", label: "map lib", status: "completed", ageSeconds: 120 } }, { expanded: false }, paintedTheme);
+	const staleRows = stale.render(80);
+	for (let frame = 0; frame < 10; frame++) assert.equal(stale.render(80), staleRows, "warm frames return the same line-array instance (issue #2860)");
+	setCardStyle(CARD_STYLE.FLOAT);
+	assert.notDeepEqual(stale.render(80), staleRows, "style changes apply without host invalidation");
+	setCardStyle(CARD_STYLE.NEON);
+
+	const notice = renderers.get("gentle-jobs.notice")!({ customType: "gentle-jobs.notice", content: "job-1 (\"CI\") exited with code 0", details: { gentleJobs: { label: "CI", status: "exited", exitCode: 0 } } }, { expanded: false }, paintedTheme);
+	const noticeRows = notice.render(80);
+	for (let frame = 0; frame < 10; frame++) assert.equal(notice.render(80), noticeRows, "warm frames return the same line-array instance (issue #2860)");
+	setCardStyle(CARD_STYLE.FLOAT);
+	assert.notDeepEqual(notice.render(80), noticeRows, "style changes apply without host invalidation");
+});
