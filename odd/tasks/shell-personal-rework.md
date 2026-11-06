@@ -41,7 +41,7 @@ Worktree: `/home/pablo/proyectos/gentle-shell-worktrees/integrate-main-20261105`
 - T10 [S17,S12,S16,S7] Merge origin/main 895f353ca applying the S17 table; transparent rail; titles in the owner's style. Route: visual-opus. Commit: 7b2d7c54d (merge with the conflict resolution, the card titles, Limits/Otras sesiones as framed sections, profile in the rail header); sheet C:\Users\pablo\Pictures\pagub-review\shell-rework\round2.png.
 - T11 [S18,S12,S16,S7] Restore the folded-rail band and editor labels. Route: visual-opus. Commit: b7e25bc42 (framed editor labels, Sesión + Breaks band); sheet C:\Users\pablo\Pictures\pagub-review\shell-rework\folded-after.png. Not restored on purpose: the dev-binary notice stays above the editor while folded (the rail Status no longer carries it).
 - T12 [S19,S12,S16,S7] Framed editor with commands at the left in the narrow chrome. Route: visual-opus. Commit: 1a49b057d.
-- T13 [S20,S21,S12,S7] Dev-binary notice as a rail line on every tab, hidden from the transcript; framed editor at full width with the rail open. Route: visual-opus. Commit: pending.
+- T13 [S20,S21,S12,S7] Dev-binary notice as a rail line on every tab, hidden from the transcript; framed editor at full width with the rail open. Route: visual-opus. Commit: 407bc51d4 (`Build` line pinned under the rail tabs and in Status → Integrations and the panel sheet, no card above the editor in the fullscreen shell, framed neon editor with the rail open); sheet C:\Users\pablo\Pictures\pagub-review\shell-rework\devnotice-after.png.
 
 ## Log
 
