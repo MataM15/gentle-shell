@@ -25,7 +25,7 @@ import type { ShellBarTheme } from "../lib/shell-bar.ts";
 import { createGentleAiExtension } from "../extensions/gentle-ai.ts";
 import { decodeReviewStatusV3 } from "../lib/review-integration-v2.ts";
 import { REVIEW_SIDEBAR_EVENT } from "../lib/review-sidebar-state.ts";
-import { isJobsSidebarSnapshot } from "../lib/jobs-sidebar-state.ts";
+import { JOBS_SIDEBAR_EVENT, isJobsSidebarSnapshot } from "../lib/jobs-sidebar-state.ts";
 import type { NativeReviewCli } from "../lib/native-review-cli.ts";
 import { chromeSurface, setChromeSurface } from "../lib/shell-panel.ts";
 import { DEFAULT_VISUAL_SETTINGS, DENSITY, VISUAL_PRESET, VISUAL_SCHEMA, resolveVisualSettings, visualPresetOf, writeVisualSettings } from "../lib/visual-customization-policy.ts";
@@ -475,6 +475,74 @@ test("session shutdown detaches the footer before a queued fullscreen render and
 		if (fresh && second && !freshStopped) await fire(fresh.handlers, "session_shutdown", second.ctx);
 		freshFooter?.dispose();
 	}
+});
+
+const JOBS_RAIL_WIDTH = 40;
+
+// Idle repaint fix: the jobs timer must compare the painted card's visible text
+// (coarse elapsed units like "5m" change rarely) instead of requesting a render
+// every second whenever a job exists. Harness mirrors the shutdown test: the
+// part registered in sidebarState is the rail copy the timer repaints.
+test("the jobs timer renders only when the visible jobs card changes", async (t) => {
+	const intervals: Array<{ tick: () => void; delay: number; stopped: boolean }> = [];
+	t.mock.method(globalThis, "setInterval", (tick: () => void, delay: number) => {
+		const timer = { tick, delay, stopped: false };
+		intervals.push(timer);
+		return { unref() {}, timer };
+	});
+	t.mock.method(globalThis, "clearInterval", (handle: { timer: (typeof intervals)[number] }) => { handle.timer.stopped = true; });
+	let now = 1_000_000_000;
+	const { pi, handlers } = fakePi();
+	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, { activeProfile: () => undefined, now: () => now });
+	const { ctx, ui } = fakeContext();
+	const renders: number[] = [];
+	const tui = {
+		mode: "fullscreen",
+		terminal: { rows: 40, columns: 160 },
+		requestRender() { renders.push(now); },
+		applyLineResets: (lines: string[]) => lines.map((line) => `${line}\x1b[0m`),
+	};
+	await fire(handlers, "session_start", ctx);
+	const installFooter = ui.footerFactory as (host: unknown, theme: ShellBarTheme, data: unknown) => { render(width: number): string[]; dispose(): void };
+	const data = { getGitBranch: () => "main", getExtensionStatuses: () => new Map(), getAvailableProviderCount: () => 1, onBranchChange: () => () => {} };
+	installFooter(tui, plainTheme, data);
+	const jobsPart = sidebarState(tui as unknown as TUI).parts.get("jobs") as SidebarRail | undefined;
+	assert.ok(jobsPart, "the fullscreen footer installs the jobs rail part");
+	const paint = () => jobsPart.render(JOBS_RAIL_WIDTH);
+	const emitJobs = (jobs: Array<Record<string, unknown>>) => pi.events.emit(JOBS_SIDEBAR_EVENT, { sessionId: "shell-session", snapshot: { jobs } });
+	const jobsTimer = intervals.find((timer) => timer.delay === 1000);
+	assert.ok(jobsTimer, "the jobs timer is the 1000 ms interval");
+
+	// (1) Coarse elapsed: one hour in, two ticks cannot change the visible text.
+	emitJobs([{ id: "j1", label: "build", startedAt: now - 3_600_000 }]);
+	assert.ok(paint().length > 0, "the running job paints the jobs card");
+	const idleText = paint().join("\n");
+	renders.length = 0;
+	jobsTimer.tick();
+	jobsTimer.tick();
+	assert.equal(renders.length, 0, "a tick whose re-rendered card text is unchanged never requests a render");
+	assert.equal(paint().join("\n"), idleText, "the idle card text really is unchanged across the ticks");
+
+	// (2) The visible elapsed label changes: exactly one render, not a burst.
+	emitJobs([{ id: "j1", label: "build", startedAt: now - 5_000 }]);
+	assert.ok(paint().length > 0);
+	renders.length = 0;
+	now += 1_000;
+	jobsTimer.tick();
+	assert.equal(renders.length, 1, "a tick that changes the visible elapsed requests exactly one render");
+	assert.notEqual(paint().join("\n"), undefined);
+
+	// (3) A finished job past the TTL clears the card once, then stays quiet.
+	emitJobs([{ id: "j2", label: "deploy", startedAt: now - 120_000, status: "exited", endedAt: now, exitCode: 0 }]);
+	assert.ok(paint().length > 0, "a finished job inside the TTL still paints");
+	renders.length = 0;
+	now += 60_001; // JOBS_FINISHED_TTL_MS + 1: the tail must clear itself.
+	jobsTimer.tick();
+	assert.equal(renders.length, 1, "TTL expiry requests exactly one render to clear the card");
+	assert.equal(paint().length, 0, "the expired tail no longer paints");
+	jobsTimer.tick();
+	jobsTimer.tick();
+	assert.equal(renders.length, 1, "further ticks after the card cleared request nothing");
 });
 
 async function reviewSidebarHarness() {

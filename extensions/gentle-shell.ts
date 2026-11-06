@@ -2644,16 +2644,21 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			// rail is natively scrollable, so it lists every running job; there is
 			// no above-editor copy — regular mode keeps the compact bar count.
 			let jobsHovered = false;
-			let jobsPainted = false;
+			// The last painted Jobs card as { width, text }: the idle timer re-renders at
+			// this width and requests a frame only when the visible text changed. Every
+			// Pi render re-lays out the whole transcript, and the elapsed label comes
+			// from coarse units ("5m"), so most seconds change nothing (same pattern as
+			// the wellness clock).
+			let jobsPainted: { width: number; text: string } | undefined;
 			let jobsHeaderRow = 0;
 			const jobsRailCard: Component = {
 				render(width: number) {
 					const jobs = runningJobs ?? [];
-					if (jobs.length === 0) { jobsPainted = false; return []; }
+					if (jobs.length === 0) { jobsPainted = undefined; return []; }
 					// The rail draws Jobs as a panel section: its header is row 0.
 					const lines = renderJobsSection(jobs, theme, width, deps.now(), { collapsed: jobsCollapsed, hovered: jobsHovered });
-					jobsPainted = lines.length > 0;
 					jobsHeaderRow = 0;
+					jobsPainted = lines.length > 0 ? { width, text: lines.join("\n") } : undefined;
 					return lines;
 				},
 				invalidate() {
@@ -2697,13 +2702,24 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			};
 			const jobsPart = sidebarPart(tui, "jobs", { render: () => [], invalidate() {}, dispose() {} }, jobsRail);
 			// Elapsed time moves while a job runs, and a finished tail must clear
-			// itself once its TTL expires with nothing running behind it; one frame
-			// a second is enough, and the digest's second bucket revalidates the
-			// cached section.
+			// itself once its TTL expires with nothing running behind it. But every Pi
+			// render re-lays out the whole transcript, so the timer repaints only when
+			// the last painted card's visible text changed at the painted width; a card
+			// that must appear (nothing painted yet) still goes through a layout pass.
 			const jobsTimer = setInterval(() => {
 				const now = deps.now();
 				const fresh = (runningJobs ?? []).some((job) => job.status === undefined || now - (job.endedAt ?? 0) < JOBS_FINISHED_TTL_MS);
-				if (jobsPainted || fresh) tui.requestRender();
+				const previous = jobsPainted;
+				if (!previous) {
+					if (fresh) { invalidateSidebar(tui); tui.requestRender(); }
+					return;
+				}
+				// Compare the card's own recorded paint, not the region output, so pointer
+				// decoration can never make every tick look changed. The render records the
+				// expected paint before this request, so a skipped frame never re-requests.
+				jobsRegion.render(previous.width);
+				if (jobsPainted?.text === previous.text) return;
+				tui.requestRender();
 			}, 1_000);
 			jobsTimer.unref?.();
 			// The header row carries everything that ticks every frame (model,
