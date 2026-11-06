@@ -79,6 +79,8 @@ export interface PromptFrameOptions {
 	commandsLabel?: { hint?: string };
 	/** A working panel callback is available in fullscreen editor chrome. */
 	panelButton?: boolean;
+	/** The narrow chrome's framed editor closes its top border with `[ Panel ]` when it fits whole (S19). */
+	framedPanelButton?: boolean;
 	panelHovered?: boolean;
 }
 
@@ -139,8 +141,10 @@ function frameLabel(options: PromptFrameOptions, which: "commands" | "panel"): {
 }
 
 // The top rule's tail after `fill` rule cells: plain `─…─╮`, or with room `─…─ « panel · key ─╮`.
+// Without the rail label, the narrow chrome's `[ Panel ]` button takes the slot. Either closes the
+// rule only when it fits whole.
 function closeTopRule(width: number, fill: number, options: PromptFrameOptions): string {
-	const panel = frameLabel(options, "panel");
+	const panel = frameLabel(options, "panel") ?? (options.framedPanelButton ? { text: paintHoverable({ fg: options.fg }, PANEL_BUTTON, options.panelHovered ?? false, "accent"), width: visibleWidth(PANEL_BUTTON) } : undefined);
 	if (panel && fill - panel.width - 3 >= 1) return options.borderColor(` ${rule(fill - panel.width - 3)} `) + panel.text + options.borderColor(" ─╮");
 	return options.borderColor(` ${rule(fill)}╮`);
 }

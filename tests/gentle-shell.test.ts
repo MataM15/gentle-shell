@@ -41,7 +41,7 @@ import { setBundledInstallForTesting } from "../lib/gentle-shell-bundled.ts";
 import { readBannerConfig } from "../extensions/startup-banner.ts";
 import { listVisualProfiles, saveVisualProfile } from "../lib/visual-profiles.ts";
 import { oddPhaseRegistry } from "../lib/odd-phase.ts";
-import { CARD_STYLE, cardStyle, setCardStyle } from "../lib/shell-card.ts";
+import { CARD_STYLE, cardStyle, setCardStyle, type CardStyle } from "../lib/shell-card.ts";
 import { resolveCardStyle, writeCardStyle } from "../lib/card-style-policy.ts";
 import { CARD_CONTENT, cardContent, resolveCardContent, setCardContent, writeCardContent } from "../lib/card-content-policy.ts";
 import { claimNotificationOwner } from "../lib/notification-service.ts";
@@ -7099,8 +7099,11 @@ test("pasted image chips warn instead of sending images a text-only model reject
 	assert.ok(ui.notices.some((notice) => /1 pasted image was not sent: the current model does not accept images/.test(notice)));
 });
 
-async function mobilePlacementFixture(t: TestContext, headerPlacement: "top" | "split" | "below-input", statusPlacement: "auto" | "bottom" | "hidden", columns: number, density: "comfortable" | "compact" | "minimal" = "compact") {
+async function mobilePlacementFixture(t: TestContext, headerPlacement: "top" | "split" | "below-input", statusPlacement: "auto" | "bottom" | "hidden", columns: number, density: "comfortable" | "compact" | "minimal" = "compact", style?: CardStyle) {
 	const home = scopedDoubleEscCancelConfigHome(t);
+	const previousStyle = cardStyle();
+	t.after(() => setCardStyle(previousStyle));
+	if (style) writeCardStyle(style, { gentlePiConfigHome: home });
 	writeVisualSettings({ ...DEFAULT_VISUAL_SETTINGS, headerPlacement, statusPlacement, density }, { gentlePiConfigHome: home });
 	const { pi, handlers, commands } = fakePi();
 	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home, GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, { activeProfile: () => undefined });
@@ -7199,6 +7202,36 @@ test("mobile top and split draw the owner's top bar over a bare status row (S6, 
 		}
 	}
 });
+
+// T12 (odd/tasks/shell-personal-rework.md S19, S12, S16, S7): below 140 columns the neon editor is the owner's
+// rose framed box, `≡ commands` at the left of its top border and `[ Panel ]` at the right when it fits.
+for (const width of [98, 80, 56, 44]) {
+	test(`S19: the installed narrow editor at ${width} columns is the framed box and keeps the panel sheet reachable`, async (t) => {
+		const f = await mobilePlacementFixture(t, "top", "auto", width, "minimal", CARD_STYLE.NEON);
+		const rows = f.editor.render(width).map(stripAnsi);
+		assert.match(rows[0]!, /^╭─ {3}≡ commands · alt\+k ─+ \[ Panel \] ─╮$/, "commands left, Panel right, in the framed top border");
+		assert.match(rows[1]!, /^│.*│$/);
+		assert.match(rows[rows.length - 1]!, /^╰─+╯$/);
+		for (const row of rows) assert.equal(visibleWidth(row), width);
+		assert.doesNotMatch(rows.join("\n"), /waiting for input|✿|🌸|🌹/, "no state title and no petal");
+		const click = (x: number): TuiMouseEvent => ({ type: "click", button: "left", x, y: 0, screenX: x, screenY: 0, width, height: rows.length, shift: false, alt: false, ctrl: false });
+		const before = f.ui.customOptions!.length;
+		assert.equal(f.editor.handleMouse(click(rows[0]!.indexOf("≡ commands")))?.handled, true);
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(f.ui.customOptions!.length, before + 1, "≡ commands opens the palette");
+		f.ui.overlayView!.handleInput("\x1b");
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(f.editor.handleMouse(click(rows[0]!.indexOf("[ Panel ]")))?.handled, true);
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.match(stripAnsi(f.ui.overlayView!.render(width).join("\n")), /PANEL/i, "[ Panel ] opens the panel sheet");
+		f.ui.closeOverlay?.();
+		void f.commands.get("gentle:panel")!.handler("", f.ctx);
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.ok(f.ui.overlayView, "/gentle:panel still opens the sheet");
+		f.ui.closeOverlay?.();
+		assert.match(f.layoutRows().at(-1)!, /SUPER-YOLO/, "the status row stays below the conversation");
+	});
+}
 
 test("mobile below-input keeps the modern Panel editor and one lower status bar", async (t) => {
 	for (const width of [80, 120]) for (const status of ["auto", "bottom", "hidden"] as const) {
@@ -7300,7 +7333,7 @@ test("the installed editor draws the panel frame in the wide and mobile IDE chro
 		agents.dispose();
 		state.active = false;
 		state.layoutAttached = () => true;
-		assert.match(stripAnsi(editor.render(80)[0]!), /^─   waiting for input/, "a narrow fullscreen terminal (mobile) keeps the panel editor");
+		assert.match(stripAnsi(editor.render(80)[0]!), /^╭─ {3}≡ commands/, "a narrow fullscreen terminal (mobile) draws the owner's framed editor (S19)");
 		state.layoutAttached = undefined;
 		assert.match(stripAnsi(editor.render(80)[0]!), /^╭/, "without the fullscreen layout installed the framed editor stays");
 		delete host.mode;

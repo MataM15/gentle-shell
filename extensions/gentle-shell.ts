@@ -617,6 +617,7 @@ export class GentlePromptEditor extends CustomEditor {
 	private hoveredTopRow: number | undefined;
 	private hoveredPanel = false;
 	private panelStart: number | undefined;
+	private panelButtonWidth: number | undefined;
 	// Where `« panel` sits on the rule row, in the width it was painted at.
 	private panelLabelHit: { start: number; end: number; width: number } | undefined;
 	private commandsLabelHit: { start: number; end: number; width: number } | undefined;
@@ -1372,7 +1373,7 @@ export class GentlePromptEditor extends CustomEditor {
 			if (event.type === "click") this.deps.openCommands();
 			return { handled: true, render: event.type === "click" };
 		}
-		const onPanel = (this.deps.panelButton?.() ?? true) && this.panelStart !== undefined && this.floatMouseLayout?.panel && event.width === this.floatMouseLayout.width && event.y === this.topRowCount &&
+		const onPanel = (this.deps.panelButton?.() ?? true) && this.panelStart !== undefined && event.width === this.panelButtonWidth && event.y === this.topRowCount &&
 			event.x >= this.panelStart && event.x < this.panelStart + visibleWidth(PANEL_BUTTON);
 		if (event.type === "move" && event.button === "none") {
 			if (onPanel || (event.y >= 0 && event.y < this.topRowCount)) setSidebarHover(this.pointerTui, this, () => this.clearEditorHover());
@@ -1422,6 +1423,12 @@ export class GentlePromptEditor extends CustomEditor {
 		return super.handleMouse({ ...event, x: event.x - layout.prefixWidth, width: layout.nativeWidth });
 	}
 
+	// The panel rule offers [ Panel ] unless the shell says no; the framed editor (S19) only when the shell asks, so the regular chrome never promises an inert control.
+	private wantsPanelButton(layout: ReturnType<typeof resolvePromptLayout>): boolean {
+		if (layout.panel) return this.deps.panelButton?.() ?? true;
+		return !layout.background && this.deps.panelButton?.() === true;
+	}
+
 	render(width: number): string[] {
 		// Render-driven petal (gentle-shell#994): every frame the host already
 		// paints while working advances the animation for free, so no fast
@@ -1461,7 +1468,8 @@ export class GentlePromptEditor extends CustomEditor {
 			fg: this.deps.fg,
 			bold: this.deps.bold,
 			workingLabel: this.promptState === PROMPT_STATE.WORKING ? this.deps.workingLabel?.() : undefined,
-			panelButton: Boolean(layout.panel && this.deps.onPanelClick && (this.deps.panelButton?.() ?? true)),
+			panelButton: Boolean(layout.panel && this.deps.onPanelClick && this.wantsPanelButton(layout)),
+			framedPanelButton: Boolean(!layout.panel && this.deps.onPanelClick && this.wantsPanelButton(layout)),
 			panelHovered: this.hoveredPanel,
 			panelLabel: this.deps.panelLabel?.(),
 			commandsLabel: this.deps.commandsLabel?.(),
@@ -1486,8 +1494,9 @@ export class GentlePromptEditor extends CustomEditor {
 		if (this.hoveredTopRow !== undefined && this.hoveredTopRow >= topRows.length) this.hoveredTopRow = undefined;
 		this.topRowCount = topRows.length;
 		const plainRule = stripAnsi(framed[0] ?? "");
-		const panelAt = layout.panel && this.deps.onPanelClick && (this.deps.panelButton?.() ?? true) ? plainRule.lastIndexOf(PANEL_BUTTON) : -1;
+		const panelAt = this.deps.onPanelClick && this.wantsPanelButton(layout) ? plainRule.lastIndexOf(PANEL_BUTTON) : -1;
 		this.panelStart = panelAt < 0 ? undefined : visibleWidth(plainRule.slice(0, panelAt));
+		this.panelButtonWidth = this.panelStart === undefined ? undefined : width;
 		const labelAt = this.deps.panelLabel?.() ? plainRule.indexOf(PANEL_LABEL_TEXT) : -1;
 		const labelHit = (text: string, hint: string | undefined) => {
 			const at = plainRule.indexOf(text);
@@ -1523,6 +1532,7 @@ export class GentlePromptEditor extends CustomEditor {
 	invalidate(): void {
 		super.invalidate();
 		this.panelStart = undefined;
+		this.panelButtonWidth = undefined;
 		this.panelLabelHit = undefined;
 		this.commandsLabelHit = undefined;
 		this.clearEditorHover();
@@ -3134,7 +3144,8 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			},
 			{ now: () => deps.now(), doubleEscCancelEnabled: () => doubleEscCancelPolicy === "on", dispatchQueuedText: (text) => { pendingQueuedText = pendingQueuedText === undefined ? text : `${pendingQueuedText}\n\n${text}`; }, vimRuntimeVersion: deps.vimRuntimeVersion, attachments: imageAttachments, readClipboardImage: () => (deps.readClipboardImage ?? readClipboardImage)(),
 				// The editor joins the wide IDE chrome while the rail owns the host with the header on top.
-				panelChrome: (tui) => chromeMode(tui) !== undefined || chromeBarsShown(tui, true),
+				// The narrow chrome draws the owner's framed editor (S19); only the float style keeps the panel rule there.
+				panelChrome: (tui) => (chromeMode(tui) === "narrow" ? cardStyle() === CARD_STYLE.FLOAT : chromeMode(tui) !== undefined) || chromeBarsShown(tui, true),
 				// Without the rail, [ Panel ] opens the Status sections: the mobile chrome,
 				// and a wide terminal with Status at the bottom.
 				panelButton: (tui) => chromeMode(tui) === "narrow" || (visualSettings.statusPlacement === "bottom" && chromeBarsShown(tui, true)),
