@@ -134,7 +134,7 @@ import { accountIdFromToken, ANTHROPIC_PROVIDER, ANTHROPIC_USAGE_URL, CODEX_PROV
 import { UsageView } from "../lib/shell-usage-view.ts";
 import { releaseSidebarHover, setSidebarHover, sidebarHeader, sidebarPart, sidebarRailHeader, sidebarState, sidebarStatusBar, VISUAL_SETTINGS_CHANGED, type SidebarRail } from "../lib/shell-sidebar.ts";
 import { installSidebar, invalidateSidebar, narrowStatusOwner, SIDEBAR_BREAKPOINT, sheetCardPart, STATUS_OWNER, themeSignature } from "../lib/shell-sidebar-layout.ts";
-import { panelSheetBackHit, renderPanelRow, renderPanelSheet, renderStaticPanelHeader, renderWorkRow, setChromeSurface, SHEET_CARD_KEYS, workRowLead } from "../lib/shell-panel.ts";
+import { panelSheetBackHit, renderPanelRow, renderPanelSheet, renderStaticPanelHeader, renderWorkRow, setChromeSurface, workRowLead } from "../lib/shell-panel.ts";
 import { installPagePaint, type PageTheme } from "../lib/shell-page.ts";
 import { layoutSchematic } from "../lib/visual-layout-preview.ts";
 import { collectSessionStats, type SessionStats } from "../lib/shell-stats.ts";
@@ -2452,8 +2452,8 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 						const host = (sidebarTui ?? tui) as TUI;
 						const rows = Math.max(4, (host.terminal?.rows ?? 24) - SHEET_RESERVED_ROWS);
 						const state = sidebarState(host);
-						// Otras sesiones and Limits reach the narrow sheet as the rail tabs' cards (S7).
-						const parts = new Map([...state.parts].filter(([key]) => key !== "todo" || state.visibility?.todo !== false).map(([key, part]) => [key, SHEET_CARD_KEYS.has(key) ? sheetCardPart(part, theme) : part] as const));
+						// Every section reaches the narrow sheet as the rail tabs' neon cards on the transparent surface (S7).
+						const parts = new Map([...state.parts].filter(([key]) => key !== "todo" || state.visibility?.todo !== false).map(([key, part]) => [key, sheetCardPart(part, theme)] as const));
 						const sheet = renderPanelSheet(parts, theme, width, { rows, scrollTop, backHovered });
 						maxScroll = sheet.maxScroll;
 						scrollTop = Math.min(scrollTop, maxScroll);

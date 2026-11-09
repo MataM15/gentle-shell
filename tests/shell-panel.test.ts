@@ -289,6 +289,27 @@ test("the narrow sheet draws Otras sesiones and Limits as neon conversation card
 	}
 });
 
+test("every sheet section is a neon card on the transparent surface and keeps plain headers when tinted (S7)", () => {
+	const section = (title: string) => ({ render: (width: number) => [renderPanelHeader(plain, width, { title, count: "1", open: true }), renderPanelRow(width, `${title} row`)], invalidate() {} });
+	const footer = { ...section("Changes"), render: (width: number) => [renderPanelHeader(plain, width, { title: "Changes", open: true }), renderPanelRow(width, "clean"), renderPanelHeader(plain, width, { title: "Integrations", open: true }), renderPanelRow(width, "- Permissions")], cardGroups: () => ({ groups: [{ start: 0, end: 2 }, { start: 2, end: 4 }] }), invalidate() {} };
+	const raw = new Map<string, { render(width: number): string[] }>([["todo", section("Todos")], ["jobs", section("Jobs")], ["agents", section("Agents")], ["sessions", section("Otras sesiones")], ["usage", section("Limits")], ["footer", footer]]);
+	const build = () => new Map([...raw].map(([key, part]) => [key, sheetCardPart(part as never, plain)]));
+	setCardStyle(CARD_STYLE.NEON);
+	try {
+		setChromeSurface("transparent");
+		const rows = renderPanelSheet(build() as never, plain, 60, { rows: 60, scrollTop: 0 }).lines.map((line) => stripAnsi(line).trimEnd());
+		for (const title of ["Todos", "Jobs", "Agents", "Otras sesiones", "Limits", "Changes", "Integrations"]) assert.ok(rows.some((row) => new RegExp(`^ ╭─ (▾ )?${title}\\b.*╮$`).test(row)), `${title} is a card\n${rows.join("\n")}`);
+		assert.equal(rows.filter((row) => row.startsWith(" ╰")).length, 7, "one closed card per section group");
+		assert.ok(!rows.some((row) => /^ ▾ /.test(row)), "no plain header is left");
+		setChromeSurface("tinted");
+		const plainRows = renderPanelSheet(build() as never, plain, 60, { rows: 60, scrollTop: 0 }).lines.map((line) => stripAnsi(line).trimEnd());
+		assert.ok(plainRows.some((row) => /^ ▾ TODOS/.test(row)) && !plainRows.some((row) => row.includes("╭")), "tinted keeps the plain headers");
+	} finally {
+		setChromeSurface("tinted");
+		setCardStyle(CARD_STYLE.FLOAT);
+	}
+});
+
 test("the mobile sheet wraps and scrolls a long Integrations status", () => {
 	const model = { ...chromeModel, permission: undefined, integrations: ["mobile-integration-with-a-long-name (local)", "MCP connected"] };
 	const visibility = { changes: false, rdd: true, agents: true, todo: true, usageCost: true, modelDetails: true, contextWarning: true, stats: false };

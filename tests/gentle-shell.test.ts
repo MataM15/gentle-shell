@@ -7788,7 +7788,7 @@ test("mobile folds live work into one row above the editor that opens /gentle:pa
 		await new Promise((resolve) => setImmediate(resolve));
 		const sheet = openPanelLines(ui);
 		assert.match(sheet[0]!, /^ Panel +esc back $/);
-		assert.ok(sheet.some((line) => /▾ TODOS/.test(line)) && sheet.some((line) => /Run the suite/.test(line)), "the sheet shows the rail sections");
+		assert.ok(sheet.some((line) => /▾ (TODOS|Todos)/.test(line)) && sheet.some((line) => /Run the suite/.test(line)), "the sheet shows the rail sections");
 		(ui.overlayView as unknown as { handleInput(data: string): void }).handleInput("\x1b");
 		tui.terminal.columns = 160;
 		assert.equal(state.compactWork?.(), false, "a wide terminal keeps the rail and the cards' rules");
