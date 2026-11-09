@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { TuiAltScreen, visibleWidth, type Terminal, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { getThemeByName } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js";
 import { CommandPalette, commandsKey, rankPaletteGroups, type CommandPaletteGroup, type CommandPaletteItem, type CommandPaletteResult, type CommandPaletteTheme } from "../lib/command-palette.ts";
-import { buildCommandPaletteGroups, COMMAND_PALETTE_CATALOG } from "../lib/command-palette-catalog.ts";
+import { buildCommandPaletteGroups, COMMAND_PALETTE_CATALOG, COMMAND_PALETTE_EXCLUSIONS } from "../lib/command-palette-catalog.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import startupBanner from "../extensions/startup-banner.ts";
 
@@ -506,6 +506,50 @@ test("wheel reaches scrolled commands and keeps keyboard navigation working", ()
 	assert.deepEqual(results, [{ type: "run", name: "cmd:18" }]);
 });
 
+test("a left click on the header esc hint closes the palette, and moving over it paints the shared hover role", () => {
+	const { palette, results } = createPalette(GROUPS, pointerTheme);
+	let frame = palette.render(80);
+	const hint = point(frame, "esc");
+	assert.equal(hint.y, 1, "the esc hint sits on the card's header row");
+	const hovered = palette.handleMouse(mouse(frame, hint.x, hint.y, "move", "none"));
+	assert.equal(hovered?.render, true);
+	frame = palette.render(80);
+	assert.match(frame[hint.y]!, /\x1b\[33mesc/, "hover paints the hint like the panel sheet's esc back");
+	assert.equal(palette.handleMouse(mouse(frame, hint.x, hint.y, "move", "none"))?.render, false, "repeated motion does not redraw");
+	assert.deepEqual(results, [], "hover never closes");
+	palette.handleMouse(mouse(frame, 4, hint.y, "move", "none"));
+	frame = palette.render(80);
+	assert.doesNotMatch(frame[hint.y]!, /\x1b\[33m/, "the title area is not the hint");
+	palette.handleMouse(mouse(frame, hint.x, hint.y, "click", "right"));
+	palette.handleMouse(mouse(frame, 4, hint.y));
+	assert.deepEqual(results, [], "only a left click on the hint closes");
+	assert.equal(palette.handleMouse(mouse(frame, hint.x, hint.y, "press"))?.handled, true);
+	assert.deepEqual(results, [], "press alone cannot close");
+	palette.handleMouse(mouse(frame, hint.x + 1, hint.y));
+	assert.deepEqual(results, [{ type: "close" }]);
+});
+
+test("the footer esc close and esc cancel hints are clickable", () => {
+	const closing = createPalette(GROUPS, pointerTheme);
+	let frame = closing.palette.render(80);
+	const close = point(frame, "esc close");
+	assert.equal(closing.palette.handleMouse(mouse(frame, close.x + 2, close.y, "move", "none"))?.render, true);
+	frame = closing.palette.render(80);
+	assert.match(frame[close.y]!, /\x1b\[33mesc close/);
+	closing.palette.handleMouse(mouse(frame, close.x + 2, close.y));
+	assert.deepEqual(closing.results, [{ type: "close" }]);
+
+	const capturing = createPalette(GROUPS, pointerTheme);
+	capturing.palette.handleInput("\t");
+	frame = capturing.palette.render(80);
+	const cancel = point(frame, "esc cancel");
+	capturing.palette.handleMouse(mouse(frame, cancel.x, cancel.y, "move", "none"));
+	frame = capturing.palette.render(80);
+	assert.match(frame[cancel.y]!, /\x1b\[33mesc cancel/);
+	capturing.palette.handleMouse(mouse(frame, cancel.x, cancel.y));
+	assert.deepEqual(capturing.results, [{ type: "close" }], "the cancel hint works while a key is being captured");
+});
+
 test("mouse cannot select, run, scroll or bind while the next key is being captured", () => {
 	const { palette, results } = createPalette(GROUPS, pointerTheme);
 	palette.handleInput(KEY.DOWN);
@@ -598,6 +642,32 @@ test("native SGR wheel reaches and clicks an initially hidden command", () => {
 	}
 });
 
+test("native SGR click on the header esc hint closes the palette", () => {
+	let input: ((data: string) => void) | undefined;
+	const terminal: Terminal = {
+		start(onInput) { input = onInput; }, stop() {}, async drainInput() {}, write() {},
+		get columns() { return 100; }, get rows() { return 24; }, get kittyProtocolActive() { return false; },
+		moveBy() {}, hideCursor() {}, showCursor() {}, clearLine() {}, clearFromCursor() {}, clearScreen() {}, setTitle() {}, setProgress() {}, setProgramStatus() {},
+	};
+	const { palette, results } = createPalette(GROUPS, undefined, () => terminal.rows);
+	const tui = new TuiAltScreen(terminal, false, undefined, { mouse: true });
+	const overlay = tui.showOverlay(palette, { anchor: "center", width: 60, maxHeight: "85%" });
+	tui.start();
+	tui.renderNow(true);
+	try {
+		const frame = palette.render(60);
+		const bounds = overlay.getBounds();
+		assert.ok(bounds);
+		const hint = point(frame, "esc");
+		const x = bounds.col + hint.x + 1, y = bounds.row + hint.y + 1;
+		input?.(`\x1b[<0;${x};${y}M`);
+		input?.(`\x1b[<0;${x};${y}m`);
+		assert.deepEqual(results, [{ type: "close" }]);
+	} finally {
+		tui.stop();
+	}
+});
+
 test("a height-clipped native overlay never dispatches a hidden row", () => {
 	let input: ((data: string) => void) | undefined;
 	const terminal: Terminal = {
@@ -655,12 +725,13 @@ test("commandsKey is disabled by an empty value or off (case-insensitive)", () =
 test("COMMAND_PALETTE_CATALOG matches the curated command set, in order", () => {
 	assert.deepEqual(
 		COMMAND_PALETTE_CATALOG.map((group) => group.title),
-		["Configuration", "Session", "Diagnostics", "Skills"],
+		["Configuration", "Session", "Tools", "Diagnostics", "Skills"],
 	);
 	const byTitle = (title: string) => COMMAND_PALETTE_CATALOG.find((group) => group.title === title)?.items.map((item) => item.command);
 	assert.deepEqual(byTitle("Configuration"), [
 		"gentle:profiles",
 		"gentle:persona",
+		"gentle:rdd",
 		"gentle:review-mode",
 		"gentle:background-subagents",
 		"gentle:double-esc-cancel",
@@ -669,11 +740,112 @@ test("COMMAND_PALETTE_CATALOG matches the curated command set, in order", () => 
 		"gentle:vim",
 		"gentle:telemetry",
 		"gentle:dev-binary",
+		"gentle:install-delegation",
+		"gentle:install-review",
 	]);
-	assert.deepEqual(byTitle("Session"), ["gentle:guide", "gentle:yolo", "gentle:changes", "gentle:agents", "gentle:jobs", "gentle:usage", "gentle:review-session-permission", "gentle:voice", "gentle:design"]);
-	assert.deepEqual(byTitle("Diagnostics"), ["gentle:status", "gentle:doctor"]);
+	assert.deepEqual(byTitle("Session"), [
+		"gentle:guide",
+		"gentle:yolo",
+		"gentle:mode",
+		"gentle:changes",
+		"gentle:agents",
+		"gentle:jobs",
+		"gentle:panel",
+		"gentle:usage",
+		"gentle:stats",
+		"gentle:review-session-permission",
+		"gentle:voice",
+		"gentle:design",
+	]);
+	assert.deepEqual(byTitle("Tools"), ["gentle:images", "gentle:scratch", "history", "gentle-wellness", "gentle:music"]);
+	assert.deepEqual(byTitle("Diagnostics"), ["gentle:status", "gentle:status-timing", "gentle:doctor", "gentle:config-snapshot"]);
 	assert.equal(byTitle("SDD"), undefined);
 	assert.deepEqual(byTitle("Skills"), ["skill-registry:refresh"]);
+});
+
+// --- catalog completeness gate -------------------------------------------------
+
+const NOT_SHIPPED_SOURCE = /\.(?:test|devtest)\.ts$/;
+
+/** Every non-test TypeScript source a shipped extension or lib module lives in. */
+function shippedSources(): { file: string; source: string }[] {
+	const found: { file: string; source: string }[] = [];
+	const walk = (dir: URL, prefix: string): void => {
+		for (const entry of readdirSync(dir, { withFileTypes: true })) {
+			if (entry.name === "node_modules" || entry.name.startsWith(".")) continue;
+			const child = new URL(`${entry.name}${entry.isDirectory() ? "/" : ""}`, dir);
+			if (entry.isDirectory()) walk(child, `${prefix}${entry.name}/`);
+			else if (entry.name.endsWith(".ts") && !NOT_SHIPPED_SOURCE.test(entry.name)) found.push({ file: `${prefix}${entry.name}`, source: readFileSync(child, "utf8") });
+		}
+	};
+	walk(new URL("../extensions/", import.meta.url), "extensions/");
+	walk(new URL("../lib/", import.meta.url), "lib/");
+	return found;
+}
+
+/** Expand `gentle:install-${owner}` from its `for (const owner of [...] as const)` loop. */
+function expandCommandTemplate(template: string, source: string, where: string): string[] {
+	let expanded = [template];
+	for (const placeholder of template.matchAll(/\$\{([A-Za-z_$][\w$]*)\}/g)) {
+		const variable = placeholder[1]!;
+		const loop = new RegExp(`for\\s*\\(\\s*const\\s+${variable}\\s+of\\s+\\[([^\\]]*)\\]`).exec(source);
+		const values = loop ? [...loop[1]!.matchAll(/"([^"]+)"/g)].map((value) => value[1]!) : [];
+		assert.ok(values.length > 0, `cannot resolve \${${variable}} in a registered command name at ${where}`);
+		expanded = expanded.flatMap((prefix) => values.map((value) => prefix.replace(`\${${variable}}`, value)));
+	}
+	return expanded;
+}
+
+/** The command names behind one `registerCommand(` argument: a string
+ * literal, a module constant, a `${...}` template, or the parameter of a
+ * helper whose call sites pass literals. */
+function resolveCommandName(argument: string, source: string, index: number, constants: ReadonlyMap<string, string>, where: string): string[] {
+	if (argument.startsWith("`")) return expandCommandTemplate(argument.slice(1, -1), source, where);
+	if (argument.startsWith("\"") || argument.startsWith("'")) return [argument.slice(1, -1)];
+	const constant = constants.get(argument);
+	if (constant !== undefined) return [constant];
+	const helper = [...source.slice(0, index).matchAll(/(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\(|function\s+([A-Za-z_$][\w$]*)\s*\(/g)].pop();
+	const helperName = helper?.[1] ?? helper?.[2];
+	if (helperName) {
+		const calls = [...source.matchAll(new RegExp(`\\b${helperName}\\(\\s*["']([^"']+)["']`, "g"))].map((call) => call[1]!);
+		if (calls.length > 0) return calls;
+	}
+	return assert.fail(`cannot resolve the command name registered at ${where}; register it with a literal or a constant so the palette completeness gate can see it`);
+}
+
+/** Every command name a shipped extension or lib module can register, with
+ * the source location of each registration. */
+function discoverRegisteredCommands(): Map<string, string> {
+	const sources = shippedSources();
+	const constants = new Map<string, string>();
+	for (const { source } of sources) {
+		for (const match of source.matchAll(/(?:export\s+)?const\s+([A-Za-z_$][\w$]*)\s*=\s*"([^"]+)"/g)) constants.set(match[1]!, match[2]!);
+	}
+	const found = new Map<string, string>();
+	for (const { file, source } of sources) {
+		for (const match of source.matchAll(/registerCommand\s*\(\s*(`[^`]*`|"[^"]*"|'[^']*'|[A-Za-z_$][\w$]*)/g)) {
+			const where = `${file}:${source.slice(0, match.index).split("\n").length}`;
+			for (const name of resolveCommandName(match[1]!, source, match.index, constants, where)) found.set(name, where);
+		}
+	}
+	return found;
+}
+
+// The palette must offer every user-facing command the shell registers, so a
+// new upstream command cannot silently go missing from `≡ commands`: any
+// registration outside both the catalog and the documented exclusion list
+// fails this gate.
+test("every registered user-facing command is in the palette catalog or an explicit exclusion", () => {
+	const registered = discoverRegisteredCommands();
+	const catalog = COMMAND_PALETTE_CATALOG.flatMap((group) => group.items.map((item) => item.command));
+	const missing = [...registered]
+		.filter(([name]) => !catalog.includes(name) && COMMAND_PALETTE_EXCLUSIONS[name] === undefined)
+		.map(([name, where]) => `${name} (${where})`);
+	assert.deepEqual(missing, [], "add a catalog entry for each new command, or a documented exclusion with its reason");
+	const dead = catalog.filter((name) => !registered.has(name));
+	assert.deepEqual(dead, [], "the catalog must not list a command no shipped module registers");
+	const stale = Object.keys(COMMAND_PALETTE_EXCLUSIONS).filter((name) => !registered.has(name));
+	assert.deepEqual(stale, [], "an exclusion for a command nobody registers is stale");
 });
 
 // #1664: banner settings live under Customization > Banner; the palette keeps

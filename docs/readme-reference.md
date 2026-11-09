@@ -1332,7 +1332,7 @@ The notice appears once per distinct change: further launches stay quiet until t
 | `/gentle:status`              | Shows package assets and global model config status. |
 | `/gentle:doctor`              | Runs read-only diagnostics for assets, model/persona config, memory tools, safety guards, and (inside Herdr) the task-summary sidebar setup. |
 | `/gentle:profiles`               | Opens the models screen on this repository's profile. `export <name>`, `import`, and `publish <name>` handle profile files and the repository declaration; `export-routing` and `restore-routing` move the saved global routing through `models.export.json`. |
-| `/gentle:commands`               | Opens the command palette (default `alt+k`): a curated, grouped menu (Configuration, Session, Diagnostics, Skills) of registered Gentle commands; search and run by label. |
+| `/gentle:commands`               | Opens the command palette (default `alt+k`): a grouped menu (Configuration, Session, Tools, Diagnostics, Skills) of every user-facing registered Gentle command, minus a short documented exclusion list (the palette's own command and the banner commands, whose settings live under Customization > Banner); search and run by label, and a left click on the header `esc` hint or the footer `esc close` hint closes it. |
 | `/gentle:persona`                | Switches global persona mode, with project override support.        |
 | `/gentle:background-subagents`   | Shows or sets the managed background-subagents policy (`status\|enable\|disable`), naming the source that decided it. |
 | `/gentle:double-esc-cancel`      | Shows or sets the double-esc-cancel preference (`status\|enable\|disable`); no argument toggles it. |

@@ -143,12 +143,38 @@ interface PalettePointerHit {
 	itemIndex: number;
 }
 
+/** A horizontal span of one card row that acts as a control (the header's
+ * `esc` hint and the footer's `esc close` / `esc cancel`). Coordinates are
+ * card-local, borders included, like every other pointer hit. */
+interface PaletteTextHit {
+	y: number;
+	x0: number;
+	x1: number;
+}
+
+/** Controls painted outside the item list, collected while rendering. */
+interface PaletteChromeHits {
+	esc?: PaletteTextHit;
+	footer?: PaletteTextHit;
+}
+
 interface PalettePointerFrame {
 	width: number;
 	height: number;
 	availableRows: number;
 	modelKey: string;
 	hits: PalettePointerHit[];
+	chrome: PaletteChromeHits;
+}
+
+// The card draws `│ ` before and ` │` after each content row, so a content
+// column is two card columns to the right of its index within the body.
+const BODY_LEFT_PADDING = 2;
+const HEADER_ESC = "esc";
+
+/** True when `event` lands on a control span; spans already include a column of padding. */
+function isTextHit(span: PaletteTextHit | undefined, event: TuiMouseEvent): boolean {
+	return span !== undefined && event.y === span.y && event.x >= span.x0 && event.x <= span.x1;
 }
 
 function buildRows(groups: readonly CommandPaletteGroup[]): PaletteRow[] {
@@ -185,6 +211,7 @@ export class CommandPalette {
 	private disposed = false;
 	private capturing: CommandPaletteItem | undefined;
 	private hovered: number | undefined;
+	private closeHover: "header" | "footer" | undefined;
 	private pointerFrame: PalettePointerFrame | undefined;
 	private renderedWidth: number | undefined;
 	private renderedRows: number | undefined;
@@ -204,6 +231,7 @@ export class CommandPalette {
 	invalidate(): void {
 		this.pointerFrame = undefined;
 		this.hovered = undefined;
+		this.closeHover = undefined;
 		this.renderedWidth = undefined;
 	}
 
@@ -214,28 +242,44 @@ export class CommandPalette {
 
 	/** Mouse events are local to the last painted card, including its borders. */
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
-		if (this.completed || this.disposed || this.capturing) return undefined;
+		if (this.completed || this.disposed) return undefined;
 		const frame = this.pointerFrame;
 		if (!frame || frame.width !== event.width || frame.height !== event.height ||
 			frame.availableRows !== this.rowsFn() || frame.modelKey !== this.modelKey()) {
 			this.pointerFrame = undefined;
-			const changed = this.setHover(undefined);
+			const changed = this.setHover(undefined) || this.setCloseHover(undefined);
 			return changed && event.type === "move" && event.button === "none" ? { handled: true, render: true } : undefined;
 		}
 		const inside = event.x >= 2 && event.x < frame.width - 2 && event.y >= 0 && event.y < frame.height;
-		const hit = inside ? frame.hits.find((candidate) => candidate.y === event.y) : undefined;
+		const closeHover: "header" | "footer" | undefined = !inside ? undefined
+			: isTextHit(frame.chrome.esc, event) ? "header"
+			: isTextHit(frame.chrome.footer, event) ? "footer"
+			: undefined;
+		const hit = inside && !this.capturing ? frame.hits.find((candidate) => candidate.y === event.y) : undefined;
 		if (event.type === "move" && event.button === "none") {
-			return { handled: true, render: this.setHover(hit?.itemIndex) };
+			const hoverChanged = this.setHover(closeHover ? undefined : hit?.itemIndex);
+			const closeChanged = this.setCloseHover(closeHover);
+			return { handled: true, render: hoverChanged || closeChanged };
 		}
 		if (event.type === "wheel" && inside && event.wheelDelta) {
+			if (this.capturing) return undefined;
 			const before = this.selected;
 			this.moveSelection(Math.sign(event.wheelDelta));
 			const changed = this.selected !== before;
-			const hoverChanged = this.setHover(undefined);
+			const hoverChanged = this.setHover(undefined) || this.setCloseHover(undefined);
 			if (changed) this.pointerFrame = undefined;
 			return { handled: true, render: changed || hoverChanged };
 		}
-		if (event.button !== "left" || !hit) return undefined;
+		if (event.button !== "left") return undefined;
+		// `esc` in the header and `esc close` / `esc cancel` in the footer are
+		// controls too: hover paints them, a left click closes the palette.
+		if (closeHover) {
+			if (event.type === "press") return { handled: true, render: false };
+			if (event.type !== "click") return undefined;
+			this.finish({ type: "close" });
+			return { handled: true, render: true };
+		}
+		if (this.capturing || !hit) return undefined;
 		if (event.type === "press") return { handled: true, render: false };
 		if (event.type === "click") {
 			this.selected = hit.itemIndex;
@@ -250,6 +294,7 @@ export class CommandPalette {
 		if (this.completed || this.disposed || isKeyRelease(data)) return;
 		this.pointerFrame = undefined;
 		this.hovered = undefined;
+		this.closeHover = undefined;
 		// After Tab the next key is the one to assign, whatever it is; esc only cancels.
 		if (this.capturing) {
 			const item = this.capturing;
@@ -295,19 +340,23 @@ export class CommandPalette {
 	render(width: number): string[] {
 		const availableRows = this.rowsFn();
 		const modelKey = this.modelKey();
-		if (this.renderedWidth !== width || this.renderedRows !== availableRows || this.renderedModelKey !== modelKey) this.hovered = undefined;
+		if (this.renderedWidth !== width || this.renderedRows !== availableRows || this.renderedModelKey !== modelKey) {
+			this.hovered = undefined;
+			this.closeHover = undefined;
+		}
 		this.renderedWidth = width;
 		this.renderedRows = availableRows;
 		this.renderedModelKey = modelKey;
 		const innerWidth = Math.max(1, width - CARD_PADDING);
 		const maxTotalLines = Math.max(MIN_TOTAL_ROWS, Math.floor(availableRows * HEIGHT_RATIO));
 		const hits: PalettePointerHit[] = [];
-		const frame = renderPaletteCard(this.renderBody(innerWidth, maxTotalLines, hits), width, this.theme);
+		const chrome: PaletteChromeHits = {};
+		const frame = renderPaletteCard(this.renderBody(innerWidth, maxTotalLines, hits, chrome), width, this.theme);
 		// showCommandPalette caps the overlay at 85% even when the card's
 		// minimum height is larger. Only the actually visible prefix can act.
 		const visibleHeight = Math.min(frame.length, Math.max(1, Math.floor(availableRows * HEIGHT_RATIO)));
 		this.pointerFrame = this.disposed || this.completed || width <= CARD_PADDING ? undefined : {
-			width, height: visibleHeight, availableRows, modelKey, hits,
+			width, height: visibleHeight, availableRows, modelKey, hits, chrome,
 		};
 		return frame;
 	}
@@ -350,6 +399,12 @@ export class CommandPalette {
 		return true;
 	}
 
+	private setCloseHover(hover: "header" | "footer" | undefined): boolean {
+		if (this.closeHover === hover) return false;
+		this.closeHover = hover;
+		return true;
+	}
+
 	private runSelected(): void {
 		const item = itemAt(this.matches(), this.selected);
 		if (item) this.finish({ type: "run", name: item.command });
@@ -360,12 +415,13 @@ export class CommandPalette {
 		this.completed = true;
 		this.pointerFrame = undefined;
 		this.hovered = undefined;
+		this.closeHover = undefined;
 		this.done(result);
 	}
 
-	private renderBody(width: number, maxTotalLines: number, hits: PalettePointerHit[]): string[] {
+	private renderBody(width: number, maxTotalLines: number, hits: PalettePointerHit[], chrome: PaletteChromeHits): string[] {
 		const lines: string[] = [];
-		lines.push(this.renderHeaderRow(width));
+		lines.push(this.renderHeaderRow(width, chrome));
 		lines.push(this.query.length > 0 ? this.renderLine(`› ${this.query}`, width) : this.renderLine("› Search", width, "muted"));
 		lines.push("");
 		const groups = this.matches();
@@ -376,15 +432,43 @@ export class CommandPalette {
 			lines.push(...this.renderGroups(groups, width, budget, hits));
 		}
 		lines.push("");
-		if (this.capturing) lines.push(this.renderLine(`Press the new key for ${this.capturing.label} · esc cancel`, width, "accent"));
-		else lines.push(this.renderLine("↑/↓ move • enter run • tab set key • esc close", width, "muted"));
+		const footer = this.renderFooterRow(width);
+		lines.push(footer.line);
+		// The footer is the last body row, so its card row is one past its index.
+		if (footer.esc) chrome.footer = { ...footer.esc, y: lines.length };
 		return lines;
 	}
 
-	private renderHeaderRow(width: number): string {
-		const left = this.renderText("Commands", "title");
-		const right = this.renderText("esc", "muted");
+	private renderHeaderRow(width: number, chrome: PaletteChromeHits): string {
+		const title = "Commands";
+		const left = this.renderText(title, "title");
+		const right = this.theme ? paintHoverable(this.theme, HEADER_ESC, this.closeHover === "header", "muted") : HEADER_ESC;
+		const titleWidth = visibleWidth(title);
+		const rightWidth = visibleWidth(HEADER_ESC);
+		// Right-aligned in the body row that follows the top border. Like the
+		// panel sheet's `esc back`, one column of padding on each side is part
+		// of the click target.
+		if (width > titleWidth + rightWidth) {
+			const start = BODY_LEFT_PADDING + width - rightWidth;
+			chrome.esc = { y: 1, x0: start - 1, x1: start + rightWidth };
+		}
 		return this.justifyToWidth(left, right, width);
+	}
+
+	/** The footer hint and, when it is fully visible, its `esc close` /
+	 * `esc cancel` clickable span in body coordinates. */
+	private renderFooterRow(width: number): { line: string; esc?: Omit<PaletteTextHit, "y"> } {
+		const tone: Tone = this.capturing ? "accent" : "muted";
+		const prefix = sanitizeTerminalText(this.capturing ? `Press the new key for ${this.capturing.label} · ` : "↑/↓ move • enter run • tab set key • ");
+		const escapeHint = this.capturing ? "esc cancel" : "esc close";
+		const hint = this.theme ? paintHoverable(this.theme, escapeHint, this.closeHover === "footer", TONE_COLOR[tone]) : escapeHint;
+		const start = BODY_LEFT_PADDING + visibleWidth(prefix);
+		// A hint clipped by a narrow card is not clickable: the pointer would
+		// land on text that is no longer there.
+		const esc = start + escapeHint.length <= width + BODY_LEFT_PADDING
+			? { x0: start - 1, x1: start + escapeHint.length + 1 }
+			: undefined;
+		return { line: truncateToWidth(`${this.renderText(prefix, tone)}${hint}`, Math.max(1, width), "…", true), esc };
 	}
 
 	private renderGroups(groups: CommandPaletteGroup[], width: number, budget: number, hits: PalettePointerHit[]): string[] {
