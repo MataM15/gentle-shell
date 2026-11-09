@@ -17,9 +17,9 @@ Base: `personal/main` @ `a0c0ac61a` (upstream main `f4cc69a33` merged). Personal
 
 | ID | Specs | Route | Worktree / branch | Commit |
 |---|---|---|---|---|
-| T1 | S1, S2, S8 | gentle-ai-worker | `gentle-shell-worktrees/voice-dictation-fixes` · `feat/voice-dictation-fixes` | pending |
-| T2 | S3, S4, S8 | gentle-ai-worker | `gentle-shell-worktrees/palette-commands-esc` · `feat/palette-commands-esc` | pending |
-| T3 | S5, S6, S7, S8 | visual (Sonnet 5.5) | `gentle-shell-worktrees/rail-upstream-gaps` · `feat/rail-upstream-gaps` | pending |
+| T1 | S1, S2, S8 | gentle-ai-worker | `gentle-shell-worktrees/voice-dictation-fixes` · `feat/voice-dictation-fixes` | `16aecbffd` (S1 done; S2 traced, diagnostics added) |
+| T2 | S3, S4, S8 | gentle-ai-worker | `gentle-shell-worktrees/palette-commands-esc` · `feat/palette-commands-esc` | `91d130a51` (S3, S4 done; 36 entries + registry gate) |
+| T3 | S5, S6, S7, S8 | visual (Sonnet 5.5) | `gentle-shell-worktrees/rail-upstream-gaps` · `feat/rail-upstream-gaps` | `c20c30c62` (S5-S7); sheet-wide cards pending |
 | T4 | S8 | parent | integrate T1-T3 on `personal/main` after owner OK | pending |
 
 ## Log
@@ -29,3 +29,4 @@ Base: `personal/main` @ `a0c0ac61a` (upstream main `f4cc69a33` merged). Personal
 - L3 (owner): "Recorda adaptarlo a nuestro estilo o diseño en todo caso".
 - L4 (owner answer): cue difference happens "Al empezar o terminar de escucharme".
 - L5 (evidence): `~/.pi/gentle-ai/voice/voice-events.log` shows Alt+M `open`/`close` cues `done` in session `01a1c21f…`; code map says both modes call `lib/voice-cues.ts` `CUES` through `lib/voice-command.ts:464`, so the conversation-mode difference is unexplained by static reading (hypotheses: cue overlaps the spoken reply tail, warm-session path, or another sound). The live Pi still runs pre-merge `992a71c7c`.
+- L6 (owner answers after the T3 sheet): "Sí, todas como cards neón" for every `[ Panel ]` sheet section (S7 extended: Todos, Agents, Changes, Integrations too, transparent surface); "No, dejalo sin tier" (no tier configured on profile claude-nan); "Sí, integrá" T1-T3 into personal/main after a full-suite run on the combination.
