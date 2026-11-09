@@ -196,6 +196,7 @@ interface Harness {
 	calls: string[];
 	sessions: FakeSession[];
 	endpoints: Array<{ endOfSpeechMs: number; noSpeechMs: number } | undefined>;
+	warms: boolean[];
 	installs: Array<{ kind: string; options: Record<string, unknown> }>;
 	settings: { enabled: boolean; reads: number; writes: boolean[] };
 	voice: { sessions: string[]; writes: string[][] };
@@ -213,6 +214,7 @@ function harness(overrides: { platform?: string; arch?: string; installed?: bool
 	const calls: string[] = [];
 	const sessions: FakeSession[] = [];
 	const endpoints: Harness["endpoints"] = [];
+	const warms: Harness["warms"] = [];
 	const installs: Harness["installs"] = [];
 	// The toggle store is always faked: no test reads or writes the real config home.
 	const settings = { enabled: overrides.pushToTalk ?? false, reads: 0, writes: [] as boolean[] };
@@ -238,6 +240,7 @@ function harness(overrides: { platform?: string; arch?: string; installed?: bool
 		createSession: (options) => {
 			calls.push(`session:${options.target}`);
 			endpoints.push(options.endpoint);
+			warms.push(options.warm === true);
 			const session = new FakeSession(options.onStateChange);
 			sessions.push(session);
 			return session;
@@ -277,7 +280,7 @@ function harness(overrides: { platform?: string; arch?: string; installed?: bool
 			signal.addEventListener("abort", () => resolve(undefined), { once: true });
 		}),
 	};
-	return Object.assign(harnessRef, { deps, calls, sessions, endpoints, installs, settings, voice, focus, turn, kokoro, miro, clock });
+	return Object.assign(harnessRef, { deps, calls, sessions, endpoints, warms, installs, settings, voice, focus, turn, kokoro, miro, clock });
 }
 
 const pick = (pattern: RegExp) => (_title: string, options: string[]) => options.find((option) => pattern.test(option));
@@ -1095,6 +1098,37 @@ test("the /gentle:voice dictation publishes its states for the session and ends 
 	assert.equal(pi.counts.sends, 0);
 });
 
+test("a hold still ends by hand: it records with no endpoint and keeps its own message when nothing is heard", async () => {
+	const h = harness({ installed: true, pushToTalk: true });
+	const pi = register(h);
+	const ui = fakeContext();
+	await startSession(pi, ui);
+	const session = await holdUntilRecording(h, ui);
+	assert.deepEqual(h.endpoints, [undefined], "a release still ends the recording, not silence");
+	h.clock.advance(RELEASE);
+	await until(() => session.calls.includes("stop"));
+	session.result.reject(new VoiceSessionError("no-speech"));
+	await until(() => ui.notices.length === 1);
+	assert.deepEqual(ui.notices.at(-1), { message: "No speech was recognized. Keep holding Space until recording starts, then speak.", type: "error" });
+});
+
+test("the /gentle:voice dictation keeps recording until Enter: no endpoint, and the command's own message when nothing is heard", async () => {
+	const h = harness({ installed: true, platform: "linux", arch: "x64" });
+	h.deps.probe = () => ({ platform: "linux", arch: "x64", glibcVersion: "2.39" });
+	const pi = register(h);
+	const ui = fakeContext({ select: pick(/start dictation/i) });
+	const done = run(pi, ui);
+	await until(() => h.sessions.length === 1);
+	assert.deepEqual(h.endpoints, [undefined], "only the shortcut ends on silence");
+	h.sessions[0]!.started.resolve();
+	await until(() => h.sessions[0]!.state === "recording");
+	h.sessions[0]!.emit("transcribing");
+	h.sessions[0]!.emit("finished");
+	h.sessions[0]!.result.reject(new VoiceSessionError("no-speech"));
+	await done;
+	assert.deepEqual(ui.notices.at(-1), { message: "No speech was recognized. Speak after recording starts, then press Enter.", type: "error" });
+});
+
 test("a failed dictation publishes idle and keeps the draft", async () => {
 	const h = harness({ installed: true, platform: "linux", arch: "x64" });
 	h.deps.probe = () => ({ platform: "linux", arch: "x64", glibcVersion: "2.39" });
@@ -1716,14 +1750,15 @@ async function speak(h: Harness, index: number, text: string) {
 	session.result.resolve({ text, truncated: false });
 }
 
-test("without conversation mode the toggle records with no endpoint and pastes", async () => {
+test("without conversation mode the toggle also ends on silence: it records with the dictation endpoint and pastes", async () => {
 	const h = harness({ installed: true });
 	const pi = register(h);
 	const ui = fakeContext();
 	await pi.fire("session_start", ui.ctx);
 	const pressed = pi.shortcuts.get("alt+m")!.handler(ui.ctx);
 	await until(() => h.sessions.length === 1);
-	assert.deepEqual(h.endpoints, [undefined]);
+	assert.deepEqual(h.endpoints, [{ endOfSpeechMs: 2500, noSpeechMs: 8000 }]);
+	assert.deepEqual(h.warms, [false], "dictation that pastes keeps its single-use worker");
 	h.sessions[0]!.started.resolve();
 	await until(() => h.sessions[0]!.state === "recording");
 	void pi.shortcuts.get("alt+m")!.handler(ui.ctx);
@@ -1731,6 +1766,45 @@ test("without conversation mode the toggle records with no endpoint and pastes",
 	await pressed;
 	assert.equal(ui.editor(), "draft: pegado");
 	assert.equal(pi.counts.sends, 0);
+});
+
+test("a dictation that hears nothing stops by itself, pastes nothing and says so", async () => {
+	const h = harness({ installed: true });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	const pressed = pi.shortcuts.get("alt+m")!.handler(ui.ctx);
+	await until(() => h.sessions.length === 1);
+	h.sessions[0]!.started.resolve();
+	await until(() => h.sessions[0]!.state === "recording");
+	// With the endpoint the worker gives up after 8 s without speech and answers
+	// no speech; the run ends without a second press.
+	h.sessions[0]!.emit("transcribing");
+	h.sessions[0]!.emit("finished");
+	h.sessions[0]!.result.reject(new VoiceSessionError("no-speech"));
+	await pressed;
+	assert.equal(ui.editor(), "draft: ", "nothing is pasted");
+	assert.deepEqual(ui.notices.at(-1), { message: "No speech was heard; nothing was pasted.", type: "info" });
+});
+
+test("a pause after speech ends a dictation by itself, with no second press", async () => {
+	const h = harness({ installed: true });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	const pressed = pi.shortcuts.get("alt+m")!.handler(ui.ctx);
+	await until(() => h.sessions.length === 1);
+	h.sessions[0]!.started.resolve();
+	await until(() => h.sessions[0]!.state === "recording");
+	// The endpointer stopped the recording on its own: transcribing, then finished.
+	h.sessions[0]!.emit("transcribing");
+	h.sessions[0]!.emit("finished");
+	h.sessions[0]!.result.resolve({ text: "dictado solo", truncated: false });
+	await pressed;
+	assert.equal(ui.editor(), "draft: dictado solo");
+	assert.deepEqual(h.cues.filter((name) => name !== "warm"), ["open", "close"], "the microphone cues still mark the capture");
+	assert.deepEqual(h.events.filter((entry) => entry.event === "cue").map((entry) => entry.mode), ["dictation", "dictation"], "a pasting dictation logs its own mode");
+	assert.equal(h.events.some((entry) => entry.event === "cue" && "sinceReadingMs" in entry), false, "nothing was read in this session");
 });
 
 test("in conversation mode the toggle records hands-free and sends the transcript instead of pasting it", async () => {
@@ -2268,9 +2342,34 @@ test("each microphone cue logs its name, whether it played and how long it took"
 	await until(() => h.events.filter((entry) => entry.event === "cue").length === 2);
 	const cues = h.events.filter((entry) => entry.event === "cue");
 	assert.deepEqual(cues.map((entry) => [entry.name, entry.outcome, entry.ms, entry.session]), [["open", "done", 12, "session-alpha"], ["close", "done", 12, "session-alpha"]]);
+	assert.deepEqual(cues.map((entry) => entry.mode), ["conversation", "conversation"], "the cue event names the mode it belongs to");
+	assert.equal(cues.some((entry) => "sinceReadingMs" in entry), false, "nothing was read in this session");
 	h.sessions[0]!.emit("finished");
 	h.sessions[0]!.result.resolve({ text: "hola", truncated: false });
 	await pressed;
+});
+
+test("a conversation turn plays the Alt+M cues through the same player and logs them as conversation", async () => {
+	const { engine, readings } = fakeEngine();
+	const h = harness({ installed: true, engine, voice: true });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	await talk(pi, h, ui.ctx, "hola");
+	await settleReply(pi, ui.ctx, "Respuesta.");
+	await until(() => readings.length === 1);
+	readings[0]!.finish("done");
+	await until(() => h.sessions.length === 2);
+	await speak(h, 1, "sigo");
+	await until(() => h.events.filter((entry) => entry.event === "cue").length === 4);
+	// Same player, same tones, same order as a pasting dictation.
+	assert.deepEqual(h.cues.filter((name) => name !== "warm"), ["open", "close", "open", "close"]);
+	assert.deepEqual(h.warms, [true, true], "both captures of the conversation keep the warm session");
+	const cues = h.events.filter((entry) => entry.event === "cue");
+	assert.deepEqual(cues.map((entry) => [entry.name, entry.mode]), [["open", "conversation"], ["close", "conversation"], ["open", "conversation"], ["close", "conversation"]]);
+	assert.equal("sinceReadingMs" in cues[0]!, false, "the first capture follows no reading");
+	assert.equal(typeof cues[2]!.sinceReadingMs, "number", "the reopen cue records how long after the reading it played");
+	assert.ok((cues[2]!.sinceReadingMs as number) >= 0);
 });
 
 test("each reading and every microphone reopen decision is logged with its reason", async () => {

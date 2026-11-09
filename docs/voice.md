@@ -10,7 +10,7 @@ from `/gentle:voice`; nothing described here runs at startup.
    confirmation lists each component, its size, the destination directory,
    the licenses and the platform limitations. Esc during the download cancels it.
 2. Run `/gentle:voice` again and choose **Start dictation**. Speak, then press
-   Enter to stop. Esc cancels at any point.
+   Enter to stop, or let the 2-minute limit stop it. Esc cancels at any point.
 3. The transcript is pasted into the editor draft at the cursor. It is never
    sent automatically. Pi collapses pastes over 1,000 characters or 10 lines into
    a `[paste #N …]` marker; the full text is retained and expanded when you submit.
@@ -29,6 +29,7 @@ from `/gentle:voice`; nothing described here runs at startup.
 | Download | Only after the confirmation; runtime first, then the model. A cancelled download keeps components that already finished. |
 | Dictation | A compact overlay shows preparing, recording, transcribing. Enter stops recording; the overlay stays until the transcript is ready. |
 | Recording limit | After 2 minutes recording stops by itself, and the transcript is pasted without a key press. |
+| End of speech | Not for this command: **Start dictation** records until Enter or the 2-minute limit. Only the dictation shortcut (`alt+m`) ends on silence; see End of speech under Conversation. |
 | Insertion | The recognized text goes through Pi's editor paste pipeline, which may collapse long text into a paste marker. A blank result pastes nothing. |
 | One at a time | A second `/gentle:voice` while a download or dictation runs is refused with a notice. A Space hold during either one types spaces as usual. The dictation shortcut is refused the same way. |
 | Cancel and shutdown | Esc, reload or session shutdown aborts the download or cancels the session. A transcript that arrives afterwards is dropped. |
@@ -110,6 +111,7 @@ phase and the key: preparing, recording (`alt+m stop and insert`), transcribing.
 | First press | Checks that the runtime and model are installed, then records. If voice is not installed, a notice points to `/gentle:voice` and nothing is recorded; the next press checks again. |
 | Second press while preparing | Remembered, not dropped: recording stops as soon as the microphone is open. |
 | Second press while transcribing | Ignored. No second capture starts and the transcript is pasted once. |
+| End of speech | The recording also ends by itself after 2.5 seconds of quiet that follow speech, and the transcript is pasted with no second press. 8 seconds without any speech end it with "No speech was heard; nothing was pasted." The 2-minute limit stays. A conversation turn uses the same two thresholds; see End of speech under Conversation. |
 | One at a time | Refused with a notice while a download, a `/gentle:voice` dictation or a Space hold is running, and those are refused while the shortcut records. A Space hold during a toggle dictation types spaces as usual. |
 | Cancel and shutdown | Esc cancels and consumes the key, so it does not reach the editor or the agent. Reload or session shutdown cancels the session and drops a transcript that arrives afterwards. |
 | Where it works | Interactive TUI parent sessions only. Delegated child sessions, RPC and print modes ignore the shortcut without probing or reading anything. |
@@ -209,7 +211,7 @@ aloud, and the microphone reopens. It needs voice dictation installed.
 | Send early | `alt+m` while listening stops the recording and sends at once. |
 | Footer | `● Conversation · listening · alt+m send · esc pause` while recording, then transcribing and sending. |
 | Other inputs | Hold-Space push-to-talk and **Start dictation** keep pasting into the draft; only the shortcut takes part in the conversation. |
-| End of speech | The worker measures the audio in 100 ms windows of audio time, never per device chunk: a WSLg microphone delivers 10 ms chunks whose levels scatter two to four times around the floor. The noise floor is the quietest window heard so far, and a window counts as speech when it is at least three times that floor and above a fixed minimum of 0.005 RMS, above the loudest ambient window measured on a low-gain WSLg microphone (0.0031; speech there starts at 0.016). Speech counts once 150 ms of it were heard. The quiet period then runs from the last speech window and forgives one isolated loud window (a click, an ambient spike) in every eight, so the 2.5 s pause survives three such windows; the tail of the speech itself is never forgiven. The request carries `endpoint: { endOfSpeechMs, noSpeechMs }`, bounded to 300–5000 ms and 1–60 s; without it a recording never ends on silence, exactly as before. |
+| End of speech | The worker measures the audio in 100 ms windows of audio time, never per device chunk: a WSLg microphone delivers 10 ms chunks whose levels scatter two to four times around the floor. The noise floor is the quietest window heard so far, and a window counts as speech when it is at least three times that floor and above a fixed minimum of 0.005 RMS, above the loudest ambient window measured on a low-gain WSLg microphone (0.0031; speech there starts at 0.016). Speech counts once 150 ms of it were heard. The quiet period then runs from the last speech window and forgives one isolated loud window (a click, an ambient spike) in every eight, so the 2.5 s pause survives three such windows; the tail of the speech itself is never forgiven. The request carries `endpoint: { endOfSpeechMs, noSpeechMs }`, bounded to 300–5000 ms and 1–60 s. A conversation turn and a dictation that pastes carry the same two values (`CONVERSATION_ENDPOINT` and `DICTATION_ENDPOINT` in `lib/voice-command.ts`); what happens when nothing was heard differs: a conversation pauses, a dictation reports that nothing was pasted. Without the field a recording never ends on silence, exactly as before. |
 
 The thresholds are tested with synthetic audio only. A loud room or a quiet
 microphone may need the shortcut to send; tuning them on real microphones is
@@ -234,7 +236,14 @@ released when the Pi session ends.
 A cue stays advisory: it never blocks the microphone, and a player that throws
 or answers with nothing never breaks the capture it announced. Each cue does
 report what became of it, as a `cue` event in `voice-events.log` with its
-`name`, its `outcome` and how many milliseconds the player took:
+`name`, its `outcome`, how many milliseconds the player took, the `mode` that
+asked for it (`conversation` or `dictation`), and `sinceReadingMs` when the
+session has already read a reply: how long before the cue the last reading
+ended. The two modes play the same tones through the same player, and those two
+fields exist so a difference heard between them can be traced from the log
+instead of guessed.
+
+Each outcome means:
 
 | Outcome | Meaning |
 |---------|---------|
@@ -341,7 +350,7 @@ spoken input, a spoken turn sent, a reply settled, a reading started and how it
 ended, and each microphone reopen decision with its reason (`opened`, or
 skipped for `not-focused`, `no-spoken-turn`, `voice-off`, `reading-cancelled`,
 `reading-error`, `dictation-running`, `voice-busy`), and each microphone cue
-with its `name`, `outcome` (`done`, `failed`, `unavailable`) and latency. Lines
+with its `name`, `outcome` (`done`, `failed`, `unavailable`), latency, the mode that asked for it and, after a reading, `sinceReadingMs`. Lines
 carry the time, the process id and the session id, and sizes instead of text:
 no reply or transcript text is written. Past 512 KB the log moves to
 `voice-events.log.1`.
@@ -454,7 +463,9 @@ submits the text or touches the editor; the caller decides what to do with it.
   not exit within 2 seconds of finishing or being cancelled is killed. If the parent
   disappears, the worker sees its input close and stops capturing.
 - **Bounds.** Recording stops by itself after 120 seconds, and the worker then
-  transcribes what it has (`truncated: true`). Starting (runtime checks and
+  transcribes what it has (`truncated: true`). With an endpoint it also stops
+  after 2.5 seconds of quiet that follow speech, or after 8 seconds without
+  speech, and transcribes what it has. Starting (runtime checks and
   opening the microphone) and transcribing (the rest of the model
   verification, the model load and the decode) each have a 120-second limit. Audio is kept in memory
   only up to the recording limit. All of these are options.

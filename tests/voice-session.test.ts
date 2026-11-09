@@ -244,7 +244,7 @@ test("records, stops and returns the transcript from a fixed, scrubbed worker la
 	assert.deepEqual(run.states, ["starting", "recording", "transcribing", "finished"]);
 });
 
-test("a hands-free endpoint is forwarded to the worker only when it is asked for", async (t) => {
+test("an endpoint is forwarded to the worker only when it is asked for", async (t) => {
 	const fixture = await installFixture(t, "linux-x64");
 	const plain = scripted(fixture);
 	void plain.session.start().catch(() => {});

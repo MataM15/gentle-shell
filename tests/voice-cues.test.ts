@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import test, { after } from "node:test";
 import { createCuePlayer, cueWav } from "../lib/voice-cues.ts";
@@ -74,6 +74,23 @@ test("outside Linux the cues are silent and touch nothing", async () => {
 
 // A cue reports what happened, so voice-events.log can tell a cue that was
 // played from one the Pulse player never confirmed.
+
+test("every caller plays the same tone bytes: the microphone cue files never depend on who asked", async () => {
+	const tempRoot = scratch();
+	const played: string[] = [];
+	const player = createCuePlayer({ tempRoot, backend: { probe: async () => ({ available: true }), play: async (path) => { played.push(path); } } });
+	// A conversation turn and a dictation both call play("open")/play("close"); the
+	// player has no mode, so the file a cue plays is one fixed byte string.
+	await player.play("open");
+	await player.play("close");
+	await player.play("open");
+	assert.deepEqual(played.map((path) => path.split("/").at(-1)), ["open.wav", "close.wav", "open.wav"]);
+	const [open, close] = [readFileSync(played[0]!), readFileSync(played[1]!)];
+	assert.deepEqual(open, cueWav([660, 990]), "the rising cue is the same 160 ms tone every time");
+	assert.deepEqual(close, cueWav([990, 660]), "the falling cue is the same 160 ms tone every time");
+	assert.notDeepEqual(open, close);
+	player.dispose();
+});
 
 test("a cue reports its name, whether it played and how long it took", async () => {
 	const tempRoot = scratch();

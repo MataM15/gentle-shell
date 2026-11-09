@@ -80,7 +80,7 @@ export interface VoiceCommandDeps {
 	readStatus?: (target: VoiceTarget) => Promise<VoiceStatusSnapshot>;
 	installRuntime?: (options: VoiceInstallRequest & { target: VoiceTarget }) => Promise<VoiceInstallResult>;
 	installModel?: (options: VoiceInstallRequest) => Promise<VoiceInstallResult>;
-	createSession?: (options: { target: VoiceTarget; onStateChange(state: VoiceSessionState): void; endpoint?: VoiceEndpoint }) => VoiceDictation;
+	createSession?: (options: { target: VoiceTarget; onStateChange(state: VoiceSessionState): void; endpoint?: VoiceEndpoint; warm?: boolean }) => VoiceDictation;
 	// The persisted push-to-talk toggle.
 	settings?: { read(): boolean; write(enabled: boolean): void };
 	pushToTalk?: PushToTalkOptions;
@@ -119,6 +119,13 @@ const SPEECH_UNAVAILABLE = "Spoken replies need the Windows voice (Windows or WS
 // turn, room to think between sentences, and 8 s without speech pauses the
 // conversation.
 export const CONVERSATION_ENDPOINT: VoiceEndpoint = { endOfSpeechMs: 2_500, noSpeechMs: 8_000 };
+
+// A dictation that pastes ends by itself too, instead of recording to the
+// 120 s limit: the same 2.5 s of quiet after speech ends the capture and
+// inserts the transcript, and 8 s without speech gives up and reports that
+// nothing was pasted. The values match the conversation's, but the two stay
+// separate constants because what happens when nothing is heard differs.
+export const DICTATION_ENDPOINT: VoiceEndpoint = { endOfSpeechMs: 2_500, noSpeechMs: 8_000 };
 
 const INSTALL_MESSAGES: Record<VoiceInstallErrorCode, string> = {
 	aborted: "Voice download was cancelled. Unfinished files were removed; completed components are kept.",
@@ -181,6 +188,15 @@ function deliver(ctx: ExtensionContext, result: Outcome, platform: string, start
 		return;
 	}
 	if (result.kind === "error") {
+		// The toggle always records with an endpoint, so a recording that hears
+		// nothing gives up by itself after a few seconds: that is not a failure, and
+		// the notice says what the draft kept. A hold and the command still end by
+		// hand and keep their own message.
+		const code = result.error instanceof VoiceSessionError ? result.error.code : undefined;
+		if (start === "toggle" && (code === "no-speech" || code === "empty-audio")) {
+			say("No speech was heard; nothing was pasted.", "info");
+			return;
+		}
 		say(sessionErrorMessage(result.error, platform, start), "error");
 		return;
 	}
@@ -201,7 +217,7 @@ function deliver(ctx: ExtensionContext, result: Outcome, platform: string, start
 // The microphone is claimed at start(), not at creation: creation is inert, and
 // start() first waits for the capture that is still closing, so two workers can
 // never be alive at once, however long the platform takes to release the device.
-function runDictation(createSession: NonNullable<VoiceCommandDeps["createSession"]>, target: VoiceTarget, onState: (state: VoiceSessionState) => void, admission?: () => Promise<void> | undefined, endpoint?: VoiceEndpoint) {
+function runDictation(createSession: NonNullable<VoiceCommandDeps["createSession"]>, target: VoiceTarget, onState: (state: VoiceSessionState) => void, admission?: () => Promise<void> | undefined, options: { endpoint?: VoiceEndpoint; warm?: boolean } = {}) {
 	let settled = false;
 	let stopping = false;
 	let cancelled = false;
@@ -243,7 +259,7 @@ function runDictation(createSession: NonNullable<VoiceCommandDeps["createSession
 			/* the observer is advisory */
 		}
 	};
-	const session = createSession({ target, onStateChange, endpoint });
+	const session = createSession({ target, onStateChange, endpoint: options.endpoint, warm: options.warm });
 	const begin = () => {
 		// A run cancelled, stopped or settled while it waited never starts.
 		if (cancelled || settled) return;
@@ -360,7 +376,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		}
 		return warm.worker;
 	};
-	const createSession = deps.createSession ?? (({ target, onStateChange, endpoint }) => (endpoint ? warmFor(target).session({ onStateChange, endpoint }) : createVoiceSession({ env, target, onStateChange, endpoint })));
+	const createSession = deps.createSession ?? (({ target, onStateChange, endpoint, warm }) => (warm ? warmFor(target).session({ onStateChange, endpoint }) : createVoiceSession({ env, target, onStateChange, endpoint })));
 	const voiceLog: VoiceLog = deps.log ?? createVoiceLog({ dir: resolveVoiceHome(env) });
 	let cuePlayer = deps.cues;
 	let cuesUsed = false;
@@ -461,7 +477,14 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	// player never confirmed used to disappear without a trace. The cue stays
 	// advisory, so a player that throws or answers with nothing never breaks the
 	// microphone state that asked for it.
-	const cue = (ctx: ExtensionContext | undefined, name: CueName): void => {
+	// When the last reading ended, for the cue event: it tells a cue that played
+	// over the reply's tail from one that played in the clear.
+	let lastReadingEndedAt: number | undefined;
+	const cue = (ctx: ExtensionContext | undefined, name: CueName, mode: "conversation" | "dictation"): void => {
+		// The mode and the distance to the last reading are logged with the cue so a
+		// reported difference between the two modes can be traced from the log: the
+		// tones, the player and this call are the same for both.
+		const sinceReadingMs = lastReadingEndedAt === undefined ? undefined : Date.now() - lastReadingEndedAt;
 		let playing: Promise<CueResult | undefined>;
 		try {
 			playing = Promise.resolve(cues().play(name));
@@ -471,7 +494,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		void playing
 			.then((result) => {
 				if (!result) return;
-				voiceLog("cue", { session: sessionIdOf(ctx), name: result.name, outcome: result.outcome, ms: result.ms });
+				voiceLog("cue", { session: sessionIdOf(ctx), name: result.name, outcome: result.outcome, ms: result.ms, mode, ...(sinceReadingMs === undefined ? {} : { sinceReadingMs }) });
 			})
 			.catch(() => {});
 	};
@@ -578,6 +601,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			const read = await replyReader.read(markdown, current.controller.signal);
 			const outcome: ReadingOutcome = read === "cancelled" && skipped ? "skipped" : read;
 			voiceLog("reading.end", { session: sessionIdOf(ctx), outcome });
+			lastReadingEndedAt = Date.now();
 			if (outcome === "unavailable" && live() && !unavailableReported) {
 				unavailableReported = true;
 				ctx.ui.notify(SPEECH_UNAVAILABLE, "warning");
@@ -585,6 +609,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			return outcome;
 		} catch (error) {
 			voiceLog("reading.end", { session: sessionIdOf(ctx), outcome: "error", error: error instanceof Error ? error.name : "unknown" });
+			lastReadingEndedAt = Date.now();
 			if (live()) ctx.ui.notify(error instanceof SpeechEngineError ? error.message : "The reply could not be read aloud.", "warning");
 			return "error";
 		} finally {
@@ -1056,10 +1081,10 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			// Rising when the microphone really records, falling when it stops.
 			if (state === "recording" && current.cue === "none") {
 				current.cue = "open";
-				cue(current.ctx, "open");
+				cue(current.ctx, "open", current.send ? "conversation" : "dictation");
 			} else if (state !== "recording" && current.cue === "open") {
 				current.cue = "closed";
-				cue(current.ctx, "close");
+				cue(current.ctx, "close", current.send ? "conversation" : "dictation");
 			}
 			setVoiceFooter(current.ctx, live, current.send ? voiceConversationStatus(state, toggleKey) : voiceToggleStatus(state, toggleKey));
 			publishVoiceState(current.ctx, voiceDisplayState(state), live);
@@ -1071,7 +1096,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		// A capture cancelled while recording reports no more states.
 		if (current.cue === "open") {
 			current.cue = "closed";
-			cue(current.ctx, "close");
+			cue(current.ctx, "close", current.send ? "conversation" : "dictation");
 		}
 		toggling = undefined;
 		if (active === current.run) active = undefined;
@@ -1137,7 +1162,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 				say("Voice dictation is not installed. Run /gentle:voice to download it.", "warning");
 				return;
 			}
-			const dictation = runDictation(createSession, found.target, (state) => display(state), captureSlot, current.send ? CONVERSATION_ENDPOINT : undefined);
+			const dictation = runDictation(createSession, found.target, (state) => display(state), captureSlot, { endpoint: current.send ? CONVERSATION_ENDPOINT : DICTATION_ENDPOINT, warm: current.send });
 			current.dictation = dictation;
 			current.run.abort = dictation.cancel;
 			display("starting");
