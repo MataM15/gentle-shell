@@ -133,8 +133,8 @@ import {
 import { accountIdFromToken, ANTHROPIC_PROVIDER, ANTHROPIC_USAGE_URL, CODEX_PROVIDER, CODEX_USAGE_URL, NAN_PROVIDER, NAN_QUOTA_URL, parseAnthropicOauthUsage, parseCodexUsage, parseNanQuota, parseProviderUsage, parseUsageHeaders, displayUsageFor, parseUsageSource, renderUsageCard, usageCardDigest, usageScopeProviders, UsageSourceRegistry, UsageStore, USAGE_SOURCE_EVENT, type ProviderUsage, type UsageSource } from "../lib/shell-usage.ts";
 import { UsageView } from "../lib/shell-usage-view.ts";
 import { releaseSidebarHover, setSidebarHover, sidebarHeader, sidebarPart, sidebarRailHeader, sidebarState, sidebarStatusBar, VISUAL_SETTINGS_CHANGED, type SidebarRail } from "../lib/shell-sidebar.ts";
-import { installSidebar, invalidateSidebar, narrowStatusOwner, SIDEBAR_BREAKPOINT, STATUS_OWNER, themeSignature } from "../lib/shell-sidebar-layout.ts";
-import { panelSheetBackHit, renderPanelRow, renderPanelSheet, renderStaticPanelHeader, renderWorkRow, setChromeSurface, workRowLead } from "../lib/shell-panel.ts";
+import { installSidebar, invalidateSidebar, narrowStatusOwner, SIDEBAR_BREAKPOINT, sheetCardPart, STATUS_OWNER, themeSignature } from "../lib/shell-sidebar-layout.ts";
+import { panelSheetBackHit, renderPanelRow, renderPanelSheet, renderStaticPanelHeader, renderWorkRow, setChromeSurface, SHEET_CARD_KEYS, workRowLead } from "../lib/shell-panel.ts";
 import { installPagePaint, type PageTheme } from "../lib/shell-page.ts";
 import { layoutSchematic } from "../lib/visual-layout-preview.ts";
 import { collectSessionStats, type SessionStats } from "../lib/shell-stats.ts";
@@ -2452,7 +2452,8 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 						const host = (sidebarTui ?? tui) as TUI;
 						const rows = Math.max(4, (host.terminal?.rows ?? 24) - SHEET_RESERVED_ROWS);
 						const state = sidebarState(host);
-						const parts = new Map([...state.parts].filter(([key]) => key !== "todo" || state.visibility?.todo !== false));
+						// Otras sesiones and Limits reach the narrow sheet as the rail tabs' cards (S7).
+						const parts = new Map([...state.parts].filter(([key]) => key !== "todo" || state.visibility?.todo !== false).map(([key, part]) => [key, SHEET_CARD_KEYS.has(key) ? sheetCardPart(part, theme) : part] as const));
 						const sheet = renderPanelSheet(parts, theme, width, { rows, scrollTop, backHovered });
 						maxScroll = sheet.maxScroll;
 						scrollTop = Math.min(scrollTop, maxScroll);

@@ -73,6 +73,8 @@ export interface ShellHeaderModel {
 	modelId: string;
 	effort: string | undefined;
 	profile?: string;
+	/** The configured tier, shown after the effort in the rail header when the row has room. */
+	profileTier?: ShellBarModel["profileTier"];
 	contextPercent: number | null;
 	costTotal: number;
 	subscription: boolean;
@@ -85,6 +87,7 @@ export interface ShellHeaderModel {
 export function buildShellHeaderModel(model: ShellBarModel, showJobs = false): ShellHeaderModel {
 	const { cwd, branch, dirty, modelId, effort, profile, contextPercent, costTotal, subscription, usage } = model;
 	return { cwd, branch, dirty, modelId, effort, profile, contextPercent, costTotal, subscription, usage,
+		...(model.profileTier ? { profileTier: model.profileTier } : {}),
 		...(showJobs && model.jobs?.length ? { jobs: model.jobs.length } : {}) };
 }
 
@@ -355,6 +358,11 @@ function weeklyUsageText(windows: UsageWindow[], theme: ShellBarTheme, stage: Us
 	return hint ? `${body}  ${theme.fg(USAGE_HINT_ROLE, hint)}` : body;
 }
 
+/** ` · Fast` / ` · Standard`: the configured tier, `Fast` in the warning role like the status bar's. */
+function tierSegment(tier: ShellBarModel["profileTier"], theme: ShellBarTheme): string {
+	return tier ? ` ${theme.fg(ROLE.LABEL, "·")} ${theme.fg(tier === "fast" ? "warning" : ROLE.LABEL, tier === "fast" ? "Fast" : "Standard")}` : "";
+}
+
 const STATUS_BAR_DIVIDER = "│";
 const paintChromeRow = (theme: ShellBarTheme, row: string) => paintSurfaceRow(row, panelSurfaceOpener(theme));
 
@@ -415,7 +423,7 @@ export function renderShellStatusBar(model: ShellBarModel, theme: ShellBarTheme,
 	const showCounters = presentation?.visibility.usageCost !== false && !railBar && !bare;
 	// The configured tier stays beside the effort and yields only at the end; the
 	// agent profile follows it and gives way before the usage does.
-	const tier = model.profileTier ? ` ${theme.fg(ROLE.LABEL, "·")} ${theme.fg(model.profileTier === "fast" ? "warning" : ROLE.LABEL, model.profileTier === "fast" ? "Fast" : "Standard")}` : "";
+	const tier = tierSegment(model.profileTier, theme);
 	const profileName = model.profile ? sanitizeStatus(model.profile) : "";
 	const profile = profileName ? ` ${theme.fg(ROLE.LABEL, "·")} ${theme.fg(ROLE.LABEL, profileName)}` : "";
 	const exec = railBar || bare || presentation?.visibility.modelDetails === false ? "" : executionSegment(model.modelId, model.effort, theme);
@@ -617,6 +625,8 @@ const RAIL_COMMANDS_ROLE = "accent";
 const RAIL_USAGE_ROLE = "borderAccent";
 const RAIL_ACTION_HINT_ROLE = "dim";
 const RAIL_COUNTER_SEPARATOR = "◇";
+const RAIL_ACTION_TRAILING_GAP = 2;
+const FIVE_HOUR_SECONDS = 5 * 3600;
 
 /**
  * The header pinned above the wide right rail's scrollable cards (the owner's
@@ -639,7 +649,10 @@ export function renderShellRailHeader(model: ShellHeaderModel, theme: ShellBarTh
 		// The effective agent profile rides next to the model (S17 row 4), so the header says which models the session spends on.
 		const profileName = model.profile ? sanitizeStatus(model.profile) : "";
 		const profile = profileName ? ` ${theme.fg(ROLE.LABEL, "·")} ${theme.fg(ROLE.LABEL, profileName)}` : "";
-		rows.push(row(theme.fg(ROLE.MODEL, theme.bold(model.modelId)) + effort + profile));
+		// Rule: model · effort · tier · profile; the tier yields first, then the profile ellipsizes.
+		const head = theme.fg(ROLE.MODEL, theme.bold(model.modelId)) + effort;
+		const withTier = head + tierSegment(model.profileTier, theme) + profile;
+		rows.push(row(visibleWidth(withTier) <= inner ? withTier : head + profile));
 	}
 	const jobs = model.jobs ? [theme.fg(ROLE.STATUS, shellJobsCount(model.jobs))] : [];
 	const showUsage = presentation?.visibility.usageCost !== false;
@@ -647,13 +660,16 @@ export function renderShellRailHeader(model: ShellHeaderModel, theme: ShellBarTh
 	if (counters.length > 0) rows.push(row(counters.join(` ${theme.fg(ROLE.SEPARATOR, RAIL_COUNTER_SEPARATOR)} `)));
 	// Two aligned action rows under a dotted rule: icon, label, then a key
 	// column. The commands row opens the palette; the usage row the usage panel.
-	const action = (icon: string, label: string, hint: string | undefined, role: string) => {
+	const action = (icon: string, label: string, hint: string | undefined, role: string, trailing: string[] = []) => {
 		const labelText = truncateToWidth(`${icon} ${label}`, inner, "");
 		const keyText = hint ? truncateToWidth(`[${hint}]`, Math.max(0, inner - RAIL_ACTION_KEY_COLUMN), "…") : "";
 		const gap = " ".repeat(Math.max(1, RAIL_ACTION_KEY_COLUMN - visibleWidth(labelText)));
 		const showKey = keyText !== "" && visibleWidth(labelText) + gap.length + visibleWidth(keyText) <= inner;
-		const text = theme.fg(role, theme.bold(labelText)) + (showKey ? gap + theme.fg(ROLE.LABEL, keyText) : "");
-		return { text: pad + text, end: RAIL_HEADER_INSET + visibleWidth(labelText) + (showKey ? gap.length + visibleWidth(keyText) : 0) };
+		const used = visibleWidth(labelText) + (showKey ? gap.length + visibleWidth(keyText) : 0);
+		// Optional trailing text (shapes widest first) beside the key; the first that fits the row stays.
+		const extra = showKey ? (trailing.find((item) => used + RAIL_ACTION_TRAILING_GAP + visibleWidth(item) <= inner) ?? "") : "";
+		const text = theme.fg(role, theme.bold(labelText)) + (showKey ? gap + theme.fg(ROLE.LABEL, keyText) : "") + (extra ? " ".repeat(RAIL_ACTION_TRAILING_GAP) + extra : "");
+		return { text: pad + text, end: RAIL_HEADER_INSET + used + (extra ? RAIL_ACTION_TRAILING_GAP + visibleWidth(extra) : 0) };
 	};
 	rows.push(pad + theme.fg(RAIL_ACTION_HINT_ROLE, RAIL_ACTION_RULE_CHAR.repeat(inner)));
 	const commands = action(RAIL_COMMANDS_ICON, "commands", commandsHint, RAIL_COMMANDS_ROLE);
@@ -662,7 +678,9 @@ export function renderShellRailHeader(model: ShellHeaderModel, theme: ShellBarTh
 	let headerRow = -1;
 	let usageSpan: HeaderUsageSpan | undefined;
 	if (showUsage) {
-		const usage = action(RAIL_USAGE_ICON, "usage", usageHint, RAIL_USAGE_ROLE);
+		const windows = model.usage ? (selectUsageLimit(model.usage, model.modelId)?.windows ?? []) : [];
+		const fiveHour = windows.find((window) => window.label === "5h" || window.windowSeconds === FIVE_HOUR_SECONDS);
+		const usage = action(RAIL_USAGE_ICON, "usage", usageHint, RAIL_USAGE_ROLE, fiveHour ? [usageWindowText(fiveHour, theme, true, paint), usageWindowText(fiveHour, theme, false, paint)] : []);
 		headerRow = rows.length;
 		rows.push(usage.text);
 		usageSpan = { start: RAIL_HEADER_INSET, end: usage.end };
@@ -694,7 +712,9 @@ export function renderShellNarrowTopBar(model: ShellBarModel, theme: ShellBarThe
 		const percent = model.contextPercent === null ? "?%" : `${Math.round(model.contextPercent)}%`;
 		const ctx = `${theme.fg(ROLE.LABEL, "ctx")} ${paintGauge(model.contextPercent, theme, NARROW_GAUGE_CELLS, paint)} ${theme.fg(ROLE.VALUE, percent)}`;
 		const counters = showUsage ? [ctx, costSegment(model.costTotal, model.subscription, theme)].join(` ${theme.fg(ROLE.SEPARATOR, RAIL_COUNTER_SEPARATOR)} `) : "";
-		const attempts = [[exec, counters], [exec, showUsage ? ctx : ""], [exec, ""]];
+		// The tier follows the effort only while the counters still fit beside it; it yields first.
+		const execTier = modelDetails ? exec + tierSegment(model.profileTier, theme) : "";
+		const attempts = [[execTier, counters], [exec, counters], [exec, showUsage ? ctx : ""], [exec, ""]];
 		const fitted = attempts.find(([left, right]) => visibleWidth(left) + (left && right ? 2 : 0) + visibleWidth(right) <= room) ?? attempts[attempts.length - 1]!;
 		const [left, right] = fitted;
 		rows.push(paintChromeRow(theme, ` ${left}${" ".repeat(Math.max(left && right ? 2 : 0, 0))}${right}${" ".repeat(Math.max(0, room - visibleWidth(left) - (left && right ? 2 : 0) - visibleWidth(right)))} `));

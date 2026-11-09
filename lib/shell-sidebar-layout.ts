@@ -88,6 +88,24 @@ function headerParts(line: string, theme: ShellBarTheme): { glyph?: string; titl
 	const hoverOpen = theme.fg(HOVER_ROLE, "\u2063").split("\u2063")[0] ?? "";
 	return { ...(glyph ? { glyph: glyph[1] } : {}), title: styledTitle.replace(/\x1b\[[0-9;]*m/g, ""), ...(count ? { count } : {}), ...(keyHint ? { hint: keyHint } : {}), ...(hoverOpen && styledTitle.includes(hoverOpen) ? { hovered: true } : {}) };
 }
+/**
+ * A section drawn as the rail's card for the panel sheet (narrow layout, no
+ * rail): the same title and body rows through the same card, on the transparent
+ * surface only; any other surface keeps the part's own panel rows.
+ */
+export function sheetCardPart<T extends { render(width: number): string[] }>(part: T, theme: ShellBarTheme): { render(width: number): string[] } {
+	return {
+		render(width: number) {
+			if (chromeSurface() !== "transparent") return part.render(width);
+			const lines = part.render(panelInnerWidth(theme, width) + PANEL_ROW_INDENT);
+			if (lines.length === 0) return [];
+			const indent = " ".repeat(PANEL_ROW_INDENT);
+			const body = lines.slice(1).map((row) => row.startsWith(indent) ? row.slice(PANEL_ROW_INDENT) : row);
+			while (body.length && body[body.length - 1]?.trim() === "") body.pop();
+			return sectionCardRows(headerParts(lines[0]!, theme), body, theme, width);
+		},
+	};
+}
 type SidebarPresentation = { scrollTop: number; output: LayoutNode };
 type PreparedRail = {
 	revision: number;

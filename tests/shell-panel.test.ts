@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { paintPanelSurface, PANEL_SURFACE_ROLE, panelSheetBackHit, renderPanelHeader, renderPanelRow, renderPanelSheet, renderWorkRow } from "../lib/shell-panel.ts";
+import { paintPanelSurface, PANEL_SURFACE_ROLE, panelSheetBackHit, renderPanelHeader, renderPanelRow, renderPanelSheet, renderStaticPanelHeader, renderWorkRow, setChromeSurface } from "../lib/shell-panel.ts";
+import { CARD_STYLE, setCardStyle } from "../lib/shell-card.ts";
+import { sheetCardPart } from "../lib/shell-sidebar-layout.ts";
 import { renderTodoSection, todoWorkSummary, type TodoState } from "../lib/shell-todo.ts";
 import { renderJobsSection } from "../lib/jobs-widget.ts";
 import { JOB_GLYPH } from "../lib/background-jobs-tools.ts";
@@ -257,6 +259,34 @@ test("the panel sheet stacks the rail sections under a title row and scrolls wit
 	assert.match(stripAnsi(clipped.lines.at(-1)!), /↓ 3 more · scroll/);
 	const end = renderPanelSheet(parts as never, plain, 30, { rows: 5, scrollTop: 4 }).lines.map((line) => stripAnsi(line).trimEnd());
 	assert.deepEqual(end.slice(1), [" ▾ AGENTS", "", " ▾ CHANGES", "   clean"], "the last page shows the last rows without a more row");
+});
+
+test("the panel sheet also offers Otras sesiones and Limits between Agents and Changes (S7)", () => {
+	const part = (title: string) => ({ render: (width: number) => [`▾ ${title}`.padEnd(width)], invalidate() {} });
+	const parts = new Map([["footer", part("Changes")], ["usage", part("Limits")], ["sessions", part("Otras sesiones")], ["agents", part("Agents")], ["todo", part("Todos")]]);
+	const rows = renderPanelSheet(parts as never, plain, 40, { rows: 20, scrollTop: 0 }).lines.map((line) => stripAnsi(line).trimEnd()).filter((line) => line.startsWith(" ▾"));
+	assert.deepEqual(rows, [" ▾ Todos", " ▾ Agents", " ▾ Otras sesiones", " ▾ Limits", " ▾ Changes"]);
+});
+
+test("the narrow sheet draws Otras sesiones and Limits as neon conversation cards like the rail tabs (S7)", () => {
+	setCardStyle(CARD_STYLE.NEON);
+	setChromeSurface("transparent");
+	try {
+		const sessions = { render: (width: number) => [renderStaticPanelHeader(plain, width, "Otras sesiones"), renderPanelRow(width, "pi-main · hace 2 min")], invalidate() {} };
+		const limits = { render: (width: number) => [renderStaticPanelHeader(plain, width, "Limits"), renderPanelRow(width, "claude · max"), renderPanelRow(width, "5h ▰▰▱▱▱▱▱▱ 23%")], invalidate() {} };
+		const parts = new Map([["sessions", sheetCardPart(sessions, plain)], ["usage", sheetCardPart(limits, plain)]]);
+		const rows = renderPanelSheet(parts as never, plain, 60, { rows: 30, scrollTop: 0 }).lines.map((line) => stripAnsi(line).trimEnd());
+		assert.ok(rows.some((row) => /^ ╭─ Otras sesiones .*╮$/.test(row)), rows.join("\n"));
+		assert.ok(rows.some((row) => /^ ╭─ Limits .*╮$/.test(row)));
+		assert.ok(rows.some((row) => /^ │ +claude · max +│$/.test(row) || /^ │ claude · max +│$/.test(row)), "the body sits inside the card");
+		assert.equal(rows.filter((row) => row.startsWith(" ╰")).length, 2, "each section closes its own card");
+		for (const line of renderPanelSheet(parts as never, plain, 60, { rows: 30, scrollTop: 0 }).lines) assert.equal(visibleWidth(stripAnsi(line)), 60);
+		setChromeSurface("tinted");
+		assert.deepEqual(sheetCardPart(sessions, plain).render(40), sessions.render(40), "a tinted surface keeps the plain panel header");
+	} finally {
+		setChromeSurface("tinted");
+		setCardStyle(CARD_STYLE.FLOAT);
+	}
 });
 
 test("the mobile sheet wraps and scrolls a long Integrations status", () => {

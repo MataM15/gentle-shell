@@ -146,7 +146,9 @@ export interface PanelSheet {
 	maxScroll: number;
 }
 
-const SHEET_ORDER = ["todo", "jobs", "agents", "footer"] as const;
+/** The sheet sections drawn as the rail tabs' cards: the ones the rail keeps off its Activity tab. */
+export const SHEET_CARD_KEYS: ReadonlySet<string> = new Set(["sessions", "usage"]);
+const SHEET_ORDER = ["todo", "jobs", "agents", "sessions", "usage", "footer"] as const;
 
 /**
  * The rail's sections as a full-width sheet (/gentle:panel, mobile): a fixed

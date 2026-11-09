@@ -36,7 +36,7 @@ test("the rail header stacks model, ctx and cost, then the commands and usage ac
 		assert.equal(text[1]!.trim(), "ctx ▰▱▱▱▱▱▱▱ 17% ◇ $0.000");
 		assert.match(text[2]!, /^ ┈+ ?$/, "dotted rule");
 		assert.equal(text[3]!.trimEnd(), " ≡ commands   [alt+k]");
-		assert.equal(text[4]!.trimEnd(), " ◔ usage      [alt+u]");
+		assert.equal(text[4]!.trimEnd(), " ◔ usage      [alt+u]  5h ▱▱▱▱▱▱▱▱ 5%", "the 5h window rides beside the usage key (S6)");
 		assert.match(text[5]!, /^─+$/, "closing rule spans the rail");
 		assert.equal(text.length, 6);
 		assert.equal(chrome.commandsRow, 3);
@@ -235,4 +235,42 @@ test("the agent profile rides next to the model in the rail header (S17 row 4)",
 	const chrome = renderShellRailHeader(buildShellHeaderModel({ ...model, profile: "claude (session)" }), plain, 50, "alt+u", undefined, "alt+k");
 	assert.equal(rows(chrome.rows)[0]!.trim(), "claude-fable-5-1 · low · claude (session)");
 	assert.equal(rows(chrome.rows).length, rows(renderShellRailHeader(buildShellHeaderModel(model), plain, 50, "alt+u", undefined, "alt+k").rows).length, "no new row, no new bar");
+});
+
+test("the rail header model row carries the configured tier before the profile and drops it first (S5)", () => {
+	const fast = { ...model, profileTier: "fast" as const };
+	const first = (width: number, source: ShellBarModel = fast) => rows(renderShellRailHeader(buildShellHeaderModel(source), plain, width, "alt+u", undefined, "alt+k").rows)[0]!.trim();
+	assert.equal(first(60), "claude-fable-5-1 · low · Fast · claude (session)");
+	assert.equal(first(60, { ...model, profileTier: "standard" }), "claude-fable-5-1 · low · Standard · claude (session)");
+	assert.equal(first(60, model), "claude-fable-5-1 · low · claude (session)", "no configured tier: nothing added");
+	assert.equal(first(48), "claude-fable-5-1 · low · claude (session)", "when the whole row does not fit, the tier yields before the profile");
+	assert.match(first(40), /^claude-fable-5-1 · low · claude.*…$/);
+	const roles: string[] = [];
+	renderShellRailHeader(buildShellHeaderModel(fast), { fg: (role, text) => { if (text === "Fast") roles.push(role); return text; }, bold: (text) => text }, 60, "alt+u", undefined, "alt+k");
+	assert.deepEqual(roles, ["warning"], "Fast uses the status bar's warning role, no petals");
+});
+
+test("the narrow top bar shows the tier after the effort when it fits (S5)", () => {
+	const fast = { ...narrowModel, profileTier: "fast" as const };
+	const text = rows(renderShellNarrowTopBar(fast, plain, 56, "alt+u").rows);
+	assert.match(text[1]!, /^ claude-fable-5-1 · low · Fast +ctx ▰▱▱ 17% ◇ \$0\.000 +$/);
+	const tight = rows(renderShellNarrowTopBar(fast, plain, 46, "alt+u").rows);
+	assert.doesNotMatch(tight[1]!, /Fast/, "the tier yields before the ctx and cost counters");
+	assert.match(tight[1]!, /ctx/);
+	for (const width of [56, 46, 36, 24]) assert.ok(rows(renderShellNarrowTopBar(fast, plain, width, "alt+u").rows).every((row) => visibleWidth(row) <= width));
+});
+
+test("the rail header's usage row carries the 5h window gauge beside the key hint and stays one click target (S6)", () => {
+	const chrome = renderShellRailHeader(buildShellHeaderModel(model), plain, 50, "alt+u", undefined, "alt+k");
+	const text = rows(chrome.rows);
+	assert.equal(text[4]!.trimEnd(), " ◔ usage      [alt+u]  5h ▱▱▱▱▱▱▱▱ 5%");
+	assert.equal(text.length, 6, "no new row");
+	assert.ok(shellHeaderUsageHit(chrome, 3, 4) && shellHeaderUsageHit(chrome, 30, 4), "the whole row, gauge included, opens usage");
+	assert.ok(!shellHeaderUsageHit(chrome, 3, 3));
+	const narrow = rows(renderShellRailHeader(buildShellHeaderModel(model), plain, 36, "alt+u", undefined, "alt+k").rows)[4]!;
+	assert.ok(visibleWidth(narrow) <= 36 && narrow.includes("5h 5%") && !narrow.includes("▱"), `the gauge gives way to text: ${narrow}`);
+	const tiny = rows(renderShellRailHeader(buildShellHeaderModel(model), plain, 26, "alt+u", undefined, "alt+k").rows)[4]!;
+	assert.equal(tiny.trimEnd(), " ◔ usage      [alt+u]", "no room: the window drops, the hint stays");
+	const none = rows(renderShellRailHeader(buildShellHeaderModel({ ...model, usage: undefined }), plain, 50, "alt+u", undefined, "alt+k").rows)[4]!;
+	assert.equal(none.trimEnd(), " ◔ usage      [alt+u]", "no 5h window: the row is as before");
 });
