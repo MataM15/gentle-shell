@@ -145,6 +145,10 @@ function sha256(openRead, file, signal) {
 	});
 }
 
+/**
+ * Fails with `runtime-invalid` unless every file the request names, plus the
+ * `extraFiles` a selected backend needs, exists in the validated runtime tree.
+ */
 async function validateRuntime(runtime, uid, extraFiles = []) {
 	const files = await readTree(runtime.root, uid, "runtime-invalid");
 	for (const required of [...runtime.files, ...extraFiles]) if (!files.has(required)) fail("runtime-invalid");
@@ -383,17 +387,21 @@ class WorkerSession {
 		fail("invalid-request");
 	}
 
+	/**
+	 * Validates the runtime, picks the capture backend for this kernel and opens
+	 * the microphone; the model is verified later, while recording.
+	 */
 	async begin(request) {
 		this.state = "loading";
 		const { io } = this;
 		if (request.target !== `${io.platform}-${io.arch}`) fail("runtime-invalid");
-		// A cancel can arrive during any await; each step re-checks before going on.
 		// WSLg exposes audio through a PulseAudio server, not an ALSA device, so a
 		// Microsoft kernel selects node-cpal's PulseAudio facade. That facade falls
 		// back to the default binary when its own native file is missing, so the
 		// facade and its native file are validated before anything is loaded.
 		const usePulse = io.platform === "linux" && /microsoft/i.test(io.kernelRelease ?? "");
 		const captureEntry = usePulse ? PULSE_ENTRY : CPAL_ENTRY;
+		// A cancel can arrive during any await; each step re-checks before going on.
 		await validateRuntime(request.runtime, io.uid, usePulse ? [PULSE_ENTRY, pulseNative(request.target)] : []);
 		if (this.state !== "loading") return;
 		this.request = request;
@@ -474,7 +482,12 @@ class WorkerSession {
 				deviceId: device.deviceId,
 				config,
 				onData: (data) => this.onData(data),
-				onError: () => void this.fail(new WorkerFailure("capture")),
+				// A buffer underrun or overrun drops some audio but the stream keeps
+				// running; WASAPI reports one at start on some devices.
+				onError: (error) => {
+					if (isRecord(error) && error.code === "XRUN") return;
+					void this.fail(new WorkerFailure("capture"));
+				},
 				autoStart: true,
 				queueCapacityBuffers: 64,
 			});

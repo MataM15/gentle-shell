@@ -5,6 +5,7 @@ import { Editor, Image, Key, decodeKittyPrintable, getCapabilities, isKeyRelease
 import { readClipboardImage, type ClipboardImage } from "../lib/clipboard-image.ts";
 import { readPastedImagePaths } from "../lib/pasted-image-paths.ts";
 import { describeAttachment, ImageAttachments } from "../lib/image-attachments.ts";
+import { defaultCacheRoot, ImageDiskCache } from "../lib/image-disk-cache.ts";
 import { execFile, spawnSync } from "node:child_process";
 import { openInExternalEditor, type ExternalEditorHost } from "../lib/external-editor.ts";
 import { existsSync, realpathSync, statSync } from "node:fs";
@@ -18,6 +19,7 @@ import { BAND_RIGHT_WIDTH, buildShellHeaderModel, renderDevBuildLine, renderFold
 import { CHANGE_STATUS, DIFF_MAX_BYTES, DIFF_MAX_LINES, DIFF_TOO_LARGE, WorktreeChangesTracker, changesDigest, renderChangesWidget, type ChangedFile, type ChangesModel, type FileRevision, type GitRunner, type LineCounter, type WorktreeChanges } from "../lib/shell-changes.ts";
 import { WorktreeChangesView } from "../lib/shell-changes-view.ts";
 import { createNativeFullscreenInteraction } from "../lib/native-fullscreen-interaction.ts";
+import { windowsProcessTreeKiller, type ProcessTreeKiller } from "../lib/native-review-cli.ts";
 import { SessionWorktreeRegistry, resolveSessionWorktree, worktreeGitEnvironment, type WorktreeResolver, type WorktreeIdentity } from "../lib/session-worktree-registry.ts";
 import { cachedCard, CARD_STYLE, CARD_TONE, cardStyle, setCardStyle, type Card, type CardTheme } from "../lib/shell-card.ts";
 import { resolveCardStyle, writeCardStyle } from "../lib/card-style-policy.ts";
@@ -49,6 +51,7 @@ import { isNanAdaptiveReasoningModel } from "../lib/nan-provider.ts";
 import { resolveAnimationPolicy, writeAnimationPolicy, type AnimationPolicy } from "../lib/animation-policy.ts";
 import { resolveVimPolicy, writeVimPolicy, type VimPolicy } from "../lib/vim-policy.ts";
 import { resolveHistoryCapture, writeHistoryCapturePolicy } from "../lib/history-capture-policy.ts";
+import { HERDR_TASK_SUMMARY_CHANGED, resolveHerdrTaskSummarySettings, writeHerdrTaskSummarySettings } from "../lib/herdr-task-summary-policy.ts";
 import { createRequire } from "node:module";
 import { createVimEditorAdapter, isAuditedPiEditorVersion } from "../lib/vim-editor-adapter.ts";
 import { VimNormalEngine } from "../lib/vim-normal-engine.ts";
@@ -1706,29 +1709,81 @@ const CHANGES_WIDGET_KEY = "gentle-shell-changes";
 const HEADER_WIDGET_KEY = "gentle-shell-below-input-header";
 const BAND_WIDGET_KEY = "gentle-shell-folded-band";
 const CHANGES_COMMAND_NAME = "gentle:changes";
+const IMAGES_COMMAND_NAME = "gentle:images";
 const CHANGES_POLL_DEFAULT_MS = 2000;
 const GIT_TIMEOUT_MS = 5000;
 const COMMANDS_COMMAND_NAME = "gentle:commands";
 
-export function shellGitRunner(cwd: string, env: NodeJS.ProcessEnv = process.env, run: typeof execFile = execFile, maxBuffer = Infinity): GitRunner {
+// If taskkill cannot run (AppLocker, a broken PATH) the direct child can exit
+// while a descendant still holds the inherited pipes, which keeps execFile from
+// calling back; cut them after this grace so the scan still settles.
+const GIT_TREE_KILL_GRACE_MS = 1_000;
+
+export function shellGitRunner(cwd: string, env: NodeJS.ProcessEnv = process.env, run: typeof execFile = execFile, maxBuffer = Infinity, killProcessTree: ProcessTreeKiller | undefined = process.platform === "win32" ? windowsProcessTreeKiller : undefined): GitRunner {
 	// Pi exec cannot replace the inherited environment. Use argv directly and
 	// a complete sanitized environment for discovery, status, and lazy diffs.
 	const childEnv = worktreeGitEnvironment(env);
+	// A timed-out Git scan on Windows is more than one process: `git` hands the
+	// status work to a descendant, and that descendant survives the direct child
+	// Node itself kills, so a large repository whose scan passes the timeout
+	// leaks another orphaned git.exe on every poll until physical memory is
+	// exhausted (#927). Windows therefore owns the deadline below, so the tree
+	// kill lands while the parent is still alive for taskkill to walk; everywhere
+	// else execFile's own timeout stays exactly as it was.
+	const treeKiller = killProcessTree;
 	return (args) => new Promise((resolve) => {
-		run("git", ["-C", cwd, ...args], {
-			env: childEnv,
-			encoding: "utf8",
-			shell: false,
-			windowsHide: true,
-			timeout: GIT_TIMEOUT_MS,
-			// Pi exec accumulates output without a maxBuffer cap. In particular,
-			// large porcelain inventories must not become partial successful scans.
-			// Only a single diff passes a bound, and is told when it hit it.
-			maxBuffer,
-		}, (error, stdout) => {
-			if ((error as { code?: unknown } | null)?.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") return resolve({ stdout, code: 1, truncated: true });
-			resolve({ stdout, code: error ? typeof error.code === "number" ? error.code : 1 : 0 });
-		});
+		let deadline: ReturnType<typeof setTimeout> | undefined;
+		let grace: ReturnType<typeof setTimeout> | undefined;
+		let settled = false;
+		// A scan that passed its deadline is a failed scan, never a partial
+		// success, even if the direct child exited 0 before its pipes closed.
+		let timedOut = false;
+		const settle = (error: { code?: unknown; killed?: boolean } | null, stdout: string): void => {
+			settled = true;
+			if (deadline !== undefined) clearTimeout(deadline);
+			if (grace !== undefined) clearTimeout(grace);
+			if (error?.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") { resolve({ stdout, code: 1, truncated: true }); return; }
+			const code = timedOut ? 1 : error ? typeof error.code === "number" ? error.code : 1 : 0;
+			// Without a tree killer execFile owns the timeout and reports its kill on the error.
+			resolve({ stdout, code, ...(timedOut || (treeKiller === undefined && error?.killed) ? { timedOut: true } : {}) });
+		};
+		let child: ReturnType<typeof execFile>;
+		try {
+			child = run("git", ["-C", cwd, ...args], {
+				env: childEnv,
+				encoding: "utf8",
+				shell: false,
+				windowsHide: true,
+				...(treeKiller === undefined ? { timeout: GIT_TIMEOUT_MS } : {}),
+				// Pi exec accumulates output without a maxBuffer cap. In particular,
+				// large porcelain inventories must not become partial successful scans.
+				// Only a single diff passes a bound, and is told when it hit it.
+				maxBuffer,
+			}, (error, stdout) => settle(error, stdout));
+		} catch (error) {
+			// A spawn that throws (invalid options, an injected runner) is a failed scan.
+			settle(error as { code?: unknown }, "");
+			return;
+		}
+		// The callback may already have settled a synchronous run (a fake in
+		// tests, a spawn error), so only arm the deadline while it is pending.
+		if (settled || treeKiller === undefined || child?.pid === undefined) return;
+		const pid = child.pid;
+		deadline = setTimeout(() => {
+			timedOut = true;
+			// taskkill walks the tree from a live parent. If the direct child
+			// already exited, only a descendant can be holding the inherited
+			// pipes, and a PID-based kill would just report "process not found";
+			// the grace below still cuts those pipes so the scan can settle.
+			if (child.exitCode === null && child.signalCode === null) treeKiller(pid);
+			grace = setTimeout(() => {
+				if (child.exitCode === null && child.signalCode === null) child.kill();
+				child.stdout?.destroy();
+				child.stderr?.destroy();
+			}, GIT_TREE_KILL_GRACE_MS);
+			grace.unref?.();
+		}, GIT_TIMEOUT_MS);
+		deadline.unref?.();
 	});
 }
 
@@ -1736,7 +1791,7 @@ export async function loadFileDiff(git: GitRunner, file: ChangedFile): Promise<s
 	const args = file.status === CHANGE_STATUS.UNTRACKED ? ["diff", "--no-index", "--", "/dev/null", file.path] : ["diff", "HEAD", "--", file.path];
 	const result = await git(args);
 	if (result.truncated || result.stdout.length > DIFF_MAX_BYTES || result.stdout.split("\n", DIFF_MAX_LINES + 2).length > DIFF_MAX_LINES + 1) return DIFF_TOO_LARGE;
-	return result.code === 0 || result.code === 1 ? result.stdout : "";
+	return !result.timedOut && (result.code === 0 || result.code === 1) ? result.stdout : "";
 }
 
 // Untracked files have no numstat; count their lines without reading past the diff bound.
@@ -2466,6 +2521,10 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 	let prompt: GentlePromptEditor | undefined;
 	// Images pasted into the current draft; emptied on every submit.
 	const imageAttachments = new ImageAttachments();
+	// Opt-in disk cache for tools that need a real file path. Off unless the user
+	// asks for it: `GENTLE_PI_IMAGES_DISK_CACHE=session`. The path is never put in
+	// the prompt; it is readable through /gentle:images only.
+	const imagesDiskCachePolicy = (env.GENTLE_PI_IMAGES_DISK_CACHE ?? "off").trim().toLowerCase() === "session" ? "session" : "off";
 	// Set by abortAndDispatchQueued via dispatchQueuedText when an Esc aborts
 	// a turn with a non-empty queue; sent exactly once, from agent_settled,
 	// once the aborted run has fully settled (issue #1218). Several aborts
@@ -2633,6 +2692,15 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 	});
 	pi.on("session_start", async (_event, ctx) => {
 		customizeGeneration++;
+		if (imagesDiskCachePolicy === "session") {
+			const cacheRoot = defaultCacheRoot(env);
+			try {
+				ImageDiskCache.sweepStale(cacheRoot, 7 * 24 * 60 * 60 * 1000);
+			} catch {
+				// A sweep that cannot run must never block the session.
+			}
+			imageAttachments.setCache(new ImageDiskCache({ root: cacheRoot, sessionId: ctx.sessionManager.getSessionId() }));
+		}
 		closeCustomize?.();
 		runningJobs = undefined;
 		sessionSnapshot = undefined;
@@ -3235,6 +3303,8 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 	pi.on("session_shutdown", (_event, ctx) => {
 		customizeGeneration++;
 		disposeFooter?.();
+		imageAttachments.dispose();
+		imageAttachments.setCache(undefined);
 		closeCustomize?.();
 		if (review) {
 			review = undefined;
@@ -3290,6 +3360,21 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		if (failed > 0) ctx.ui.notify(`Git status failed for ${failed} ${failed === 1 ? "root" : "roots"}; ${failed === 1 ? "its" : "their"} changes are not listed.`, "warning");
 		await showChangesOverlay(ctx, { loadDiff: (root, file) => loadFileDiff(deps.gitRunner(root, DIFF_MAX_BYTES), file), worktrees: () => tracker.worktrees, refresh: () => tracker.refresh(), apply: applyChanges, pollMs: changesPollMs(env) });
 	};
+	pi.registerCommand(IMAGES_COMMAND_NAME, {
+		description: "List the on-disk paths of images pasted in this draft (needs GENTLE_PI_IMAGES_DISK_CACHE=session).",
+		handler: async (_args, ctx) => {
+			if (imagesDiskCachePolicy !== "session") {
+				ctx.ui.notify("Image disk cache is off. Set GENTLE_PI_IMAGES_DISK_CACHE=session to enable it.", "info");
+				return;
+			}
+			const cached = imageAttachments.cachedPaths(prompt?.getText() ?? "");
+			if (cached.length === 0) {
+				ctx.ui.notify("No pasted images are cached in this draft.", "info");
+				return;
+			}
+			for (const entry of cached) ctx.ui.notify(`${entry.token} ${entry.path}`, "info");
+		},
+	});
 	pi.registerCommand(CHANGES_COMMAND_NAME, {
 		description: "Browse uncommitted Git changes (working tree vs HEAD, untracked included) in this session's repository and its subagents' worktrees. Press o to open $EDITOR.",
 		handler: async (_args, ctx) => openChanges(ctx),
@@ -3366,7 +3451,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		});
 	}
 	pi.registerCommand("gentle:customize", {
-		description: "Configure appearance, audio notifications, Vim editing, RDD, session permissions and global Auto/YOLO defaults, and prompt history capture.",
+		description: "Configure appearance, task summary publishing, audio notifications, Vim editing, RDD, session permissions and global Auto/YOLO defaults, and prompt history capture.",
 		handler: async (_args, ctx) => {
 			if (ctx.mode !== "tui" || !ctx.hasUI) {
 				if (ctx.hasUI) ctx.ui.notify("Customization requires an interactive terminal.", "warning");
@@ -3642,6 +3727,23 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			});
 			rows.push(...buildNotificationRows(ctx));
 			category = "Layout";
+			const taskSummary = () => resolveHerdrTaskSummarySettings(home);
+			const taskSummaryCurrent = (enabled: boolean) => {
+				const current = taskSummary();
+				return !current.malformed && !current.readError && current.settings.enabled === enabled;
+			};
+			for (const enabled of [true, false]) add(
+				() => `Task summary: ${enabled ? "on" : "off"}${taskSummaryCurrent(enabled) ? " (current)" : ""}`,
+				`Task summary: ${enabled ? "on" : "off"}. Applies now to the active-task summary published to terminal tools (for example Herdr's sidebar).`,
+				() => {
+					const current = taskSummary();
+					if (current.malformed || current.readError) throw new Error(`Cannot update malformed or unreadable task summary preference: ${current.globalFile}`);
+					writeHerdrTaskSummarySettings({ ...current.settings, enabled }, home);
+					pi.events.emit(HERDR_TASK_SUMMARY_CHANGED, { configHome: doubleEscCancelConfigHome });
+				},
+				undefined,
+				{ ...explicitChoice("Task summary", enabled ? "on" : "off", () => taskSummaryCurrent(enabled)), hint: "Controls the task summary published to terminal tools" },
+			);
 			// Presets set the visibility switches and keep the placements, the density and the surface; any switch below still overrides them.
 			for (const preset of Object.values(VISUAL_PRESET)) add(() => `Preset: ${PRESET_LABEL[preset]}${visualPresetOf(visual()) === preset ? " (current)" : ""}`, pending, () => updateVisual((settings) => applyVisualPreset(settings, preset)), () => layoutPreview(applyVisualPreset(visual(), preset)),
 				layoutChoice("Preset", PRESET_LABEL[preset], () => visualPresetOf(visual()) === preset, "Light hides the rail, Power user adds Stats; alt+l cycles them"));

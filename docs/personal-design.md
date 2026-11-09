@@ -40,6 +40,8 @@ The owner, verbatim: "me gusta el diseño que tenemos, el estilo ... habría que
 | Wide editor with the rail open | Neon: the framed rose editor box at full width, no `≡ commands`/`« panel` labels (the rail header carries commands); float keeps upstream's panel rule | `tests/gentle-shell.test.ts` (`S21`) |
 | Dead code gate | `pnpm run check:unused` fails on new unused imports or locals | `tests/check-unused.test.ts` |
 
+Turn TPS notifications (upstream `extensions/gentle-tps.ts`, on by default since `8a1d7b341`) stay off through the package filter `!extensions/gentle-tps.ts` in `~/.pi/agent/settings.json`, beside `!extensions/quiet-tools.ts`; remove that entry to enable them. The extension code is unchanged.
+
 Accepted losses: the Background card (Agents and Jobs cover it) and the visible `ctrl+shift+t` hint.
 
 ## History

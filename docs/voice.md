@@ -493,8 +493,8 @@ built for their architecture (checked from the binary headers, not by loading).
 |--------|--------------------------------------------|
 | macOS arm64 | macOS 11 or newer |
 | macOS x64 | macOS 10.12 or newer |
-| Linux x64, glibc 2.34+ | ALSA `libasound.so.2` |
-| Linux arm64, glibc 2.34+ | ALSA `libasound.so.2` |
+| Linux x64, glibc 2.34+ | ALSA `libasound.so.2`; under WSL, a PulseAudio server (WSLg provides one) |
+| Linux arm64, glibc 2.34+ | ALSA `libasound.so.2`; under WSL, a PulseAudio server (WSLg provides one) |
 | Windows x64 | Microsoft Visual C++ runtime (`vcruntime140.dll`) |
 
 node-cpal requires Node 22 or newer, and a dictation session refuses to start
@@ -506,32 +506,10 @@ Apart from the user-confirmed WSLg session described below, these targets have n
 been verified on real hardware. Linux with a glibc
 older than 2.34 is unsupported and the diagnosis names the version found.
 Windows ARM64 has no native sherpa-onnx package and is unsupported. musl Linux
-is unsupported.
-
-### WSL
-
-A Linux kernel whose release names Microsoft (WSL2) has no ALSA hardware device
-to record from, so the worker loads node-cpal's PulseAudio facade
-(`backend-pulseaudio.js`) instead of the default one, and checks that facade and
-its `bin/backend-pulseaudio/<target>/index.node` before loading. The PulseAudio
-binaries ship in the same pinned `node-cpal@1.0.0` tarball, so a WSL install
-downloads nothing extra. Before this path existed, WSL reported the fixed
-message "The default microphone uses an unsupported audio format.", because the
-ALSA default device there exposes no usable format. Requirements, none of them
-checked before loading:
-
-- WSLg (Windows 11 WSL, audio support enabled), which provides a
-  PulseAudio-compatible server, or another PulseAudio server reachable through
-  `PULSE_SERVER`. The worker passes `PULSE_SERVER` and `PULSE_COOKIE` through.
-- The PulseAudio server socket in the runtime directory named by
-  `XDG_RUNTIME_DIR`, also passed through.
-
-Without a reachable PulseAudio server the session reports a microphone or
-capture error rather than falling back to ALSA, which cannot record there. One
-user confirmed that dictation works with this backend on WSLg. Automated backend
-selection tests use fake modules; the current shortcut and sidebar integration
-have not yet been verified with a real WSL microphone. The platform limitation and
-the ALSA advice in `/gentle:voice` do not change for WSL yet.
+is unsupported. On a Microsoft kernel (WSL) the worker selects node-cpal's
+shipped PulseAudio backend instead of ALSA, because WSLg exposes audio through
+a PulseAudio server and no ALSA device; the backend's own native file is
+validated before loading.
 
 ## Licenses and attribution
 

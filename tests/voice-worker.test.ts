@@ -183,6 +183,35 @@ const interleaved = (frames: number, channels: number, value: (frame: number, ch
 	return data;
 };
 
+test("WSL uses the shipped PulseAudio backend without loading ALSA", async (t) => {
+	const h = harness(t, {}, { kernelRelease: "6.18-microsoft-standard-WSL2" });
+	h.send(startRequest(h.paths));
+	await h.waitFor(() => h.types().includes("recording"));
+	h.send({ schema: SCHEMA, type: "cancel" });
+	await h.done;
+	assert.deepEqual(h.loaded, [join(h.paths.runtimeRoot, PULSE_ENTRY)]);
+	assert.equal(h.streams[0].closes, 1);
+});
+
+test("ordinary Linux keeps the default capture backend", async (t) => {
+	const h = harness(t, {}, { kernelRelease: "6.8.0-generic" });
+	h.send(startRequest(h.paths));
+	await h.waitFor(() => h.types().includes("recording"));
+	h.send({ schema: SCHEMA, type: "cancel" });
+	await h.done;
+	assert.deepEqual(h.loaded, [join(h.paths.runtimeRoot, CPAL_ENTRY)]);
+});
+
+test("WSL refuses an incomplete PulseAudio backend before native loading", async (t) => {
+	const h = harness(t, {}, { kernelRelease: "6.18-microsoft-standard-WSL2" });
+	rmSync(join(h.paths.runtimeRoot, PULSE_NATIVE));
+	h.send(startRequest(h.paths));
+	await h.done;
+	assert.deepEqual(h.loaded, []);
+	assert.deepEqual(h.messages, [{ schema: SCHEMA, type: "error", code: "runtime-invalid" }]);
+	assert.equal(h.exitCode(), 1);
+});
+
 test("records multichannel audio, resamples it to 16 kHz mono and closes its retained stream once on stop", async (t) => {
 	const worker = harness(t);
 	worker.send(startRequest(worker.paths));
@@ -339,6 +368,46 @@ test("reports a missing microphone, an unusable format and empty audio", async (
 			assert.deepEqual(worker.messages.at(-1), { schema: SCHEMA, type: "error", code });
 			assert.equal(worker.exitCode(), 1);
 			for (const stream of worker.streams) assert.equal(stream.closes, 1);
+		});
+	}
+});
+
+// node-cpal reports stream errors as CpalError objects with a string code.
+const cpalError = (code: string, message: string) => Object.assign(new Error(message), { code });
+
+test("a buffer underrun or overrun keeps capturing and the dictation is still transcribed", async (t) => {
+	const worker = harness(t);
+	worker.send(startRequest(worker.paths));
+	await worker.waitFor(() => worker.types().includes("recording"));
+	const [stream] = worker.streams;
+	// WASAPI reports one before the first buffer on some devices; others may report one between buffers.
+	stream!.options.onError(cpalError("XRUN", "A buffer underrun or overrun occurred."));
+	stream!.options.onData(interleaved(4800, 2, () => 16384));
+	stream!.options.onError(cpalError("XRUN", "A buffer underrun or overrun occurred."));
+	stream!.options.onData(interleaved(4800, 2, () => 16384));
+	worker.send({ schema: SCHEMA, type: "stop" });
+	await worker.done;
+	assert.deepEqual(worker.types(), ["recording", "transcribing", "result"]);
+	assert.equal(worker.messages.at(-1)!.text, "hello world");
+	assert.equal(worker.recognizers[0]!.waves[0]!.samples.length, 3200);
+	assert.equal(stream!.closes, 1);
+	assert.equal(worker.exitCode(), 0);
+});
+
+test("any other stream error ends the session with capture", async (t) => {
+	for (const error of [cpalError("DEVICE_NOT_AVAILABLE", "The requested audio device is not available."), cpalError("OTHER", "backend failure"), new Error("no code"), undefined]) {
+		await t.test(String(error?.message), async (st) => {
+			const worker = harness(st);
+			worker.send(startRequest(worker.paths));
+			await worker.waitFor(() => worker.types().includes("recording"));
+			const [stream] = worker.streams;
+			stream!.options.onData(interleaved(4800, 2, () => 16384));
+			stream!.options.onError(error);
+			await worker.done;
+			assert.deepEqual(worker.messages.at(-1), { schema: SCHEMA, type: "error", code: "capture" });
+			assert.equal(worker.exitCode(), 1);
+			assert.equal(stream!.closes, 1);
+			assert.equal(worker.recognizers.length, 0);
 		});
 	}
 });
