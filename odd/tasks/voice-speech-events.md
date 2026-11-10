@@ -20,8 +20,8 @@ Branch `feat/voice-speech-events`. Additive: no existing event, payload, or beha
 
 - T1 (S1-S6) worker: implement event, player playback markers, loudness envelope, tests, docs. Commit: `30c52938f` (done).
 - T2 (S1) parent: LED bridge outside this repo (Pi extension + Windows BLE daemon). Not in this repo.
-- T3 (S4) worker: feed the player one chunk at a time (`createPlayerFeed` replaces the queue-everything sink), so its playback marker is never held back by pending input, and each chunk is still measured on the bytes the player receives. Tests cover the order, the release, an unmeasurable chunk and the failure paths. Real path, four 4 s chunks, before: second event 4.1 s after its audio, two events 3 ms apart; after: 0, 3, 10 and 17 ms against the player's own clock.
-- T4 (S7) worker: reply volume through `GENTLE_PI_VOICE_VOLUME`, in the three WAV engines and the Windows voice. Commit: this one.
+- T3 (S4) worker: feed the player one chunk at a time (`createPlayerFeed` replaces the queue-everything sink), so its playback marker is never held back by pending input, and each chunk is still measured on the bytes the player receives. Tests cover the order, the release, an unmeasurable chunk and the failure paths. Real path, four 4 s chunks, before: second event 4.1 s after its audio, two events 3 ms apart; after: 0, 3, 10 and 17 ms against the player's own clock. Commit: `b375e3b5c` (done).
+- T4 (S7) worker: reply volume through `GENTLE_PI_VOICE_VOLUME`, in the three WAV engines and the Windows voice. Commit: `3929f5d1c` (done).
 
 ## Log
 
