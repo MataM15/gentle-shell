@@ -166,10 +166,11 @@ saved by session id in `voice-sessions.json` in the Gentle AI config home
 (the newest 64 sessions), so it survives `/reload` and applies at once in every
 Pi process. Delegated child sessions never speak or listen.
 
-Voice needs the Windows voice (System.Speech), or the natural voice once that
-is installed (see below), so it works on Windows and on WSL only. Elsewhere,
-turning it on is refused with "Spoken replies need the Windows voice (Windows
-or WSL)." A session without an id is refused too.
+Voice needs the Windows voice (OneCore, through the WinRT API), so it works on
+Windows and on WSL only. A machine without `powershell.exe` reachable from here
+has no voice, and spoken replies need no download. Elsewhere, turning it on is
+refused with "Spoken replies need the Windows voice (Windows or WSL)." A session
+without an id is refused too.
 
 In a voice session:
 
@@ -190,12 +191,14 @@ In a voice session:
 | When | Once a run has settled, with no retry, compaction or queued message left. An aborted run, a delegated child session, RPC and print modes read nothing. |
 | What is read | The text of the last assistant message that has any. Thinking, tool calls and tool results are never read. |
 | What is skipped | Code blocks, table rows, link targets, bare URLs and Markdown markers. A path keeps only its last segment, so `lib/voice-speech.ts` is read as `voice-speech.ts`. List items and headings become separate sentences. A reply is read whole: it streams sentence by sentence, and only a runaway reply is cut, at a sentence boundary after about 8,000 characters. |
-| Voice | Each reply is checked for Spanish or English and read with an installed voice of that language when there is one (for example Microsoft Sabina for Spanish), otherwise with the Windows default voice. |
-| Volume | `GENTLE_PI_VOICE_VOLUME` turns the reply down, from `0` (silent) to `1` (full, the default), for example `0.8` for a fifth quieter. It scales the reply's own audio, so the machine's volume and every other sound stay as they are: the Kokoro, Miro and Raúl voices scale the samples before the player gets them, and the Windows voice sets the synthesizer's own volume. A value that is not a number from 0 to 1 reads as full volume, so a typo never mutes a reply or makes it louder. It is read when the session builds its voice chain, so a change applies to the next session. |
+| Voice | Each reply is checked for Spanish or English: Spanish and undecided replies are read by **Microsoft Raul** (es-MX) and English ones by **Microsoft David** (en-US), both through the same robot effect and leveler (see [Robot voice](#robot-voice)). No other voice reads a reply. |
+| Rate | `GENTLE_PI_VOICE_RATE_ES` and `GENTLE_PI_VOICE_RATE_EN` are one speech-rate multiplier per language: `1` (the default) keeps the voice's own pace, `0.5` is the slowest and `2` the fastest, and anything else reads as `1`. English can be slowed down without touching Spanish (`GENTLE_PI_VOICE_RATE_EN=0.6`). It reaches the synthesizer as its own `SpeakingRate`, and it is read when the session builds its voice chain, so a change applies to the next session. |
+| Volume | `GENTLE_PI_VOICE_VOLUME` turns the reply down, from `0` (silent) to `1` (full, the default), for example `0.8` for a fifth quieter. It scales the reply's own audio, so the machine's volume and every other sound stay as they are: the robot voice scales the samples before the player gets them. A value that is not a number from 0 to 1 reads as full volume, so a typo never mutes a reply or makes it louder. It is read when the session builds its voice chain, so a change applies to the next session. |
+| Retry | A failure before any of the reply was heard (a missing voice, a synthesizer that did not start, a timeout) is read again once from the start by the same voice. A second failure ends the reading with `error` and the voice's one fixed message: there is no fallback to Miro, Kokoro or the plain Windows voice. A failure after part of the reply was heard stops there, so the reply is never repeated from the start. |
 | Stop | Esc stops the reading and is consumed, so it never reaches the editor or the agent. **Stop reading** in `/gentle:voice` does the same. Your own message, typed or spoken, stops it too. A run that a background notice or another extension starts does not: its reply waits until the reading ends, and only the newest reply waits. Esc, Stop reading and your own message also drop the waiting reply. |
 | Talk over it | The dictation shortcut (`alt+m`) stops the reading and starts a dictation at once. |
 | Footer | `Reading reply · esc stop · alt+m talk` while it reads. No reading state is published on the voice-state event; the speech event below covers what is playing. |
-| Process | Each reading runs PowerShell with a fixed script; the reply goes only through its standard input, as base64 JSON, never as an argument. PowerShell takes about 1.5 seconds to start before the voice is heard. Of its output, only the one word the player writes before each line it plays is read, to report that chunk as it starts; everything else is discarded and a failure shows one fixed message. Each chunk is written to it only after it reported the previous one began, because its input and output share one relay. A reading is killed after 30 seconds plus about 0.1 second per character. |
+| Process | Each reading runs two PowerShell processes with fixed scripts; the reply goes only through standard input, as base64 JSON, never as an argument. PowerShell takes about 1.5 seconds to start before the voice is heard. Of its output, only the one word the player writes before each line it plays is read, to report that chunk as it starts; everything else is discarded and a failure shows one fixed message. Each chunk is written to it only after it reported the previous one began, because its input and output share one relay. A reading is killed after 60 seconds plus about 0.15 second per character. |
 
 ### Speech events
 
@@ -217,12 +220,12 @@ pi.events.on("gentle-ai:voice-speech", (event: VoiceSpeechEvent) => {
 | Topic | Behavior |
 |-------|----------|
 | Channel | `gentle-ai:voice-speech`, schema `gentle-pi.voice-speech/v1`. Subscribing is the only setup, and a session may subscribe or not. |
-| `phase: "start"` | Published once, right before the engine is asked to speak. `engine` names the chain by engine id, for example `windows`, or `raul-robot+kokoro+kokoro+kokoro+windows` when every voice is installed: Miro and Kokoro share one engine id because they run the same player. |
+| `phase: "start"` | Published once, right before the engine is asked to speak. `engine` names the voice that speaks, not the chain: `Microsoft Raul` for Spanish and undecided replies, `Microsoft David` for English ones. An engine that names no voice reports its id (the `fake` of the tests does). |
 | `phase: "chunk"` | One per chunk the player really begins, in the order the chunks were queued, so a chunk still waiting in the player is never reported. `levels` is one RMS value per 50 ms of that chunk (`frameMs: 50`), normalized to the loudest frame of that chunk, so the peak frame is `1` and a silent chunk is all zeros. `durationMs` is the length of the chunk. Scale `levels` to your own effect; they are relative per chunk, never absolute loudness. |
 | One chunk at a time | The player gets the first chunk at once and each next one only once it reported it began the previous one, and each chunk is measured then. Under WSL a player's input and output share one interop relay, which holds the report back while chunk bytes are still to be delivered: a player fed a chunk ahead reported every chunk about one chunk late (measured over four 4 s chunks, the second event arrived 4.1 s after the audio it named, and two events arrived 3 ms apart). One chunk in the player keeps that relay idle, so every event lands with the audio it names (measured against the player's own clock: 0, 3, 10 and 17 ms). |
 | `phase: "end"` | Published exactly once per reading, whatever ended it, with the outcome the reading log records: `done`, `skipped` (Esc), `cancelled` (Stop reading or your own message), `empty`, `unavailable` or `error`. A failed reading still reports `error` and still shows its one message. |
-| Which voices report chunks | Kokoro, Miro and Raúl play audio that Node already holds, so they report one chunk per chunk the player begins. The Windows voice hands the text to PowerShell, so it reports only `start` and `end`: there is no audio in Node to measure. |
-| What it never carries | Reply text, file paths, transcript and error messages. Only the engine chain, the loudness of audio that already played, and the outcome. |
+| Which voices report chunks | The robot voice plays audio that Node already holds, so it reports one chunk per chunk the player begins, for Spanish and English alike. A voice that hands the text to PowerShell instead, such as the plain Windows voice, reports only `start` and `end`: there is no audio in Node to measure. |
+| What it never carries | Reply text, file paths, transcript and error messages. Only the voice name, the loudness of audio that already played, and the outcome. |
 | Safety | The event is advisory: a listener that throws, and a session with no event bus, never break, delay or silence a reading. Publishing starts no process and opens no file. |
 
 ### Conversation
@@ -235,7 +238,7 @@ aloud, and the microphone reopens. It needs voice dictation installed.
 |-------|----------|
 | Start | Press `alt+m` and speak. Recording ends by itself after 2.5 seconds of quiet that follows speech, room to think between sentences, so no second press is needed. |
 | Send | The transcript is sent as the next prompt, never pasted. Whatever is in the draft goes with it, draft first, then a blank line and the transcript, and the draft is cleared: a pasted image is a file path in the draft, so it is sent exactly as a typed submit would send it. A blank draft sends the transcript alone; a turn that hears nothing sends nothing and keeps the draft. While the agent is still busy it is queued as a follow-up instead of interrupting the run. |
-| The loop | When the reply to something you said has been read to the end, the microphone reopens the same way, but only in the pane herdr reports focused (`herdr pane get`, from `HERDR_PANE_ID`); outside herdr the pane counts as focused. In another pane it stays closed with "Conversation paused in this pane. Press alt+m to talk." A reply with nothing readable reopens it too. A reply to a typed message is read but never reopens the microphone. The spoken turn stays pending until the microphone reopens, so a run that a background notice starts, and that cuts the reading, does not lose it: the next reply reopens the microphone. Typing a message, Esc on a reading, Stop reading and a failed reading end it. A failed herdr lookup keeps it closed. |
+| The loop | When the reply to something you said has been read to the end, the microphone reopens the same way, but only in the pane herdr reports focused (`herdr pane get`, from `HERDR_PANE_ID`); outside herdr the pane counts as focused. In another pane it stays closed with "Conversation paused in this pane. Press alt+m to talk." A reply with nothing readable reopens it too. A reply to a typed message is read but never reopens the microphone. The spoken turn stays pending until the microphone reopens, so a run that a background notice starts, and that cuts the reading, does not lose it: the next reply reopens the microphone. Typing a message, Stop reading and a failed reading end the spoken turn. Esc on a reading skips the rest of it and reopens the microphone after a spoken turn, exactly as reading it to the end does (recorded as `outcome=skipped`, `mic.reopen result=opened`); esc on the reading of a typed message stops it and leaves the microphone closed, because a typed turn has nothing to answer. A failed herdr lookup keeps it closed. |
 | Pause | Esc while listening cancels the recording and pauses the conversation. Esc while the reply to something you said is read skips the rest of the reading and reopens the microphone, so you can correct what you already heard; `alt+m` then closes it without sending. Esc on the reading of a typed message stops it and leaves the microphone closed. Stopping it with `alt+m` before saying anything also pauses it, with "Conversation paused. Press alt+m to talk." With no speech within 8 seconds, it pauses with "Conversation paused: no speech was heard. Press alt+m to talk." Press `alt+m` to go on. |
 | Send early | `alt+m` while listening stops the recording and sends at once. |
 | Footer | `● Conversation · listening · alt+m send · esc pause` while recording, then transcribing and sending. |
@@ -326,8 +329,10 @@ phoneme data comes from nested folders, so it is installed as three flat
 components, one per folder, under `models/` next to Parakeet; the speech worker
 rebuilds the folder tree espeak-ng expects in a private temporary directory.
 
-Once it is installed, every spoken reply uses it, including conversation mode,
-with no setting to change; the Windows voice stays as the fallback.
+Once it is installed, it stays offered in `/gentle:voice`, but a spoken reply
+no longer uses it: the robot voice reads every reply, in both languages (see
+[Robot voice](#robot-voice)). The engine is kept for the voice workers and for
+any future use, and nothing reads a reply with it today.
 
 | Topic | Behavior |
 |-------|----------|
@@ -335,7 +340,7 @@ with no setting to change; the Windows voice stays as the fallback.
 | How it plays | `scripts/voice-tts-worker.cjs` runs in its own Node process with a scrubbed environment and synthesizes chunk by chunk: the first sentence alone, then one sentence per chunk, short ones merged up to 40 characters and none past 160, so each chunk is ready before the previous one ends. It reads 8% faster than the voice's normal pace. Each chunk goes as a 16-bit mono WAV line to one PowerShell process that plays it with `System.Media.SoundPlayer`. PowerShell starts while the first sentence is synthesized. |
 | Speed | On an idle CPU with 4 threads, synthesis ran at about a third of real time; under heavy load it ran slower than real time, which leaves pauses between chunks. |
 | Checks | Before anything native loads, the worker checks that every model and phoneme file is a regular file of the pinned size. Digests are verified at download, and the parent checks the install marker before each reading. The worker's temporary phoneme tree is removed whenever it ends. |
-| Failure | A natural-voice failure before any audio was played falls back to the Windows voice for that reply, silently. A failure after part of the reply was heard stops there with "The reply could not be read aloud." instead of reading it again from the start. |
+| Failure | A natural-voice failure before any audio was played falls back to the Windows voice, silently. A failure after part of the reply was heard stops there with "The reply could not be read aloud." instead of reading it again from the start. No reply chain reaches this voice today, so neither case is reachable from a reading. |
 | Stop | Esc and the dictation shortcut kill both processes. The worker handles the termination signal, so its temporary phoneme tree is still removed; a chunk being synthesized at that moment finishes first, so the worker can outlive the stop by a few seconds while the player is already silent. |
 
 Licenses: the Kokoro-82M weights by hexgrad are Apache-2.0, exported for
@@ -343,32 +348,35 @@ sherpa-onnx by csukuangfj. The espeak-ng phoneme data is GPL-3.0-or-later. It
 runs on the pinned sherpa-onnx 1.13.8 runtime; sherpa-onnx 2.x drops espeak-ng,
 so that pin must not move without replacing the phonemizer.
 
-## Raúl robot voice
+## Robot voice
 
-Spanish replies are read by the owner's pick: the Windows OneCore voice
-**Microsoft Raul** (Spanish, Mexico), with a metallic robot effect and a
+The owner's pick reads every reply. Spanish and undecided replies are read by
+the Windows OneCore voice **Microsoft Raul** (es-MX) and English ones by
+**Microsoft David** (en-US), both with the same metallic robot effect and
 leveler. Everything runs on this machine; no text leaves it. It needs no
-download: Raúl ships with Windows' Spanish (Mexico) speech pack.
+download: both voices ship with Windows' speech packs.
 
 | Topic | Behavior |
 |-------|----------|
-| How it plays | One PowerShell process synthesizes the reply sentence by sentence through the WinRT speech API (`lib/voice-onecore.ts`) and writes each sentence as a base64 WAV line; the reply reaches it only through its standard input, as base64 JSON lines. Each sentence is processed in code and handed to a second PowerShell process that plays them in order. |
+| Which voice | A `es` reading (or one whose language is undecided) asks for `Microsoft Raul`; an `en` reading asks for `Microsoft David`. Both come from the same engine, so the effect, the leveler, the volume and the chunk reporting are identical. There is no other voice in the chain: Miro, Kokoro and the plain Windows voice never read a reply. |
+| Rate | Each reading carries its language's multiplier (`GENTLE_PI_VOICE_RATE_ES`, `GENTLE_PI_VOICE_RATE_EN`, default `1`) and the synthesizer sets it as its `SpeakingRate`: `0.5` is the slowest, `2` the fastest, and the bounds are clamped in both Node and the script. |
+| How it plays | One PowerShell process synthesizes the reply sentence by sentence through the WinRT speech API (`lib/voice-onecore.ts`) and writes each sentence as a base64 WAV line; the reply and its rate reach it only through standard input, as base64 JSON lines. Each sentence is processed in code and handed to a second PowerShell process that plays them in order. |
 | Effect | `lib/voice-robot.ts` reproduces ffmpeg's `afftfilt=real='hypot(re,im)*sin(0)':imag='hypot(re,im)*cos(0)':win_size=512:overlap=0.75,volume=1.6` step by step from `af_afftfilt.c` (ffmpeg 6.1): on a real reply it matches ffmpeg's output within 0.00002, less than one 16-bit step, and processes 20 seconds of audio in about 0.3 seconds. ffmpeg is not needed. |
 | Level | The effect leaves speech low and uneven, so a leveler brings every 50 ms of speech toward a steady level (at most 6 times louder, never quieter), keeps pauses as they are, and rounds off peaks instead of clipping. |
-| Fallback | English replies, and any Raúl failure before audio (for example a missing voice), go to Miro, then Kokoro, then the Windows SAPI voice. A failure after part of the reply was heard stops there. |
+| Retry and failure | A failure before any of the reply was heard (no-voice, unavailable, failed, timeout) is retried once by the same voice, from the start. A second failure ends the reading with `error` and the voice's one fixed message (`The Windows voice Microsoft David is not installed.`), and no other voice takes over. A failure after part of the reply was heard stops there, so nothing is repeated. |
 
 ## Miro voice (Piper)
 
-Miro is a Spanish (Spain) Piper VITS voice, the owner's pick for Spanish
-replies. Once the voice runtime is installed, `/gentle:voice` offers
-**Download Miro voice (Piper, about 64 MB)**. The confirmation names the files,
-the destination and the license; nothing is fetched before you accept.
+Miro is a Spanish (Spain) Piper VITS voice. Once the voice runtime is installed,
+`/gentle:voice` still offers **Download Miro voice (Piper, about 64 MB)**, but it
+no longer reads replies. The confirmation names the files, the destination and
+the license; nothing is fetched before you accept.
 
 | Topic | Behavior |
 |-------|----------|
 | Source | `es_ES-miro-high.onnx`, `tokens.txt` and its `README.md` license text from Hugging Face `csukuangfj/vits-piper-es_ES-miro-high`, commit `0e1f77356142`, checked against the sherpa-onnx release tarball. Pins live in `lib/voice-kokoro.ts`. |
 | Phoneme data | Reuses the Spanish and English espeak-ng parts the natural voice uses; installing Miro fetches them only when missing. |
-| Which voice reads | Spanish replies use Raúl first; Miro reads them when Raúl fails before audio. English replies, and any Miro failure before audio, fall back to Kokoro, then to the Windows voice. |
+| Which voice reads | None: no reply is read by Miro. Spanish replies are read by Raúl and English ones by David, both from the robot voice. |
 | License | CC BY-NC-SA 4.0: non-commercial use only. It reads replies to the owner inside this personal tool; it is not shipped in any product. |
 
 ## Diagnostics
@@ -383,6 +391,19 @@ with its `name`, `outcome` (`done`, `failed`, `unavailable`), latency, the mode 
 carry the time, the process id and the session id, and sizes instead of text:
 no reply or transcript text is written. Past 512 KB the log moves to
 `voice-events.log.1`.
+
+The reading lines name the voice that spoke and why a reading changed course:
+
+| Event | Fields |
+|-------|--------|
+| `reading.start` | `session`, `chars`, `voice` (`Microsoft Raul` or `Microsoft David`) and `language` (`es`, `en`, or absent when the reply's language is undecided). |
+| `reading.retry` | `session`, `voice`, `attempt` (`1`) and `failure`, one per retry, written between the start and the end: `no-voice`, `unavailable`, `failed` or `timeout`. |
+| `reading.end` | `session`, `outcome` (`done`, `skipped`, `cancelled`, `empty`, `unavailable`, `error`) and `voice`; a failed reading adds `failure` with the same four codes. |
+
+A reading that is retried and then fails writes `reading.start`,
+`reading.retry` and one `reading.end { outcome: "error", failure }` naming the
+voice that failed. The speech event's `engine` field carries the same voice name,
+so a subscriber sees who speaks and the log says why.
 
 ## What gets downloaded
 

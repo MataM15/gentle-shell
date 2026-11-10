@@ -8,7 +8,7 @@ import { VoiceSessionError, type VoiceSessionState, type VoiceTranscript } from 
 import { VOICE_COMMAND_NAME, type VoiceCommandDeps, type VoiceDictation } from "../lib/voice-command.ts";
 import type { CuePlayer } from "../lib/voice-cues.ts";
 import type { PushToTalkTimers } from "../lib/voice-push-to-talk.ts";
-import { createWindowsSpeechEngine, SpeechEngineError, type SpeechEngine, type SpeechOptions, type SpeechOutcome } from "../lib/voice-speech.ts";
+import { createRetrySpeechEngine, createWindowsSpeechEngine, SpeechEngineError, type SpeechEngine, type SpeechOptions, type SpeechOutcome } from "../lib/voice-speech.ts";
 
 // /gentle:voice through its registered command, with fake UI, acquisition and
 // session adapters: nothing here downloads, loads native code or opens a
@@ -2039,7 +2039,7 @@ test("an accepted natural voice download installs it with a cancel signal and re
 	assert.equal(h.kokoro.installs.length, 1);
 	assert.ok(h.kokoro.installs[0]!.signal instanceof AbortSignal);
 	assert.equal(h.kokoro.state, "installed");
-	assert.deepEqual(ui.notices.at(-1), { message: "The natural voice is installed. Spoken replies now use Kokoro.", type: "info" });
+	assert.deepEqual(ui.notices.at(-1), { message: "The natural voice is installed. Spoken replies keep using the robot voices.", type: "info" });
 	assert.equal(ui.open(), false, "the progress overlay is closed");
 });
 
@@ -2154,7 +2154,7 @@ test("downloading Miro asks first with its non-commercial license, and an accept
 	await run(pi, yes);
 	assert.equal(h.miro.installs.length, 1);
 	assert.ok(h.miro.installs[0]!.signal instanceof AbortSignal);
-	assert.deepEqual(yes.notices.at(-1), { message: "The Miro voice is installed. Spanish replies now use it.", type: "info" });
+	assert.deepEqual(yes.notices.at(-1), { message: "The Miro voice is installed. Spoken replies keep using the robot voices.", type: "info" });
 });
 
 test("a hands-free turn sends whatever is in the draft, such as a pasted image path, together with the transcript, then clears the draft", async () => {
@@ -2393,6 +2393,52 @@ test("each reading and every microphone reopen decision is logged with its reaso
 	assert.equal(reopen.reason, "not-focused");
 	assert.equal(reopen.session, "session-alpha");
 	assert.ok(!JSON.stringify(h.events).includes("Respuesta."), "no reply text is logged");
+});
+
+test("the reading log and the speech event name the voice that spoke, not the chain id", async () => {
+	const { engine, readings } = fakeEngine();
+	const voiced: SpeechEngine = { ...engine, voiceFor: (language) => (language === "en" ? "Microsoft David" : "Microsoft Raul") };
+	const h = harness({ voice: true, engine: voiced, installed: true });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	await settleReply(pi, ui.ctx, "All the tests are green and the build is done.");
+	await until(() => readings.length === 1);
+	assert.equal(readings[0]!.options.language, "en");
+	assert.deepEqual(speechEvents(pi), [{ schema: VOICE_SPEECH_SCHEMA, phase: "start", engine: "Microsoft David" }], "the event names the voice, not raul-robot");
+	const start = h.events.find((entry) => entry.event === "reading.start")!;
+	assert.equal(start.voice, "Microsoft David");
+	assert.equal(start.language, "en");
+	readings[0]!.finish("done");
+	await until(() => speechEvents(pi).length === 2);
+	assert.deepEqual(speechEvents(pi).at(-1), { schema: VOICE_SPEECH_SCHEMA, phase: "end", engine: "Microsoft David", outcome: "done" });
+	assert.equal(h.events.find((entry) => entry.event === "reading.end")!.voice, "Microsoft David");
+});
+
+test("a reading that fails after its one retry is logged with the voice and the failure code", async () => {
+	const failures: string[] = [];
+	const engine = createRetrySpeechEngine({
+		id: "raul-robot",
+		voiceFor: () => "Microsoft Raul",
+		async speak() {
+			failures.push("attempt");
+			throw Object.assign(new Error("no voice"), { code: "no-voice" });
+		},
+	});
+	const h = harness({ voice: true, engine, installed: true });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	await settleReply(pi, ui.ctx, "Listo, ya está.");
+	await until(() => h.events.some((entry) => entry.event === "reading.end"));
+	const retry = h.events.find((entry) => entry.event === "reading.retry")!;
+	assert.deepEqual([retry.voice, retry.failure, retry.attempt], ["Microsoft Raul", "no-voice", 1], "the log says why the reply was read again");
+	const end = h.events.find((entry) => entry.event === "reading.end")!;
+	assert.equal(end.outcome, "error");
+	assert.equal(end.voice, "Microsoft Raul");
+	assert.equal(end.failure, "no-voice", "the log records the failure code, not the error class");
+	assert.equal(failures.length, 2, "the voice is retried once and no other voice reads the reply");
+	assert.equal(speechEvents(pi).filter((event) => event.phase === "end").length, 1);
 });
 
 // --- speech events (S2-S5) ------------------------------------------------------

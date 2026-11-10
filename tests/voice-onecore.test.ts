@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
-import { createRobotVoiceEngine, ONECORE_SYNTH_SCRIPT, processRobotVoice } from "../lib/voice-onecore.ts";
+import { createRobotVoiceEngine, ONECORE_SYNTH_SCRIPTS, ONECORE_VOICES, processRobotVoice } from "../lib/voice-onecore.ts";
 import { PLAYBACK_MARKER, type VoiceSpeechChunk } from "../lib/voice-speech-events.ts";
 import { decodeWav, encodeWav } from "../lib/voice-robot.ts";
 
-// The owner's voice (T8): Windows OneCore "Microsoft Raul" synthesized locally
-// sentence by sentence, robotized and leveled in code, played by one player.
+// The owner's voice (T8, S1-S3): Windows OneCore "Microsoft Raul" for Spanish
+// and "Microsoft David" for English, synthesized locally sentence by sentence,
+// robotized and leveled in code, played by one player, at a per-language rate.
 // Fake processes only.
 
 class FakeProc extends EventEmitter {
@@ -28,7 +29,7 @@ class FakeProc extends EventEmitter {
 
 const tone = (seconds = 0.2) => encodeWav(Float32Array.from({ length: Math.round(16000 * seconds) }, (_value, i) => 0.05 * Math.sin(i / 5)), 16000).toString("base64");
 
-function harness(timeoutMs?: (text: string) => number, volume?: number) {
+function harness(timeoutMs?: (text: string) => number, volume?: number, rates?: { es?: number; en?: number }) {
 	const procs: Array<{ args: readonly string[]; options: Record<string, unknown>; proc: FakeProc }> = [];
 	const engine = createRobotVoiceEngine({
 		powershell: "/mnt/c/Windows/powershell.exe",
@@ -39,15 +40,18 @@ function harness(timeoutMs?: (text: string) => number, volume?: number) {
 		},
 		timeoutMs,
 		volume,
+		rates,
 	});
+	const SCRIPT_LANGUAGE = new Map(Object.entries(ONECORE_SYNTH_SCRIPTS).map(([language, script]) => [script, language]));
 	const scriptOf = (entry: { args: readonly string[] }) => Buffer.from(entry.args.at(-1)!, "base64").toString("utf16le");
-	const synth = () => procs.find((entry) => scriptOf(entry) === ONECORE_SYNTH_SCRIPT)!;
-	const player = () => procs.find((entry) => scriptOf(entry) !== ONECORE_SYNTH_SCRIPT)!;
+	const synth = () => procs.find((entry) => SCRIPT_LANGUAGE.has(scriptOf(entry)))!;
+	const player = () => procs.find((entry) => !SCRIPT_LANGUAGE.has(scriptOf(entry)))!;
+	const synthesisLanguage = () => SCRIPT_LANGUAGE.get(scriptOf(synth()));
 	const until = async (check: () => boolean) => {
 		for (let i = 0; i < 200 && !check(); i++) await new Promise((resolve) => setTimeout(resolve, 1));
 		assert.ok(check(), "condition not reached");
 	};
-	return { engine, procs, synth, player, until };
+	return { engine, procs, synth, player, synthesisLanguage, until };
 }
 
 test("each sentence goes to the synthesizer as base64 JSON, and comes back robotized and leveled to the player", async () => {
@@ -76,20 +80,74 @@ test("each sentence goes to the synthesizer as base64 JSON, and comes back robot
 	assert.equal(await spoken, "done");
 });
 
-test("English replies and empty text start nothing; English is refused so the next voice reads it", async () => {
+test("English replies are read by Microsoft David with the same robot effect, and undecided replies by Raúl", async () => {
+	assert.deepEqual(ONECORE_VOICES, { es: "Microsoft Raul", en: "Microsoft David" });
+	assert.match(ONECORE_SYNTH_SCRIPTS.es, /DisplayName -eq 'Microsoft Raul'/);
+	assert.match(ONECORE_SYNTH_SCRIPTS.en, /DisplayName -eq 'Microsoft David'/);
+
 	const h = harness();
-	await assert.rejects(h.engine.speak("Done, all tests pass.", { language: "en", signal: new AbortController().signal }), (error: unknown) => (error as { audible?: boolean }).audible === false);
+	assert.equal(h.engine.voiceFor?.("en"), "Microsoft David");
+	assert.equal(h.engine.voiceFor?.("es"), "Microsoft Raul");
+	assert.equal(h.engine.voiceFor?.(undefined), "Microsoft Raul", "an undecided reply keeps the Spanish robot voice");
+	const spoken = h.engine.speak("Try again.", { language: "en", signal: new AbortController().signal });
+	await h.until(() => h.procs.length === 2);
+	assert.equal(h.synthesisLanguage(), "en", "English replies reach the synthesizer that selects David");
+	const original = tone();
+	h.synth().proc.stdout.emit("data", `audio:${original}\n`);
+	await h.until(() => h.player().proc.lines().length === 1);
+	assert.notDeepEqual([...decodeWav(Buffer.from(h.player().proc.lines()[0]!, "base64")).samples.slice(2000, 2010)], [...decodeWav(Buffer.from(original, "base64")).samples.slice(2000, 2010)], "English audio gets the same robot effect");
+	h.player().proc.stdout.emit("data", `${PLAYBACK_MARKER}\n`);
+	h.synth().proc.emit("exit", 0, null);
+	h.player().proc.emit("exit", 0, null);
+	assert.equal(await spoken, "done");
+
+	const undecided = harness();
+	const controller = new AbortController();
+	const other = undecided.engine.speak("Hola.", { signal: controller.signal });
+	await undecided.until(() => undecided.procs.length === 2);
+	assert.equal(undecided.synthesisLanguage(), "es");
+	controller.abort();
+	assert.equal(await other, "cancelled");
+});
+
+test("empty text starts nothing", async () => {
+	const h = harness();
 	assert.equal(await h.engine.speak("   ", { language: "es", signal: new AbortController().signal }), "done");
+	assert.equal(await h.engine.speak("   ", { language: "en", signal: new AbortController().signal }), "done");
 	assert.equal(h.procs.length, 0);
 });
 
-test("a missing Raúl voice before any audio is refused without audio, so Miro reads instead", async () => {
+test("each language's speech rate multiplier reaches the synthesizer as its SpeakingRate", async () => {
+	assert.match(ONECORE_SYNTH_SCRIPTS.es, /\$synth\.Options\.SpeakingRate/);
+	const h = harness(undefined, undefined, { es: 0.8, en: 0.6 });
+	const spoken = h.engine.speak("Try again.", { language: "en", signal: new AbortController().signal });
+	await h.until(() => h.procs.length === 2);
+	const request = JSON.parse(Buffer.from(h.synth().proc.lines()[0]!, "base64").toString("utf8"));
+	assert.deepEqual(request, { text: "Try again.", rate: 0.6 }, "the English multiplier is sent with the text");
+	h.synth().proc.emit("exit", 1, null);
+	await assert.rejects(spoken);
+
+	const es = harness(undefined, undefined, { es: 0.8, en: 0.6 });
+	const spanish = es.engine.speak("Hola.", { language: "es", signal: new AbortController().signal });
+	await es.until(() => es.procs.length === 2);
+	assert.deepEqual(JSON.parse(Buffer.from(es.synth().proc.lines()[0]!, "base64").toString("utf8")), { text: "Hola.", rate: 0.8 }, "each language has its own multiplier");
+	es.synth().proc.emit("exit", 1, null);
+	await assert.rejects(spanish);
+});
+
+test("a missing voice before any audio is refused without audio, naming the voice that is missing", async () => {
 	const h = harness();
 	const spoken = h.engine.speak("Hola.", { language: "es", signal: new AbortController().signal });
 	await h.until(() => h.procs.length === 2);
 	h.synth().proc.stdout.emit("data", "error:no-voice\n");
-	await assert.rejects(spoken, (error: unknown) => (error as { audible?: boolean }).audible === false && /Raúl/.test((error as Error).message));
+	await assert.rejects(spoken, (error: unknown) => (error as { audible?: boolean }).audible === false && /Microsoft Raul/.test((error as Error).message) && (error as { code?: string }).code === "no-voice");
 	assert.ok(h.player().proc.signals.length > 0, "the player is stopped");
+
+	const david = harness();
+	const english = david.engine.speak("Try again.", { language: "en", signal: new AbortController().signal });
+	await david.until(() => david.procs.length === 2);
+	david.synth().proc.stdout.emit("data", "error:no-voice\n");
+	await assert.rejects(english, (error: unknown) => /Microsoft David/.test((error as Error).message));
 });
 
 test("a failure after audio was played is marked audible, and cancel or timeout stop both processes", async () => {

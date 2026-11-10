@@ -7,14 +7,14 @@ import { diagnoseVoicePlatform, readVoicePlatformProbe, type VoicePlatformDiagno
 import { SpaceHoldDetector, type PushToTalkOptions } from "./voice-push-to-talk.ts";
 import { createVoiceSession, VoiceSessionError, type VoiceEndpoint, type VoiceSessionErrorCode, type VoiceSessionState, type VoiceTranscript } from "./voice-session.ts";
 import { installKokoro, installMiro, KOKORO_MANIFESTS, KOKORO_NOTICES, kokoroBytes, MIRO_MANIFEST, MIRO_NOTICE, miroBytes, readKokoroStatus, readMiroStatus, type KokoroStatus } from "./voice-kokoro.ts";
-import { createReplyReader, defaultSpeechEngineResolver, lastAssistantText } from "./voice-reply-speech.ts";
+import { createReplyReader, defaultSpeechEngineResolver, lastAssistantText, replyLanguage } from "./voice-reply-speech.ts";
 import { createVoiceSpeechPublisher, type VoiceSpeechReading } from "./voice-speech-events.ts";
 import { acquireReadingTurn, paneFocused as herdrPaneFocused } from "./voice-presence.ts";
 import { createCuePlayer, type CueName, type CuePlayer, type CueResult } from "./voice-cues.ts";
 import { createVoiceLog, type VoiceLog } from "./voice-diagnostics.ts";
 import { createWarmVoiceWorker, type WarmVoiceWorker } from "./voice-warm.ts";
 import { readVoicePushToTalk, readVoiceSessions, writeVoicePushToTalk, writeVoiceSessions } from "./voice-settings.ts";
-import { SpeechEngineError, type SpeechEngine } from "./voice-speech.ts";
+import { SpeechEngineError, speechFailureCode, speechVoiceName, type SpeechEngine } from "./voice-speech.ts";
 import { createVoiceStatePublisher, voiceDisplayState, type VoiceDisplayState, type VoiceStatePublisher } from "./voice-status-event.ts";
 import { pushToTalkStatus, voiceConversationStatus, voiceReadingStatus, voiceToggleStatus, VoiceDictationView, VoiceProgressView, type VoiceViewTheme } from "./voice-ui.ts";
 
@@ -100,7 +100,8 @@ export interface VoiceCommandDeps {
 	log?: VoiceLog;
 	// The natural voice (Kokoro): its install status and its consented download.
 	kokoro?: { readStatus(): Promise<KokoroStatus>; install(options: VoiceInstallRequest): Promise<void> };
-	// The Miro voice (Piper), chosen by the owner for Spanish replies.
+	// The Miro voice (Piper) and its consented download, still offered by
+	// /gentle:voice; the robot voices read every spoken reply.
 	miro?: { readStatus(): Promise<{ state: string; voiceHome: string }>; install(options: VoiceInstallRequest): Promise<void> };
 }
 
@@ -597,6 +598,8 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		setVoiceFooter(ctx, live, "Waiting to read · esc skip");
 		let release: (() => void) | undefined;
 		let started: VoiceSpeechReading | undefined;
+		// The voice that speaks this reading, as the log and the event report it.
+		let voice: string | undefined;
 		try {
 			// One reading at a time across every Pi process: wait for the turn.
 			release = await readingTurn(current.controller.signal);
@@ -604,13 +607,20 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			if (!release || !live() || !voiceOn(ctx)) return skipped ? "skipped" : "cancelled";
 			setVoiceFooter(ctx, live, voiceReadingStatus(toggleShortcut));
 			// The start is published before the engine is asked to speak, so a
-			// consumer knows the voice is live before the first chunk arrives.
+			// consumer knows the voice is live before the first chunk arrives. Both
+			// the event and the log name the voice that speaks, not the chain.
 			const engine = speechEngine();
-			started = engine ? speechEvents.begin(engine.id) : undefined;
-			voiceLog("reading.start", { session: sessionIdOf(ctx), chars: markdown.length });
-			const read = await replyReader.read(markdown, current.controller.signal, { chunk: (chunk) => started?.chunk(chunk) });
+			const language = replyLanguage(markdown);
+			voice = engine ? speechVoiceName(engine, language) : undefined;
+			started = engine ? speechEvents.begin(voice ?? engine.id) : undefined;
+			voiceLog("reading.start", { session: sessionIdOf(ctx), chars: markdown.length, language, voice });
+			const read = await replyReader.read(markdown, current.controller.signal, {
+				chunk: (chunk) => started?.chunk(chunk),
+				// Why the reply was read again by the same voice (S4).
+				retry: ({ attempt, failure }) => voiceLog("reading.retry", { session: sessionIdOf(ctx), voice, attempt, failure }),
+			});
 			const outcome: ReadingOutcome = read === "cancelled" && skipped ? "skipped" : read;
-			voiceLog("reading.end", { session: sessionIdOf(ctx), outcome });
+			voiceLog("reading.end", { session: sessionIdOf(ctx), outcome, voice });
 			started?.end(outcome);
 			lastReadingEndedAt = Date.now();
 			if (outcome === "unavailable" && live() && !unavailableReported) {
@@ -619,7 +629,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			}
 			return outcome;
 		} catch (error) {
-			voiceLog("reading.end", { session: sessionIdOf(ctx), outcome: "error", error: error instanceof Error ? error.name : "unknown" });
+			voiceLog("reading.end", { session: sessionIdOf(ctx), outcome: "error", voice, failure: speechFailureCode(error) });
 			started?.end("error");
 			lastReadingEndedAt = Date.now();
 			if (live()) ctx.ui.notify(error instanceof SpeechEngineError ? error.message : "The reply could not be read aloud.", "warning");
@@ -764,7 +774,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		}
 		if (controller.signal.aborted) say("Miro voice download was cancelled. Unfinished files were removed; completed parts are kept.", "info");
 		else if (failure !== undefined) say(failure instanceof VoiceInstallError ? INSTALL_MESSAGES[failure.code] : "Miro voice download failed.", "error");
-		else say("The Miro voice is installed. Spanish replies now use it.", "info");
+		else say("The Miro voice is installed. Spoken replies keep using the robot voices.", "info");
 	};
 
 	const installNatural = async (ctx: ExtensionCommandContext, run: Run, voiceHome: string, say: Say): Promise<void> => {
@@ -799,7 +809,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		}
 		if (controller.signal.aborted) say("Natural voice download was cancelled. Unfinished files were removed; completed parts are kept.", "info");
 		else if (failure !== undefined) say(failure instanceof VoiceInstallError ? INSTALL_MESSAGES[failure.code] : "Natural voice download failed.", "error");
-		else say("The natural voice is installed. Spoken replies now use Kokoro.", "info");
+		else say("The natural voice is installed. Spoken replies keep using the robot voices.", "info");
 	};
 
 	const install = async (
