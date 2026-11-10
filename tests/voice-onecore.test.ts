@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
 import { createRobotVoiceEngine, ONECORE_SYNTH_SCRIPT } from "../lib/voice-onecore.ts";
+import { PLAYBACK_MARKER, type VoiceSpeechChunk } from "../lib/voice-speech-events.ts";
 import { decodeWav, encodeWav } from "../lib/voice-robot.ts";
 
 // The owner's voice (T8): Windows OneCore "Microsoft Raul" synthesized locally
@@ -115,4 +116,26 @@ test("unreadable synthesizer output fails cleanly", async () => {
 	await h.until(() => h.procs.length === 2);
 	h.synth().proc.stdout.emit("data", "audio:bm90IGEgd2F2\n");
 	await assert.rejects(spoken, (error: unknown) => (error as { audible?: boolean }).audible === false);
+});
+
+test("each sentence publishes its loudness when the player begins it, measured on the processed audio", async () => {
+	const h = harness();
+	const chunks: VoiceSpeechChunk[] = [];
+	const spoken = h.engine.speak("Uno. Dos.", { language: "es", signal: new AbortController().signal, onChunk: (chunk) => { chunks.push(chunk); } });
+	await h.until(() => h.procs.length === 2);
+	h.synth().proc.stdout.emit("data", `audio:${tone(0.2)}\naudio:${tone(0.1)}\n`);
+	await h.until(() => h.player().proc.lines().length === 2);
+	assert.deepEqual(chunks, [], "sentences waiting in the player are not reported as played");
+	h.player().proc.stdout.emit("data", `${PLAYBACK_MARKER}\n`);
+	assert.equal(chunks.length, 1);
+	assert.equal(chunks[0]!.frameMs, 50);
+	assert.equal(chunks[0]!.durationMs, 200);
+	assert.equal(chunks[0]!.levels.length, 4);
+	assert.equal(Math.max(...chunks[0]!.levels), 1);
+	h.player().proc.stdout.emit("data", `${PLAYBACK_MARKER}\n`);
+	assert.equal(chunks[1]!.durationMs, 100);
+	h.synth().proc.emit("exit", 0, null);
+	h.player().proc.emit("exit", 0, null);
+	assert.equal(await spoken, "done");
+	assert.equal(chunks.length, 2);
 });

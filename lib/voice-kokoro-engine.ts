@@ -1,6 +1,7 @@
 import { spawn as nodeSpawn } from "node:child_process";
 import type { EventEmitter } from "node:events";
 import { fileURLToPath } from "node:url";
+import { createChunkSink, PLAYBACK_MARKER, readPlaybackMarkers } from "./voice-speech-events.ts";
 import type { SpeechEngine, SpeechOutcome } from "./voice-speech.ts";
 
 // The natural-voice engine (docs/voice.md, "Natural voice with Kokoro"). One
@@ -29,6 +30,9 @@ export const KOKORO_PLAYER_SCRIPT = [
 	"  if (-not $line) { continue }",
 	"  $stream = New-Object System.IO.MemoryStream(,[Convert]::FromBase64String($line))",
 	"  $player = New-Object System.Media.SoundPlayer($stream)",
+	// Reported before the sound starts, so each chunk's loudness reaches the
+	// listener while it is still being heard, not after it ended.
+	`  [Console]::Out.WriteLine('${PLAYBACK_MARKER}')`,
 	"  $player.PlaySync()",
 	"  $player.Dispose()",
 	"  $stream.Dispose()",
@@ -137,7 +141,7 @@ export function createKokoroSpeechEngine(options: KokoroEngineOptions): SpeechEn
 	return {
 		id: "kokoro",
 		available: async () => (await options.launch().catch(() => undefined)) !== undefined,
-		async speak(text, { language, rate, signal }) {
+		async speak(text, { language, rate, signal, onChunk }) {
 			if (signal.aborted) return "cancelled";
 			const voice = (options.voices ?? VOICE_BY_LANGUAGE)[language ?? "es"];
 			if (!voice) throw new KokoroSpeechError("unavailable");
@@ -189,7 +193,12 @@ export function createKokoroSpeechEngine(options: KokoroEngineOptions): SpeechEn
 					finish(new KokoroSpeechError("failed"));
 					return;
 				}
-				player.stdout?.on("data", () => {});
+				// Native output names paths or devices: drained, never shown. Only the
+				// player's own playback markers are read, so each chunk event lands
+				// when that chunk is heard. Each chunk is queued and measured as it is
+				// written, and reported when its marker arrives, in that order.
+				const sink = createChunkSink(onChunk);
+				readPlaybackMarkers(player.stdout, () => sink.play());
 				player.stderr?.on("data", () => {});
 				worker.stderr?.on("data", () => {});
 				player.stdin?.on("error", () => {});
@@ -210,6 +219,9 @@ export function createKokoroSpeechEngine(options: KokoroEngineOptions): SpeechEn
 						if (!message || message.schema !== KOKORO_TTS_SCHEMA) return finish(new KokoroSpeechError("failed"));
 						if (message.type === "audio" && typeof message.wav === "string" && /^[A-Za-z0-9+/=]+$/.test(message.wav)) {
 							audible = true;
+							// Measured now from the very bytes the player receives, and
+							// reported when the player reports it began playing.
+							sink.queue(Buffer.from(message.wav, "base64"));
 							player.stdin?.write(`${message.wav}\n`);
 						}
 						else if (message.type === "done") {

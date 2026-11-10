@@ -8,6 +8,7 @@ import { SpaceHoldDetector, type PushToTalkOptions } from "./voice-push-to-talk.
 import { createVoiceSession, VoiceSessionError, type VoiceEndpoint, type VoiceSessionErrorCode, type VoiceSessionState, type VoiceTranscript } from "./voice-session.ts";
 import { installKokoro, installMiro, KOKORO_MANIFESTS, KOKORO_NOTICES, kokoroBytes, MIRO_MANIFEST, MIRO_NOTICE, miroBytes, readKokoroStatus, readMiroStatus, type KokoroStatus } from "./voice-kokoro.ts";
 import { createReplyReader, defaultSpeechEngineResolver, lastAssistantText } from "./voice-reply-speech.ts";
+import { createVoiceSpeechPublisher, type VoiceSpeechReading } from "./voice-speech-events.ts";
 import { acquireReadingTurn, paneFocused as herdrPaneFocused } from "./voice-presence.ts";
 import { createCuePlayer, type CueName, type CuePlayer, type CueResult } from "./voice-cues.ts";
 import { createVoiceLog, type VoiceLog } from "./voice-diagnostics.ts";
@@ -514,6 +515,10 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	// the microphone, and no other reply does.
 	let spokenTurnPending = false;
 	const replyReader = createReplyReader({ engine: speechEngine });
+	// Every reading reports itself on the event bus, so a consumer outside this
+	// command can follow the voice: one start, one chunk per chunk the player
+	// begins, one end. The payload carries no reply text.
+	const speechEvents = createVoiceSpeechPublisher(pi.events);
 	const miro = deps.miro ?? {
 		readStatus: () => readMiroStatus({ env }),
 		install: ({ signal, onProgress }: VoiceInstallRequest) => installMiro({ env, signal, onProgress }),
@@ -591,16 +596,22 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		});
 		setVoiceFooter(ctx, live, "Waiting to read · esc skip");
 		let release: (() => void) | undefined;
+		let started: VoiceSpeechReading | undefined;
 		try {
 			// One reading at a time across every Pi process: wait for the turn.
 			release = await readingTurn(current.controller.signal);
 			// Voice may have been turned off, in any Pi process, while this waited.
 			if (!release || !live() || !voiceOn(ctx)) return skipped ? "skipped" : "cancelled";
 			setVoiceFooter(ctx, live, voiceReadingStatus(toggleShortcut));
+			// The start is published before the engine is asked to speak, so a
+			// consumer knows the voice is live before the first chunk arrives.
+			const engine = speechEngine();
+			started = engine ? speechEvents.begin(engine.id) : undefined;
 			voiceLog("reading.start", { session: sessionIdOf(ctx), chars: markdown.length });
-			const read = await replyReader.read(markdown, current.controller.signal);
+			const read = await replyReader.read(markdown, current.controller.signal, { chunk: (chunk) => started?.chunk(chunk) });
 			const outcome: ReadingOutcome = read === "cancelled" && skipped ? "skipped" : read;
 			voiceLog("reading.end", { session: sessionIdOf(ctx), outcome });
+			started?.end(outcome);
 			lastReadingEndedAt = Date.now();
 			if (outcome === "unavailable" && live() && !unavailableReported) {
 				unavailableReported = true;
@@ -609,10 +620,13 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			return outcome;
 		} catch (error) {
 			voiceLog("reading.end", { session: sessionIdOf(ctx), outcome: "error", error: error instanceof Error ? error.name : "unknown" });
+			started?.end("error");
 			lastReadingEndedAt = Date.now();
 			if (live()) ctx.ui.notify(error instanceof SpeechEngineError ? error.message : "The reply could not be read aloud.", "warning");
 			return "error";
 		} finally {
+			// A reading that ended by any path still pairs its start with one end.
+			started?.end("error");
 			release?.();
 			if (reading === current) stopReading();
 		}

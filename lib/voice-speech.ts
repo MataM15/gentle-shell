@@ -2,6 +2,7 @@ import { spawn as nodeSpawn } from "node:child_process";
 import type { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
 import { delimiter, join } from "node:path";
+import type { VoiceSpeechChunk } from "./voice-speech-events.ts";
 
 // Spoken replies (docs/voice.md, "Read replies aloud"). This module turns a
 // finished Markdown reply into plain sentences worth hearing and reads them
@@ -21,6 +22,9 @@ export interface SpeechOptions {
 	// -10 (slowest) to 10 (fastest); 0 is the voice's normal pace.
 	rate?: number;
 	signal: AbortSignal;
+	// The loudness of each chunk, reported when the player really begins it.
+	// An engine with no audio bytes in Node never calls it.
+	onChunk?: (chunk: VoiceSpeechChunk) => void;
 }
 
 export type SpeechOutcome = "done" | "cancelled";

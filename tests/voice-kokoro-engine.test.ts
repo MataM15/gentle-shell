@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
 import { createKokoroSpeechEngine, KOKORO_PLAYER_SCRIPT, kokoroChunks, type KokoroLaunch } from "../lib/voice-kokoro-engine.ts";
+import { PLAYBACK_MARKER, type VoiceSpeechChunk } from "../lib/voice-speech-events.ts";
+import { encodeWav } from "../lib/voice-robot.ts";
 import { createFallbackSpeechEngine, type SpeechEngine } from "../lib/voice-speech.ts";
 
 // The natural-voice engine (S6): text split for a quick first sentence, one
@@ -219,4 +221,67 @@ test("a Piper voice reads Spanish with its single speaker and refuses other lang
 test("kokoroChunks keeps every sentence of a long reply made of short sentences", () => {
 	const text = Array.from({ length: 300 }, (_value, index) => `Frase corta número ${index}.`).join(" ");
 	assert.equal(kokoroChunks(text).join(" "), text);
+});
+
+// --- speech events (S3, S4) ---------------------------------------------------------
+
+// A 16 kHz tone of the given length, as the base64 WAV line the worker sends.
+const wavLine = (seconds: number) => encodeWav(Float32Array.from({ length: Math.round(16_000 * seconds) }, (_value, i) => 0.1 * Math.sin((2 * Math.PI * 220 * i) / 16_000)), 16_000).toString("base64");
+
+test("the shared player announces every line it plays on stdout before playback starts", () => {
+	const lines = KOKORO_PLAYER_SCRIPT.split("\n");
+	const announcement = lines.findIndex((line) => line.includes(`WriteLine('${PLAYBACK_MARKER}')`));
+	const playSync = lines.findIndex((line) => line.includes("PlaySync()"));
+	assert.ok(announcement >= 0, "the player reports each line it plays");
+	assert.ok(announcement < playSync, "the report comes before the line is played, not after");
+});
+
+test("a chunk is published only when the player begins it, in the order it was queued", async () => {
+	const h = harness();
+	const chunks: VoiceSpeechChunk[] = [];
+	const spoken = h.engine.speak("Hola. Una. Dos.", { language: "es", signal: new AbortController().signal, onChunk: (chunk) => { chunks.push(chunk); } });
+	await h.until(() => h.procs.length === 2);
+	h.worker().proc.say({ type: "audio", index: 0, wav: wavLine(0.2) });
+	h.worker().proc.say({ type: "audio", index: 1, wav: wavLine(0.1) });
+	assert.deepEqual(chunks, [], "audio waiting in the player is not reported as played");
+	h.player().proc.stdout.emit("data", `${PLAYBACK_MARKER}\n`);
+	assert.equal(chunks.length, 1, "the marker reports the chunk that just started");
+	assert.equal(chunks[0]!.frameMs, 50);
+	assert.equal(chunks[0]!.durationMs, 200);
+	assert.equal(chunks[0]!.levels.length, 4);
+	assert.equal(Math.max(...chunks[0]!.levels), 1, "the loudness is normalized to the chunk's peak frame");
+	h.player().proc.stdout.emit("data", `${PLAYBACK_MARKER}\n`);
+	assert.equal(chunks[1]!.durationMs, 100, "each marker advances the queue exactly one chunk");
+	h.worker().proc.say({ type: "done" });
+	h.worker().proc.emit("exit", 0, null);
+	h.player().proc.emit("exit", 0, null);
+	assert.equal(await spoken, "done");
+	assert.equal(chunks.length, 2);
+});
+
+test("a consumer that throws on a chunk never breaks or delays the reading", async () => {
+	const h = harness();
+	const spoken = h.engine.speak("Hola. Una frase.", { language: "es", signal: new AbortController().signal, onChunk: () => { throw new Error("consumer failed"); } });
+	await h.until(() => h.procs.length === 2);
+	h.worker().proc.say({ type: "audio", index: 0, wav: wavLine(0.1) });
+	assert.doesNotThrow(() => h.player().proc.stdout.emit("data", `${PLAYBACK_MARKER}\n`));
+	h.worker().proc.say({ type: "done" });
+	h.worker().proc.emit("exit", 0, null);
+	h.player().proc.emit("exit", 0, null);
+	assert.equal(await spoken, "done");
+});
+
+test("a player that prints nothing worth reading still reads the reply to the end", async () => {
+	const h = harness();
+	const chunks: VoiceSpeechChunk[] = [];
+	const spoken = h.engine.speak("Hola. Una frase.", { language: "es", signal: new AbortController().signal, onChunk: (chunk) => { chunks.push(chunk); } });
+	await h.until(() => h.procs.length === 2);
+	h.worker().proc.say({ type: "audio", index: 0, wav: wavLine(0.1) });
+	h.player().proc.stdout.emit("data", "played\n");
+	h.player().proc.stdout.emit("data", "progress: 50%\n");
+	assert.deepEqual(chunks, [], "only the player's own marker reports a chunk");
+	h.worker().proc.say({ type: "done" });
+	h.worker().proc.emit("exit", 0, null);
+	h.player().proc.emit("exit", 0, null);
+	assert.equal(await spoken, "done", "unrelated player output changes nothing");
 });

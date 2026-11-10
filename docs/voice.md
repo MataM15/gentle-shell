@@ -193,8 +193,35 @@ In a voice session:
 | Voice | Each reply is checked for Spanish or English and read with an installed voice of that language when there is one (for example Microsoft Sabina for Spanish), otherwise with the Windows default voice. |
 | Stop | Esc stops the reading and is consumed, so it never reaches the editor or the agent. **Stop reading** in `/gentle:voice` does the same. Your own message, typed or spoken, stops it too. A run that a background notice or another extension starts does not: its reply waits until the reading ends, and only the newest reply waits. Esc, Stop reading and your own message also drop the waiting reply. |
 | Talk over it | The dictation shortcut (`alt+m`) stops the reading and starts a dictation at once. |
-| Footer | `Reading reply · esc stop · alt+m talk` while it reads. No state is published on the voice-state event. |
-| Process | Each reading runs PowerShell with a fixed script; the reply goes only through its standard input, as base64 JSON, never as an argument. PowerShell takes about 1.5 seconds to start before the voice is heard. Its output is discarded and a failure shows one fixed message. A reading is killed after 30 seconds plus about 0.1 second per character. |
+| Footer | `Reading reply · esc stop · alt+m talk` while it reads. No reading state is published on the voice-state event; the speech event below covers what is playing. |
+| Process | Each reading runs PowerShell with a fixed script; the reply goes only through its standard input, as base64 JSON, never as an argument. PowerShell takes about 1.5 seconds to start before the voice is heard. Of its output, only the one word the player writes before each line it plays is read, to report that chunk as it starts; everything else is discarded and a failure shows one fixed message. A reading is killed after 30 seconds plus about 0.1 second per character. |
+
+### Speech events
+
+While a reply is read aloud, the extension publishes what is playing on the
+extension event bus, so an animation, a visualizer or any other consumer can
+follow the voice without touching the voice command:
+
+```ts
+type VoiceSpeechEvent =
+	| { schema: "gentle-pi.voice-speech/v1"; phase: "start"; engine: string }
+	| { schema: "gentle-pi.voice-speech/v1"; phase: "chunk"; engine: string; frameMs: number; durationMs: number; levels: number[] }
+	| { schema: "gentle-pi.voice-speech/v1"; phase: "end"; engine: string; outcome: string };
+
+pi.events.on("gentle-ai:voice-speech", (event: VoiceSpeechEvent) => {
+	// start: a reading began. chunk: one chunk is playing now. end: it is over.
+});
+```
+
+| Topic | Behavior |
+|-------|----------|
+| Channel | `gentle-ai:voice-speech`, schema `gentle-pi.voice-speech/v1`. Subscribing is the only setup, and a session may subscribe or not. |
+| `phase: "start"` | Published once, right before the engine is asked to speak. `engine` names the chain by engine id, for example `windows`, or `raul-robot+kokoro+kokoro+kokoro+windows` when every voice is installed: Miro and Kokoro share one engine id because they run the same player. |
+| `phase: "chunk"` | One per chunk the player really begins, in the order the chunks were queued, so a chunk still waiting in the player is never reported. `levels` is one RMS value per 50 ms of that chunk (`frameMs: 50`), normalized to the loudest frame of that chunk, so the peak frame is `1` and a silent chunk is all zeros. `durationMs` is the length of the chunk. Scale `levels` to your own effect; they are relative per chunk, never absolute loudness. |
+| `phase: "end"` | Published exactly once per reading, whatever ended it, with the outcome the reading log records: `done`, `skipped` (Esc), `cancelled` (Stop reading or your own message), `empty`, `unavailable` or `error`. A failed reading still reports `error` and still shows its one message. |
+| Which voices report chunks | Kokoro, Miro and Raúl play audio that Node already holds, so they report one chunk per chunk the player begins. The Windows voice hands the text to PowerShell, so it reports only `start` and `end`: there is no audio in Node to measure. |
+| What it never carries | Reply text, file paths, transcript and error messages. Only the engine chain, the loudness of audio that already played, and the outcome. |
+| Safety | The event is advisory: a listener that throws, and a session with no event bus, never break, delay or silence a reading. Publishing starts no process and opens no file. |
 
 ### Conversation
 

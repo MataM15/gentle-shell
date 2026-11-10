@@ -2,6 +2,7 @@ import { release } from "node:os";
 import { createKokoroSpeechEngine } from "./voice-kokoro-engine.ts";
 import { resolveKokoroLaunch, resolveMiroLaunch } from "./voice-kokoro.ts";
 import { createRobotVoiceEngine } from "./voice-onecore.ts";
+import type { VoiceSpeechChunk } from "./voice-speech-events.ts";
 import {
 	createFallbackSpeechEngine,
 	createWindowsSpeechEngine,
@@ -43,19 +44,24 @@ export function lastAssistantText(messages: readonly unknown[]): string | undefi
 
 export type ReplyReadOutcome = SpeechOutcome | "empty" | "unavailable";
 
+// Where the reading reports the chunks its player really began.
+export interface ReplyReadSink {
+	chunk(chunk: VoiceSpeechChunk): void;
+}
+
 export interface ReplyReader {
 	// Rejects with the engine's SpeechEngineError when the engine fails.
-	read(markdown: string, signal: AbortSignal): Promise<ReplyReadOutcome>;
+	read(markdown: string, signal: AbortSignal, sink?: ReplyReadSink): Promise<ReplyReadOutcome>;
 }
 
 export function createReplyReader(options: { engine: () => SpeechEngine | undefined; rate?: number }): ReplyReader {
 	return {
-		async read(markdown, signal) {
+		async read(markdown, signal, sink) {
 			const text = spokenText(markdown);
 			if (!text) return "empty";
 			const engine = options.engine();
 			if (!engine) return "unavailable";
-			return engine.speak(text, { language: guessReplyLanguage(text), rate: options.rate, signal });
+			return engine.speak(text, { language: guessReplyLanguage(text), rate: options.rate, signal, ...(sink ? { onChunk: (chunk) => sink.chunk(chunk) } : {}) });
 		},
 	};
 }

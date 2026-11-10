@@ -2,6 +2,7 @@ import { spawn as nodeSpawn } from "node:child_process";
 import type { EventEmitter } from "node:events";
 import { KOKORO_PLAYER_SCRIPT, kokoroChunks } from "./voice-kokoro-engine.ts";
 import { decodeWav, encodeWav, levelVoice, robotize } from "./voice-robot.ts";
+import { createChunkSink, readPlaybackMarkers } from "./voice-speech-events.ts";
 import type { SpeechEngine, SpeechOutcome } from "./voice-speech.ts";
 
 // The owner's voice for Spanish replies (docs/voice.md, "Raúl robot voice"):
@@ -97,7 +98,7 @@ export function createRobotVoiceEngine(options: RobotVoiceOptions): SpeechEngine
 	return {
 		id: "raul-robot",
 		available: async () => true,
-		async speak(text, { language, signal }) {
+		async speak(text, { language, signal, onChunk }) {
 			if (signal.aborted) return "cancelled";
 			if ((language ?? "es") !== "es") throw new RobotVoiceError("unavailable");
 			const chunks = kokoroChunks(text);
@@ -139,8 +140,11 @@ export function createRobotVoiceEngine(options: RobotVoiceOptions): SpeechEngine
 					finish(new RobotVoiceError("failed"));
 					return;
 				}
-				// Native output may name paths or devices: drained, never shown.
-				player.stdout?.on("data", () => {});
+				// Only the player's own playback markers are read, so each sentence's
+				// loudness is reported when it starts playing. Every other native
+				// output line names paths or devices and is drained, never shown.
+				const sink = createChunkSink(onChunk);
+				readPlaybackMarkers(player.stdout, () => sink.play());
 				player.stderr?.on("data", () => {});
 				synth.stderr?.on("data", () => {});
 				player.stdin?.on("error", () => {});
@@ -158,15 +162,18 @@ export function createRobotVoiceEngine(options: RobotVoiceOptions): SpeechEngine
 						if (!line) continue;
 						if (line === "error:no-voice") return finish(new RobotVoiceError("no-voice"));
 						if (!line.startsWith("audio:")) return finish(new RobotVoiceError("failed"));
-						let processed: string;
+						let processed: Buffer;
 						try {
-							processed = processRobotVoice(Buffer.from(line.slice("audio:".length), "base64")).toString("base64");
+							processed = processRobotVoice(Buffer.from(line.slice("audio:".length), "base64"));
 						} catch {
 							return finish(new RobotVoiceError("failed"));
 						}
 						received++;
 						audible = true;
-						player.stdin?.write(`${processed}\n`);
+						// Measured on the very audio the player receives, and reported
+						// when the player reports it began playing that sentence.
+						sink.queue(processed);
+						player.stdin?.write(`${processed.toString("base64")}\n`);
 					}
 				});
 				synth.once("error", () => finish(new RobotVoiceError("failed")));

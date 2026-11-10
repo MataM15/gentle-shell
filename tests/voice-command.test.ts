@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import nodeTest from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import gentleVoice from "../extensions/gentle-voice.ts";
@@ -7,7 +8,7 @@ import { VoiceSessionError, type VoiceSessionState, type VoiceTranscript } from 
 import { VOICE_COMMAND_NAME, type VoiceCommandDeps, type VoiceDictation } from "../lib/voice-command.ts";
 import type { CuePlayer } from "../lib/voice-cues.ts";
 import type { PushToTalkTimers } from "../lib/voice-push-to-talk.ts";
-import { SpeechEngineError, type SpeechEngine, type SpeechOptions, type SpeechOutcome } from "../lib/voice-speech.ts";
+import { createWindowsSpeechEngine, SpeechEngineError, type SpeechEngine, type SpeechOptions, type SpeechOutcome } from "../lib/voice-speech.ts";
 
 // /gentle:voice through its registered command, with fake UI, acquisition and
 // session adapters: nothing here downloads, loads native code or opens a
@@ -2392,4 +2393,114 @@ test("each reading and every microphone reopen decision is logged with its reaso
 	assert.equal(reopen.reason, "not-focused");
 	assert.equal(reopen.session, "session-alpha");
 	assert.ok(!JSON.stringify(h.events).includes("Respuesta."), "no reply text is logged");
+});
+
+// --- speech events (S2-S5) ------------------------------------------------------
+
+// The reply-reading contract a consumer subscriptions to: one channel, one
+// schema, one start before the reading, one chunk per chunk the player begins,
+// one end per start.
+const VOICE_SPEECH_CHANNEL = "gentle-ai:voice-speech";
+const VOICE_SPEECH_SCHEMA = "gentle-pi.voice-speech/v1";
+
+const speechEvents = (pi: ReturnType<typeof fakePi>) =>
+	pi.emitted.filter((event) => event.channel === VOICE_SPEECH_CHANNEL).map((event) => event.data as Record<string, unknown>);
+
+class FakeSpeechChild extends EventEmitter {
+	readonly written: string[] = [];
+	stdin = { write: (chunk: string) => { this.written.push(chunk); return true; }, end: () => {}, on: () => {} };
+	stdout = new EventEmitter();
+	stderr = new EventEmitter();
+	kill() {
+		return true;
+	}
+}
+
+test("a reading publishes start before it speaks, its played chunks, and one end after it settles", async () => {
+	const { engine, readings } = fakeEngine();
+	const h = harness({ voice: true, engine });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	await settleReply(pi, ui.ctx, "Respuesta.");
+	await until(() => readings.length === 1);
+	assert.deepEqual(speechEvents(pi), [{ schema: VOICE_SPEECH_SCHEMA, phase: "start", engine: "fake" }], "started before the engine was asked to speak");
+	readings[0]!.options.onChunk!({ frameMs: 50, durationMs: 300, levels: [1, 0.4] });
+	assert.deepEqual(speechEvents(pi).at(-1), { schema: VOICE_SPEECH_SCHEMA, phase: "chunk", engine: "fake", frameMs: 50, durationMs: 300, levels: [1, 0.4] });
+	readings[0]!.finish("done");
+	await until(() => speechEvents(pi).length === 3);
+	assert.deepEqual(speechEvents(pi).at(-1), { schema: VOICE_SPEECH_SCHEMA, phase: "end", engine: "fake", outcome: "done" });
+	await tick();
+	assert.equal(speechEvents(pi).length, 3, "exactly one end per start");
+});
+
+test("Esc and Stop reading each end the reading once, with the outcome the log records", async () => {
+	for (const how of ["esc", "stop"] as const) {
+		const { engine, readings } = fakeEngine();
+		const h = harness({ voice: true, engine });
+		const pi = register(h);
+		const ui = fakeContext({ select: pick(/^Stop reading$/) });
+		await pi.fire("session_start", ui.ctx);
+		await settleReply(pi, ui.ctx, "Respuesta.");
+		await until(() => readings.length === 1);
+		await until(() => speechEvents(pi).some((event) => event.phase === "start"));
+		if (how === "esc") ui.type(ESC);
+		else await run(pi, ui);
+		await until(() => speechEvents(pi).some((event) => event.phase === "end"));
+		await tick();
+		const outcome = how === "esc" ? "skipped" : "cancelled";
+		assert.deepEqual(speechEvents(pi).filter((event) => event.phase === "end"), [{ schema: VOICE_SPEECH_SCHEMA, phase: "end", engine: "fake", outcome }], how);
+		assert.equal(speechEvents(pi).filter((event) => event.phase === "start").length, 1, how);
+		assert.equal(speechEvents(pi).filter((event) => event.phase === "chunk").length, 0, how);
+		assert.equal(h.events.find((entry) => entry.event === "reading.end")!.outcome, outcome, how);
+	}
+});
+
+test("a failed reading ends the event once with an error outcome", async () => {
+	const { engine, readings } = fakeEngine();
+	const h = harness({ voice: true, engine });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	await settleReply(pi, ui.ctx, "Esto va a fallar.");
+	await until(() => readings.length === 1);
+	readings[0]!.fail(new SpeechEngineError("failed"));
+	await until(() => ui.notices.length === 1);
+	await until(() => speechEvents(pi).some((event) => event.phase === "end"));
+	await tick();
+	const ends = speechEvents(pi).filter((event) => event.phase === "end");
+	assert.deepEqual(ends, [{ schema: VOICE_SPEECH_SCHEMA, phase: "end", engine: "fake", outcome: "error" }]);
+	assert.equal(ui.notices.length, 1, "the failure is still reported once");
+});
+
+test("the Windows voice publishes only start and end, because the reply never reaches Node as audio", async () => {
+	const child = new FakeSpeechChild();
+	const engine = createWindowsSpeechEngine({ command: "/p/powershell.exe", spawn: () => child });
+	const h = harness({ voice: true, engine });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	await settleReply(pi, ui.ctx, "Respuesta.");
+	await until(() => speechEvents(pi).length === 1);
+	assert.deepEqual(speechEvents(pi), [{ schema: VOICE_SPEECH_SCHEMA, phase: "start", engine: "windows" }]);
+	child.emit("exit", 0, null);
+	await until(() => speechEvents(pi).length === 2);
+	assert.deepEqual(speechEvents(pi).at(-1), { schema: VOICE_SPEECH_SCHEMA, phase: "end", engine: "windows", outcome: "done" });
+	assert.equal(speechEvents(pi).some((event) => event.phase === "chunk"), false, "a voice with no audio in Node reports no loudness");
+});
+
+test("an event listener that throws never stops the reading", async () => {
+	const { engine, readings } = fakeEngine();
+	const h = harness({ voice: true, engine });
+	const pi = register(h);
+	(pi.pi as unknown as { events: { emit(channel: string, data: unknown): void } }).events.emit = () => { throw new Error("listener failed"); };
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	await settleReply(pi, ui.ctx, "Respuesta.");
+	await until(() => readings.length === 1);
+	assert.doesNotThrow(() => readings[0]!.options.onChunk!({ frameMs: 50, durationMs: 100, levels: [1] }));
+	readings[0]!.finish("done");
+	await until(() => ui.statuses.at(-1) === undefined);
+	await tick();
+	assert.equal(ui.notices.length, 0, "the reading settles normally");
 });
