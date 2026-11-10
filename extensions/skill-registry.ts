@@ -40,6 +40,36 @@ const SKILL_REGISTRY_EXTENSION_SOURCE_KEY =
 	"__gentlePiSkillRegistryExtensionSource";
 const activeWatchers = new Set<FSWatcher>();
 
+type NotifyLevel = "info" | "warning";
+type Notify = (message: string, level?: NotifyLevel) => void;
+
+interface SessionNotifyContext {
+	hasUI: boolean;
+	ui: { notify(message: string, level?: NotifyLevel): void };
+}
+
+// Pi invalidates a session's ctx on reload and session replacement, so a later
+// read of its `ui` getter throws from ExtensionRunner.assertActive. A notice is
+// best-effort UI: it must never escape a watcher, poll or timer callback, where
+// the throw becomes an uncaught exception that kills Pi.
+function safeNotify(notify: Notify, message: string, level: NotifyLevel = "info"): void {
+	try {
+		notify(message, level);
+	} catch {
+		// A replaced session is silent; the refresh work itself continues.
+	}
+}
+
+function createSessionNotifier(ctx: SessionNotifyContext): Notify {
+	return (message, level = "info") => {
+		try {
+			if (ctx.hasUI) ctx.ui.notify(message, level);
+		} catch {
+			// Same stale-ctx guard as safeNotify: a dead session drops the notice.
+		}
+	};
+}
+
 interface SkillRegistryExtensionGlobal {
 	[SKILL_REGISTRY_EXTENSION_SOURCE_KEY]?: string;
 }
@@ -765,7 +795,16 @@ function shouldSkipDuplicateExtensionLoad(
 	return existingSource !== currentSource;
 }
 
+const watcherRefreshTimers = new Set<ReturnType<typeof setTimeout>>();
+// A reload disposes the old session while a debounced refresh is still
+// scheduled. Bumping on every close makes that refresh a no-op instead of a
+// write and a notification through the replaced session's stale ctx.
+let watcherGeneration = 0;
+
 function closeSkillRegistryWatchers(): void {
+	watcherGeneration += 1;
+	for (const timer of watcherRefreshTimers) clearTimeout(timer);
+	watcherRefreshTimers.clear();
 	for (const watcher of activeWatchers) {
 		try {
 			watcher.close();
@@ -781,39 +820,55 @@ function closeSkillRegistryWatchers(): void {
 
 async function startSkillRegistryWatcher(
 	cwd: string,
-	notify: (message: string, level?: "info" | "warning") => void,
+	notify: Notify,
 ): Promise<void> {
 	if (watchedCwds.has(cwd)) return;
 	watchedCwds.add(cwd);
+	const generation = watcherGeneration;
 	const dirs = await uniqueExistingDirs([
 		...projectSkillDirs(cwd),
 		...userSkillDirs(),
 	]);
+	// The scan above yields the event loop, so a reload can dispose this
+	// generation before its watchers exist.
+	if (generation !== watcherGeneration) return;
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	// The poll re-asks a state the watchers already answered: without this,
 	// an unchanged tracked-target warning would repeat every poll interval.
 	let lastWarning: string | undefined;
 	const refresh = () => {
-		if (timer) clearTimeout(timer);
+		if (generation !== watcherGeneration) return;
+		if (timer) {
+			clearTimeout(timer);
+			watcherRefreshTimers.delete(timer);
+		}
 		timer = setTimeout(() => {
+			if (timer) watcherRefreshTimers.delete(timer);
+			timer = undefined;
 			void (async () => {
+				if (generation !== watcherGeneration) return;
 				try {
 					await pendingStartups.get(cwd);
+					if (generation !== watcherGeneration) return;
 					const result = await regenerateRegistry(cwd, false, lastResolvedSkills);
+					if (generation !== watcherGeneration) return;
 					if (result.warning) {
-						if (result.warning !== lastWarning) notify(result.warning, "warning");
+						if (result.warning !== lastWarning) safeNotify(notify, result.warning, "warning");
 						lastWarning = result.warning;
 					} else {
 						lastWarning = undefined;
 						if (result.regenerated) {
-							notify(`Skill registry refreshed (${result.skillCount} skills)`, "info");
+							safeNotify(notify, `Skill registry refreshed (${result.skillCount} skills)`, "info");
 						}
 					}
 				} catch (error) {
-					notify(`Skill registry refresh failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
+					// This catch used to re-notify through the same stale ctx and the
+					// second throw escaped as the uncaught exception that killed Pi.
+					safeNotify(notify, `Skill registry refresh failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
 				}
 			})();
 		}, WATCH_DEBOUNCE_MS);
+		watcherRefreshTimers.add(timer);
 	};
 	for (const dir of dirs) {
 		try {
@@ -823,7 +878,8 @@ async function startSkillRegistryWatcher(
 				// assets directory). Without this listener Node terminates Pi.
 				watcher.close();
 				activeWatchers.delete(watcher);
-				notify(`Skill registry watcher stopped: ${error.message}. Run /skill-registry:refresh to update manually.`, "warning");
+				if (generation !== watcherGeneration) return;
+				safeNotify(notify, `Skill registry watcher stopped: ${error.message}. Run /skill-registry:refresh to update manually.`, "warning");
 			});
 			activeWatchers.add(watcher);
 		} catch {
@@ -859,6 +915,9 @@ export const __testing = {
 	activeWatcherCount() {
 		return activeWatchers.size;
 	},
+	pendingRefreshCount() {
+		return watcherRefreshTimers.size;
+	},
 	async startupSettled(): Promise<void> {
 		await Promise.all(pendingStartups.values());
 	},
@@ -885,13 +944,15 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		// A replacement can leave the previous session's watchers and pending
+		// refreshes alive; they belong to that session and must not survive here.
+		closeSkillRegistryWatchers();
 		if (shouldSkipSkillRegistryStartup(pi)) return;
 		if (repositoryRootedAtHome(ctx.cwd)) return;
 		const cwd = ctx.cwd;
 		const generation = startupGeneration;
-		const notifyWarning = (message: string) => {
-			if (ctx.hasUI) ctx.ui.notify(message, "warning");
-		};
+		const notify = createSessionNotifier(ctx);
+		const notifyWarning = (message: string) => notify(message, "warning");
 		const regenerate = async () => {
 			if (generation !== startupGeneration) return;
 			try {
@@ -901,14 +962,14 @@ export default function (pi: ExtensionAPI) {
 				// A capture that already arrived is newer authority than this scan.
 				const result = await regenerateRegistry(cwd, quarantinedLegacy, lastResolvedSkills);
 				if (result.warning) notifyWarning(result.warning);
-				if (result.regenerated && ctx.hasUI) {
-					ctx.ui.notify(
+				if (result.regenerated) {
+					notify(
 						`Skill registry refreshed (${result.skillCount} skills)`,
 						"info",
 					);
 				}
-				if (quarantinedLegacy && ctx.hasUI) {
-					ctx.ui.notify(
+				if (quarantinedLegacy) {
+					notify(
 						"Disabled stale project-local skill registry extension; using package registry with project skills first.",
 						"warning",
 					);
@@ -927,14 +988,8 @@ export default function (pi: ExtensionAPI) {
 					}, WATCH_DEBOUNCE_MS);
 				}
 			} catch (error) {
-				if (ctx.hasUI) {
-					const message =
-						error instanceof Error ? error.message : String(error);
-					ctx.ui.notify(
-						`Skill registry refresh failed: ${message}`,
-						"warning",
-					);
-				}
+				const message = error instanceof Error ? error.message : String(error);
+				notify(`Skill registry refresh failed: ${message}`, "warning");
 			}
 		};
 		// Pi awaits session_start handlers one after another, so the Git tracking
@@ -946,9 +1001,7 @@ export default function (pi: ExtensionAPI) {
 		pendingStartups.set(cwd, startup);
 		try {
 			if (ctx.hasUI) {
-				await startSkillRegistryWatcher(cwd, (message, level = "info") => {
-					ctx.ui.notify(message, level);
-				});
+				await startSkillRegistryWatcher(cwd, notify);
 			}
 		} catch (error) {
 			notifyWarning(`Skill registry refresh failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -959,13 +1012,14 @@ export default function (pi: ExtensionAPI) {
 		if (shouldSkipSkillRegistryStartup(pi)) return;
 		const skills = event.systemPromptOptions?.skills;
 		if (!Array.isArray(skills) || !skills.every(isResolvedSkill)) return;
+		const notify = createSessionNotifier(ctx);
 		try {
 			// The startup scan this session scheduled must land before this newer
 			// capture, so an older loose-only scan never overwrites runtime authority.
 			await pendingStartups.get(ctx.cwd);
 			const result = await applyResolvedSkillsUpdate(ctx.cwd, skills);
-			if (result.regenerated && ctx.hasUI) {
-				ctx.ui.notify(
+			if (result.regenerated) {
+				notify(
 					`Skill registry refreshed (${result.skillCount} skills)`,
 					"info",
 				);
@@ -978,20 +1032,21 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("skill-registry:refresh", {
 		description: "Regenerate .atl/skill-registry.md from local skill sources.",
 		handler: async (_args, ctx) => {
+			const notify = createSessionNotifier(ctx);
 			try {
 				await ensureAtlIgnored(ctx.cwd, true);
 				const result = await regenerateRegistry(ctx.cwd, true, lastResolvedSkills, true);
 				if (result.reason === "storage-unavailable") {
-					ctx.ui.notify(result.warning ?? "Skill registry is unavailable.", "warning");
+					notify(result.warning ?? "Skill registry is unavailable.", "warning");
 					return;
 				}
-				ctx.ui.notify(
+				notify(
 					`Skill registry: ${result.skillCount} skill(s) written to ${REGISTRY_REL_PATH}`,
 					"info",
 				);
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
-				ctx.ui.notify(`Skill registry refresh failed: ${message}`, "warning");
+				notify(`Skill registry refresh failed: ${message}`, "warning");
 			}
 		},
 	});

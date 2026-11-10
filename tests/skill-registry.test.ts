@@ -1348,6 +1348,54 @@ for (const git of [true, false]) {
 	});
 }
 
+// A replaced session keeps only a dead ctx. Its notification must be dropped
+// instead of escaping the watcher's async refresh as an unhandled rejection
+// that kills Pi.
+test("watcher refresh swallows a notification from a replaced session", async (t) => {
+	const fixture = registryFixture();
+	const rejections: string[] = [];
+	const onRejection = (reason: unknown) => rejections.push(reason instanceof Error ? reason.message : String(reason));
+	process.on("unhandledRejection", onRejection);
+	t.after(() => {
+		process.off("unhandledRejection", onRejection);
+		__testing.closeSkillRegistryWatchers();
+		rmSync(fixture.root, { recursive: true, force: true });
+	});
+	let notifyCalls = 0;
+	await __testing.startSkillRegistryWatcher(fixture.cwd, () => {
+		notifyCalls += 1;
+		throw new Error("This extension ctx is stale after session replacement or reload.");
+	});
+	writeFileSync(fixture.skill, "---\nname: local\ndescription: Replaced session skill.\n---\n");
+	const deadline = Date.now() + 10_000;
+	while (notifyCalls === 0 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
+	assert.ok(notifyCalls > 0, "the watcher must attempt its refresh notification");
+	assert.match(readFileSync(fixture.registry, "utf8"), /Replaced session skill/, "the refresh itself must still land");
+	await new Promise((resolve) => setTimeout(resolve, 100));
+	assert.deepEqual(rejections, []);
+});
+
+test("registered watcher still notifies a live session after a skill change", async (t) => {
+	const fixture = registryFixture();
+	const runtime = registeredRegistry(fixture.cwd);
+	t.after(() => {
+		runtime.stop();
+		rmSync(fixture.root, { recursive: true, force: true });
+	});
+	await runtime.start();
+	runtime.notices.length = 0;
+	writeFileSync(fixture.skill, "---\nname: local\ndescription: Live session skill.\n---\n");
+	const deadline = Date.now() + 10_000;
+	while (!runtime.notices.some(({ message }) => message.includes("refreshed")) && Date.now() < deadline) {
+		await new Promise((resolve) => setTimeout(resolve, 50));
+	}
+	assert.ok(
+		runtime.notices.some(({ message, level }) => message === "Skill registry refreshed (1 skills)" && level === "info"),
+		"a live session must still receive the watcher notification",
+	);
+	assert.match(readFileSync(fixture.registry, "utf8"), /Live session skill/);
+});
+
 test("automatic forced freshness protects tracked cache without partial registry writes", async () => {
 	const fixture = registryFixture();
 	await __testing.regenerateRegistry(fixture.cwd, false);
