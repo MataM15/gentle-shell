@@ -25,13 +25,33 @@ export interface SpeechOptions {
 	// The loudness of each chunk, reported when the player really begins it.
 	// An engine with no audio bytes in Node never calls it.
 	onChunk?: (chunk: VoiceSpeechChunk) => void;
+	// Reported by a chain that reads the reply again with the same voice after a
+	// failure it heard nothing of, so the reading can log why it was retried.
+	onRetry?: (info: { attempt: number; failure: string }) => void;
 }
 
 export type SpeechOutcome = "done" | "cancelled";
 
 export interface SpeechEngine {
 	readonly id: string;
+	// The voice this engine speaks with in a reply's language, when it names one
+	// (for example "Microsoft David"): what the reading log and the speech event
+	// report. An engine without one is known by its id.
+	voiceFor?(language: SpeechLanguage | undefined): string;
 	speak(text: string, options: SpeechOptions): Promise<SpeechOutcome>;
+}
+
+// The voice a reading should report: the engine's own name for that language
+// when it has one, its id otherwise. Never the composite chain id.
+export function speechVoiceName(engine: SpeechEngine, language: SpeechLanguage | undefined): string {
+	return engine.voiceFor?.(language) ?? engine.id;
+}
+
+// The failure code a reading log records: the engine's own code when it has
+// one (unavailable, no-voice, failed, timeout), a plain failure otherwise.
+export function speechFailureCode(error: unknown): string {
+	const code = (error as { code?: unknown } | undefined)?.code;
+	return typeof code === "string" && code ? code : "failed";
 }
 
 export type SpeechEngineErrorCode = "unavailable" | "failed" | "timeout";
@@ -164,6 +184,27 @@ export function voiceVolume(env: NodeJS.ProcessEnv = process.env): number {
 	return Number.isFinite(parsed) && parsed >= 0 && parsed <= 1 ? parsed : 1;
 }
 
+// GENTLE_PI_VOICE_RATE_ES and GENTLE_PI_VOICE_RATE_EN are one speech-rate
+// multiplier per language: 1 keeps the voice's own pace, 0.5 the slowest and 2
+// the fastest. Each language keeps its own, so English can be slowed down
+// without touching Spanish. Anything else reads as 1, so a typo never makes a
+// reply unintelligible.
+export const VOICE_RATE_ENV = { es: "GENTLE_PI_VOICE_RATE_ES", en: "GENTLE_PI_VOICE_RATE_EN" } as const;
+
+export const VOICE_RATE_MIN = 0.5;
+export const VOICE_RATE_MAX = 2;
+
+export function voiceRate(language: SpeechLanguage, env: NodeJS.ProcessEnv = process.env): number {
+	const value = (env[VOICE_RATE_ENV[language]] ?? "").trim();
+	if (!value) return 1;
+	const parsed = Number(value);
+	return Number.isFinite(parsed) && parsed >= VOICE_RATE_MIN && parsed <= VOICE_RATE_MAX ? parsed : 1;
+}
+
+export function voiceRates(env: NodeJS.ProcessEnv = process.env): Record<SpeechLanguage, number> {
+	return { es: voiceRate("es", env), en: voiceRate("en", env) };
+}
+
 // --- the Windows engine -------------------------------------------------------------
 
 export const WINDOWS_SPEECH_SCRIPT = [
@@ -282,8 +323,7 @@ export function createWindowsSpeechEngine(options: WindowsSpeechEngineOptions): 
 // with the fallback (the Windows voice) otherwise, or when the preferred one
 // fails before any of the reply was heard. A reading the user stopped is never
 // read again by the fallback.
-export function createFallbackSpeechEngine(preferred: SpeechEngine & { available(): Promise<boolean> }, fallback: SpeechEngine): SpeechEngine {
-	return {
+export function createFallbackSpeechEngine(preferred: SpeechEngine & { available(): Promise<boolean> }, fallback: SpeechEngine): SpeechEngine {	return {
 		id: `${preferred.id}+${fallback.id}`,
 		async speak(text, options) {
 			if (await preferred.available().catch(() => false)) {
@@ -298,6 +338,38 @@ export function createFallbackSpeechEngine(preferred: SpeechEngine & { available
 			}
 			if (options.signal.aborted) return "cancelled";
 			return fallback.speak(text, options);
+		},
+	};
+}
+
+// --- the same voice, read again after a silent failure --------------------------------
+
+// Reads with one voice and, when it fails before any of the reply was heard,
+// asks it once more from the start: a missing voice or a synthesizer that did
+// not start is worth one more try. A second failure stands, and there is no
+// other voice behind it (S2). A failure after part of the reply was played, and
+// a reading the user stopped, are never retried. The chain keeps the voice's id
+// and name, so the log and the speech event name the voice and not the chain.
+export function createRetrySpeechEngine(engine: SpeechEngine, retries = 1): SpeechEngine {
+	const attempts = Math.max(0, Math.floor(retries)) + 1;
+	const voiceFor = engine.voiceFor;
+	return {
+		id: engine.id,
+		...(voiceFor ? { voiceFor: (language: SpeechLanguage | undefined) => voiceFor(language) } : {}),
+		async speak(text, options) {
+			for (let attempt = 1; ; attempt++) {
+				if (options.signal.aborted) return "cancelled";
+				try {
+					return await engine.speak(text, options);
+				} catch (error) {
+					if (options.signal.aborted) return "cancelled";
+					// Part of the reply was already heard: reading it again from the
+					// start would repeat it.
+					if ((error as { audible?: unknown } | undefined)?.audible === true) throw error;
+					if (attempt >= attempts) throw error;
+					options.onRetry?.({ attempt, failure: speechFailureCode(error) });
+				}
+			}
 		},
 	};
 }

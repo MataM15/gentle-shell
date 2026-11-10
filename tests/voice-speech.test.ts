@@ -2,14 +2,21 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
 import {
+	createRetrySpeechEngine,
 	createWindowsSpeechEngine,
 	guessReplyLanguage,
 	resolvePowerShell,
 	SpeechEngineError,
+	speechFailureCode,
 	spokenText,
+	voiceRate,
+	voiceRates,
 	voiceVolume,
 	windowsSpeechAvailable,
 	WINDOWS_SPEECH_SCRIPT,
+	VOICE_RATE_ENV,
+	type SpeechEngine,
+	type SpeechOptions,
 } from "../lib/voice-speech.ts";
 
 // Spoken replies (S1, S5): what is read aloud, which voice language a reply
@@ -201,6 +208,93 @@ test("a reading that runs past its bound is killed and rejects as timeout", asyn
 	const spoken = engine.speak("hola", { signal: new AbortController().signal });
 	await assert.rejects(spoken, (error: unknown) => error instanceof SpeechEngineError && error.code === "timeout");
 	assert.deepEqual(calls[0].child.signals, ["SIGTERM"]);
+});
+
+// --- per-language rate and the retry rule (S2, S3) -------------------------------
+
+class CodedError extends Error {
+	readonly code: string;
+	readonly audible: boolean;
+	constructor(code: string, audible = false) {
+		super(code);
+		this.code = code;
+		this.audible = audible;
+	}
+}
+
+function countingEngine(failures: CodedError[], outcome: "done" | "cancelled" = "done") {
+	const calls: SpeechOptions[] = [];
+	const engine: SpeechEngine = {
+		id: "raul-robot",
+		async speak(_text, options) {
+			calls.push(options);
+			const failure = failures.shift();
+			if (failure) throw failure;
+			return outcome;
+		},
+	};
+	return { engine, calls };
+}
+
+test("GENTLE_PI_VOICE_RATE_ES and GENTLE_PI_VOICE_RATE_EN read as one multiplier per language", () => {
+	assert.deepEqual(Object.values(VOICE_RATE_ENV), ["GENTLE_PI_VOICE_RATE_ES", "GENTLE_PI_VOICE_RATE_EN"]);
+	assert.deepEqual(voiceRates({}), { es: 1, en: 1 }, "unset reads as the voice's own pace");
+	assert.equal(voiceRate("en", { GENTLE_PI_VOICE_RATE_EN: "0.6" }), 0.6);
+	assert.equal(voiceRates({ GENTLE_PI_VOICE_RATE_ES: "0.6" }).es, 0.6);
+	assert.deepEqual(voiceRates({ GENTLE_PI_VOICE_RATE_ES: "0.6" }), { es: 0.6, en: 1 }, "each language has its own multiplier");
+	assert.equal(voiceRate("es", { GENTLE_PI_VOICE_RATE_ES: " 1.5 " }), 1.5, "surrounding spaces are ignored");
+	assert.equal(voiceRate("es", { GENTLE_PI_VOICE_RATE_ES: "0.5" }), 0.5, "the slowest multiplier is allowed");
+	assert.equal(voiceRate("es", { GENTLE_PI_VOICE_RATE_ES: "2" }), 2, "the fastest multiplier is allowed");
+	for (const bad of ["", "  ", "0.4", "2.1", "0", "-1", "slow", "1,5"]) {
+		assert.equal(voiceRate("en", { GENTLE_PI_VOICE_RATE_EN: bad }), 1, `"${bad}" reads as the voice's own pace`);
+	}
+});
+
+test("a voice that fails before any audio is retried once, and the retry reports its failure code", async () => {
+	const retried = countingEngine([new CodedError("no-voice")]);
+	const engine = createRetrySpeechEngine(retried.engine);
+	const retries: Array<{ attempt: number; failure: string }> = [];
+	assert.equal(await engine.speak("Hola.", { signal: new AbortController().signal, onRetry: (info) => retries.push(info) }), "done");
+	assert.equal(retried.calls.length, 2, "the reading is heard again from the start");
+	assert.deepEqual(retries, [{ attempt: 1, failure: "no-voice" }]);
+});
+
+test("a second failure ends the reading with its code and no other voice reads it", async () => {
+	const failing = countingEngine([new CodedError("failed"), new CodedError("timeout")]);
+	const engine = createRetrySpeechEngine(failing.engine);
+	const retries: Array<{ attempt: number; failure: string }> = [];
+	await assert.rejects(engine.speak("Hola.", { signal: new AbortController().signal, onRetry: (info) => retries.push(info) }), (error: unknown) => (error as { code?: string }).code === "timeout");
+	assert.equal(failing.calls.length, 2, "exactly one retry, then it stops");
+	assert.deepEqual(retries, [{ attempt: 1, failure: "failed" }]);
+});
+
+test("a failure after part of the reply was heard, and a reading the user stopped, are never retried", async () => {
+	const audible = countingEngine([new CodedError("failed", true)]);
+	const engine = createRetrySpeechEngine(audible.engine);
+	await assert.rejects(engine.speak("Hola.", { signal: new AbortController().signal }), (error: unknown) => (error as { audible?: boolean }).audible === true);
+	assert.equal(audible.calls.length, 1, "the reply is not repeated from the start");
+
+	const cancelled = countingEngine([]);
+	const stopped = createRetrySpeechEngine(cancelled.engine);
+	const controller = new AbortController();
+	controller.abort();
+	assert.equal(await stopped.speak("Hola.", { signal: controller.signal }), "cancelled");
+	assert.equal(cancelled.calls.length, 0);
+});
+
+test("the retried voice keeps the id and the voice name of the voice it retries", () => {
+	const engine = createRetrySpeechEngine({ id: "raul-robot", voiceFor: (language) => (language === "en" ? "Microsoft David" : "Microsoft Raul"), speak: async () => "done" });
+	assert.equal(engine.id, "raul-robot", "no composite chain id");
+	assert.equal(engine.voiceFor?.("en"), "Microsoft David");
+	assert.equal(engine.voiceFor?.("es"), "Microsoft Raul");
+	assert.equal(createRetrySpeechEngine({ id: "fake", speak: async () => "done" }).voiceFor, undefined, "a voice without a name adds none");
+});
+
+test("a failure reads as its own code, and anything else as a plain failure", () => {
+	assert.equal(speechFailureCode(new CodedError("no-voice")), "no-voice");
+	assert.equal(speechFailureCode(new SpeechEngineError("unavailable")), "unavailable");
+	assert.equal(speechFailureCode(new Error("boom")), "failed");
+	assert.equal(speechFailureCode(undefined), "failed");
 });
 
 test("spokenText reads a long reply whole: a 3,000-character reply is not cut", () => {
