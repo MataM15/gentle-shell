@@ -151,6 +151,19 @@ export function resolvePowerShell(platform: string, env: NodeJS.ProcessEnv = pro
 	return exists(WSL_POWERSHELL) ? WSL_POWERSHELL : undefined;
 }
 
+// GENTLE_PI_VOICE_VOLUME turns spoken replies down without touching the
+// machine's own volume, for example 0.8 for a fifth quieter. It reads as full
+// volume unless it is a number from 0 to 1, so a typo never mutes a reply or
+// plays it louder than the voice itself.
+export const VOICE_VOLUME_ENV = "GENTLE_PI_VOICE_VOLUME";
+
+export function voiceVolume(env: NodeJS.ProcessEnv = process.env): number {
+	const value = (env[VOICE_VOLUME_ENV] ?? "").trim();
+	if (!value) return 1;
+	const parsed = Number(value);
+	return Number.isFinite(parsed) && parsed >= 0 && parsed <= 1 ? parsed : 1;
+}
+
 // --- the Windows engine -------------------------------------------------------------
 
 export const WINDOWS_SPEECH_SCRIPT = [
@@ -163,6 +176,7 @@ export const WINDOWS_SPEECH_SCRIPT = [
 	"  if ($voice) { $synth.SelectVoice($voice.VoiceInfo.Name) }",
 	"}",
 	"$synth.Rate = [Math]::Max(-10, [Math]::Min(10, [int]$payload.rate))",
+	"if ($null -ne $payload.volume) { $synth.Volume = [Math]::Max(0, [Math]::Min(100, [int]$payload.volume)) }",
 	"$synth.SetOutputToDefaultAudioDevice()",
 	"$synth.Speak([string]$payload.text)",
 	"$synth.Dispose()",
@@ -183,6 +197,8 @@ export type SpeechSpawn = (command: string, args: readonly string[], options: { 
 export interface WindowsSpeechEngineOptions {
 	command: string;
 	spawn?: SpeechSpawn;
+	// The reply volume, 0..1; full volume when absent.
+	volume?: number;
 	// The longest one reading may take before it is killed, by text length.
 	timeoutMs?: (text: string) => number;
 }
@@ -194,6 +210,7 @@ const defaultTimeout = (text: string) => 30_000 + text.length * 120;
 export function createWindowsSpeechEngine(options: WindowsSpeechEngineOptions): SpeechEngine {
 	const spawn = options.spawn ?? (nodeSpawn as unknown as SpeechSpawn);
 	const timeoutFor = options.timeoutMs ?? defaultTimeout;
+	const volume = Math.max(0, Math.min(1, options.volume ?? 1));
 	return {
 		id: "windows",
 		speak(text, { language, rate, signal }) {
@@ -245,9 +262,12 @@ export function createWindowsSpeechEngine(options: WindowsSpeechEngineOptions): 
 					stopChild();
 					finish(new SpeechEngineError("timeout"));
 				}, timeoutFor(text));
-				const payload: { text: string; language?: SpeechLanguage; rate?: number } = { text };
+				const payload: { text: string; language?: SpeechLanguage; rate?: number; volume?: number } = { text };
 				if (language) payload.language = language;
 				if (rate !== undefined) payload.rate = Math.max(-10, Math.min(10, Math.round(rate)));
+				// Only a turned-down reply travels with it, so full volume keeps the
+				// synthesizer's own level.
+				if (volume < 1) payload.volume = Math.round(volume * 100);
 				child.stdin?.on("error", () => {});
 				child.stdin?.write(`${Buffer.from(JSON.stringify(payload), "utf8").toString("base64")}\n`);
 				child.stdin?.end();

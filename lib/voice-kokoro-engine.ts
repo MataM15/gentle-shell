@@ -2,6 +2,7 @@ import { spawn as nodeSpawn } from "node:child_process";
 import type { EventEmitter } from "node:events";
 import { fileURLToPath } from "node:url";
 import { createPlayerFeed, PLAYBACK_MARKER, readPlaybackMarkers } from "./voice-speech-events.ts";
+import { scaleWav } from "./voice-robot.ts";
 import type { SpeechEngine, SpeechOutcome } from "./voice-speech.ts";
 
 // The natural-voice engine (docs/voice.md, "Natural voice with Kokoro"). One
@@ -122,6 +123,8 @@ export interface KokoroEngineOptions {
 	workerPath?: string;
 	env?: NodeJS.ProcessEnv;
 	numThreads?: number;
+	// The reply volume, 0..1 (GENTLE_PI_VOICE_VOLUME); full volume when absent.
+	volume?: number;
 	timeoutMs?: (text: string) => number;
 	// The voice per reply language; a language without one is refused so the
 	// fallback reads it. Kokoro's Spanish and English voices by default.
@@ -138,6 +141,7 @@ export function createKokoroSpeechEngine(options: KokoroEngineOptions): SpeechEn
 	const spawn = options.spawn ?? (nodeSpawn as unknown as ProcSpawn);
 	const timeoutFor = options.timeoutMs ?? defaultTimeout;
 	const env = options.env ?? process.env;
+	const volume = Math.max(0, Math.min(1, options.volume ?? 1));
 	return {
 		id: "kokoro",
 		available: async () => (await options.launch().catch(() => undefined)) !== undefined,
@@ -225,7 +229,7 @@ export function createKokoroSpeechEngine(options: KokoroEngineOptions): SpeechEn
 							audible = true;
 							// Measured now from the very bytes the player receives, and
 							// reported when the player reports it began playing.
-							feed.queue(Buffer.from(message.wav, "base64"));
+							feed.queue(scaleWav(Buffer.from(message.wav, "base64"), volume));
 						}
 						else if (message.type === "done") {
 							workerDone = true;

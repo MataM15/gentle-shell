@@ -1,7 +1,7 @@
 import { spawn as nodeSpawn } from "node:child_process";
 import type { EventEmitter } from "node:events";
 import { KOKORO_PLAYER_SCRIPT, kokoroChunks } from "./voice-kokoro-engine.ts";
-import { decodeWav, encodeWav, levelVoice, robotize } from "./voice-robot.ts";
+import { decodeWav, encodeWav, levelVoice, robotize, scaleWav } from "./voice-robot.ts";
 import { createPlayerFeed, readPlaybackMarkers } from "./voice-speech-events.ts";
 import type { SpeechEngine, SpeechOutcome } from "./voice-speech.ts";
 
@@ -79,6 +79,8 @@ export interface RobotVoiceOptions {
 	powershell: string;
 	spawn?: ProcSpawn;
 	timeoutMs?: (text: string) => number;
+	// The reply volume, 0..1 (GENTLE_PI_VOICE_VOLUME); full volume when absent.
+	volume?: number;
 }
 
 // PowerShell starts in about a second; OneCore synthesizes far faster than
@@ -95,6 +97,7 @@ export function processRobotVoice(wav: Buffer): Buffer {
 export function createRobotVoiceEngine(options: RobotVoiceOptions): SpeechEngine & { available(): Promise<boolean> } {
 	const spawn = options.spawn ?? (nodeSpawn as unknown as ProcSpawn);
 	const timeoutFor = options.timeoutMs ?? defaultTimeout;
+	const volume = Math.max(0, Math.min(1, options.volume ?? 1));
 	return {
 		id: "raul-robot",
 		available: async () => true,
@@ -178,7 +181,7 @@ export function createRobotVoiceEngine(options: RobotVoiceOptions): SpeechEngine
 						// Processed, turned down and measured on the very audio the player
 						// receives, and reported when the player reports it began playing
 						// that sentence.
-						feed.queue(processed);
+						feed.queue(scaleWav(processed, volume));
 					}
 				});
 				synth.once("error", () => finish(new RobotVoiceError("failed")));

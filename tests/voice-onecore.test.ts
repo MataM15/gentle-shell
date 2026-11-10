@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
-import { createRobotVoiceEngine, ONECORE_SYNTH_SCRIPT } from "../lib/voice-onecore.ts";
+import { createRobotVoiceEngine, ONECORE_SYNTH_SCRIPT, processRobotVoice } from "../lib/voice-onecore.ts";
 import { PLAYBACK_MARKER, type VoiceSpeechChunk } from "../lib/voice-speech-events.ts";
 import { decodeWav, encodeWav } from "../lib/voice-robot.ts";
 
@@ -28,7 +28,7 @@ class FakeProc extends EventEmitter {
 
 const tone = (seconds = 0.2) => encodeWav(Float32Array.from({ length: Math.round(16000 * seconds) }, (_value, i) => 0.05 * Math.sin(i / 5)), 16000).toString("base64");
 
-function harness(timeoutMs?: (text: string) => number) {
+function harness(timeoutMs?: (text: string) => number, volume?: number) {
 	const procs: Array<{ args: readonly string[]; options: Record<string, unknown>; proc: FakeProc }> = [];
 	const engine = createRobotVoiceEngine({
 		powershell: "/mnt/c/Windows/powershell.exe",
@@ -38,6 +38,7 @@ function harness(timeoutMs?: (text: string) => number) {
 			return proc;
 		},
 		timeoutMs,
+		volume,
 	});
 	const scriptOf = (entry: { args: readonly string[] }) => Buffer.from(entry.args.at(-1)!, "base64").toString("utf16le");
 	const synth = () => procs.find((entry) => scriptOf(entry) === ONECORE_SYNTH_SCRIPT)!;
@@ -119,6 +120,23 @@ test("unreadable synthesizer output fails cleanly", async () => {
 	await h.until(() => h.procs.length === 2);
 	h.synth().proc.stdout.emit("data", "audio:bm90IGEgd2F2\n");
 	await assert.rejects(spoken, (error: unknown) => (error as { audible?: boolean }).audible === false);
+});
+
+test("GENTLE_PI_VOICE_VOLUME quiets the robotized audio the player gets, after the leveling", async () => {
+	const h = harness(undefined, 0.5);
+	const spoken = h.engine.speak("Hola.", { language: "es", signal: new AbortController().signal });
+	await h.until(() => h.procs.length === 2);
+	const original = tone();
+	h.synth().proc.stdout.emit("data", `audio:${original}\n`);
+	await h.until(() => h.player().proc.lines().length === 1);
+	const unscaled = decodeWav(processRobotVoice(Buffer.from(original, "base64")));
+	const played = decodeWav(Buffer.from(h.player().proc.lines()[0]!, "base64"));
+	const peakOf = (samples: Float32Array) => samples.reduce((highest, sample) => Math.max(highest, Math.abs(sample)), 0);
+	assert.ok(Math.abs(peakOf(played.samples) - peakOf(unscaled.samples) * 0.5) < 0.01, "the volume applies to the processed audio, so the leveling never undoes it");
+	h.player().proc.stdout.emit("data", `${PLAYBACK_MARKER}\n`);
+	h.synth().proc.emit("exit", 0, null);
+	h.player().proc.emit("exit", 0, null);
+	assert.equal(await spoken, "done");
 });
 
 test("each sentence publishes its loudness when the player begins it, measured on the processed audio", async () => {

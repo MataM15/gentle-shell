@@ -7,6 +7,7 @@ import {
 	resolvePowerShell,
 	SpeechEngineError,
 	spokenText,
+	voiceVolume,
 	windowsSpeechAvailable,
 	WINDOWS_SPEECH_SCRIPT,
 } from "../lib/voice-speech.ts";
@@ -128,6 +129,27 @@ test("the Windows engine sends no language when the reply language is unknown an
 	const engine = createWindowsSpeechEngine({ spawn, command: "powershell.exe" });
 	const spoken = engine.speak("ok", { rate: 42, signal: new AbortController().signal });
 	assert.deepEqual(decodePayload(calls[0].child), { text: "ok", rate: 10 });
+	calls[0].child.emit("exit", 0, null);
+	assert.equal(await spoken, "done");
+});
+
+test("GENTLE_PI_VOICE_VOLUME reads as full volume unless it is a number from 0 to 1", () => {
+	assert.equal(voiceVolume({}), 1, "unset reads as full volume");
+	assert.equal(voiceVolume({ GENTLE_PI_VOICE_VOLUME: "0.8" }), 0.8);
+	assert.equal(voiceVolume({ GENTLE_PI_VOICE_VOLUME: " 0.25 " }), 0.25, "surrounding spaces are ignored");
+	assert.equal(voiceVolume({ GENTLE_PI_VOICE_VOLUME: "0" }), 0, "zero mutes the reading");
+	assert.equal(voiceVolume({ GENTLE_PI_VOICE_VOLUME: "1" }), 1);
+	for (const bad of ["", "8", "80%", "-0.2", "1.5", "loud"]) {
+		assert.equal(voiceVolume({ GENTLE_PI_VOICE_VOLUME: bad }), 1, `"${bad}" never mutes a reply or makes it louder`);
+	}
+});
+
+test("the Windows voice sets the synthesizer volume from the reply volume", async () => {
+	const { calls, spawn } = fakeSpawn();
+	const engine = createWindowsSpeechEngine({ spawn, command: "powershell.exe", volume: 0.8 });
+	const spoken = engine.speak("hola", { signal: new AbortController().signal });
+	assert.deepEqual(decodePayload(calls[0].child), { text: "hola", volume: 80 }, "the volume goes to PowerShell as 0..100");
+	assert.ok(WINDOWS_SPEECH_SCRIPT.includes("$synth.Volume = "), "the script applies it to the synthesizer");
 	calls[0].child.emit("exit", 0, null);
 	assert.equal(await spoken, "done");
 });

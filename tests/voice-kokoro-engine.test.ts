@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 import test from "node:test";
 import { createKokoroSpeechEngine, KOKORO_PLAYER_SCRIPT, kokoroChunks, type KokoroLaunch } from "../lib/voice-kokoro-engine.ts";
 import { PLAYBACK_MARKER, type VoiceSpeechChunk } from "../lib/voice-speech-events.ts";
-import { encodeWav } from "../lib/voice-robot.ts";
+import { decodeWav, encodeWav } from "../lib/voice-robot.ts";
 import { createFallbackSpeechEngine, type SpeechEngine } from "../lib/voice-speech.ts";
 
 // The natural-voice engine (S6): text split for a quick first sentence, one
@@ -49,7 +49,7 @@ const LAUNCH: KokoroLaunch = {
 	],
 };
 
-function harness(launch: KokoroLaunch | null = LAUNCH, timeoutMs?: (text: string) => number, voices?: Parameters<typeof createKokoroSpeechEngine>[0]["voices"]) {
+function harness(launch: KokoroLaunch | null = LAUNCH, timeoutMs?: (text: string) => number, voices?: Parameters<typeof createKokoroSpeechEngine>[0]["voices"], volume?: number) {
 	const procs: Array<{ command: string; args: readonly string[]; options: Record<string, unknown>; proc: FakeProc }> = [];
 	const spawn = (command: string, args: readonly string[], options: Record<string, unknown>) => {
 		const proc = new FakeProc();
@@ -65,6 +65,7 @@ function harness(launch: KokoroLaunch | null = LAUNCH, timeoutMs?: (text: string
 		env: { HOME: "/home/someone", SECRET_TOKEN: "abc", NODE_OPTIONS: "--require /evil.js" },
 		timeoutMs,
 		voices,
+		volume,
 	});
 	const worker = () => procs.find((entry) => entry.command === "/usr/bin/node")!;
 	const player = () => procs.find((entry) => entry.command === "/mnt/c/Windows/powershell.exe")!;
@@ -237,6 +238,27 @@ test("the shared player announces every line it plays on stdout before playback 
 	const playSync = lines.findIndex((line) => line.includes("PlaySync()"));
 	assert.ok(announcement >= 0, "the player reports each line it plays");
 	assert.ok(announcement < playSync, "the report comes before the line is played, not after");
+});
+
+test("GENTLE_PI_VOICE_VOLUME quiets the audio the player gets and leaves the loudness report as it was", async () => {
+	const h = harness(LAUNCH, undefined, undefined, 0.8);
+	const chunks: VoiceSpeechChunk[] = [];
+	const spoken = h.engine.speak("Hola.", { language: "es", signal: new AbortController().signal, onChunk: (chunk) => { chunks.push(chunk); } });
+	await h.until(() => h.procs.length === 2);
+	const loud = wavLine(0.2);
+	h.worker().proc.say({ type: "audio", index: 0, wav: loud });
+	const played = decodeWav(Buffer.from(h.player().proc.written[0]!.trim(), "base64"));
+	const original = decodeWav(Buffer.from(loud, "base64"));
+	const peakOf = (samples: Float32Array) => samples.reduce((highest, sample) => Math.max(highest, Math.abs(sample)), 0);
+	assert.equal(played.sampleRate, 16_000);
+	assert.ok(Math.abs(peakOf(played.samples) - peakOf(original.samples) * 0.8) < 0.01, "the very samples the player receives are quieter");
+	h.player().proc.stdout.emit("data", `${PLAYBACK_MARKER}\n`);
+	assert.equal(Math.max(...chunks[0]!.levels), 1, "levels are normalized per chunk, so a quieter reply keeps its shape");
+	assert.equal(chunks[0]!.durationMs, 200, "the quieter audio keeps its length");
+	h.worker().proc.say({ type: "done" });
+	h.worker().proc.emit("exit", 0, null);
+	h.player().proc.emit("exit", 0, null);
+	assert.equal(await spoken, "done");
 });
 
 test("a chunk is published only when the player begins it, in the order it was queued", async () => {

@@ -159,6 +159,17 @@ export function encodeWav(samples: Float32Array, sampleRate: number): Buffer {
 	return Buffer.concat([header, pcm]);
 }
 
+// The same audio turned down: GENTLE_PI_VOICE_VOLUME scales the samples before
+// the player gets them, so the machine's own volume and every other sound stay
+// as they are. Full volume returns the very bytes it was given.
+export function scaleWav(wav: Buffer, volume: number): Buffer {
+	const level = Math.max(0, Math.min(1, volume));
+	if (level >= 1) return wav;
+	const { samples, sampleRate } = decodeWav(wav);
+	for (let index = 0; index < samples.length; index++) samples[index] = samples[index]! * level;
+	return encodeWav(samples, sampleRate);
+}
+
 // 16-bit PCM WAV, mono or stereo (mixed down to mono); other formats throw.
 export function decodeWav(wav: Buffer): { samples: Float32Array; sampleRate: number } {
 	if (wav.length < 12 || wav.toString("ascii", 0, 4) !== "RIFF" || wav.toString("ascii", 8, 12) !== "WAVE") throw new Error("not a WAV file");

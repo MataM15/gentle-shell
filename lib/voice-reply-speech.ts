@@ -9,6 +9,7 @@ import {
 	guessReplyLanguage,
 	resolvePowerShell,
 	spokenText,
+	voiceVolume,
 	windowsSpeechAvailable,
 	type SpeechEngine,
 	type SpeechOutcome,
@@ -75,15 +76,18 @@ export function defaultSpeechEngineResolver(env: NodeJS.ProcessEnv = process.env
 	return () => {
 		if (resolved === undefined) {
 			const command = windowsSpeechAvailable({ platform: process.platform, kernelRelease: release() }) ? resolvePowerShell(process.platform, env) : undefined;
+			// Read once, when the chain is built, so a change applies to the next
+			// session; full volume unless the variable asks for 0..1.
+			const volume = voiceVolume(env);
 			resolved = command
 				? createFallbackSpeechEngine(
 						// The owner's Raúl robot voice reads Spanish replies; Miro takes
 						// over when Raúl fails before any audio, then Kokoro and the
 						// Windows voice, which also read everything else.
-						createRobotVoiceEngine({ powershell: command }),
+						createRobotVoiceEngine({ powershell: command, volume }),
 						createFallbackSpeechEngine(
-							createKokoroSpeechEngine({ launch: () => resolveMiroLaunch({ env }), powershell: command, env, voices: { es: { lang: "es", sid: 0 } } }),
-							createFallbackSpeechEngine(createKokoroSpeechEngine({ launch: () => resolveKokoroLaunch({ env }), powershell: command, env }), createWindowsSpeechEngine({ command })),
+							createKokoroSpeechEngine({ launch: () => resolveMiroLaunch({ env }), powershell: command, env, volume, voices: { es: { lang: "es", sid: 0 } } }),
+							createFallbackSpeechEngine(createKokoroSpeechEngine({ launch: () => resolveKokoroLaunch({ env }), powershell: command, env, volume }), createWindowsSpeechEngine({ command, volume })),
 						),
 					)
 				: null;
