@@ -17,7 +17,7 @@ Branch `feat/voice-speech-events`. Additive: no existing event, payload, or beha
 
 ## Tasks
 
-- T1 (S1-S6) worker: implement event, player playback markers, loudness envelope, tests, docs. Commit: pending.
+- T1 (S1-S6) worker: implement event, player playback markers, loudness envelope, tests, docs. Commit: `30c52938f` (done).
 - T2 (S1) parent: LED bridge outside this repo (Pi extension + Windows BLE daemon). Not in this repo.
 
 ## Log
