@@ -6,7 +6,7 @@ import { decodeWav } from "./voice-robot.ts";
 // consumer outside the voice command needs to follow the voice: that a reading
 // started, how loud each chunk the player actually began is, and that it ended.
 // The payload carries no reply text, path, session or error message: only the
-// engine chain and the loudness of audio that already played. Importing this
+// voice name and the loudness of audio that already played. Importing this
 // module has no side effects; nothing is published unless a reading calls it.
 
 export const VOICE_SPEECH_EVENT = "gentle-ai:voice-speech";
@@ -30,8 +30,8 @@ export interface VoiceSpeechChunk {
 export interface VoiceSpeechStart {
 	schema: typeof VOICE_SPEECH_SCHEMA;
 	phase: "start";
-	// The engine chain that reads the reply, for example "windows" or
-	// "raul-robot+miro+kokoro+windows" when a fallback is in the chain.
+	// The voice that reads the reply, for example "Microsoft Raul" or
+	// "Microsoft David", not the chain that produced it.
 	engine: string;
 }
 
