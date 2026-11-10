@@ -864,6 +864,7 @@ async function startSkillRegistryWatcher(
 				} catch (error) {
 					// This catch used to re-notify through the same stale ctx and the
 					// second throw escaped as the uncaught exception that killed Pi.
+					if (generation !== watcherGeneration) return;
 					safeNotify(notify, `Skill registry refresh failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
 				}
 			})();
