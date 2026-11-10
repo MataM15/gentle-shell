@@ -98,11 +98,14 @@ test("a reading starts the player and the worker, streams each WAV to the player
 	assert.deepEqual(request.core, LAUNCH.core);
 	assert.deepEqual(request.espeak, LAUNCH.espeak);
 	proc.say({ type: "audio", index: 0, wav: "UklGRg==" });
-	proc.say({ type: "audio", index: 1, wav: "UklGRh==" });
-	assert.deepEqual(h.player().proc.written, ["UklGRg==\n", "UklGRh==\n"]);
+	assert.deepEqual(h.player().proc.written, ["UklGRg==\n"], "the first chunk is played as soon as the worker has it");
+	proc.say({ type: "audio", index: 1, wav: "V0FWRQ==" });
+	assert.deepEqual(h.player().proc.written, ["UklGRg==\n"], "the next chunk waits until the player begins the previous one");
+	h.player().proc.stdout.emit("data", `${PLAYBACK_MARKER}\n`);
+	assert.deepEqual(h.player().proc.written, ["UklGRg==\n", "V0FWRQ==\n"], "the marker releases exactly the next chunk");
 	proc.say({ type: "done" });
 	proc.emit("exit", 0, null);
-	assert.equal(h.player().proc.ended, true, "the player's input closes once every chunk is queued");
+	assert.equal(h.player().proc.ended, true, "the player's input closes once every chunk was written");
 	h.player().proc.emit("exit", 0, null);
 	assert.equal(await spoken, "done");
 });

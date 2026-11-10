@@ -2,7 +2,7 @@ import { spawn as nodeSpawn } from "node:child_process";
 import type { EventEmitter } from "node:events";
 import { KOKORO_PLAYER_SCRIPT, kokoroChunks } from "./voice-kokoro-engine.ts";
 import { decodeWav, encodeWav, levelVoice, robotize } from "./voice-robot.ts";
-import { createChunkSink, readPlaybackMarkers } from "./voice-speech-events.ts";
+import { createPlayerFeed, readPlaybackMarkers } from "./voice-speech-events.ts";
 import type { SpeechEngine, SpeechOutcome } from "./voice-speech.ts";
 
 // The owner's voice for Spanish replies (docs/voice.md, "Raúl robot voice"):
@@ -142,15 +142,20 @@ export function createRobotVoiceEngine(options: RobotVoiceOptions): SpeechEngine
 				}
 				// Only the player's own playback markers are read, so each sentence's
 				// loudness is reported when it starts playing. Every other native
-				// output line names paths or devices and is drained, never shown.
-				const sink = createChunkSink(onChunk);
-				readPlaybackMarkers(player.stdout, () => sink.play());
+				// output line names paths or devices and is drained, never shown. One
+				// sentence is in the player at a time, measured on what it receives.
+				const feed = createPlayerFeed({
+					write: (line) => { player.stdin?.write(line); },
+					end: () => { player.stdin?.end(); },
+					onChunk,
+				});
+				readPlaybackMarkers(player.stdout, () => feed.play());
 				player.stderr?.on("data", () => {});
 				synth.stderr?.on("data", () => {});
 				player.stdin?.on("error", () => {});
 				synth.stdin?.on("error", () => {});
 				const allQueued = () => {
-					if (synthDone && received === chunks.length) player.stdin?.end();
+					if (synthDone && received === chunks.length) feed.close();
 				};
 				let buffered = "";
 				synth.stdout?.on("data", (data: unknown) => {
@@ -170,10 +175,10 @@ export function createRobotVoiceEngine(options: RobotVoiceOptions): SpeechEngine
 						}
 						received++;
 						audible = true;
-						// Measured on the very audio the player receives, and reported
-						// when the player reports it began playing that sentence.
-						sink.queue(processed);
-						player.stdin?.write(`${processed.toString("base64")}\n`);
+						// Processed, turned down and measured on the very audio the player
+						// receives, and reported when the player reports it began playing
+						// that sentence.
+						feed.queue(processed);
 					}
 				});
 				synth.once("error", () => finish(new RobotVoiceError("failed")));

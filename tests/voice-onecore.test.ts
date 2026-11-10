@@ -62,6 +62,9 @@ test("each sentence goes to the synthesizer as base64 JSON, and comes back robot
 	}
 	const original = tone();
 	h.synth().proc.stdout.emit("data", `audio:${original}\naudio:${tone()}\n`);
+	await h.until(() => h.player().proc.lines().length === 1);
+	assert.equal(h.player().proc.lines().length, 1, "the next sentence waits until the player begins the previous one");
+	h.player().proc.stdout.emit("data", `${PLAYBACK_MARKER}\n`);
 	await h.until(() => h.player().proc.lines().length === 2);
 	const played = decodeWav(Buffer.from(h.player().proc.lines()[0]!, "base64"));
 	assert.equal(played.sampleRate, 16000);
@@ -124,9 +127,10 @@ test("each sentence publishes its loudness when the player begins it, measured o
 	const spoken = h.engine.speak("Uno. Dos.", { language: "es", signal: new AbortController().signal, onChunk: (chunk) => { chunks.push(chunk); } });
 	await h.until(() => h.procs.length === 2);
 	h.synth().proc.stdout.emit("data", `audio:${tone(0.2)}\naudio:${tone(0.1)}\n`);
-	await h.until(() => h.player().proc.lines().length === 2);
+	await h.until(() => h.player().proc.lines().length === 1);
 	assert.deepEqual(chunks, [], "sentences waiting in the player are not reported as played");
 	h.player().proc.stdout.emit("data", `${PLAYBACK_MARKER}\n`);
+	await h.until(() => h.player().proc.lines().length === 2);
 	assert.equal(chunks.length, 1);
 	assert.equal(chunks[0]!.frameMs, 50);
 	assert.equal(chunks[0]!.durationMs, 200);

@@ -1,7 +1,7 @@
 import { spawn as nodeSpawn } from "node:child_process";
 import type { EventEmitter } from "node:events";
 import { fileURLToPath } from "node:url";
-import { createChunkSink, PLAYBACK_MARKER, readPlaybackMarkers } from "./voice-speech-events.ts";
+import { createPlayerFeed, PLAYBACK_MARKER, readPlaybackMarkers } from "./voice-speech-events.ts";
 import type { SpeechEngine, SpeechOutcome } from "./voice-speech.ts";
 
 // The natural-voice engine (docs/voice.md, "Natural voice with Kokoro"). One
@@ -194,11 +194,15 @@ export function createKokoroSpeechEngine(options: KokoroEngineOptions): SpeechEn
 					return;
 				}
 				// Native output names paths or devices: drained, never shown. Only the
-				// player's own playback markers are read, so each chunk event lands
-				// when that chunk is heard. Each chunk is queued and measured as it is
-				// written, and reported when its marker arrives, in that order.
-				const sink = createChunkSink(onChunk);
-				readPlaybackMarkers(player.stdout, () => sink.play());
+				// player's own playback markers are read, so each chunk event lands when
+				// that chunk is heard. The player is fed one chunk at a time, and each
+				// chunk is measured from the very bytes it receives.
+				const feed = createPlayerFeed({
+					write: (line) => { player.stdin?.write(line); },
+					end: () => { player.stdin?.end(); },
+					onChunk,
+				});
+				readPlaybackMarkers(player.stdout, () => feed.play());
 				player.stderr?.on("data", () => {});
 				worker.stderr?.on("data", () => {});
 				player.stdin?.on("error", () => {});
@@ -221,12 +225,11 @@ export function createKokoroSpeechEngine(options: KokoroEngineOptions): SpeechEn
 							audible = true;
 							// Measured now from the very bytes the player receives, and
 							// reported when the player reports it began playing.
-							sink.queue(Buffer.from(message.wav, "base64"));
-							player.stdin?.write(`${message.wav}\n`);
+							feed.queue(Buffer.from(message.wav, "base64"));
 						}
 						else if (message.type === "done") {
 							workerDone = true;
-							player.stdin?.end();
+							feed.close();
 						} else return finish(new KokoroSpeechError("failed"));
 					}
 				});

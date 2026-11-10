@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 import test from "node:test";
 import { encodeWav } from "../lib/voice-robot.ts";
 import {
-	createChunkSink,
+	createPlayerFeed,
 	createVoiceSpeechPublisher,
 	PLAYBACK_MARKER,
 	readPlaybackMarkers,
@@ -99,30 +99,81 @@ test("the player's markers are read line by line, even when a line arrives in pi
 	assert.deepEqual(plays, [1, 2], "a player without output is inert");
 });
 
-test("queued chunks are reported in FIFO order when the player begins each one", () => {
+test("the player is fed one chunk at a time, so its report never trails the audio by a chunk", () => {
+	// WSL carries a Windows player's input and output over one interop relay:
+	// while it still has chunk bytes to deliver, it does not pass on the marker
+	// the player wrote. Writing every chunk up front therefore put each marker
+	// one chunk behind the audio it describes, and the next chunk is written
+	// only once the player reports it began the previous one.
+	const written: string[] = [];
 	const seen: VoiceSpeechChunk[] = [];
-	const sink = createChunkSink((chunk) => { seen.push(chunk); });
-	const first = { frameMs: 50, durationMs: 200, levels: [1, 0.3, 0.3, 0.3] };
-	const second = { frameMs: 50, durationMs: 100, levels: [1, 0.3] };
-	sink.queue(encodeWav(tone(16_000, 0.2, 0.2), 16_000));
-	sink.queue(encodeWav(tone(16_000, 0.1, 0.1), 16_000));
+	const feed = createPlayerFeed({ write: (line) => { written.push(line); }, end: () => {}, onChunk: (chunk) => { seen.push(chunk); } });
+	const first = encodeWav(tone(16_000, 0.2, 0.2), 16_000);
+	const second = encodeWav(tone(16_000, 0.1, 0.1), 16_000);
+	const line = (wav: Buffer) => `${wav.toString("base64")}\n`;
+	feed.queue(first);
+	assert.deepEqual(written, [line(first)], "the first chunk goes out at once, so the reading never waits");
+	feed.queue(second);
+	assert.equal(written.length, 1, "the next chunk is held back while the player still owes a marker");
 	assert.deepEqual(seen, [], "nothing is reported before it plays");
-	sink.play();
-	assert.deepEqual(seen.length, 1);
-	assert.equal(seen[0]!.frameMs, first.frameMs);
-	assert.equal(seen[0]!.durationMs, first.durationMs);
-	assert.equal(seen[0]!.levels.length, first.levels.length);
-	sink.play();
-	assert.equal(seen[1]!.durationMs, second.durationMs);
-	sink.play();
-	assert.equal(seen.length, 2, "a marker with nothing queued reports nothing");
+	feed.play();
+	assert.equal(seen.length, 1, "the marker reports the chunk that just began");
+	assert.equal(seen[0]!.frameMs, 50);
+	assert.equal(seen[0]!.durationMs, 200);
+	assert.equal(seen[0]!.levels.length, 4);
+	assert.deepEqual(written, [line(first), line(second)], "the marker releases exactly the next chunk");
+	feed.play();
+	assert.equal(seen.length, 2);
+	assert.equal(seen[1]!.durationMs, 100, "each marker advances the queue exactly one chunk");
+	assert.equal(written.length, 2);
+	feed.play();
+	assert.equal(seen.length, 2, "a marker with no chunk in the player reports nothing");
 });
 
-test("a chunk callback that throws, or none at all, never breaks playback", () => {
-	const throwing = createChunkSink(() => { throw new Error("consumer failed"); });
-	assert.doesNotThrow(() => throwing.queue(encodeWav(tone(16_000, 0.1, 0.2), 16_000)));
+test("the player's input ends once every queued chunk was written, and only once", () => {
+	const written: string[] = [];
+	let ends = 0;
+	const feed = createPlayerFeed({ write: (line) => { written.push(line); }, end: () => { ends++; } });
+	feed.queue(encodeWav(tone(16_000, 0.2, 0.2), 16_000));
+	feed.queue(encodeWav(tone(16_000, 0.1, 0.1), 16_000));
+	feed.close();
+	assert.equal(ends, 0, "a chunk still waiting keeps the input open");
+	feed.play();
+	assert.equal(written.length, 2);
+	assert.equal(ends, 1, "the input closes as soon as the last chunk went out");
+	feed.close();
+	feed.play();
+	assert.equal(ends, 1, "closing twice, or a late marker, never closes the input again");
+});
+
+test("a chunk that cannot be measured still plays, and is reported with no loudness", () => {
+	const written: string[] = [];
+	const seen: VoiceSpeechChunk[] = [];
+	const feed = createPlayerFeed({ write: (line) => { written.push(line); }, end: () => {}, onChunk: (chunk) => { seen.push(chunk); } });
+	const notWav = Buffer.from("not a wav");
+	feed.queue(notWav);
+	assert.deepEqual(written, [`${notWav.toString("base64")}\n`], "the reply is read even when its loudness cannot be measured");
+	feed.play();
+	assert.deepEqual(seen, [{ frameMs: VOICE_SPEECH_FRAME_MS, durationMs: 0, levels: [] }]);
+});
+
+test("a consumer that throws, a player that cannot be written to, and no callback at all never stop the reading", () => {
+	const written: string[] = [];
+	const throwing = createPlayerFeed({ write: (line) => { written.push(line); }, end: () => {}, onChunk: () => { throw new Error("consumer failed"); } });
+	throwing.queue(encodeWav(tone(16_000, 0.1, 0.2), 16_000));
+	throwing.queue(encodeWav(tone(16_000, 0.1, 0.2), 16_000));
 	assert.doesNotThrow(() => throwing.play());
-	const silent = createChunkSink(undefined);
-	assert.doesNotThrow(() => silent.queue(Buffer.from("not a wav")));
-	assert.doesNotThrow(() => silent.play());
+	assert.equal(written.length, 2, "a failing consumer never holds the next chunk back");
+	const broken = createPlayerFeed({ write: () => { throw new Error("closed"); }, end: () => { throw new Error("closed"); }, onChunk: () => { throw new Error("consumer failed"); } });
+	assert.doesNotThrow(() => {
+		broken.queue(encodeWav(tone(16_000, 0.1, 0.2), 16_000));
+		broken.play();
+		broken.close();
+	});
+	const silent = createPlayerFeed({ write: () => {}, end: () => {} });
+	assert.doesNotThrow(() => {
+		silent.queue(Buffer.from("not a wav"));
+		silent.play();
+		silent.close();
+	});
 });

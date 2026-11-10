@@ -119,36 +119,103 @@ export function wavLevels(wav: Buffer, frameMs = VOICE_SPEECH_FRAME_MS): VoiceSp
 	return { frameMs, durationMs: Math.round((samples.length / sampleRate) * 1000), levels };
 }
 
-// The chunks a player still owes: an engine queues one per WAV line it writes,
-// and every marker shifts exactly one off the front, so each chunk is reported
-// when it really begins playing, in the order it was queued. With no callback
-// nothing is measured or reported.
-export interface ChunkSink {
+// The chunks the player owes, and the line it is fed: one WAV at a time. An
+// engine queues each chunk as it is synthesized and the feed writes it to the
+// player, but only when the player is free, that is, only after it reported it
+// began the previous one (the very first chunk goes out at once, so a reading
+// never waits for itself). This is not pacing: nothing is measured here.
+//
+// It is what keeps the report on time. Under WSL the Windows player's input and
+// output travel over one interop relay, and while that relay still has chunk
+// bytes to deliver into the player's stdin it does not pass on the marker the
+// player wrote. A player fed several chunks ahead therefore reports each one a
+// chunk late, and the audio it names has already been heard: measured here with
+// four 4 s chunks written up front, the first marker reached Node about 4.1 s
+// after it was written, the rest arrived in pairs as the player drew them in,
+// while the same player fed one chunk at a time reported every marker within
+// 20 ms. With one chunk in the player, the relay has nothing left to deliver
+// when the player writes its marker.
+//
+// With no onChunk nothing is measured or reported, and the feed still paces the
+// writes, so a session that follows no events behaves the same way.
+export interface PlayerFeed {
+	// A chunk is synthesized: measured now and written when the player is free.
 	queue(wav: Buffer): void;
+	// The player began the chunk it was last given.
 	play(): void;
+	// No more chunks are coming: the input ends once every one was written.
+	close(): void;
 }
 
-export function createChunkSink(onChunk?: (chunk: VoiceSpeechChunk) => void): ChunkSink {
-	if (!onChunk) return { queue: () => {}, play: () => {} };
-	const queued: VoiceSpeechChunk[] = [];
+export interface PlayerFeedOptions {
+	// Sends one base64 WAV line the player reads and plays.
+	write(line: string): void;
+	// Ends the player's input, so it stops after the last chunk it plays.
+	end(): void;
+	onChunk?: (chunk: VoiceSpeechChunk) => void;
+}
+
+export function createPlayerFeed(options: PlayerFeedOptions): PlayerFeed {
+	const waiting: Array<{ line: string; chunk?: VoiceSpeechChunk }> = [];
+	// The chunk the player has but did not begin yet: its marker releases the
+	// next write and reports it.
+	let inflight: { chunk?: VoiceSpeechChunk } | undefined;
+	let closing = false;
+	let ended = false;
+	const endOnce = () => {
+		if (ended) return;
+		ended = true;
+		try {
+			options.end();
+		} catch {
+			/* a player that is already gone never breaks the reading */
+		}
+	};
+	const flush = () => {
+		if (!inflight && waiting.length > 0) {
+			const next = waiting.shift()!;
+			inflight = { chunk: next.chunk };
+			try {
+				options.write(next.line);
+			} catch {
+				/* a player that cannot be written to never breaks the reading */
+			}
+		}
+		// The input ends behind the last chunk, so the player reads it whole and
+		// stops after playing it.
+		if (closing && waiting.length === 0) endOnce();
+	};
 	return {
 		queue(wav) {
-			try {
-				queued.push(wavLevels(wav));
-			} catch {
-				// A chunk that cannot be measured is still played; it is reported
-				// with no loudness rather than not at all.
-				queued.push({ frameMs: VOICE_SPEECH_FRAME_MS, durationMs: 0, levels: [] });
+			let chunk: VoiceSpeechChunk | undefined;
+			if (options.onChunk) {
+				try {
+					chunk = wavLevels(wav);
+				} catch {
+					// A chunk that cannot be measured is still played; it is reported
+					// with no loudness rather than not at all.
+					chunk = { frameMs: VOICE_SPEECH_FRAME_MS, durationMs: 0, levels: [] };
+				}
 			}
+			waiting.push({ line: `${wav.toString("base64")}\n`, chunk });
+			flush();
 		},
 		play() {
-			const next = queued.shift();
-			if (!next) return;
-			try {
-				onChunk(next);
-			} catch {
-				/* the event is advisory: a consumer never breaks the player */
+			const started = inflight;
+			if (!started) return;
+			inflight = undefined;
+			if (started.chunk) {
+				try {
+					options.onChunk?.(started.chunk);
+				} catch {
+					/* the event is advisory: a consumer never breaks the player */
+				}
 			}
+			flush();
+		},
+		close() {
+			closing = true;
+			flush();
 		},
 	};
 }
