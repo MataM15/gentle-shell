@@ -215,3 +215,30 @@ test("open is two short rising notes with a gap; close is one longer falling not
 	assert.equal(open.readInt16LE(middle), 0, "the open cue has a silent gap between its notes");
 	assert.equal(peak(cueTones(0.3).open) <= 0.3 * 32767 + 1, true, "the volume scales the tones");
 });
+
+test("a warm-up queued before dispose never starts a host", async () => {
+	const { spawn, procs } = fakeSpawn();
+	const backend = createWindowsCueBackend({ powershell: "ps.exe", sounds: SOUNDS, spawn, timeoutMs: 50 });
+	const slow = backend.play("open");
+	backend.warm();
+	backend.dispose();
+	await slow.catch(() => {});
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.ok(procs.length <= 1, "only the host of the cue already in flight may exist");
+	assert.ok(procs.every((proc) => proc.ended || proc.killed), "no host outlives dispose");
+});
+
+test("a retired host that exits late never fails the cue its replacement is playing", async () => {
+	let holdPlay = false;
+	const { spawn, procs } = fakeSpawn((line) => (holdPlay && line.startsWith("play") ? undefined : `ok ${line.split(" ").slice(0, 2).join(" ")}`));
+	const backend = createWindowsCueBackend({ powershell: "ps.exe", sounds: SOUNDS, spawn, timeoutMs: 40 });
+	holdPlay = true;
+	await assert.rejects(backend.play("open"), "the first host times out and is stopped");
+	holdPlay = false;
+	const second = backend.play("close");
+	await new Promise((resolve) => setImmediate(resolve));
+	procs[0]!.exit(1);
+	await second;
+	assert.equal(procs.length, 2);
+	backend.dispose();
+});

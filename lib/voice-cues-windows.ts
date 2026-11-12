@@ -73,7 +73,9 @@ export function createWindowsCueBackend(options: WindowsCueOptions): WindowsCueB
 	const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 	const idleMs = options.idleMs ?? DEFAULT_IDLE_MS;
 	let host: { proc: Proc; alive: boolean } | undefined;
-	let waiting: { expect: string; resolve: () => void; reject: (error: Error) => void } | undefined;
+	// The command in flight and the host it was sent to: a host that already
+	// retired never settles a command sent to its replacement.
+	let waiting: { host: object; expect: string; resolve: () => void; reject: (error: Error) => void } | undefined;
 	let queue: Promise<void> = Promise.resolve();
 	let idle: ReturnType<typeof setTimeout> | undefined;
 	let disposed = false;
@@ -101,7 +103,7 @@ export function createWindowsCueBackend(options: WindowsCueOptions): WindowsCueB
 			while ((newline = buffered.indexOf("\n")) !== -1) {
 				const line = buffered.slice(0, newline).trim();
 				buffered = buffered.slice(newline + 1);
-				if (!line || !waiting) continue;
+				if (!line || waiting?.host !== current) continue;
 				const pending = waiting;
 				waiting = undefined;
 				if (line === pending.expect) pending.resolve();
@@ -113,9 +115,10 @@ export function createWindowsCueBackend(options: WindowsCueOptions): WindowsCueB
 		const gone = () => {
 			current.alive = false;
 			if (host === current) host = undefined;
+			if (waiting?.host !== current) return;
 			const pending = waiting;
 			waiting = undefined;
-			pending?.reject(new Error("cue host exited"));
+			pending.reject(new Error("cue host exited"));
 		};
 		proc.once("exit", gone);
 		proc.once("error", gone);
@@ -125,11 +128,12 @@ export function createWindowsCueBackend(options: WindowsCueOptions): WindowsCueB
 	const command = (current: NonNullable<typeof host>, line: string, expect: string) =>
 		new Promise<void>((resolve, reject) => {
 			const timer = setTimeout(() => {
-				waiting = undefined;
+				if (waiting?.host === current) waiting = undefined;
 				retire(current, true);
 				reject(new Error("cue host timed out"));
 			}, timeoutMs);
 			waiting = {
+				host: current,
 				expect,
 				resolve: () => {
 					clearTimeout(timer);
@@ -174,6 +178,7 @@ export function createWindowsCueBackend(options: WindowsCueOptions): WindowsCueB
 		warm: () => {
 			if (disposed) return;
 			void serial(async () => {
+				if (disposed) return;
 				await ensureLoaded(start());
 				armIdle();
 			}).catch(() => {});

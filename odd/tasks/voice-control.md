@@ -19,7 +19,7 @@ Base: `personal/main` @ `e815d8936`. Worktree `gentle-shell-worktrees/voice-cont
 
 | ID | Specs | Route | Commit |
 |---|---|---|---|
-| T1 | S1, S10 | gentle-ai-worker (background) | pending |
+| T1 | S1, S10 | inline (writer guard refused); review review-65c2ada4ac9c2f95 approved | `2930b193d`, follow-up fix in the next commit |
 | T2 | S3 | gentle-ai-worker research, scratch only (background) | pending |
 | T3 | S2, S4, S10 | after T1 | pending |
 | T4 | S5 | after T3 | pending |
