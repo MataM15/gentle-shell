@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { chmodSync, lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, linkSync, lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 import {
@@ -204,8 +204,12 @@ export function clearStaleListenerSocket(path: string): void {
 
 export type ListenerLog = (event: string, fields?: Record<string, unknown>) => void;
 
+// A focus lookup has three outcomes: a pane, nobody focused, and a failed lookup
+// (never "nobody focused": it fails closed).
+export type ListenerFocusResult = { readonly focused: string | undefined } | { readonly failed: true };
+
 export interface ListenerFocus {
-	focusedPaneId(): Promise<string | undefined>;
+	focusedPaneId(): Promise<ListenerFocusResult>;
 }
 
 interface Client {
@@ -225,14 +229,15 @@ export interface VoiceListenerOptions {
 	pid?: number;
 	now?: () => number;
 	log?: ListenerLog;
-	// Focus comes from herdr; a failure or a changed shape focuses nothing, so
-	// nothing is delivered and no microphone is opened for a guess.
+	// Focus comes from herdr; a failed or malformed lookup is not "nobody
+	// focused", so the transcript is dropped instead of guessed.
 	focus?: ListenerFocus;
 	idleMs?: number;
 	asleepIdleMs?: number;
+	heartbeatMs?: number;
 }
 
-const noFocus: ListenerFocus = { focusedPaneId: async () => undefined };
+const noFocus: ListenerFocus = { focusedPaneId: async () => ({ focused: undefined }) };
 
 const withId = <T extends object>(frame: T, id?: string): T => (id === undefined ? frame : ({ ...frame, id } as T));
 
@@ -244,12 +249,15 @@ export class VoiceListener {
 	private readonly log: ListenerLog;
 	private readonly idleMs: number;
 	private readonly asleepIdleMs: number;
+	private readonly heartbeatMs: number;
 	private server: Server | undefined;
 	private readonly clients = new Map<Socket, Client>();
 	private currentState: ListenerState = "asleep";
 	private heartbeat: ReturnType<typeof setInterval> | undefined;
 	private idleTimer: ReturnType<typeof setTimeout> | undefined;
 	private closing = false;
+	private fenced = false;
+	private boundInode: number | undefined;
 	private closed: Promise<void> | undefined;
 
 	constructor(options: VoiceListenerOptions) {
@@ -260,6 +268,7 @@ export class VoiceListener {
 		this.log = options.log ?? (() => {});
 		this.idleMs = options.idleMs ?? LISTENER_IDLE_MS;
 		this.asleepIdleMs = options.asleepIdleMs ?? LISTENER_ASLEEP_IDLE_MS;
+		this.heartbeatMs = options.heartbeatMs ?? LISTENER_HEARTBEAT_MS;
 	}
 
 	get state(): ListenerState {
@@ -277,17 +286,32 @@ export class VoiceListener {
 		ensureDir(this.paths.dir);
 		this.takeLock();
 		clearStaleListenerSocket(this.paths.socket);
+		// Bind a private name and publish the shared one as a second link to the same
+		// socket: the runtime unlinks the path it bound at close, which after a
+		// takeover holds the replacement's socket.
+		const bound = join(this.paths.dir, `.bind-${this.pid}`);
+		clearStaleListenerSocket(bound);
 		const server = createServer((socket) => this.accept(socket));
 		this.server = server;
 		await new Promise<void>((resolve, reject) => {
 			server.once("error", reject);
-			server.listen(this.paths.socket, () => {
+			server.listen(bound, () => {
 				server.off("error", reject);
 				resolve();
 			});
 		});
-		chmodSync(this.paths.socket, 0o600);
-		const heartbeat = setInterval(() => refreshListenerLock(this.paths, { pid: this.pid }), LISTENER_HEARTBEAT_MS);
+		chmodSync(bound, 0o600);
+		try {
+			linkSync(bound, this.paths.socket);
+		} finally {
+			unlinkSync(bound);
+		}
+		this.boundInode = lstatSync(this.paths.socket).ino;
+		const heartbeat = setInterval(() => {
+			if (refreshListenerLock(this.paths, { pid: this.pid })) return;
+			// Only a lock body naming another owner fences; a failed write retries.
+			if (readListenerLock(this.paths)?.pid !== this.pid) this.fence();
+		}, this.heartbeatMs);
 		heartbeat.unref?.();
 		this.heartbeat = heartbeat;
 		this.log("listener.listen", { pid: this.pid });
@@ -317,13 +341,31 @@ export class VoiceListener {
 			this.server.close(() => resolve());
 		});
 		await this.closed;
+		// Ownership-aware: after a takeover the socket file belongs to the replacement.
 		try {
-			unlinkSync(this.paths.socket);
+			if (this.ownsSocket()) unlinkSync(this.paths.socket);
 		} catch {
 			/* already gone */
 		}
-		releaseListenerLock(this.paths, { pid: this.pid });
+		if (!this.fenced) releaseListenerLock(this.paths, { pid: this.pid });
 		this.log("listener.exit", { reason });
+	}
+
+	// True while the socket path still resolves to the inode this listener published.
+	private ownsSocket(): boolean {
+		try {
+			return lstatSync(this.paths.socket).ino === this.boundInode;
+		} catch {
+			return false;
+		}
+	}
+
+	// Lost ownership is not ownership: bye, close the server, leave the files alone.
+	private fence(): void {
+		if (this.fenced || this.closing) return;
+		this.fenced = true;
+		this.log("listener.fenced", { pid: this.pid });
+		void this.close("error");
 	}
 
 	// A transcript belongs to the session whose pane is focused when the
@@ -336,7 +378,13 @@ export class VoiceListener {
 			return undefined;
 		}
 		const withPane = clients.filter((client) => client.paneId);
-		const focused = await (this.options.focus ?? noFocus).focusedPaneId();
+		const lookup = await (this.options.focus ?? noFocus).focusedPaneId();
+		if ("failed" in lookup) {
+			// A failed lookup is not an unfocused one: the fallback would be a guess.
+			this.log("transcript.undelivered", { clients: clients.length, focus: "unknown" });
+			return undefined;
+		}
+		const focused = lookup.focused;
 		// A known focused pane decides alone; with nobody focused the single
 		// registered session still counts (design §2.2, §2.3), and anything else is
 		// dropped rather than broadcast.
@@ -445,7 +493,9 @@ export class VoiceListener {
 				client.voiceOn = request.voiceOn;
 				this.log("listener.voice", { sessionId: client.sessionId, voiceOn: request.voiceOn });
 				this.say(client, withId({ type: "ok", request: "set-voice" }, request.id));
-				// L10: voice off from any session turns voice off everywhere.
+				// L10: voice off from any session turns voice off everywhere: every
+				// registered flag is cleared with it, or armIdle never arms the exit.
+				if (!request.voiceOn) for (const other of this.clients.values()) other.voiceOn = false;
 				this.broadcast({ type: "command", command: request.voiceOn ? "voice-on" : "voice-off" });
 				if (!request.voiceOn) this.setState("asleep");
 				this.armIdle();
@@ -581,17 +631,24 @@ export function createHerdrFocus(options: { env?: NodeJS.ProcessEnv; run?: Focus
 	const ttlMs = options.ttlMs ?? FOCUS_CACHE_MS;
 	const now = options.now ?? Date.now;
 	let cached: { at: number; agents: HerdrAgent[] } | undefined;
-	const read = async (): Promise<HerdrAgent[]> => {
+	// Undefined means the lookup failed; an empty list would mean nobody focused.
+	const read = async (): Promise<HerdrAgent[] | undefined> => {
 		if (cached && now() - cached.at < ttlMs) return cached.agents;
 		cached = undefined;
 		try {
 			const agents = parseHerdrAgents(await (options.run ?? runHerdr)(env.HERDR_BIN_PATH?.trim() || "herdr", ["agent", "list"]));
-			if (!agents) return [];
+			if (!agents) return undefined;
 			cached = { at: now(), agents };
 			return agents;
 		} catch {
-			return [];
+			return undefined;
 		}
 	};
-	return { agents: read, focusedPaneId: async () => (await read()).find((agent) => agent.focused)?.paneId };
+	return {
+		agents: async () => (await read()) ?? [],
+		focusedPaneId: async () => {
+			const agents = await read();
+			return agents ? { focused: agents.find((agent) => agent.focused)?.paneId } : { failed: true };
+		},
+	};
 }

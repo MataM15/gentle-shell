@@ -117,12 +117,14 @@ function decode(line: string, specs: Record<string, Spec>): Record<string, unkno
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
 	const record = value as Record<string, unknown>;
 	if (record.schema !== VOICE_LISTENER_SCHEMA || typeof record.type !== "string") return undefined;
+	// Own properties only: "toString" or "constructor" would otherwise reach
+	// Object.prototype and throw out of the caller's socket data handler.
+	if (!Object.hasOwn(specs, record.type)) return undefined;
 	const spec = specs[record.type];
-	if (!spec) return undefined;
 	const declared: Record<string, Kind> = { ...spec.required, ...spec.optional };
 	for (const key of Object.keys(record)) {
 		if (key === "schema" || key === "type") continue;
-		const kind = declared[key];
+		const kind = Object.hasOwn(declared, key) ? declared[key] : undefined;
 		if (!kind || !KINDS[kind](record[key])) return undefined;
 	}
 	for (const key of Object.keys(spec.required)) if (!Object.hasOwn(record, key)) return undefined;

@@ -64,6 +64,12 @@ test("a session id is a bounded identifier", () => {
 	}
 });
 
+test("an inherited property name is neither a type nor a field", () => {
+	for (const type of ["toString", "constructor", "__proto__", "hasOwnProperty"]) assert.equal(parseListenerRequestLine(line({ type })), undefined, type);
+	const hello = { type: "hello", proto: 1, sessionId: "s-1", voiceOn: true };
+	for (const key of ["toString", "constructor", "valueOf"]) assert.equal(parseListenerRequestLine(line({ ...hello, [key]: "x" })), undefined, key);
+});
+
 test("a line over the protocol bound is refused without being parsed", () => {
 	assert.equal(parseListenerRequestLine(`{"pad":"${"x".repeat(LISTENER_MAX_LINE)}"}`), undefined);
 });

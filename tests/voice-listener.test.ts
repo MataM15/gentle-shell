@@ -13,8 +13,9 @@ import {
 	releaseListenerLock,
 	takeListenerLock,
 	VoiceListener,
+	type ListenerFocus,
 } from "../lib/voice-listener.ts";
-import { encodeListenerFrame, parseListenerFrameLine, type ListenerFrame, type ListenerRequest } from "../lib/voice-listener-protocol.ts";
+import { encodeListenerFrame, parseListenerFrameLine, VOICE_LISTENER_SCHEMA, type ListenerFrame, type ListenerRequest } from "../lib/voice-listener-protocol.ts";
 
 // One voice listener for every Pi session (S6, slice A): the single-instance
 // lock, the unix-socket registry, the state edges, focus resolution and the
@@ -89,14 +90,14 @@ interface Started {
 	client(): Promise<Client>;
 }
 
-async function startListener(dir: string, options: { idleMs?: number; asleepIdleMs?: number; focus?: { focusedPaneId(): Promise<string | undefined> } } = {}): Promise<Started> {
+async function startListener(dir: string, options: { idleMs?: number; asleepIdleMs?: number; focus?: ListenerFocus } = {}): Promise<Started> {
 	const events: Array<{ event: string; fields?: Record<string, unknown> }> = [];
 	const listener = new VoiceListener({
 		dir,
 		idleMs: options.idleMs ?? 60_000,
 		asleepIdleMs: options.asleepIdleMs ?? 600_000,
 		log: (event, fields) => events.push({ event, fields }),
-		focus: options.focus ?? { focusedPaneId: async () => undefined },
+		focus: options.focus ?? { focusedPaneId: async () => ({ focused: undefined }) },
 	});
 	await listener.listen();
 	return { listener, events, client: () => connectClient(dir) };
@@ -211,7 +212,7 @@ test("voice off from one session turns voice off everywhere (L10)", async () => 
 });
 
 test("a transcript goes only to the session whose pane is focused", async () => {
-	const started = await startListener(scratch(), { focus: { focusedPaneId: async () => "w1:p2" } });
+	const started = await startListener(scratch(), { focus: { focusedPaneId: async () => ({ focused: "w1:p2" }) } });
 	const first = await started.client();
 	const second = await started.client();
 	const third = await started.client();
@@ -231,7 +232,7 @@ test("a transcript goes only to the session whose pane is focused", async () => 
 
 test("nobody focused: one registered session still gets it, more than one drops it", async () => {
 	const dir = scratch();
-	const started = await startListener(dir, { focus: { focusedPaneId: async () => undefined } });
+	const started = await startListener(dir, { focus: { focusedPaneId: async () => ({ focused: undefined }) } });
 	const single = await started.client();
 	single.hello("s-1", "w1:p1");
 	await waitFor(() => framesOf(single, "welcome").length === 1);
@@ -252,30 +253,90 @@ test("nobody focused: one registered session still gets it, more than one drops 
 test("herdr failing delivers nothing instead of guessing", async () => {
 	const started = await startListener(scratch(), { focus: createHerdrFocus({ env: {}, run: async () => { throw new Error("herdr down"); } }) });
 	const first = await started.client();
-	const second = await started.client();
 	first.hello("s-1", "w1:p1");
+	await waitFor(() => framesOf(first, "welcome").length === 1);
+	assert.equal(await started.listener.deliverTranscript("hola"), undefined, "a failed lookup is not an unfocused one: the only session would be a guess");
+	assert.deepEqual(framesOf(first, "transcript"), []);
+	assert.ok(started.events.some((entry) => entry.event === "transcript.undelivered"), "a dropped transcript is logged");
+	const second = await started.client();
 	second.hello("s-2", "w1:p2");
 	await waitFor(() => framesOf(second, "welcome").length === 1);
 	assert.equal(await started.listener.deliverTranscript("hola"), undefined);
-	assert.deepEqual(framesOf(first, "transcript"), []);
 	assert.deepEqual(framesOf(second, "transcript"), []);
 	first.socket.destroy();
 	second.socket.destroy();
 	await started.listener.close();
 });
 
+test("voice off from one session clears every session's flag so the asleep exit arms (L10)", async () => {
+	const dir = scratch();
+	const started = await startListener(dir, { idleMs: 600_000, asleepIdleMs: 40 });
+	const first = await started.client();
+	const second = await started.client();
+	first.hello("s-1", "w1:p1", true);
+	second.hello("s-2", "w1:p2", true);
+	await waitFor(() => framesOf(first, "welcome").length === 1 && framesOf(second, "welcome").length === 1);
+	await new Promise((resolve) => setTimeout(resolve, 60));
+	assert.deepEqual(framesOf(first, "bye"), [], "two sessions with voice keep the listener alive");
+	first.send({ type: "set-voice", voiceOn: false });
+	await waitFor(() => framesOf(second, "bye").length === 1, 3_000);
+	assert.deepEqual(framesOf(second, "bye")[0], { type: "bye", reason: "idle" }, "asleep with no session asking for voice idles out");
+	await waitFor(() => !existsSync(listenerPaths(dir).socket), 3_000);
+});
+
+test("a frame naming an inherited property gets one error and the listener keeps serving", async () => {
+	const started = await startListener(scratch());
+	const attacker = await started.client();
+	attacker.hello("s-1", "w1:p1");
+	await waitFor(() => framesOf(attacker, "welcome").length === 1);
+	attacker.socket.write(`${JSON.stringify({ schema: VOICE_LISTENER_SCHEMA, type: "toString" })}\n`);
+	await waitFor(() => framesOf(attacker, "error").length === 1);
+	assert.equal((framesOf(attacker, "error")[0] as { code: string }).code, "bad-frame");
+	await attacker.closed;
+	const survivor = await started.client();
+	survivor.hello("s-2", "w1:p2");
+	await waitFor(() => framesOf(survivor, "welcome").length === 1);
+	survivor.socket.destroy();
+	await started.listener.close();
+});
+
+test("a listener that lost the lock stops serving and leaves the replacement reachable", async () => {
+	const dir = scratch();
+	const paths = listenerPaths(dir);
+	const old = new VoiceListener({ dir, pid: 111, heartbeatMs: 20 });
+	await old.listen();
+	const client = await connectClient(dir);
+	client.hello("s-1", "w1:p1");
+	await waitFor(() => framesOf(client, "welcome").length === 1);
+	// A starting listener found the lock stale, took it and bound its own socket.
+	assert.equal(releaseListenerLock(paths, { pid: 111 }), true);
+	const replacement = new VoiceListener({ dir, pid: 222, heartbeatMs: 20 });
+	await replacement.listen();
+	await waitFor(() => framesOf(client, "bye").length === 1, 3_000);
+	assert.deepEqual(framesOf(client, "bye")[0], { type: "bye", reason: "error" }, "a fenced listener stops serving");
+	await client.closed;
+	assert.equal(old.clientCount, 0);
+	await old.close("shutdown");
+	assert.equal(readListenerLock(paths)?.pid, 222, "the fenced listener never removes the replacement's lock");
+	const survivor = await connectClient(dir);
+	survivor.hello("s-2", "w1:p2");
+	await waitFor(() => framesOf(survivor, "welcome").length === 1);
+	assert.deepEqual(framesOf(survivor, "welcome")[0], { type: "welcome", listenerPid: 222, proto: 1, state: "asleep" });
+	await replacement.close();
+});
+
 test("herdr agent list is read once per decision and a changed shape focuses nothing", async () => {
 	const calls: string[][] = [];
 	const agents = JSON.stringify({ result: { agents: [{ pane_id: "w1:p1", focused: false }, { pane_id: "w1:p2", focused: true, agent_status: "idle" }] } });
 	const focus = createHerdrFocus({ env: {}, now: () => 0, ttlMs: 300, run: async (_command, args) => { calls.push(args); return agents; } });
-	assert.equal(await focus.focusedPaneId(), "w1:p2");
-	assert.equal(await focus.focusedPaneId(), "w1:p2");
+	assert.deepEqual(await focus.focusedPaneId(), { focused: "w1:p2" });
+	assert.deepEqual(await focus.focusedPaneId(), { focused: "w1:p2" });
 	assert.equal(calls.length, 1, "one call serves everyone inside the cache window");
 	assert.deepEqual(calls[0], ["agent", "list"]);
 	assert.deepEqual(parseHerdrAgents(agents), [{ paneId: "w1:p1", focused: false, status: undefined }, { paneId: "w1:p2", focused: true, status: "idle" }]);
 	assert.equal(parseHerdrAgents('{"result":{}}'), undefined);
 	assert.equal(parseHerdrAgents('{"result":{"agents":[{"pane_id":1}]}}'), undefined);
-	assert.equal(await createHerdrFocus({ env: {}, run: async () => "not json" }).focusedPaneId(), undefined);
+	assert.deepEqual(await createHerdrFocus({ env: {}, run: async () => "not json" }).focusedPaneId(), { failed: true }, "a malformed answer is a failed lookup, not an unfocused one");
 	const binary: string[] = [];
 	await createHerdrFocus({ env: { HERDR_BIN_PATH: "/opt/herdr" }, run: async (command) => { binary.push(command); return agents; } }).focusedPaneId();
 	assert.deepEqual(binary, ["/opt/herdr"]);
