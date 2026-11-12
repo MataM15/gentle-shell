@@ -355,6 +355,33 @@ alive between recordings (`keepAlive: true` in its start request):
 | Release | The worker closes after 10 idle minutes, when voice is turned off in the session and when the Pi session ends. A cancel or any error ends it, and the next recording starts a fresh one. Dictation that pastes keeps its single-use worker. |
 | Noise | With no speech heard by the end-of-speech detector, the recognizer is not asked at all and the transcript is blank, because Parakeet can turn noise into a word such as "Yeah." that would otherwise be sent. |
 
+## Voice listener (in progress)
+
+One listener per user will own the microphone for every session, so a session
+that is not focused still hears nothing and two panes never record at once.
+This is the skeleton only: it owns the process, the lock and the socket, and it
+opens no microphone yet.
+
+- **Single instance.** The listener binds `listener.sock` in the voice directory
+  and holds `listener.lock` (an exclusive create of the same kind the reading
+  turn uses). A second listener refuses with `voice_listener_busy`; a lock left
+  by a process that is gone, or one whose heartbeat stopped, is taken over.
+- **No session, no listener.** With no client connected it exits after a
+  minute; asleep with no session that has voice on, it ends after ten minutes
+  (turning voice off in any session turns it off everywhere), and it removes its
+  socket and lock on the way out.
+- **Protocol.** `gentle.voice-listener/v1`, JSON on one line each way, at most
+  64 KiB per line. A connection starts with a hello carrying the session id and
+  the herdr pane id, then answers status and reports the state:
+  `asleep`, `listening`, `transcribing`, `reading`.
+- **One target.** A transcript goes only to the session whose pane herdr
+  reports focused when the recording ends; with nobody focused it goes to the
+  single registered session, and otherwise it is dropped and logged. A failed
+  herdr lookup never guesses, so it never opens a microphone for the wrong pane.
+
+Nothing in a session uses it yet: per-session voice keeps working as described
+above.
+
 ## Natural voice with Kokoro
 
 The Windows voice works with no download but sounds robotic. Once the voice

@@ -64,6 +64,9 @@ export const requiredPaths = [
   "lib/voice-kokoro-engine.ts",
   "lib/voice-platform.ts",
   "lib/voice-onecore.ts",
+  "lib/voice-listener.ts",
+  "lib/voice-listener-client.ts",
+  "lib/voice-listener-protocol.ts",
   "lib/voice-presence.ts",
   "lib/voice-reply-speech.ts",
   "lib/voice-robot.ts",
@@ -76,6 +79,9 @@ export const requiredPaths = [
   "scripts/voice-worker.cjs",
   // The natural-voice worker is spawned by path too.
   "scripts/voice-tts-worker.cjs",
+  // The one voice listener is started by path, so only this list would notice
+  // it missing from the packed tarball.
+  "scripts/voice-listener.mjs",
   "docs/voice.md",
   "extensions/gentle-design.ts",
   "lib/gentle-design.ts",
