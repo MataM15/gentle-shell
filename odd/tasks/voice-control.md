@@ -23,7 +23,7 @@ Base: `personal/main` @ `e815d8936`. Worktree `gentle-shell-worktrees/voice-cont
 | T2 | S3 | gentle-ai-worker research | this commit (odd/notes/voice-stt-spanish.md) |
 | T3 | S2, S4, S10 | gentle-ai-worker | this commit |
 | T4 | S5 | after T3 | pending |
-| T5 | S6 | after T4 | pending |
+| T5 | S6 | design odd/notes/voice-listener-design.md (`df4200889`); slices A-C by gentle-ai-worker | pending |
 | T6 | S7 | after T5 | pending |
 | T7 | S8 | after T5 | pending |
 | T8 | S9 | after T2 and T5 | pending |
@@ -39,3 +39,4 @@ Base: `personal/main` @ `e815d8936`. Worktree `gentle-shell-worktrees/voice-cont
 - L7 (evidence): cues `done` in voice-events.log (route/level problem, not playback failure); S2 root cause traced from the log (dictation + Enter = interactive input).
 - L8 (owner, verbatim, answering deaf vs asleep after "Gentle Voice off"): "dormido".
 - L9 (evidence, T2): odd/notes/voice-stt-spanish.md — Whisper base int8 with language "es" recommended (153 MiB, 1.7 s load, no language flips); a Spanish-pinned model cannot read "Gentle Voice off". Owner choice between A (English keyword spotter also catches "Gentle Voice off"; dictation in Spanish) and B (Spanish command phrases), verbatim: "A".
+- L10 (owner answers to the listener design questions): (1) asleep after "Gentle Voice off": "Se apaga en todas" — off turns voice off in every session; "Gentle Voice on" wakes the listener and turns voice on for the focused session only (assumption, confirm at T6). (2) "Solo navegar (Recomendado por ahora)" — no spoken prompts to other agents yet. (3) "10 minutos y se apaga (Recomendado)" — asleep with no session that has voice lasts 10 minutes, then off.
