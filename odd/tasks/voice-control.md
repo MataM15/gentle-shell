@@ -14,6 +14,7 @@ Base: `personal/main` @ `e815d8936`. Worktree `gentle-shell-worktrees/voice-cont
 - **S8 — Navigate herdr agents by voice.** Owner: "si el día de mañana, por ejemplo, quiero navegar desde Header mediante vos entre las diferentes agentes que están activos o levantados, me gustaría poder hacerlo". Fixed command list over `herdr agent list/focus`; sending a prompt to another agent asks for confirmation.
 - **S9 — Deliberate English mode.** Owner: "más adelante, un modo inglés que se active a propósito para practicar." Switched on and off on purpose only, never auto-detected; the overlay shows it.
 - **S11 — Confirmation window in conversation mode.** Owner: "me quedo callado, ¿no? Que se quede el texto un segundo. Y si no confirme, bien, si lo envío o no, porque quizá lo quiero borrar." After a hands-free utterance, the transcript shows in the overlay with a short countdown (~3 s): silence sends it; the whole utterance "cancel" discards it. Also: after a reading, if the owner does not answer, the mic falls to asleep and "Gentle Voice on" resumes conversation with auto-send. Out of scope by owner agreement: spoken line breaks, lists or editing (Alt+M + keyboard covers them); "Gentle send" dropped.
+- **S12 — Only the focused session reads aloud.** Owner: "que esperar que la gente me hable cuando está enfocado en la sesión. Bien, porque yo he escuchado que a veces me habla, cuando estoy en otra sesión, me habla desde otra sesión, entonces bueno no puedo prestar atención así." A reply from a session that is not focused in herdr is held, not read; it is read when the owner focuses that session, if it settled less than 10 minutes ago; older ones are not read (the text stays on screen). Owner choice: "Guardar y leer al enfocar (Recomendado)". Done first in the per-session voice, later moved to the listener.
 - **S10 — Safety rules (all phases).** Owner: "evaluando situaciones también, por ejemplo, que pasaría si estoy hablando y por ejemplo, no sé, algo y se activa, o no se activa, cuestiones de seguridad". Voice never runs free text as a command (fixed list only); nothing destructive or publishing by voice; every activation is visible and audible; false activations close on silence and are logged; Alt+M always works as fallback; audio stays local and is not stored. Development probes stay near-silent (peak at most 20 of 32767).
 
 ## Tasks
@@ -24,11 +25,12 @@ Base: `personal/main` @ `e815d8936`. Worktree `gentle-shell-worktrees/voice-cont
 | T2 | S3 | gentle-ai-worker research | this commit (odd/notes/voice-stt-spanish.md) |
 | T3 | S2, S4, S10 | gentle-ai-worker | this commit |
 | T4 | S5 | after T3 | pending |
-| T5 | S6 | design odd/notes/voice-listener-design.md (`df4200889`); slices A-C by gentle-ai-worker | pending |
+| T5 | S6 | design `df4200889`; slice A `dda1e9e31`+`6519fcd7b`, review fix `2d6ed4499` (review-96bf85039fdb322a approved); slices B-C pending | in progress |
 | T6 | S7 | after T5 | pending |
 | T7 | S8 | after T5 | pending |
 | T8 | S9 | after T2 and T5 | pending |
 | T9 | S11 | after T4 and T6 | pending |
+| T10 | S12 | gentle-ai-worker, per-session voice | this commit |
 
 ## Log
 
@@ -43,3 +45,4 @@ Base: `personal/main` @ `e815d8936`. Worktree `gentle-shell-worktrees/voice-cont
 - L9 (evidence, T2): odd/notes/voice-stt-spanish.md — Whisper base int8 with language "es" recommended (153 MiB, 1.7 s load, no language flips); a Spanish-pinned model cannot read "Gentle Voice off". Owner choice between A (English keyword spotter also catches "Gentle Voice off"; dictation in Spanish) and B (Spanish command phrases), verbatim: "A".
 - L10 (owner answers to the listener design questions): (1) asleep after "Gentle Voice off": "Se apaga en todas" — off turns voice off in every session; "Gentle Voice on" wakes the listener and turns voice on for the focused session only (assumption, confirm at T6). (2) "Solo navegar (Recomendado por ahora)" — no spoken prompts to other agents yet. (3) "10 minutos y se apaga (Recomendado)" — asleep with no session that has voice lasts 10 minutes, then off.
 - L11 (owner, verbatim): "No leí más o menos lo que me dijiste, pero bueno, me quedo con la confirmación. Lo que sí, por ejemplo, podría decir alguna palabra o quedarme callado, o por ejemplo, me quedo callado, ¿no? Que se quede el texto un segundo. Y si no confirme, bien, si lo envío o no, porque quizá lo quiero borrar. [...] O por ejemplo, también que pasaría si quiero un salto de línea [...] creo que ya me estoy yendo, se está complejizando mucho, ¿no?" Agreed proposal: one confirmation window (silence sends, "cancel" discards); line breaks/lists stay with Alt+M; owner: "ok dale".
+- L12 (owner, verbatim): "Mira, y otra cosa que también que creo que no pulimos, por ejemplo, que esperar que la gente me hable cuando está enfocado en la sesión. Bien, porque yo he escuchado que a veces me habla, cuando estoy en otra sesión, me habla desde otra sesión, entonces bueno no puedo prestar atención así." Choice: "Guardar y leer al enfocar (Recomendado)"; "dale" to do it now.

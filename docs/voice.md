@@ -174,8 +174,15 @@ without an id is refused too.
 
 In a voice session:
 
-- Every settled reply is read aloud, also while you look at another pane, so a
-  coordinating session can report while you work elsewhere.
+- A settled reply is read aloud only in the pane you are looking at (S12). A
+  session whose pane is not focused in herdr holds its reply instead of reading
+  it, and reads it when you focus that pane, as long as it settled less than ten
+  minutes before; an older one is dropped and never read, and its text stays on
+  screen. Each session keeps only its newest held reply, so a newer one replaces
+  the older, and a new message, voice off and the end of the session drop it
+  too. A focus herdr cannot report counts as focused, so a broken lookup never
+  silences a reply; outside herdr there is one terminal and it counts as
+  focused.
 - Readings from all Pi processes take turns through `reading-turn.json` in the
   voice directory: one reads, the others wait with the footer `Waiting to read
   · esc skip`. A turn left by a process that is gone is taken over, and a
@@ -189,13 +196,14 @@ In a voice session:
 | Topic | Behavior |
 |-------|----------|
 | When | Once a run has settled, with no retry, compaction or queued message left. An aborted run, a delegated child session, RPC and print modes read nothing. |
+| Focus | Only in the pane herdr reports focused, asked when the run settles. A reply that settles in another pane is held (`reading.held`, with its session and size) and read when that pane comes back, with the whole reading below unchanged; one that settled ten minutes earlier is dropped instead (`reading.dropped reason=stale`) and its text stays on screen. Each session keeps only its newest held reply, so a burst of background replies replaces the older one; a new message, voice off, the end of the session and `alt+m` drop it. A focus herdr cannot report counts as focused, so a herdr that is down never silences a reply. |
 | What is read | The text of the last assistant message that has any. Thinking, tool calls and tool results are never read. |
 | What is skipped | Code blocks, table rows, link targets, bare URLs and Markdown markers. A path keeps only its last segment, so `lib/voice-speech.ts` is read as `voice-speech.ts`. List items and headings become separate sentences. A reply is read whole: it streams sentence by sentence, and only a runaway reply is cut, at a sentence boundary after about 8,000 characters. |
 | Voice | Each reply is checked for Spanish or English: Spanish and undecided replies are read by **Microsoft Raul** (es-MX) and English ones by **Microsoft David** (en-US), both through the same robot effect and leveler (see [Robot voice](#robot-voice)). No other voice reads a reply. |
 | Rate | `GENTLE_PI_VOICE_RATE_ES` and `GENTLE_PI_VOICE_RATE_EN` are one speech-rate multiplier per language: `1` (the default) keeps the voice's own pace, `0.5` is the slowest and `2` the fastest, and anything else reads as `1`. English can be slowed down without touching Spanish (`GENTLE_PI_VOICE_RATE_EN=0.6`). It reaches the synthesizer as its own `SpeakingRate`, and it is read when the session builds its voice chain, so a change applies to the next session. |
 | Volume | `GENTLE_PI_VOICE_VOLUME` turns the reply down, from `0` (silent) to `1` (full, the default), for example `0.8` for a fifth quieter. It scales the reply's own audio, so the machine's volume and every other sound stay as they are: the robot voice scales the samples before the player gets them. A value that is not a number from 0 to 1 reads as full volume, so a typo never mutes a reply or makes it louder. It is read when the session builds its voice chain, so a change applies to the next session. |
 | Retry | A failure before any of the reply was heard (a missing voice, a synthesizer that did not start, a timeout) is read again once from the start by the same voice. A second failure ends the reading with `error` and the voice's one fixed message: there is no fallback to Miro, Kokoro or the plain Windows voice. A failure after part of the reply was heard stops there, so the reply is never repeated from the start. |
-| Stop | Esc stops the reading and is consumed, so it never reaches the editor or the agent. **Stop reading** in `/gentle:voice` does the same. Your own message, typed or spoken, stops it too. A run that a background notice or another extension starts does not: its reply waits until the reading ends, and only the newest reply waits. Esc, Stop reading and your own message also drop the waiting reply. |
+| Stop | Esc stops the reading and is consumed, so it never reaches the editor or the agent. **Stop reading** in `/gentle:voice` does the same. Your own message, typed or spoken, stops it too. A run that a background notice or another extension starts does not: its reply waits until the reading ends, and only the newest reply waits. Esc, Stop reading, voice off, the end of the session and your own message also drop the waiting and the held reply. |
 | Talk over it | The dictation shortcut (`alt+m`) stops the reading and starts a dictation at once. |
 | Footer | `Reading reply · esc stop · alt+m talk` while it reads. No reading state is published on the voice-state event; the speech event below covers what is playing. |
 | Process | Each reading runs two PowerShell processes with fixed scripts; the reply goes only through standard input, as base64 JSON, never as an argument. PowerShell takes about 1.5 seconds to start before the voice is heard. Of its output, only the one word the player writes before each line it plays is read, to report that chunk as it starts; everything else is discarded and a failure shows one fixed message. Each chunk is written to it only after it reported the previous one began, because its input and output share one relay. A reading is killed after 60 seconds plus about 0.15 second per character. |
@@ -238,7 +246,7 @@ aloud, and the microphone reopens. It needs voice dictation installed.
 |-------|----------|
 | Start | Press `alt+m` and speak. Recording ends by itself after 2.5 seconds of quiet that follows speech, room to think between sentences, so no second press is needed. |
 | Send | The transcript is sent as the next prompt, never pasted. Whatever is in the draft goes with it, draft first, then a blank line and the transcript, and the draft is cleared: a pasted image is a file path in the draft, so it is sent exactly as a typed submit would send it. A blank draft sends the transcript alone; a turn that hears nothing sends nothing and keeps the draft. While the agent is still busy it is queued as a follow-up instead of interrupting the run. |
-| The loop | When the reply to something you said has been read to the end, the microphone reopens the same way, but only in the pane herdr reports focused (`herdr pane get`, from `HERDR_PANE_ID`); outside herdr the pane counts as focused. In another pane it stays closed with "Conversation paused in this pane. Press alt+m to talk." A reply with nothing readable reopens it too. A reply to a typed message is read but never reopens the microphone. The spoken turn stays pending until the microphone reopens, so a run that a background notice starts, and that cuts the reading, does not lose it: the next reply reopens the microphone. Typing a message, Stop reading and a failed reading end the spoken turn. Esc on a reading skips the rest of it and reopens the microphone after a spoken turn, exactly as reading it to the end does (recorded as `outcome=skipped`, `mic.reopen result=opened`); esc on the reading of a typed message stops it and leaves the microphone closed, because a typed turn has nothing to answer. A failed herdr lookup keeps it closed. |
+| The loop | When the reply to something you said has been read to the end, the microphone reopens the same way, but only in the pane herdr reports focused (`herdr pane get`, from `HERDR_PANE_ID`); outside herdr the pane counts as focused. In another pane it stays closed with "Conversation paused in this pane. Press alt+m to talk." A reply that settled while you were in another pane is held and read when you come back to this one (see [Reading replies](#reading-replies)), and it reopens the microphone by the same rule once it is read. A reply with nothing readable reopens it too. A reply to a typed message is read but never reopens the microphone. The spoken turn stays pending until the microphone reopens, so a run that a background notice starts, and that cuts the reading, does not lose it: the next reply reopens the microphone. Typing a message, Stop reading and a failed reading end the spoken turn. Esc on a reading skips the rest of it and reopens the microphone after a spoken turn, exactly as reading it to the end does (recorded as `outcome=skipped`, `mic.reopen result=opened`); esc on the reading of a typed message stops it and leaves the microphone closed, because a typed turn has nothing to answer. A failed herdr lookup keeps it closed. |
 | Dictated turn | A message whose text came from a dictation counts as a spoken turn too. A dictation inserts its transcript into the editor; when you then send that message with Enter, Pi reports it as an ordinary interactive message, and the reply is still read aloud **and** reopens the microphone, exactly like a hands-free turn. The rule is conservative: the message counts as spoken only while the transcript this session inserted is still in it, so editing the dictation away or typing a message of your own leaves a read-only typed turn, which never reopens the microphone. Each dictation answers for one turn; after that the microphone does not reopen for a later typed message. |
 | Spoken commands | A whole utterance from a fixed list runs a command instead of being sent; see [Spoken commands](#spoken-commands). |
 | Pause | Esc while listening cancels the recording and pauses the conversation. Esc while the reply to something you said is read skips the rest of the reading and reopens the microphone, so you can correct what you already heard; `alt+m` then closes it without sending. Esc on the reading of a typed message stops it and leaves the microphone closed. Stopping it with `alt+m` before saying anything also pauses it, with "Conversation paused. Press alt+m to talk." With no speech within 8 seconds, it pauses with "Conversation paused: no speech was heard. Press alt+m to talk." Press `alt+m` to go on. |
@@ -380,7 +388,8 @@ opens no microphone yet.
   herdr lookup never guesses, so it never opens a microphone for the wrong pane.
 
 Nothing in a session uses it yet: per-session voice keeps working as described
-above.
+above. A reply is read only in the focused pane (S12) inside each session for
+now; the listener takes that decision over once it owns the reading.
 
 ## Natural voice with Kokoro
 
@@ -459,7 +468,8 @@ the license; nothing is fetched before you accept.
 Every voice session appends one JSON line per voice event to
 `voice-events.log` in the voice directory (`~/.pi/gentle-ai/voice/`): typed or
 spoken input, a spoken turn sent, a reply settled, a reading started and how it
-ended, and each microphone reopen decision with its reason (`opened`, or
+ended, a reply held for the focus or dropped instead of read, and each
+microphone reopen decision with its reason (`opened`, or
 skipped for `not-focused`, `no-spoken-turn`, `voice-off`, `reading-cancelled`,
 `reading-error`, `dictation-running`, `voice-busy`), each microphone cue
 with its `name`, `outcome` (`done`, `failed`, `unavailable`), latency, the mode that asked for it and, after a reading, `sinceReadingMs`, and each spoken command
@@ -485,6 +495,14 @@ A reading that is retried and then fails writes `reading.start`,
 `reading.retry` and one `reading.end { outcome: "error", failure }` naming the
 voice that failed. The speech event's `engine` field carries the same voice name,
 so a subscriber sees who speaks and the log says why.
+
+A reply the focus moved away from is logged instead of read, so a session that
+did not speak can be explained afterwards:
+
+| Event | Fields |
+|-------|--------|
+| `reading.held` | `session` and `chars`: the reply settled while another pane had the focus. Written again when a newer reply replaces it. |
+| `reading.dropped` | `session` and `reason` (`stale`, the only one today): the held reply settled more than ten minutes before and is never read. |
 
 ## What gets downloaded
 

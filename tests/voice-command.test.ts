@@ -5,7 +5,8 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import gentleVoice from "../extensions/gentle-voice.ts";
 import { VoiceInstallError, type VoiceInstallProgress, type VoiceInstallResult } from "../lib/voice-install.ts";
 import { VoiceSessionError, type VoiceSessionState, type VoiceTranscript } from "../lib/voice-session.ts";
-import { VOICE_COMMAND_NAME, type VoiceCommandDeps, type VoiceDictation } from "../lib/voice-command.ts";
+import { HELD_REPLY_POLL_MS, HELD_REPLY_STALE_MS, VOICE_COMMAND_NAME, type VoiceCommandDeps, type VoiceDictation } from "../lib/voice-command.ts";
+import type { PaneFocus } from "../lib/voice-presence.ts";
 import type { CuePlayer } from "../lib/voice-cues.ts";
 import type { PushToTalkTimers } from "../lib/voice-push-to-talk.ts";
 import { createRetrySpeechEngine, createWindowsSpeechEngine, SpeechEngineError, type SpeechEngine, type SpeechOptions, type SpeechOutcome } from "../lib/voice-speech.ts";
@@ -201,7 +202,7 @@ interface Harness {
 	installs: Array<{ kind: string; options: Record<string, unknown> }>;
 	settings: { enabled: boolean; reads: number; writes: boolean[] };
 	voice: { sessions: string[]; writes: string[][] };
-	focus: { focused: boolean; asks: number };
+	focus: { state: PaneFocus; asks: number };
 	turn: { held: boolean; waiting: Array<() => void>; acquired: number; released: number };
 	warmReleases: number;
 	cues: string[];
@@ -211,7 +212,7 @@ interface Harness {
 	clock: ReturnType<typeof manualClock>;
 }
 
-function harness(overrides: { platform?: string; arch?: string; installed?: boolean; install?: (kind: "runtime" | "model", options: { signal: AbortSignal; onProgress(progress: VoiceInstallProgress): void }) => Promise<VoiceInstallResult>; env?: NodeJS.ProcessEnv; pushToTalk?: boolean; voice?: boolean; focused?: boolean; turnHeld?: boolean; engine?: SpeechEngine; kokoro?: "installed" | "missing"; kokoroInstall?: () => Promise<void>; miro?: "installed" | "missing"; cues?: CuePlayer } = {}): Harness {
+function harness(overrides: { platform?: string; arch?: string; installed?: boolean; install?: (kind: "runtime" | "model", options: { signal: AbortSignal; onProgress(progress: VoiceInstallProgress): void }) => Promise<VoiceInstallResult>; env?: NodeJS.ProcessEnv; pushToTalk?: boolean; voice?: boolean; focus?: PaneFocus; holdPollMs?: number; holdStaleMs?: number; turnHeld?: boolean; engine?: SpeechEngine; kokoro?: "installed" | "missing"; kokoroInstall?: () => Promise<void>; miro?: "installed" | "missing"; cues?: CuePlayer } = {}): Harness {
 	const calls: string[] = [];
 	const sessions: FakeSession[] = [];
 	const endpoints: Harness["endpoints"] = [];
@@ -221,7 +222,7 @@ function harness(overrides: { platform?: string; arch?: string; installed?: bool
 	const settings = { enabled: overrides.pushToTalk ?? false, reads: 0, writes: [] as boolean[] };
 	// Spoken replies are faked too: no test reaches PowerShell or the config home.
 	const voice: Harness["voice"] = { sessions: overrides.voice ? ["session-alpha"] : [], writes: [] };
-	const focus: Harness["focus"] = { focused: overrides.focused ?? true, asks: 0 };
+	const focus: Harness["focus"] = { state: overrides.focus ?? "focused", asks: 0 };
 	const turn: Harness["turn"] = { held: overrides.turnHeld ?? false, waiting: [], acquired: 0, released: 0 };
 	const harnessRef = { warmReleases: 0, cues: [] as string[], events: [] as Array<{ event: string } & Record<string, unknown>> };
 	const kokoro: Harness["kokoro"] = { state: overrides.kokoro ?? "missing", installs: [] };
@@ -268,7 +269,14 @@ function harness(overrides: { platform?: string; arch?: string; installed?: bool
 			read: () => [...voice.sessions],
 			write: (next) => { voice.writes.push([...next]); voice.sessions = [...next]; },
 		},
-		paneFocused: async () => { focus.asks++; return focus.focused; },
+		// Both questions go to the same fake herdr; the reading gate also uses the
+		// third answer, "unknown" (S12).
+		paneFocused: async () => { focus.asks++; return focus.state === "focused"; },
+		paneFocus: async () => { focus.asks++; return focus.state; },
+		// A held reply is polled quickly here; the window stays the real one unless a
+		// test needs it to run out.
+		holdPollMs: overrides.holdPollMs ?? 5,
+		holdStaleMs: overrides.holdStaleMs ?? HELD_REPLY_STALE_MS,
 		releaseWarm: async () => { harnessRef.warmReleases++; },
 		log: (event, fields) => { harnessRef.events.push({ event, ...fields }); },
 		cues: overrides.cues ?? { play: (name) => { harnessRef.cues.push(name); return Promise.resolve({ name, outcome: "done" as const, ms: 12 }); }, warm: () => { harnessRef.cues.push("warm"); }, dispose: () => { harnessRef.cues.push("dispose"); } },
@@ -1611,6 +1619,139 @@ test("Esc on a reading also drops the reply waiting behind it", async () => {
 	assert.equal(readings.length, 1);
 });
 
+// --- only the focused pane reads aloud (S12) ---------------------------------------------
+
+// A held reply is polled every few milliseconds here so a test never waits for
+// the real interval; the ten-minute window stays the real one unless it is the
+// subject.
+test("the held window is ten minutes and the poll is a modest interval", async () => {
+	assert.equal(HELD_REPLY_STALE_MS, 600_000);
+	assert.ok(HELD_REPLY_POLL_MS >= 1_000 && HELD_REPLY_POLL_MS <= 2_000, `${HELD_REPLY_POLL_MS} ms`);
+});
+
+test("a reply in the focused pane is read at once and never held", async () => {
+	const { engine, readings } = fakeEngine();
+	const h = harness({ voice: true, engine });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	await settleReply(pi, ui.ctx, "Respuesta al panel enfocado.");
+	await until(() => readings.length === 1);
+	assert.equal(readings[0]!.text, "Respuesta al panel enfocado.");
+	assert.equal(h.events.some((entry) => entry.event === "reading.held"), false);
+});
+
+test("a reply from a pane without the focus is held, then read when that pane is focused", async () => {
+	const { engine, readings } = fakeEngine();
+	const h = harness({ voice: true, engine, focus: "unfocused" });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	await settleReply(pi, ui.ctx, "Terminé lo que pediste.");
+	await until(() => h.events.some((entry) => entry.event === "reading.held"));
+	await new Promise((resolve) => setTimeout(resolve, 30));
+	assert.equal(readings.length, 0, "nothing is read while the owner looks at another pane");
+	const held = h.events.find((entry) => entry.event === "reading.held")!;
+	assert.deepEqual([held.session, held.chars], ["session-alpha", "Terminé lo que pediste.".length]);
+	assert.equal(JSON.stringify(h.events).includes("Terminé"), false, "the held text is never logged");
+	assert.equal(ui.terminal.subscribes, 0, "no reading, so no Esc listener either");
+	h.focus.state = "focused";
+	await until(() => readings.length === 1);
+	assert.equal(readings[0]!.text, "Terminé lo que pediste.", "the held reply is read when the pane comes back");
+	assert.equal(ui.terminal.subscribes, 1, "it is an ordinary reading: esc skips it");
+});
+
+test("only the newest held reply is kept, and focusing reads that one", async () => {
+	const { engine, readings } = fakeEngine();
+	const h = harness({ voice: true, engine, focus: "unfocused" });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	await settleReply(pi, ui.ctx, "Primera guardada.");
+	await settleReply(pi, ui.ctx, "Segunda guardada.");
+	await until(() => h.events.filter((entry) => entry.event === "reading.held").length === 2);
+	assert.equal(readings.length, 0);
+	h.focus.state = "focused";
+	await until(() => readings.length === 1);
+	assert.equal(readings[0]!.text, "Segunda guardada.", "the older held reply is gone");
+	await new Promise((resolve) => setTimeout(resolve, 30));
+	assert.equal(readings.length, 1, "and it is never read later");
+});
+
+test("a held reply older than ten minutes is dropped and never read", async () => {
+	const { engine, readings } = fakeEngine();
+	const h = harness({ voice: true, engine, focus: "unfocused", holdStaleMs: 20 });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	await settleReply(pi, ui.ctx, "Respuesta que ya no importa.");
+	await until(() => h.events.some((entry) => entry.event === "reading.dropped"));
+	const dropped = h.events.find((entry) => entry.event === "reading.dropped")!;
+	assert.deepEqual([dropped.session, dropped.reason], ["session-alpha", "stale"]);
+	h.focus.state = "focused";
+	await new Promise((resolve) => setTimeout(resolve, 30));
+	assert.equal(readings.length, 0, "the stale reply is not read on focus");
+	assert.equal(JSON.stringify(h.events).includes("ya no importa"), false, "the dropped text is never logged");
+});
+
+test("a new message drops the held reply instead of reading it later", async () => {
+	const { engine, readings } = fakeEngine();
+	const h = harness({ voice: true, engine, focus: "unfocused" });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	await settleReply(pi, ui.ctx, "Respuesta guardada.");
+	await until(() => h.events.some((entry) => entry.event === "reading.held"));
+	await pi.fire("input", ui.ctx, { type: "input", text: "sigo yo", source: "interactive" });
+	h.focus.state = "focused";
+	await new Promise((resolve) => setTimeout(resolve, 30));
+	assert.equal(readings.length, 0, "the owner moved on");
+});
+
+test("turning voice off drops the held reply", async () => {
+	const { engine, readings } = fakeEngine();
+	const h = harness({ voice: true, engine, focus: "unfocused", installed: true });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	await settleReply(pi, ui.ctx, "Respuesta guardada.");
+	await until(() => h.events.some((entry) => entry.event === "reading.held"));
+	await run(pi, fakeContext({ select: pick(/^Voice in this session \(on\): turn off$/) }));
+	assert.deepEqual(h.voice.sessions, [], "voice is off");
+	h.focus.state = "focused";
+	await new Promise((resolve) => setTimeout(resolve, 30));
+	assert.equal(readings.length, 0);
+});
+
+test("the end of the session drops the held reply and stops the poll", async () => {
+	const { engine, readings } = fakeEngine();
+	const h = harness({ voice: true, engine, focus: "unfocused" });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	await settleReply(pi, ui.ctx, "Respuesta guardada.");
+	await until(() => h.events.some((entry) => entry.event === "reading.held"));
+	await pi.fire("session_shutdown", ui.ctx);
+	const asked = h.focus.asks;
+	h.focus.state = "focused";
+	await new Promise((resolve) => setTimeout(resolve, 30));
+	assert.equal(readings.length, 0);
+	assert.equal(h.focus.asks, asked, "nothing polls for a session that is gone");
+});
+
+// A herdr that cannot answer never silences a reply: it keeps reading it, as it
+// did before the focus decided anything.
+test("a focus herdr cannot report keeps reading the reply at once", async () => {
+	const { engine, readings } = fakeEngine();
+	const h = harness({ voice: true, engine, focus: "unknown" });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	await settleReply(pi, ui.ctx, "Respuesta sin foco conocido.");
+	await until(() => readings.length === 1);
+	assert.equal(h.events.some((entry) => entry.event === "reading.held"), false);
+});
+
 test("an engine failure is reported once with its fixed message", async () => {
 	const { engine, readings } = fakeEngine();
 	const h = harness({ voice: true, engine });
@@ -1878,21 +2019,23 @@ test("a reply to a typed message is read but does not reopen the microphone", as
 	await until(() => ui.statuses.at(-1) === undefined);
 	await tick();
 	assert.equal(h.sessions.length, 0);
-	assert.equal(h.focus.asks, 0, "herdr is not even asked");
+	assert.equal(h.focus.asks, 1, "herdr is asked once, for the reading, and never for the microphone");
 });
 
-test("in a pane that is not focused the reply is read but the microphone stays closed", async () => {
+test("in a pane that lost the focus the reply is still read but the microphone stays closed", async () => {
 	const { engine, readings } = fakeEngine();
 	const h = harness({ installed: true, engine, voice: true });
 	const pi = register(h);
 	const ui = fakeContext();
 	await pi.fire("session_start", ui.ctx);
 	await talk(pi, h, ui.ctx, "hola");
-	h.focus.focused = false;
-	await settleReply(pi, ui.ctx, "Te respondo aunque estés en otro panel.");
+	await settleReply(pi, ui.ctx, "Te respondo aunque después mires otro panel.");
 	await until(() => readings.length === 1);
+	// The reply was read because the pane had the focus when it settled; the owner
+	// moved to another pane while it was read.
+	h.focus.state = "unfocused";
 	readings[0]!.finish("done");
-	await until(() => h.focus.asks === 1);
+	await until(() => h.focus.asks === 2);
 	await tick();
 	assert.equal(h.sessions.length, 1, "no second recording");
 	assert.deepEqual(ui.notices.at(-1), { message: "Conversation paused in this pane. Press alt+m to talk.", type: "info" });
@@ -2501,9 +2644,9 @@ test("each reading and every microphone reopen decision is logged with its reaso
 	const ui = fakeContext();
 	await pi.fire("session_start", ui.ctx);
 	await talk(pi, h, ui.ctx, "hola");
-	h.focus.focused = false;
 	await settleReply(pi, ui.ctx, "Respuesta.");
 	await until(() => readings.length === 1);
+	h.focus.state = "unfocused";
 	readings[0]!.finish("done");
 	await until(() => h.events.some((entry) => entry.event === "mic.reopen"));
 	const names = h.events.map((entry) => entry.event);

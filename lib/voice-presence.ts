@@ -3,7 +3,8 @@ import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 // Where voice may act (docs/voice.md, "Voice in a session"). The microphone
-// reopens only in the pane the user is looking at, and readings from every Pi
+// reopens only in the pane the user is looking at, a reply is read only there
+// (a reply from any other pane is held, S12), and readings from every Pi
 // process take turns instead of talking over each other.
 
 export type CommandRunner = (command: string, args: string[]) => Promise<string>;
@@ -17,16 +18,29 @@ const runCommand: CommandRunner = (command, args) =>
 // only its own answer that this pane is focused counts: a failed or unclear
 // lookup keeps the microphone closed.
 export async function paneFocused(options: { env?: NodeJS.ProcessEnv; run?: CommandRunner } = {}): Promise<boolean> {
+	return (await paneFocus(options)) === "focused";
+}
+
+// The same question with its third answer: "unknown" when herdr cannot say
+// (no process, an error, an answer that is not JSON, or a field that is neither
+// true nor false). The microphone resolves unknown as unfocused, because
+// opening one in the wrong pane is worse than waiting; a spoken reply resolves
+// it as focused, so a herdr that cannot answer never silences a reply (S12).
+export type PaneFocus = "focused" | "unfocused" | "unknown";
+
+export async function paneFocus(options: { env?: NodeJS.ProcessEnv; run?: CommandRunner } = {}): Promise<PaneFocus> {
 	const env = options.env ?? process.env;
 	const pane = env.HERDR_PANE_ID?.trim();
-	if (!pane) return true;
+	if (!pane) return "focused";
 	try {
 		const output = await (options.run ?? runCommand)(env.HERDR_BIN_PATH?.trim() || "herdr", ["pane", "get", pane]);
 		const parsed: unknown = JSON.parse(output);
 		const focused = (parsed as { result?: { pane?: { focused?: unknown } } } | null)?.result?.pane?.focused;
-		return focused === true;
+		if (focused === true) return "focused";
+		if (focused === false) return "unfocused";
+		return "unknown";
 	} catch {
-		return false;
+		return "unknown";
 	}
 }
 

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import test, { after } from "node:test";
-import { acquireReadingTurn, paneFocused, READING_TURN_FILE } from "../lib/voice-presence.ts";
+import { acquireReadingTurn, paneFocus, paneFocused, READING_TURN_FILE } from "../lib/voice-presence.ts";
 
 // Where voice may act (S8, S9): whether this herdr pane is the focused one, and
 // one reading at a time across every Pi process.
@@ -26,6 +26,20 @@ test("inside herdr the pane is focused only when herdr says so", async () => {
 	assert.equal(await paneFocused({ env, run: async () => { throw new Error("herdr down"); } }), false, "a failed lookup never opens the microphone");
 	assert.equal(await paneFocused({ env: { HERDR_PANE_ID: "w1C4:p1" }, run: run(answer(true)) }), true);
 	assert.equal(calls.at(-1)!.command, "herdr", "the binary on the PATH when herdr names none");
+});
+
+test("a focus herdr cannot report is unknown, not unfocused, so a reader can keep its old behavior", async () => {
+	const env = { HERDR_PANE_ID: "w1C4:p1" };
+	const answer = (focused: unknown) => JSON.stringify({ result: { pane: { focused } } });
+	const run = (output: string) => async () => output;
+	assert.equal(await paneFocus({ env: {}, run: run(answer(false)) }), "focused", "outside herdr there is one terminal");
+	assert.equal(await paneFocus({ env, run: run(answer(true)) }), "focused");
+	assert.equal(await paneFocus({ env, run: run(answer(false)) }), "unfocused");
+	for (const output of [answer("yes"), answer(undefined), "not json", ""]) assert.equal(await paneFocus({ env, run: run(output) }), "unknown", output);
+	assert.equal(await paneFocus({ env, run: async () => { throw new Error("herdr down"); } }), "unknown");
+	// The microphone keeps its stricter reading: only a focused answer opens it.
+	assert.equal(await paneFocused({ env, run: async () => { throw new Error("herdr down"); } }), false);
+	assert.equal(await paneFocused({ env, run: run(answer("yes")) }), false);
 });
 
 const scratchRoot = join(import.meta.dirname, "..", "tmp");

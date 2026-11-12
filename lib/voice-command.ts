@@ -9,7 +9,7 @@ import { createVoiceSession, VoiceSessionError, type VoiceEndpoint, type VoiceSe
 import { installKokoro, installMiro, KOKORO_MANIFESTS, KOKORO_NOTICES, kokoroBytes, MIRO_MANIFEST, MIRO_NOTICE, miroBytes, readKokoroStatus, readMiroStatus, type KokoroStatus } from "./voice-kokoro.ts";
 import { createReplyReader, defaultSpeechEngineResolver, lastAssistantText, replyLanguage } from "./voice-reply-speech.ts";
 import { createVoiceSpeechPublisher, type VoiceSpeechReading } from "./voice-speech-events.ts";
-import { acquireReadingTurn, paneFocused as herdrPaneFocused } from "./voice-presence.ts";
+import { acquireReadingTurn, paneFocus as herdrPaneFocus, paneFocused as herdrPaneFocused, type PaneFocus } from "./voice-presence.ts";
 import { createCuePlayer, type CueName, type CuePlayer, type CueResult } from "./voice-cues.ts";
 import { createVoiceLog, type VoiceLog } from "./voice-diagnostics.ts";
 import { matchSpokenCommand } from "./voice-spoken-command.ts";
@@ -92,6 +92,13 @@ export interface VoiceCommandDeps {
 	speechEngine?: () => SpeechEngine | undefined;
 	voiceSessions?: { read(): string[]; write(sessions: string[]): void };
 	paneFocused?: () => Promise<boolean>;
+	// Whether this pane has the focus, with herdr's third answer (S12): a reply is
+	// held outside the focused pane, and read where the focus cannot be told.
+	paneFocus?: () => Promise<PaneFocus>;
+	// How often a held reply asks for the focus, and how long it stays readable.
+	// Both have a fixed production value; the tests only shorten them.
+	holdPollMs?: number;
+	holdStaleMs?: number;
 	readingTurn?: (signal: AbortSignal) => Promise<(() => void) | undefined>;
 	// Releases the dictation worker kept alive for hands-free recordings.
 	releaseWarm?: () => Promise<void>;
@@ -129,6 +136,12 @@ export const CONVERSATION_ENDPOINT: VoiceEndpoint = { endOfSpeechMs: 2_500, noSp
 // nothing was pasted. The values match the conversation's, but the two stay
 // separate constants because what happens when nothing is heard differs.
 export const DICTATION_ENDPOINT: VoiceEndpoint = { endOfSpeechMs: 2_500, noSpeechMs: 8_000 };
+
+// A reply from a pane without the focus waits for it (S12): one poll of the
+// focus while a reply is held, and ten minutes after it settled before it is
+// too old to be read. Both are what docs/voice.md documents.
+export const HELD_REPLY_POLL_MS = 1_500;
+export const HELD_REPLY_STALE_MS = 10 * 60_000;
 
 const INSTALL_MESSAGES: Record<VoiceInstallErrorCode, string> = {
 	aborted: "Voice download was cancelled. Unfinished files were removed; completed components are kept.",
@@ -480,6 +493,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		write: (next: string[]) => { writeVoiceSessions(next, { env }); },
 	};
 	const paneFocused = deps.paneFocused ?? (() => herdrPaneFocused({ env }));
+	const paneFocus = deps.paneFocus ?? (() => herdrPaneFocus({ env }));
 	const readingTurn = deps.readingTurn ?? ((signal: AbortSignal) => acquireReadingTurn({ dir: resolveVoiceHome(env), signal }));
 	const sessionIdOf = (ctx: ExtensionContext | undefined): string | undefined => {
 		try {
@@ -578,10 +592,90 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	// A reply that settles while another is read waits here; only the newest
 	// waits, so a burst of background replies cannot pile up.
 	let queuedReply: { ctx: ExtensionContext; text: string } | undefined;
+	// A reply that settles while the owner looks at another pane is held instead
+	// of read (S12): reading waits for that pane, so no session talks over the one
+	// in front. Only the newest held reply is kept, with the time it settled, so a
+	// burst of replies cannot pile up either.
+	interface HeldReply {
+		ctx: ExtensionContext;
+		text: string;
+		session: string | undefined;
+		settledAt: number;
+	}
+	const holdPollMs = deps.holdPollMs ?? HELD_REPLY_POLL_MS;
+	const holdStaleMs = deps.holdStaleMs ?? HELD_REPLY_STALE_MS;
+	let heldReply: HeldReply | undefined;
+	let heldTimer: NodeJS.Timeout | undefined;
+	// Set while one focus question is in flight, so a slow herdr never stacks
+	// lookups on top of each other.
+	let heldAsking = false;
+	// Drops the held reply and stops its poll. The text stays where it already is
+	// on screen; nothing reads it later.
+	const clearHeld = (): void => {
+		heldReply = undefined;
+		if (!heldTimer) return;
+		clearTimeout(heldTimer);
+		heldTimer = undefined;
+	};
+	// One poll at a time, and only while something is held. The timer is unref'd,
+	// so a held reply never keeps a process alive on its own.
+	const scheduleHeldPoll = (): void => {
+		if (heldTimer || heldAsking || !heldReply) return;
+		heldTimer = setTimeout(() => {
+			heldTimer = undefined;
+			void pollHeld();
+		}, holdPollMs);
+		heldTimer.unref?.();
+	};
+	const pollHeld = async (): Promise<void> => {
+		const held = heldReply;
+		if (!held) return;
+		// Voice turned off, in this process or another one: nothing is read here.
+		if (!voiceOn(held.ctx)) {
+			clearHeld();
+			return;
+		}
+		// Too old to be worth hearing: the reply stays on screen, unread.
+		if (Date.now() - held.settledAt >= holdStaleMs) {
+			clearHeld();
+			voiceLog("reading.dropped", { session: held.session, reason: "stale" });
+			return;
+		}
+		heldAsking = true;
+		let focus: PaneFocus;
+		try {
+			focus = await paneFocus();
+		} catch {
+			focus = "unknown";
+		} finally {
+			heldAsking = false;
+		}
+		// Replaced, dropped or ended while herdr answered: the newer state wins,
+		// never a read of the reply it replaced. A reply held meanwhile keeps its
+		// own poll, which this one could not schedule while it was asking.
+		if (heldReply !== held) {
+			scheduleHeldPoll();
+			return;
+		}
+		if (focus === "unfocused") {
+			scheduleHeldPoll();
+			return;
+		}
+		clearHeld();
+		startReply(held.ctx, held.text);
+	};
+	const holdReply = (ctx: ExtensionContext, text: string): void => {
+		const held: HeldReply = { ctx, text, session: sessionIdOf(ctx), settledAt: Date.now() };
+		heldReply = held;
+		voiceLog("reading.held", { session: held.session, chars: text.length });
+		scheduleHeldPoll();
+	};
 	// Stops the reading and drops the reply waiting behind it: for the user's
-	// own Esc, message, shortcut, Stop reading, voice off and session end.
+	// own Esc, message, shortcut, Stop reading, voice off and session end. A held
+	// reply goes with them (S12): the owner moved on, or nothing is left to read.
 	const cutReadings = (): void => {
 		queuedReply = undefined;
+		clearHeld();
 		stopReading();
 	};
 	// Set while this extension sends a spoken transcript, so its input event is
@@ -1452,6 +1546,31 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			if (!focused) ctx.ui.notify(`Conversation paused in this pane. Press ${toggleKey} to talk.`, "info");
 		});
 	};
+	// Reads the reply that settled now, or waits behind the reading in progress as
+	// before.
+	const startReply = (ctx: ExtensionContext, text: string): void => {
+		if (reading) {
+			queuedReply = { ctx, text };
+			return;
+		}
+		readReply(ctx, text);
+	};
+	// A reply is read only in the pane the owner is looking at (S12); anywhere
+	// else it is held and read when that pane comes back. A herdr that cannot say
+	// never silences a reply: unknown keeps the old behavior and reads it now.
+	const settleForReading = async (ctx: ExtensionContext, text: string): Promise<void> => {
+		const owner = generation;
+		let focus: PaneFocus;
+		try {
+			focus = await paneFocus();
+		} catch {
+			focus = "unknown";
+		}
+		// The session was replaced, or voice was turned off, while herdr answered.
+		if (owner !== generation || !voiceOn(ctx)) return;
+		if (focus === "unfocused") holdReply(ctx, text);
+		else startReply(ctx, text);
+	};
 	pi.on("agent_settled", (event, ctx) => {
 		const text = pendingReply;
 		pendingReply = undefined;
@@ -1459,11 +1578,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		// and a failed reading end it.
 		voiceLog("reply.settled", { session: sessionIdOf(ctx), aborted: Boolean(event?.aborted), chars: text?.length ?? 0, voice: voiceOn(ctx), reading: Boolean(reading), spokenTurnPending });
 		if (event?.aborted || !text || !supportedSession(ctx) || !voiceOn(ctx)) return;
-		if (reading) {
-			queuedReply = { ctx, text };
-			return;
-		}
-		readReply(ctx, text);
+		void settleForReading(ctx, text);
 	});
 	pi.on("session_shutdown", (_event, ctx) => {
 		const previous = sessionCtx;
