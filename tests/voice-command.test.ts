@@ -1994,6 +1994,127 @@ test("Esc while listening in conversation mode pauses it without sending", async
 	assert.deepEqual(ui.notices.at(-1), { message: "Conversation paused. Press alt+m to talk.", type: "info" });
 });
 
+// --- spoken commands (S4, S10) and the dictated turn (S2) -------------------------------
+
+test("saying \"Gentle Voice off\" turns voice off for the session, sends nothing and leaves the editor alone", async () => {
+	const { engine, readings } = fakeEngine();
+	const h = harness({ installed: true, engine, voice: true });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	(ui.ctx.ui as unknown as { setEditorText(text: string): void }).setEditorText("un borrador");
+	await talk(pi, h, ui.ctx, "Gentle Voice off.");
+	assert.equal(pi.counts.sends, 0, "the command is never sent to the model");
+	assert.equal(ui.editor(), "un borrador", "the draft is untouched");
+	assert.deepEqual(h.voice.sessions, [], "voice is off for this session");
+	assert.ok(h.warmReleases >= 1, "the warm worker is closed");
+	assert.deepEqual(ui.notices.at(-1), { message: "Voice is off in this session.", type: "info" });
+	assert.deepEqual(h.events.filter((entry) => entry.event === "voice.command").map((entry) => [entry.name, entry.session]), [["voice-off", "session-alpha"]]);
+	assert.equal(JSON.stringify(h.events).toLowerCase().includes("gentle voice off"), false, "the transcript is never logged");
+	// The reply that follows is neither read nor does it reopen the microphone.
+	await settleReply(pi, ui.ctx, "Respuesta.");
+	await until(() => h.events.some((entry) => entry.event === "reply.settled"));
+	await tick();
+	assert.equal(readings.length, 0);
+	assert.equal(h.sessions.length, 1);
+});
+
+test("the same command in a dictation that pastes never enters the editor", async () => {
+	const h = harness({ installed: true });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	(ui.ctx.ui as unknown as { setEditorText(text: string): void }).setEditorText("");
+	const pressed = pi.shortcuts.get("alt+m")!.handler(ui.ctx);
+	await until(() => h.sessions.length === 1);
+	h.sessions[0]!.started.resolve();
+	await until(() => h.sessions[0]!.state === "recording");
+	h.sessions[0]!.emit("transcribing");
+	h.sessions[0]!.emit("finished");
+	h.sessions[0]!.result.resolve({ text: "gentel voice of", truncated: false });
+	await pressed;
+	assert.equal(ui.editor(), "", "the command is not pasted");
+	assert.equal(pi.counts.sends, 0);
+	assert.deepEqual(ui.notices.at(-1), { message: "Voice is off in this session.", type: "info" });
+	assert.deepEqual(h.events.filter((entry) => entry.event === "voice.command").map((entry) => entry.name), ["voice-off"]);
+});
+
+test("the phrase inside a longer sentence is sent as ordinary text and leaves voice on", async () => {
+	const { engine } = fakeEngine();
+	const h = harness({ installed: true, engine, voice: true });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	(ui.ctx.ui as unknown as { setEditorText(text: string): void }).setEditorText("");
+	await talk(pi, h, ui.ctx, "quiero que digas gentle voice off cuando termines");
+	assert.deepEqual(h.voice.sessions, ["session-alpha"], "voice stays on");
+	assert.deepEqual(pi.sent, [{ content: "quiero que digas gentle voice off cuando termines", options: undefined }]);
+	assert.equal(h.events.some((entry) => entry.event === "voice.command"), false);
+});
+
+test("a dictation the owner sends with Enter counts as a spoken turn, so its reply reopens the microphone", async () => {
+	const { engine, readings } = fakeEngine();
+	const h = harness({ installed: true, engine, voice: true });
+	const pi = register(h);
+	const ui = fakeContext({ select: pick(/start dictation/i) });
+	await pi.fire("session_start", ui.ctx);
+	(ui.ctx.ui as unknown as { setEditorText(text: string): void }).setEditorText("");
+	const { done, session } = await startDictation(h, pi, ui);
+	ui.component()!.handleInput!(ENTER);
+	session.result.resolve({ text: "revisá el repo", truncated: false });
+	await done;
+	assert.equal(ui.editor(), "revisá el repo", "the dictation is pasted, as always");
+	// The owner sends it with Enter: Pi reports interactive input, not a spoken send.
+	await pi.fire("input", ui.ctx, { type: "input", text: ui.editor(), source: "interactive" });
+	assert.equal(h.events.find((entry) => entry.event === "input")!.dictated, true, "the submitted dictation is logged as such");
+	await settleReply(pi, ui.ctx, "Ya lo revisé.");
+	await until(() => readings.length === 1);
+	readings[0]!.finish("done");
+	await until(() => h.sessions.length === 2);
+	assert.deepEqual(h.endpoints.at(-1), HANDS_FREE, "the microphone reopens hands-free");
+});
+
+test("a dictation the owner kept inside a longer message still counts as spoken", async () => {
+	const { engine, readings } = fakeEngine();
+	const h = harness({ installed: true, engine, voice: true });
+	const pi = register(h);
+	const ui = fakeContext({ select: pick(/start dictation/i) });
+	await pi.fire("session_start", ui.ctx);
+	(ui.ctx.ui as unknown as { setEditorText(text: string): void }).setEditorText("");
+	const { done, session } = await startDictation(h, pi, ui);
+	ui.component()!.handleInput!(ENTER);
+	session.result.resolve({ text: "revisá el repo", truncated: false });
+	await done;
+	// The owner adds a line around the dictation and sends the whole thing.
+	await pi.fire("input", ui.ctx, { type: "input", text: "por favor\nrevisá el repo", source: "interactive" });
+	await settleReply(pi, ui.ctx, "Respuesta.");
+	await until(() => readings.length === 1);
+	readings[0]!.finish("done");
+	await until(() => h.sessions.length === 2);
+	assert.deepEqual(h.endpoints.at(-1), HANDS_FREE, "the microphone reopens hands-free");
+});
+
+test("a dictation typed away makes the turn typed, so its reply does not reopen the microphone", async () => {
+	const { engine, readings } = fakeEngine();
+	const h = harness({ installed: true, engine, voice: true });
+	const pi = register(h);
+	const ui = fakeContext({ select: pick(/start dictation/i) });
+	await pi.fire("session_start", ui.ctx);
+	(ui.ctx.ui as unknown as { setEditorText(text: string): void }).setEditorText("");
+	const { done, session } = await startDictation(h, pi, ui);
+	ui.component()!.handleInput!(ENTER);
+	session.result.resolve({ text: "revisá el repo", truncated: false });
+	await done;
+	await pi.fire("input", ui.ctx, { type: "input", text: "esto lo escribí", source: "interactive" });
+	assert.equal(h.events.find((entry) => entry.event === "input")!.dictated, false);
+	await settleReply(pi, ui.ctx, "Respuesta.");
+	await until(() => readings.length === 1);
+	readings[0]!.finish("done");
+	await until(() => ui.statuses.at(-1) === undefined);
+	await tick();
+	assert.equal(h.sessions.length, 1);
+});
+
 // --- the natural voice download (S6) ----------------------------------------------------
 
 const NATURAL = /^Download natural voice \(Kokoro, about \d+ MB\)$/;

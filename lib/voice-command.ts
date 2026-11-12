@@ -12,6 +12,7 @@ import { createVoiceSpeechPublisher, type VoiceSpeechReading } from "./voice-spe
 import { acquireReadingTurn, paneFocused as herdrPaneFocused } from "./voice-presence.ts";
 import { createCuePlayer, type CueName, type CuePlayer, type CueResult } from "./voice-cues.ts";
 import { createVoiceLog, type VoiceLog } from "./voice-diagnostics.ts";
+import { matchSpokenCommand } from "./voice-spoken-command.ts";
 import { createWarmVoiceWorker, type WarmVoiceWorker } from "./voice-warm.ts";
 import { readVoicePushToTalk, readVoiceSessions, writeVoicePushToTalk, writeVoiceSessions } from "./voice-settings.ts";
 import { SpeechEngineError, speechFailureCode, speechVoiceName, type SpeechEngine } from "./voice-speech.ts";
@@ -182,9 +183,19 @@ function sessionErrorMessage(error: unknown, platform: string, start: DictationS
 type Outcome = { kind: "text"; transcript: VoiceTranscript } | { kind: "cancelled" } | { kind: "error"; error: unknown };
 type Say = (message: string, type: "info" | "warning" | "error") => void;
 
+// What the caller adds to a settled dictation: a whole-utterance command may
+// consume the transcript instead of pasting it, the text that did reach the
+// editor is remembered for the spoken-turn rule (S2), and the command repaints
+// its overlay once the paste landed.
+interface DeliveryHooks {
+	command?(text: string): boolean;
+	dictated?(text: string): void;
+	afterPaste?(): void;
+}
+
 // Reports a settled dictation. The transcript goes through the editor's paste
 // pipeline as is; it is never sent.
-function deliver(ctx: ExtensionContext, result: Outcome, platform: string, start: DictationStart, say: Say, afterPaste?: () => void): void {
+function deliver(ctx: ExtensionContext, result: Outcome, platform: string, start: DictationStart, say: Say, hooks: DeliveryHooks = {}): void {
 	if (result.kind === "cancelled") {
 		say("Voice dictation cancelled; the draft is unchanged.", "info");
 		return;
@@ -207,8 +218,11 @@ function deliver(ctx: ExtensionContext, result: Outcome, platform: string, start
 		say("No speech was recognized.", "warning");
 		return;
 	}
+	// A whole-utterance command never reaches the editor and never the model.
+	if (hooks.command?.(text.trim())) return;
 	ctx.ui.pasteToEditor(text);
-	afterPaste?.();
+	hooks.dictated?.(text);
+	hooks.afterPaste?.();
 	if (truncated) say("Recording reached the 2-minute limit; the transcript covers what was recorded.", "info");
 }
 
@@ -515,6 +529,10 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	// Set when a transcript is sent by voice; the reply to that turn may reopen
 	// the microphone, and no other reply does.
 	let spokenTurnPending = false;
+	// The last transcript a dictation inserted into the editor (S2). A message the
+	// owner submits while it is still in it came from a dictation, so it is a
+	// spoken turn even though Pi reports interactive input.
+	let lastDictated: string | undefined;
 	const replyReader = createReplyReader({ engine: speechEngine });
 	// Every reading reports itself on the event bus, so a consumer outside this
 	// command can follow the voice: one start, one chunk per chunk the player
@@ -669,6 +687,33 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		cues().warm();
 		const start = toggleShortcut ? `${toggleShortcut} starts a hands-free conversation` : "the reply starts a hands-free conversation";
 		say(`Voice is on in this session: replies are read aloud, and ${start}. Esc skips a reading.`, "info");
+	};
+
+	// A whole-utterance command (S4, S10) runs the same action the menu runs and is
+	// never sent, pasted or written to the log: only its name is recorded. The
+	// matcher's fixed list decides what is a command; anything else is text.
+	const runSpokenCommand = (ctx: ExtensionContext, text: string, say: Say): boolean => {
+		const name = matchSpokenCommand(text);
+		if (!name) return false;
+		voiceLog("voice.command", { session: sessionIdOf(ctx), name });
+		if (name === "voice-off") setVoice(ctx, false, say);
+		return true;
+	};
+
+	// The transcript a dictation inserted into the editor, so a message the owner
+	// sends while it is still there counts as a spoken turn (S2).
+	const recordDictation = (text: string): void => {
+		const inserted = text.trim();
+		if (inserted) lastDictated = inserted;
+	};
+	// A dictation answers for one turn: once a submitted message contained it, the
+	// next typed message is typed again. Editing it away makes the turn typed.
+	const takeDictated = (submitted: string | undefined): boolean => {
+		const inserted = lastDictated;
+		if (!inserted) return false;
+		if (!submitted || !submitted.trim().includes(inserted)) return false;
+		lastDictated = undefined;
+		return true;
 	};
 
 	const command = async (ctx: ExtensionCommandContext): Promise<void> => {
@@ -895,14 +940,18 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		try {
 			// After a session shutdown the old context is stale: say and paste nothing.
 			if (!live()) return;
-			deliver(ctx, result, platform, "command", say, () => {
-				setTimeout(() => {
-					try {
-						tui?.requestRender();
-					} catch {
-						/* best-effort repaint after the overlay teardown */
-					}
-				}, 0);
+			deliver(ctx, result, platform, "command", say, {
+				command: (text) => runSpokenCommand(ctx, text, say),
+				dictated: recordDictation,
+				afterPaste: () => {
+					setTimeout(() => {
+						try {
+							tui?.requestRender();
+						} catch {
+							/* best-effort repaint after the overlay teardown */
+						}
+					}, 0);
+				},
 			});
 		} finally {
 			// Delivered, empty, cancelled and failed all end idle; a stale run
@@ -1051,7 +1100,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		try {
 			dictation.start();
 			const result = await dictation.outcome;
-			if (live()) deliver(ctx, result, platform, "hold", say);
+			if (live()) deliver(ctx, result, platform, "hold", say, { command: (text) => runSpokenCommand(ctx, text, say), dictated: recordDictation });
 		} finally {
 			run.abort = () => {};
 			current.hold = undefined;
@@ -1195,7 +1244,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			const result = await dictation.outcome;
 			if (!live()) return;
 			if (current.send) sendToAgent(ctx, result, found.platform, say, current.stopRequested);
-			else deliver(ctx, result, found.platform, "toggle", say);
+			else deliver(ctx, result, found.platform, "toggle", say, { command: (text) => runSpokenCommand(ctx, text, say), dictated: recordDictation });
 		} finally {
 			current.run.abort = () => {};
 			closeToggle(current);
@@ -1240,6 +1289,9 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			say(unheard, "info");
 			return;
 		}
+		// A whole-utterance command is never sent to the model: it runs the action
+		// the menu runs and the draft stays as it is.
+		if (runSpokenCommand(ctx, text, say)) return;
 		// Whatever is in the draft goes with the transcript: a pasted image is a
 		// file path in the draft, so it travels exactly as a typed submit would
 		// send it. The draft is cleared only once it was sent.
@@ -1289,6 +1341,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		pendingReply = undefined;
 		unavailableReported = false;
 		spokenTurnPending = false;
+		lastDictated = undefined;
 		generation++;
 		const running = active;
 		active = undefined;
@@ -1352,9 +1405,13 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	pi.on("input", (event) => {
 		const typed = event?.source === "interactive";
 		const spokenSend = voiceSendPending;
-		voiceLog("input", { source: event?.source, spokenSend, reading: Boolean(reading) });
+		// A dictation the owner sent with Enter is a spoken turn too, even though Pi
+		// reports it as interactive input: that is what the log showed (S2).
+		const dictated = typed && takeDictated(event?.text);
+		voiceLog("input", { source: event?.source, spokenSend, dictated, reading: Boolean(reading) });
 		voiceSendPending = false;
-		if (typed) spokenTurnPending = false;
+		if (dictated) spokenTurnPending = true;
+		else if (typed) spokenTurnPending = false;
 		if (typed || spokenSend) cutReadings();
 	});
 	pi.on("agent_start", () => {

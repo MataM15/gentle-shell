@@ -239,6 +239,8 @@ aloud, and the microphone reopens. It needs voice dictation installed.
 | Start | Press `alt+m` and speak. Recording ends by itself after 2.5 seconds of quiet that follows speech, room to think between sentences, so no second press is needed. |
 | Send | The transcript is sent as the next prompt, never pasted. Whatever is in the draft goes with it, draft first, then a blank line and the transcript, and the draft is cleared: a pasted image is a file path in the draft, so it is sent exactly as a typed submit would send it. A blank draft sends the transcript alone; a turn that hears nothing sends nothing and keeps the draft. While the agent is still busy it is queued as a follow-up instead of interrupting the run. |
 | The loop | When the reply to something you said has been read to the end, the microphone reopens the same way, but only in the pane herdr reports focused (`herdr pane get`, from `HERDR_PANE_ID`); outside herdr the pane counts as focused. In another pane it stays closed with "Conversation paused in this pane. Press alt+m to talk." A reply with nothing readable reopens it too. A reply to a typed message is read but never reopens the microphone. The spoken turn stays pending until the microphone reopens, so a run that a background notice starts, and that cuts the reading, does not lose it: the next reply reopens the microphone. Typing a message, Stop reading and a failed reading end the spoken turn. Esc on a reading skips the rest of it and reopens the microphone after a spoken turn, exactly as reading it to the end does (recorded as `outcome=skipped`, `mic.reopen result=opened`); esc on the reading of a typed message stops it and leaves the microphone closed, because a typed turn has nothing to answer. A failed herdr lookup keeps it closed. |
+| Dictated turn | A message whose text came from a dictation counts as a spoken turn too. A dictation inserts its transcript into the editor; when you then send that message with Enter, Pi reports it as an ordinary interactive message, and the reply is still read aloud **and** reopens the microphone, exactly like a hands-free turn. The rule is conservative: the message counts as spoken only while the transcript this session inserted is still in it, so editing the dictation away or typing a message of your own leaves a read-only typed turn, which never reopens the microphone. Each dictation answers for one turn; after that the microphone does not reopen for a later typed message. |
+| Spoken commands | A whole utterance from a fixed list runs a command instead of being sent; see [Spoken commands](#spoken-commands). |
 | Pause | Esc while listening cancels the recording and pauses the conversation. Esc while the reply to something you said is read skips the rest of the reading and reopens the microphone, so you can correct what you already heard; `alt+m` then closes it without sending. Esc on the reading of a typed message stops it and leaves the microphone closed. Stopping it with `alt+m` before saying anything also pauses it, with "Conversation paused. Press alt+m to talk." With no speech within 8 seconds, it pauses with "Conversation paused: no speech was heard. Press alt+m to talk." Press `alt+m` to go on. |
 | Send early | `alt+m` while listening stops the recording and sends at once. |
 | Footer | `● Conversation · listening · alt+m send · esc pause` while recording, then transcribing and sending. |
@@ -248,6 +250,36 @@ aloud, and the microphone reopens. It needs voice dictation installed.
 The thresholds are tested with synthetic audio only. A loud room or a quiet
 microphone may need the shortcut to send; tuning them on real microphones is
 still open.
+
+### Spoken commands
+
+Some whole utterances are commands. Only an utterance that is exactly one of
+them runs one: the same words inside a longer sentence are sent to the model as
+ordinary text. The current list has one command:
+
+| Said | Effect |
+|------|--------|
+| `Gentle Voice off` | Turns voice off in this session, exactly as **Voice in this session (on): turn off** does in `/gentle:voice`: spoken replies stop being read, a reading in progress is cut, the pending spoken turn is cleared and the kept-alive dictation worker is closed. Nothing is sent to the model and nothing is pasted. The draft is left as it was. |
+
+Case, accents, punctuation and extra spaces never decide whether a command was
+spoken: `gentle voice, off.` and `Gentle  voice  OFF` are the same command. A
+likely transcription still counts, such as `gentle voz off`, `yentel voice off`
+or `gentel voice of`, because the matcher accepts a small fixed set of words at
+each position. It never accepts a different sentence: `quiero que digas gentle
+voice off`, `gentle voice offset` and `gentle voice` are all text, and
+`gentle voice on` is not a command yet: turning voice on by voice arrives in a
+later phase.
+
+The command is checked in every place a transcript arrives: a hands-free
+conversation turn, the dictation shortcut when voice is off (which pastes), a
+Space hold and **Start dictation**. It never enters the editor and never becomes
+a prompt. The log keeps one `voice.command` event with the command `name`, never
+the transcript.
+
+Voice never runs free text as a command. The list is fixed in
+`lib/voice-spoken-command.ts` and only a matcher hit does anything, so nothing
+you say can invent an action; later phases (voice on, agent navigation, English
+mode) add entries to that same list instead of matching free text.
 
 ### Microphone cues
 
@@ -402,11 +434,17 @@ Every voice session appends one JSON line per voice event to
 spoken input, a spoken turn sent, a reply settled, a reading started and how it
 ended, and each microphone reopen decision with its reason (`opened`, or
 skipped for `not-focused`, `no-spoken-turn`, `voice-off`, `reading-cancelled`,
-`reading-error`, `dictation-running`, `voice-busy`), and each microphone cue
-with its `name`, `outcome` (`done`, `failed`, `unavailable`), latency, the mode that asked for it and, after a reading, `sinceReadingMs`. Lines
+`reading-error`, `dictation-running`, `voice-busy`), each microphone cue
+with its `name`, `outcome` (`done`, `failed`, `unavailable`), latency, the mode that asked for it and, after a reading, `sinceReadingMs`, and each spoken command
+it ran. Lines
 carry the time, the process id and the session id, and sizes instead of text:
 no reply or transcript text is written. Past 512 KB the log moves to
 `voice-events.log.1`.
+
+An `input` line names its `source` and also says `dictated: true` when the
+submitted message still carried the transcript a dictation inserted, which is
+what makes it a spoken turn. A `voice.command` line carries the command `name`
+(`voice-off`) and the session, never the words that were spoken.
 
 The reading lines name the voice that spoke and why a reading changed course:
 
