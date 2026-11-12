@@ -251,19 +251,35 @@ still open.
 
 ### Microphone cues
 
-A short rising tone plays when the microphone really starts recording, after
-the worker reports it, and a falling tone when recording stops: at the end of
-speech, on the dictation shortcut, or on Esc. A capture cancelled before it
-recorded plays neither. Both shortcut dictation and hands-free turns play them.
+Two short rising notes play when the microphone really starts recording,
+after the worker reports it, and one longer falling note when recording stops:
+at the end of speech, on the dictation shortcut, or on Esc. A capture cancelled
+before it recorded plays neither. Both shortcut dictation and hands-free turns
+play them.
 
-The tones are generated in `lib/voice-cues.ts`, written once into a private
-temporary directory, and played through the native PulseAudio player the
-notifications use: about 20 ms from the request to sound once its worker is
-awake. A voice session wakes it at session start and when voice is turned on,
-so the first cue is on time. Where PulseAudio is not available, including
-native Windows, the cues stay silent, because the Windows players start
-PowerShell and would arrive about a second late. The player and its files are
-released when the Pi session ends.
+| Cue | Tone |
+|-----|------|
+| Open | G5 then D6, 120 ms each with a 40 ms silent gap (280 ms) |
+| Close | One note falling from E5 to A4 (260 ms) |
+
+The tones are generated in `lib/voice-cues.ts` at 60% of full scale.
+`GENTLE_PI_VOICE_CUE_VOLUME` sets that level from `0` (silent) to `1` (full
+scale); anything else keeps `0.6`. It is read when the session creates its cue
+player, so a change applies to the next session.
+
+Under WSL the cues play on Windows, on the same output the reply voice uses,
+because WSLg's PulseAudio output can be another device or a quieter one: with
+the replies on the speakers, the PulseAudio cues were not heard. One
+PowerShell host (`lib/voice-cues-windows.ts`) stays warm: the tones reach it
+once over stdin as base64 lines, never on the command line, and each cue is
+one `play open` or `play close` line that the host answers once the tone has
+played. Started cold it answers in about 1.5 s; warm, a cue takes about its
+own length (about 325 ms measured). A voice session warms it at session start
+and when voice is turned on, and it retires after 30 idle minutes. When the
+Windows host fails, the cue plays through the native PulseAudio player the
+notifications use. On plain Linux the cues play only through PulseAudio. On
+native Windows they stay silent. The players and their files are released when
+the Pi session ends.
 
 A cue stays advisory: it never blocks the microphone, and a player that throws
 or answers with nothing never breaks the capture it announced. Each cue does
@@ -279,9 +295,9 @@ Each outcome means:
 
 | Outcome | Meaning |
 |---------|---------|
-| `done` | The Pulse player drained the tone into the sink. Whether it reached the ears is then up to Windows and the audio path; the log cannot tell. |
+| `done` | The Windows host played the tone, or the Pulse player drained it into the sink. Whether it reached the ears is then up to the output device; the log cannot tell. |
 | `failed` | The player was asked and did not confirm the tone. |
-| `unavailable` | No PulseAudio player is reachable, so nothing was played. |
+| `unavailable` | No player is reachable, so nothing was played. |
 
 A cue that comes back `failed` is played once more after about 150 ms: the
 Pulse worker retires after a minute idle, so the first cue after a long reading

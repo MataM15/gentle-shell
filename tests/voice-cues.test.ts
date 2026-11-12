@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import test, { after } from "node:test";
-import { createCuePlayer, cueWav } from "../lib/voice-cues.ts";
+import { createCuePlayer, cueTones, cueWav } from "../lib/voice-cues.ts";
 
 // Microphone cues: generated tones, played only through an available player,
 // in a private temporary directory removed on dispose.
@@ -86,8 +86,8 @@ test("every caller plays the same tone bytes: the microphone cue files never dep
 	await player.play("open");
 	assert.deepEqual(played.map((path) => path.split("/").at(-1)), ["open.wav", "close.wav", "open.wav"]);
 	const [open, close] = [readFileSync(played[0]!), readFileSync(played[1]!)];
-	assert.deepEqual(open, cueWav([660, 990]), "the rising cue is the same 160 ms tone every time");
-	assert.deepEqual(close, cueWav([990, 660]), "the falling cue is the same 160 ms tone every time");
+	assert.deepEqual(open, cueTones().open, "the rising cue is the same tone every time");
+	assert.deepEqual(close, cueTones().close, "the falling cue is the same tone every time");
 	assert.notDeepEqual(open, close);
 	player.dispose();
 });

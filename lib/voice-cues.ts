@@ -1,15 +1,18 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { release, tmpdir } from "node:os";
 import { join } from "node:path";
 import { NativePulsePlayer } from "./notification-audio-native.ts";
+import { createWindowsCueBackend, type WindowsCueOptions } from "./voice-cues-windows.ts";
+import { resolvePowerShell } from "./voice-speech.ts";
 
-// Microphone cues (docs/voice.md, "Microphone cues"): a short rising tone when
-// the microphone really starts recording and a falling one when it stops, so
-// the speaker knows when to talk. They play through the native PulseAudio
-// player the notifications use, which answers in about 20 ms once its worker is
-// awake; the Windows players start PowerShell and arrive a second late, so no
-// cue plays where PulseAudio is not available. The tones are generated here,
-// written once into a private temporary directory, and removed on dispose.
+// Microphone cues (docs/voice.md, "Microphone cues"): two short rising notes
+// when the microphone really starts recording and one longer falling note when
+// it stops, so the speaker knows when to talk without looking. Under WSL they
+// play on Windows, on the output the reply voice uses, through one warm
+// PowerShell host (lib/voice-cues-windows.ts); when that host fails, and on
+// plain Linux, they play through the native PulseAudio player the
+// notifications use. The tones are generated here, written once into a private
+// temporary directory for PulseAudio, and removed on dispose.
 
 export type CueName = "open" | "close";
 
@@ -61,23 +64,123 @@ export function cueWav(steps: readonly number[], ms = 160, gain = 0.25): Buffer 
 	return Buffer.concat([header, pcm]);
 }
 
-const CUES: Record<CueName | "silence", Buffer> = {
-	open: cueWav([660, 990]),
-	close: cueWav([990, 660]),
-	silence: cueWav([0], 20, 0),
-};
+// GENTLE_PI_VOICE_CUE_VOLUME sets how loud the cues are, from 0 (silent) to 1
+// (full scale); anything else keeps the default, so a typo never mutes them.
+export const CUE_VOLUME_ENV = "GENTLE_PI_VOICE_CUE_VOLUME";
+const DEFAULT_CUE_VOLUME = 0.6;
+
+export function cueVolume(env: NodeJS.ProcessEnv = process.env): number {
+	const raw = env[CUE_VOLUME_ENV]?.trim();
+	if (!raw) return DEFAULT_CUE_VOLUME;
+	const value = Number(raw);
+	return Number.isFinite(value) && value >= 0 && value <= 1 ? value : DEFAULT_CUE_VOLUME;
+}
+
+// One note sweeps from `from` to `to` Hz; a note of 0 Hz is a silent gap.
+interface Note {
+	readonly from: number;
+	readonly to: number;
+	readonly ms: number;
+}
+
+function notesWav(notes: readonly Note[], gain: number): Buffer {
+	const pcm: number[] = [];
+	for (const note of notes) {
+		const samples = Math.round((RATE * note.ms) / 1000);
+		let phase = 0;
+		for (let i = 0; i < samples; i++) {
+			if (note.from === 0) {
+				pcm.push(0);
+				continue;
+			}
+			const frequency = note.from + ((note.to - note.from) * i) / samples;
+			phase += (2 * Math.PI * frequency) / RATE;
+			const envelope = Math.min(1, i / 220, (samples - i) / 660);
+			pcm.push(Math.round(Math.sin(phase) * gain * envelope * 32767));
+		}
+	}
+	const data = Buffer.alloc(pcm.length * 2);
+	pcm.forEach((sample, i) => data.writeInt16LE(sample, i * 2));
+	// The same 16-bit mono header cueWav writes, sized for these samples.
+	const header = Buffer.from(cueWav([0], 0, 0).subarray(0, 44));
+	header.writeUInt32LE(36 + data.length, 4);
+	header.writeUInt32LE(data.length, 40);
+	return Buffer.concat([header, data]);
+}
+
+// Open: two short rising notes with a gap (G5 then D6). Close: one longer note
+// falling from E5 to A4. Different in shape, pitch and length, so neither can
+// be taken for the other through a speaker across the room.
+export function cueTones(gain: number = DEFAULT_CUE_VOLUME): { open: Buffer; close: Buffer } {
+	return {
+		open: notesWav([{ from: 784, to: 784, ms: 120 }, { from: 0, to: 0, ms: 40 }, { from: 1175, to: 1175, ms: 120 }], gain),
+		close: notesWav([{ from: 659, to: 440, ms: 260 }], gain),
+	};
+}
 
 interface CueBackend {
 	probe(): Promise<{ available: boolean }>;
-	play(path: string): Promise<void>;
+	play(path: string, name: CueName | "silence"): Promise<void>;
+	warm?(): void;
 	dispose?(): void;
 }
 
-export function createCuePlayer(options: { platform?: string; env?: NodeJS.ProcessEnv; backend?: CueBackend; tempRoot?: string } = {}): CuePlayer {
+// Windows first; PulseAudio when the Windows host fails.
+function windowsThenPulse(windows: ReturnType<typeof createWindowsCueBackend>, pulse: CueBackend): CueBackend {
+	let pulseReady: Promise<boolean> | undefined;
+	const pulseAvailable = () => (pulseReady ??= pulse.probe().then((result) => result.available, () => false));
+	return {
+		probe: async () => ({ available: true }),
+		play: async (path, name) => {
+			if (name === "silence") return;
+			try {
+				await windows.play(name);
+			} catch (error) {
+				if (!(await pulseAvailable())) throw error;
+				await pulse.play(path, name);
+			}
+		},
+		warm: () => windows.warm(),
+		dispose: () => {
+			windows.dispose();
+			pulse.dispose?.();
+		},
+	};
+}
+
+// The native player takes only the file; the cue name is for the Windows host.
+function pulseBackend(native: NativePulsePlayer): CueBackend {
+	return { probe: () => native.probe(), play: (path) => native.play(path), dispose: () => native.dispose() };
+}
+
+export interface CuePlayerOptions {
+	platform?: string;
+	env?: NodeJS.ProcessEnv;
+	backend?: CueBackend;
+	tempRoot?: string;
+	// The kernel release, to tell WSL apart (os.release() when absent).
+	kernelRelease?: string;
+	// The Windows PowerShell to play through; resolved when the key is absent.
+	powershell?: string;
+	spawn?: WindowsCueOptions["spawn"];
+	// The PulseAudio player (the native one when absent).
+	pulse?: CueBackend;
+}
+
+export function createCuePlayer(options: CuePlayerOptions = {}): CuePlayer {
 	const platform = options.platform ?? process.platform;
 	if (!options.backend && platform !== "linux")
 		return { play: async (name) => ({ name, outcome: "unavailable" as const, ms: 0 }), warm: () => {}, dispose: () => {} };
-	const backend: CueBackend = options.backend ?? new NativePulsePlayer({ platform, env: options.env ?? process.env });
+	const env = options.env ?? process.env;
+	const tones = cueTones(cueVolume(env));
+	const CUES: Record<CueName | "silence", Buffer> = { ...tones, silence: cueWav([0], 20, 0) };
+	const backend: CueBackend = options.backend ?? (() => {
+		const pulse = options.pulse ?? pulseBackend(new NativePulsePlayer({ platform, env }));
+		const wsl = /microsoft/i.test(options.kernelRelease ?? release());
+		const powershell = "powershell" in options ? options.powershell : resolvePowerShell(platform, env);
+		if (!wsl || !powershell) return pulse;
+		return windowsThenPulse(createWindowsCueBackend({ powershell, sounds: tones, spawn: options.spawn }), pulse);
+	})();
 	let dir: string | undefined;
 	let available: Promise<boolean> | undefined;
 	let disposed = false;
@@ -100,7 +203,7 @@ export function createCuePlayer(options: { platform?: string; env?: NodeJS.Proce
 		if (!path) return { outcome: "failed", ms: 0 };
 		const started = Date.now();
 		try {
-			await backend.play(path);
+			await backend.play(path, name);
 			return { outcome: "done", ms: Date.now() - started };
 		} catch {
 			return { outcome: "failed", ms: Date.now() - started };
@@ -125,7 +228,8 @@ export function createCuePlayer(options: { platform?: string; env?: NodeJS.Proce
 		play,
 		// A silence cue now, so a real one does not pay the worker's start-up.
 		warm: () => {
-			void playCue("silence");
+			if (backend.warm) backend.warm();
+			else void playCue("silence");
 		},
 		dispose: () => {
 			if (disposed) return;
