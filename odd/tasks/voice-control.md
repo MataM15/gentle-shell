@@ -10,7 +10,7 @@ Base: `personal/main` @ `e815d8936`. Worktree `gentle-shell-worktrees/voice-cont
 - **S4 — "Gentle Voice off" by voice.** Owner: "decir «Gentle Voice off» para apagar todo (micrófono y lectura en voz alta), sin comandos escritos." Only a whole utterance that is the command counts; the phrase inside a sentence is sent as text. The command is never sent to the model.
 - **S5 — Big overlay with a waveform.** Owner: "Quiere una ventana o aviso grande en el centro de la pantalla (idealmente con una onda de audio mientras habla)." A Windows topmost, click-through, semi-transparent window launched by Gentle Shell (PowerShell), showing state (listening / transcribing), the live mic level as a wave, the session that is listening, and the active language. Requires the worker to publish audio levels.
 - **S6 — One listener for all sessions.** With many Pi sessions in herdr, one process owns the mic, wake word, cues and overlay; dictation goes to the focused session.
-- **S7 — "Gentle Voice on" by voice.** Owner: "decir «Gentle Voice on» para empezar a escuchar". Local keyword spotting (sherpa-onnx KeywordSpotter ships in the installed runtime; a small KWS model must be pinned). Test the owner's pronunciation before committing. Must not hear its own reading. OPEN owner decision: after "off", is it fully deaf (keyboard only) or asleep (listening for the keyword only)?
+- **S7 — "Gentle Voice on" by voice.** Owner: "decir «Gentle Voice on» para empezar a escuchar". Local keyword spotting (sherpa-onnx KeywordSpotter ships in the installed runtime; a small KWS model must be pinned). Test the owner's pronunciation before committing. Must not hear its own reading. Owner decision (L8): after "off" it stays ASLEEP: mic, readings and dictation off, only the local keyword spotter keeps listening for "Gentle Voice on"; the overlay/status must show the asleep state.
 - **S8 — Navigate herdr agents by voice.** Owner: "si el día de mañana, por ejemplo, quiero navegar desde Header mediante vos entre las diferentes agentes que están activos o levantados, me gustaría poder hacerlo". Fixed command list over `herdr agent list/focus`; sending a prompt to another agent asks for confirmation.
 - **S9 — Deliberate English mode.** Owner: "más adelante, un modo inglés que se active a propósito para practicar." Switched on and off on purpose only, never auto-detected; the overlay shows it.
 - **S10 — Safety rules (all phases).** Owner: "evaluando situaciones también, por ejemplo, que pasaría si estoy hablando y por ejemplo, no sé, algo y se activa, o no se activa, cuestiones de seguridad". Voice never runs free text as a command (fixed list only); nothing destructive or publishing by voice; every activation is visible and audible; false activations close on silence and are logged; Alt+M always works as fallback; audio stays local and is not stored. Development probes stay near-silent (peak at most 20 of 32767).
@@ -24,7 +24,7 @@ Base: `personal/main` @ `e815d8936`. Worktree `gentle-shell-worktrees/voice-cont
 | T3 | S2, S4, S10 | gentle-ai-worker | this commit |
 | T4 | S5 | after T3 | pending |
 | T5 | S6 | after T4 | pending |
-| T6 | S7 | after T5 and the S7 decision | pending |
+| T6 | S7 | after T5 | pending |
 | T7 | S8 | after T5 | pending |
 | T8 | S9 | after T2 and T5 | pending |
 
@@ -37,3 +37,4 @@ Base: `personal/main` @ `e815d8936`. Worktree `gentle-shell-worktrees/voice-cont
 - L5 (owner): "el dictado tomó «sí, siguiente» como inglés y lo transcribió «And they're». Quiere el idioma fijo en español y, más adelante, un modo inglés que se active a propósito para practicar."
 - L6 (owner): "ok dale" — roadmap approved, start.
 - L7 (evidence): cues `done` in voice-events.log (route/level problem, not playback failure); S2 root cause traced from the log (dictation + Enter = interactive input).
+- L8 (owner, verbatim, answering deaf vs asleep after "Gentle Voice off"): "dormido".
