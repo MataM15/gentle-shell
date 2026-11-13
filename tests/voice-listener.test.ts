@@ -524,6 +524,30 @@ test("a cut ends the reading wherever it speaks and frees the turn", async () =>
 	await started.listener.close();
 });
 
+test("a cut naming another reading leaves the current one speaking", async () => {
+	const dir = scratch();
+	const started = await startListener(dir, { readTailMs: 5 });
+	const first = await started.client();
+	first.hello("s-1", "w1:p1");
+	const second = await started.client();
+	second.hello("s-2", "w1:p2");
+	await waitFor(() => framesOf(first, "welcome").length === 1 && framesOf(second, "welcome").length === 1);
+	first.send({ type: "read-begin", id: "a1", readingId: "read-2", chars: 100 });
+	await awaitFrame(first, (frame) => "id" in frame && frame.id === "a1");
+	// A late cut for a reading that already ended must not cut its successor.
+	second.send({ type: "read-cut", id: "c1", readingId: "read-1" });
+	assert.deepEqual(await awaitFrame(second, (frame) => "id" in frame && frame.id === "c1"), { type: "busy", id: "c1", reason: "reading", holder: "s-1" });
+	assert.equal(started.listener.state, "reading");
+	assert.equal(framesOf(first, "reading").filter((frame) => "change" in frame && frame.change === "released").length, 0);
+	// The matching id still cuts it.
+	second.send({ type: "read-cut", id: "c2", readingId: "read-2" });
+	assert.equal((await awaitFrame(second, (frame) => "id" in frame && frame.id === "c2")).type, "ok");
+	await waitFor(() => started.listener.state === "asleep");
+	first.socket.destroy();
+	second.socket.destroy();
+	await started.listener.close();
+});
+
 test("a reader whose session went away releases the turn at once", async () => {
 	const dir = scratch();
 	const started = await startListener(dir, { readTailMs: 5 });

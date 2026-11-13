@@ -597,6 +597,12 @@ export class VoiceListener {
 					this.say(client, withId({ type: "busy", reason: "reading" }, request.id));
 					return;
 				}
+				// A cut that names a reading cuts only that one: a late cut for a reading
+				// that already ended never cuts the one that replaced it.
+				if (request.readingId !== undefined && request.readingId !== reading.readingId) {
+					this.say(client, withId({ type: "busy", reason: "reading", holder: reading.session }, request.id));
+					return;
+				}
 				this.endReading("cut");
 				this.say(client, withId({ type: "ok", request: "read-cut", state: this.currentState }, request.id));
 				return;
