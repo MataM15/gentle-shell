@@ -98,6 +98,22 @@ export interface VoiceTranscript {
 	text: string;
 	// True when the recording limit ended capture before stop() was called.
 	truncated: boolean;
+	// Set when the capture ended on a spoken command (S4): the id the keyword
+	// option gave it, such as "voice-off". The text is then empty, because a
+	// command is never transcribed.
+	command?: string;
+}
+
+// The keyword option of a start request (S7), as the worker validates it: the
+// pinned spotter model with its digests, the keyword lines with the command
+// each one stands for, and the tuning values.
+export interface VoiceKeywordOption {
+	model: { root: string; files: Record<string, { name: string; size: number; sha256: string }> };
+	keywords: Array<{ tokens: string; command: string }>;
+	boost: number;
+	threshold: number;
+	maxActivePaths: number;
+	trailingBlanks: number;
 }
 
 export interface VoiceWorkerSpawnOptions {
@@ -149,7 +165,14 @@ export type WorkerMessage =
 	| { type: "error"; code: WorkerErrorCode }
 	// A display level, never part of the transcript protocol: 0..1, one per 50 ms
 	// of audio, and only after a start request asked for it.
-	| { type: "level"; rms: number };
+	| { type: "level"; rms: number }
+	// Keyword spotting, only after a start request asked for it: a spoken command
+	// that ends the capture, and the two answers of a spot-only capture.
+	| { type: "command"; command: string }
+	| { type: "spotting" }
+	| { type: "stopped" };
+
+const COMMAND_ID = /^[a-z][a-z0-9-]{0,31}$/;
 
 const hasExactKeys = (value: Record<string, unknown>, keys: string[]) => Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
 
@@ -167,7 +190,13 @@ export function parseWorkerLine(line: string): WorkerMessage | undefined {
 	switch (record.type) {
 		case "recording":
 		case "transcribing":
+		case "spotting":
+		case "stopped":
 			return hasExactKeys(record, ["schema", "type"]) ? { type: record.type } : undefined;
+		case "command":
+			// The id and nothing else: never the words that were said.
+			if (!hasExactKeys(record, ["schema", "type", "command"]) || typeof record.command !== "string" || !COMMAND_ID.test(record.command)) return undefined;
+			return { type: "command", command: record.command };
 		case "result":
 			if (!hasExactKeys(record, ["schema", "type", "text", "truncated"]) || typeof record.text !== "string" || record.text.length > MAX_TEXT || typeof record.truncated !== "boolean") return undefined;
 			return { type: "result", text: record.text, truncated: record.truncated };
@@ -350,6 +379,9 @@ export class VoiceSession {
 					this.onLevel(message.rms);
 					continue;
 				}
+				// This session never asks for keyword spotting, so these can only be
+				// strays: ignored, like a level nobody asked for.
+				if (message?.type === "command" || message?.type === "spotting" || message?.type === "stopped") continue;
 				if (!message || ++lines > MAX_LINES) {
 					this.abort("protocol");
 					continue;

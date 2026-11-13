@@ -12,6 +12,7 @@ import {
 	VOICE_WORKER_URL,
 	VoiceSessionError,
 	type VoiceEndpoint,
+	type VoiceKeywordOption,
 	type VoiceSessionErrorCode,
 	type VoiceSessionState,
 	type VoiceTranscript,
@@ -46,6 +47,19 @@ export interface WarmDictation {
 	cancel(): Promise<void>;
 }
 
+// A spot-only capture (S7): the microphone open for the keyword spotter alone.
+// It has no transcript and no end of its own; it is `recording` while it listens.
+export interface WarmSpotting {
+	readonly state: VoiceSessionState;
+	// Resolves once the microphone is open.
+	start(): Promise<void>;
+	// The command that was heard, or undefined when the capture was stopped.
+	heard(): Promise<string | undefined>;
+	// Closes the microphone and keeps the worker.
+	stop(): Promise<void>;
+	cancel(): Promise<void>;
+}
+
 export interface WarmVoiceWorkerOptions {
 	target: VoiceTarget;
 	env?: NodeJS.ProcessEnv;
@@ -60,7 +74,11 @@ export interface WarmVoiceWorker {
 	// `levels`: the worker publishes the microphone RMS for a display, and it is
 	// handed to `onLevel` while recording. A session that does not ask sends
 	// exactly the request it always did.
-	session(options: { onStateChange(state: VoiceSessionState): void; endpoint?: VoiceEndpoint; levels?: boolean; onLevel?: (rms: number) => void }): WarmDictation;
+	// `kws`: the worker also listens for spoken commands while it records, and a
+	// capture that ends on one resolves with `command` set and an empty text.
+	session(options: { onStateChange(state: VoiceSessionState): void; endpoint?: VoiceEndpoint; levels?: boolean; onLevel?: (rms: number) => void; kws?: VoiceKeywordOption }): WarmDictation;
+	// Listens for spoken commands only, on the same worker and its one spotter.
+	spot(options: { kws: VoiceKeywordOption; onStateChange?(state: VoiceSessionState): void }): WarmSpotting;
 	// Closes the worker, killing it if it has not exited within graceMs.
 	close(graceMs?: number): Promise<void>;
 }
@@ -78,6 +96,9 @@ interface Capture {
 	onStateChange(state: VoiceSessionState): void;
 	levels: boolean;
 	onLevel?: (rms: number) => void;
+	// Asked for keyword spotting; and, when `spot`, for nothing else.
+	kws: boolean;
+	spot: boolean;
 	recording: { resolve(): void; reject(error: unknown): void };
 	result: { resolve(transcript: VoiceTranscript): void; reject(error: unknown): void };
 	settled: boolean;
@@ -162,19 +183,39 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 				}
 				return;
 			case "recording":
-				if (capture.state !== "starting") return protocolError();
+				if (capture.spot || capture.state !== "starting") return protocolError();
 				setState(capture, "recording");
 				arm(capture, VOICE_SESSION_DEFAULTS.maxRecordingMs + RECORDING_MARGIN_MS);
 				capture.recording.resolve();
 				return;
+			case "spotting":
+				if (!capture.spot || capture.state !== "starting") return protocolError();
+				setState(capture, "recording");
+				// No limit: it listens until a command is heard or it is told to stop.
+				if (capture.timer) clearTimeout(capture.timer);
+				capture.recording.resolve();
+				return;
+			case "command":
+				// Only a capture that asked for keywords is handed one; a stray one
+				// changes nothing.
+				if (!capture.kws) return;
+				if (capture.state !== "recording" && capture.state !== "transcribing") return protocolError();
+				settle(capture, { transcript: { text: "", truncated: false, command: message.command } });
+				return;
+			case "stopped":
+				if (!capture.spot) return;
+				if (capture.state !== "recording" && capture.state !== "transcribing") return protocolError();
+				settle(capture, { transcript: { text: "", truncated: false } });
+				return;
 			case "transcribing":
+				if (capture.spot) return protocolError();
 				if (capture.state === "recording") {
 					setState(capture, "transcribing");
 					arm(capture, VOICE_SESSION_DEFAULTS.transcribeTimeoutMs);
 				} else if (capture.state !== "transcribing") protocolError();
 				return;
 			case "result": {
-				if (capture.state !== "transcribing") return protocolError();
+				if (capture.spot || capture.state !== "transcribing") return protocolError();
 				const text = message.text.trim();
 				settle(capture, text ? { transcript: { text, truncated: message.truncated } } : { error: fail("no-speech") });
 				return;
@@ -256,20 +297,21 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 		clearTimeout(timer);
 	};
 
-	return {
-		close,
-		session({ onStateChange, endpoint, levels, onLevel }) {
+	// One capture on the worker: a dictation, or with `spot` a capture for the
+	// keyword spotter alone. `result` is the outcome without asking it to stop.
+	const open = ({ onStateChange, endpoint, levels, onLevel, kws, spot }: { onStateChange(state: VoiceSessionState): void; endpoint?: VoiceEndpoint; levels?: boolean; onLevel?: (rms: number) => void; kws?: VoiceKeywordOption; spot?: boolean }): WarmDictation & { result(): Promise<VoiceTranscript> } => {
 			let recording!: Capture["recording"];
 			let result!: Capture["result"];
 			const recordingPromise = new Promise<void>((resolve, reject) => { recording = { resolve, reject }; });
 			const resultPromise = new Promise<VoiceTranscript>((resolve, reject) => { result = { resolve, reject }; });
 			recordingPromise.catch(() => {});
 			resultPromise.catch(() => {});
-			const capture: Capture = { state: "idle", onStateChange, levels: levels === true, onLevel, recording, result, settled: false };
+			const capture: Capture = { state: "idle", onStateChange, levels: levels === true, onLevel, kws: kws !== undefined, spot: spot === true, recording, result, settled: false };
 			return {
 				get state() {
 					return capture.state;
 				},
+				result: () => resultPromise,
 				async start() {
 					if (capture.state !== "idle" || current) throw fail("invalid-state");
 					current = capture;
@@ -290,6 +332,8 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 						numThreads: WARM_WORKER_DEFAULTS.numThreads,
 						...(endpoint ? { endpoint: { endOfSpeechMs: endpoint.endOfSpeechMs, noSpeechMs: endpoint.noSpeechMs } } : {}),
 						...(levels === true ? { levels: true } : {}),
+						...(kws ? { kws } : {}),
+						...(spot === true ? { spot: true } : {}),
 						keepAlive: true,
 					});
 					return recordingPromise;
@@ -330,6 +374,26 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 					await entry.closed;
 					clearTimeout(timer);
 				},
+			};
+	};
+
+	return {
+		close,
+		session: (sessionOptions) => open(sessionOptions),
+		spot({ kws, onStateChange }) {
+			const capture = open({ onStateChange: onStateChange ?? (() => {}), kws, spot: true });
+			return {
+				get state() {
+					return capture.state;
+				},
+				start: () => capture.start(),
+				heard: () => capture.result().then((outcome) => outcome.command),
+				// Before the microphone opened there is nothing to stop: it is cancelled.
+				async stop() {
+					if (capture.state === "idle" || capture.state === "starting") return capture.cancel();
+					await capture.stop().catch(() => {});
+				},
+				cancel: () => capture.cancel(),
 			};
 		},
 	};

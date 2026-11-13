@@ -494,3 +494,22 @@ test("the real worker process records and transcribes through fake installed mod
 	assert.equal(cancelled.state, "finished");
 	await rejectsWith(cancelled.stop(), "cancelled");
 });
+
+// --- spoken commands (T15, S7/S4) ---------------------------------------------
+
+test("a session that never asked for keywords ignores a stray command and still transcribes", async (t) => {
+	const fixture = await installFixture(t, "linux-x64");
+	const run = scripted(fixture);
+	const started = run.session.start();
+	await run.until(() => run.workers.length === 1 && run.worker().received.length === 1);
+	assert.equal(Object.hasOwn(run.worker().received[0] as Record<string, unknown>, "kws"), false);
+	run.worker().say({ type: "recording" });
+	await started;
+	for (let i = 0; i < 40; i++) run.worker().say({ type: "command", command: "voice-off" });
+	run.worker().say({ type: "spotting" });
+	run.worker().say({ type: "stopped" });
+	const stopped = run.session.stop();
+	run.worker().say({ type: "transcribing" });
+	run.worker().say({ type: "result", text: "hola", truncated: false });
+	assert.deepEqual(await stopped, { text: "hola", truncated: false });
+});

@@ -466,7 +466,11 @@ a session that asks for a capture only receives the transcript.
   `spotting`, keeps no audio, has no time limit, never verifies or loads the
   dictation model, and ends with a `command`, or with `stopped` when it is told
   to stop. It is what will listen while voice is asleep and while a reply is
-  read aloud.
+  read aloud. The warm worker (`lib/voice-warm.ts`) carries both: a session
+  given `kws` resolves with `command` set and an empty text when the capture
+  ended on a command, and `spot()` opens a spot-only capture whose `heard()`
+  resolves with the command, or with nothing when it was stopped. A session
+  that did not ask ignores a stray `command`.
 - **The overlay port.** `lib/voice-overlay.ts` is the seam the window plugs into:
   the listener hands it a snapshot of the display (state, language, owning session) on every change and the smoothed level while recording. The
   meter lives there, never in the detector: the same worker RMS is normalized

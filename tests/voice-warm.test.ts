@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import nodeTest from "node:test";
-import { VoiceSessionError, VOICE_WORKER_SCHEMA, type VoiceSessionState } from "../lib/voice-session.ts";
+import { parseWorkerLine, VoiceSessionError, VOICE_WORKER_SCHEMA, type VoiceSessionState } from "../lib/voice-session.ts";
 import { createWarmVoiceWorker } from "../lib/voice-warm.ts";
 
 // The warm dictation worker (S11): one worker process kept alive between
@@ -217,4 +217,131 @@ test("without levels the warm start request is unchanged and a stray level is ig
 	worker.say({ type: "result", text: "otra", truncated: false });
 	assert.deepEqual(await stopped, { text: "otra", truncated: false }, "a level is not a protocol error");
 	await h.warm.close();
+});
+
+// --- spoken commands (T15, S7/S4) ---------------------------------------------
+
+const KWS = {
+	model: { root: "/kws", files: {} },
+	keywords: [{ tokens: "▁G ENT LE ▁ VO IC E ▁OF F", command: "voice-off" }],
+	boost: 2,
+	threshold: 0.25,
+	maxActivePaths: 16,
+	trailingBlanks: 2,
+};
+
+test("a warm session that asks for keywords forwards the option and ends on a command instead of a transcript", async () => {
+	const h = harness();
+	const states: VoiceSessionState[] = [];
+	const dictation = h.warm.session({ onStateChange: (state) => states.push(state), kws: KWS });
+	const started = dictation.start();
+	await h.until(() => h.workers.length === 1 && h.workers[0]!.received.length === 1);
+	const worker = h.workers[0]!;
+	assert.deepEqual(worker.received[0]!.kws, KWS, "the start request carries the option as given");
+	assert.equal(Object.hasOwn(worker.received[0]!, "spot"), false);
+	worker.say({ type: "recording" });
+	await started;
+	worker.say({ type: "command", command: "voice-off" });
+	assert.deepEqual(await dictation.stop(), { text: "", truncated: false, command: "voice-off" });
+	assert.deepEqual(states, ["starting", "recording", "finished"]);
+	assert.equal(worker.received.some((message) => message.type === "stop"), false, "nothing is left to stop");
+	assert.equal(worker.exited, false, "the worker stays for the next recording");
+	// A command the worker found while it was ending the recording counts too.
+	const second = h.warm.session({ onStateChange: () => {}, kws: KWS });
+	const secondStarted = second.start();
+	await h.until(() => worker.received.filter((message) => message.type === "start").length === 2);
+	worker.say({ type: "recording" });
+	await secondStarted;
+	const stopped = second.stop();
+	worker.say({ type: "command", command: "voice-off" });
+	assert.deepEqual(await stopped, { text: "", truncated: false, command: "voice-off" });
+	await h.warm.close();
+});
+
+test("without the keyword option the warm start request is unchanged and a stray command is ignored", async () => {
+	const h = harness();
+	const dictation = h.warm.session({ onStateChange: () => {} });
+	const started = dictation.start();
+	await h.until(() => h.workers.length === 1 && h.workers[0]!.received.length === 1);
+	const worker = h.workers[0]!;
+	assert.deepEqual(worker.received[0], { ...BASE_REQUEST, keepAlive: true });
+	worker.say({ type: "recording" });
+	await started;
+	worker.say({ type: "command", command: "voice-off" });
+	worker.say({ type: "stopped" });
+	const stopped = dictation.stop();
+	worker.say({ type: "transcribing" });
+	worker.say({ type: "result", text: "hola", truncated: false });
+	assert.deepEqual(await stopped, { text: "hola", truncated: false });
+	assert.equal(worker.exited, false);
+	await h.warm.close();
+});
+
+test("a spot-only capture opens the microphone for keywords alone and reports the command it hears", async () => {
+	const h = harness();
+	const states: VoiceSessionState[] = [];
+	const spotting = h.warm.spot({ kws: KWS, onStateChange: (state) => states.push(state) });
+	const started = spotting.start();
+	await h.until(() => h.workers.length === 1 && h.workers[0]!.received.length === 1);
+	const worker = h.workers[0]!;
+	assert.deepEqual(worker.received[0], { ...BASE_REQUEST, kws: KWS, spot: true, keepAlive: true });
+	worker.say({ type: "spotting" });
+	await started;
+	assert.equal(spotting.state, "recording");
+	const heard = spotting.heard();
+	worker.say({ type: "command", command: "voice-off" });
+	assert.equal(await heard, "voice-off");
+	assert.deepEqual(states, ["starting", "recording", "finished"]);
+	assert.equal(worker.exited, false);
+	// The same worker dictates afterwards.
+	const after = await record(h, "hola");
+	assert.equal(after.worker, worker);
+	assert.deepEqual(after.transcript, { text: "hola", truncated: false });
+	await h.warm.close();
+});
+
+test("a spot-only capture that is stopped hears nothing, and one capture at a time still holds", async () => {
+	const h = harness();
+	const spotting = h.warm.spot({ kws: KWS });
+	const started = spotting.start();
+	await h.until(() => h.workers.length === 1 && h.workers[0]!.received.length === 1);
+	const worker = h.workers[0]!;
+	worker.say({ type: "spotting" });
+	await started;
+	await assert.rejects(h.warm.session({ onStateChange: () => {} }).start(), (error: unknown) => error instanceof VoiceSessionError && error.code === "invalid-state");
+	const heard = spotting.heard();
+	const stopping = spotting.stop();
+	await h.until(() => worker.received.some((message) => message.type === "stop"));
+	worker.say({ type: "stopped" });
+	await stopping;
+	assert.equal(await heard, undefined);
+	assert.equal(worker.exited, false);
+	await h.warm.close();
+});
+
+test("a spot-only capture answered like a dictation is a protocol error", async () => {
+	const h = harness();
+	const spotting = h.warm.spot({ kws: KWS });
+	const started = spotting.start();
+	await h.until(() => h.workers.length === 1 && h.workers[0]!.received.length === 1);
+	h.workers[0]!.say({ type: "recording" });
+	await assert.rejects(started, (error: unknown) => error instanceof VoiceSessionError && error.code === "protocol");
+	await h.until(() => h.workers[0]!.exited);
+});
+
+const workerLine = (message: Record<string, unknown>) => JSON.stringify({ schema: VOICE_WORKER_SCHEMA, ...message });
+
+test("command, spotting and stopped lines carry exactly their fields", async () => {
+	assert.deepEqual(parseWorkerLine(workerLine({ type: "command", command: "voice-off" })), { type: "command", command: "voice-off" });
+	assert.deepEqual(parseWorkerLine(workerLine({ type: "spotting" })), { type: "spotting" });
+	assert.deepEqual(parseWorkerLine(workerLine({ type: "stopped" })), { type: "stopped" });
+	const malformed = [
+		workerLine({ type: "command" }),
+		workerLine({ type: "command", command: "Voice Off" }),
+		workerLine({ type: "command", command: 7 }),
+		workerLine({ type: "command", command: "voice-off", text: "gentle voice off" }),
+		workerLine({ type: "spotting", extra: 1 }),
+		workerLine({ type: "stopped", command: "voice-off" }),
+	];
+	for (const line of malformed) assert.equal(parseWorkerLine(line), undefined, line);
 });
