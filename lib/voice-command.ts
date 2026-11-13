@@ -409,6 +409,8 @@ export interface ReadingTurnHooks {
 	// Read at hello time: a queued reading must not replay an old voice choice.
 	voiceOn?: () => boolean;
 	chars?: number;
+	// A capture can outlast the ordinary two-minute reading-turn wait.
+	maxWaitMs?: number;
 	// The listener took the turn back (a cut, a lost lease): the reading stops.
 	onCut?: (reason: ReadingReleaseReason) => void;
 }
@@ -427,7 +429,7 @@ export interface CreateReadingTurnOptions {
 	// The voice home, shared by every Pi process of this user.
 	dir: string;
 	// The listener route and the local fallback; both have production defaults.
-	turn?: (options: { dir: string; session: ListenerSession; chars?: number; signal: AbortSignal; onCut?: (reason: ReadingReleaseReason) => void }) => Promise<ListenerReading | undefined>;
+	turn?: (options: { dir: string; session: ListenerSession; chars?: number; signal: AbortSignal; maxWaitMs?: number; onCut?: (reason: ReadingReleaseReason) => void }) => Promise<ListenerReading | undefined>;
 	local?: (options: { signal: AbortSignal }) => Promise<(() => void) | undefined>;
 	start?: () => void | Promise<void>;
 }
@@ -443,7 +445,7 @@ export function createReadingTurn(options: CreateReadingTurnOptions): ReadingTur
 		if (hooks.sessionId) {
 			let answer: ListenerReading | undefined;
 			try {
-				answer = await turn({ dir: options.dir, session: { sessionId: hooks.sessionId, get voiceOn() { return hooks.voiceOn?.() ?? false; } }, chars: hooks.chars, signal, onCut: hooks.onCut });
+				answer = await turn({ dir: options.dir, session: { sessionId: hooks.sessionId, get voiceOn() { return hooks.voiceOn?.() ?? false; } }, chars: hooks.chars, signal, onCut: hooks.onCut, ...(hooks.maxWaitMs === undefined ? {} : { maxWaitMs: hooks.maxWaitMs }) });
 			} catch {
 				answer = { kind: "unavailable" };
 			}
@@ -751,6 +753,10 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		ctx: ExtensionContext;
 		generation: number;
 		controller: AbortController;
+		// A reply that became ready during this conversation must survive that
+		// conversation's own send; typed input and other sends still cut it.
+		waitingForCapture?: ToggleRun;
+		preserveSpokenSend?: boolean;
 		unsubscribe(): void;
 	}
 	let reading: Reading | undefined;
@@ -849,8 +855,8 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		clearHeld();
 		startReply(held.ctx, held.text);
 	};
-	const holdReply = (ctx: ExtensionContext, text: string): void => {
-		const held: HeldReply = { ctx, text, session: sessionIdOf(ctx), settledAt: Date.now() };
+	const holdReply = (ctx: ExtensionContext, text: string, settledAt = Date.now()): void => {
+		const held: HeldReply = { ctx, text, session: sessionIdOf(ctx), settledAt };
 		heldReply = held;
 		voiceLog("reading.held", { session: held.session, chars: text.length });
 		scheduleHeldPoll();
@@ -871,8 +877,9 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	// to the microphone as if it had been heard to the end.
 	type ReadingOutcome = "done" | "skipped" | "cancelled" | "empty" | "unavailable" | "error";
 	const readAloud = async (ctx: ExtensionContext, markdown: string): Promise<ReadingOutcome> => {
+		const settledAt = Date.now();
 		stopReading();
-		const current: Reading = { ctx, generation, controller: new AbortController(), unsubscribe: () => {} };
+		const current: Reading = { ctx, generation, controller: new AbortController(), waitingForCapture: toggling?.send ? toggling : undefined, unsubscribe: () => {} };
 		reading = current;
 		let skipped = false;
 		const live = () => reading === current && current.generation === generation;
@@ -907,10 +914,26 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 				sessionId,
 				voiceOn: () => current.generation === generation && sessionIdOf(sessionCtx) === sessionId && sessionIdOf(ctx) === sessionId && voiceOn(ctx),
 				chars: markdown.length,
+				// The worker can record for two minutes and then transcribe: the
+				// ordinary two-minute turn deadline would drop this reply too early.
+				...(current.waitingForCapture ? { maxWaitMs: holdStaleMs } : {}),
 				onCut: () => cutReadings(),
 			});
 			// Voice may have been turned off, in any Pi process, while this waited.
 			if (!release || !live() || !voiceOn(ctx)) return skipped ? "skipped" : "cancelled";
+			if (current.waitingForCapture) {
+				// The owner may have moved panes during a long capture. Keep S12's
+				// held-reply path and original age rather than speaking out of focus.
+				const focus = await paneFocus().catch(() => "unknown" as const);
+				if (!live() || !voiceOn(ctx)) return skipped ? "skipped" : "cancelled";
+				if (focus === "unfocused") {
+					const next = queuedReply;
+					queuedReply = undefined;
+					if (next && voiceOn(next.ctx)) holdReply(next.ctx, next.text);
+					else holdReply(ctx, markdown, settledAt);
+					return "cancelled";
+				}
+			}
 			setVoiceFooter(ctx, live, voiceReadingStatus(toggleShortcut));
 			// The start is published before the engine is asked to speak, so a
 			// consumer knows the voice is live before the first chunk arrives. Both
@@ -1622,6 +1645,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		const message = draft ? `${draft}\n\n${text}` : text;
 		spokenTurnPending = true;
 		const idle = typeof ctx.isIdle === "function" ? ctx.isIdle() : true;
+		if (reading && toggling && reading.waitingForCapture === toggling) reading.preserveSpokenSend = true;
 		voiceSendPending = true;
 		voiceLog("turn.sent", { session: sessionIdOf(ctx), chars: message.length, idle, draft: draft.length > 0 });
 		if (idle) pi.sendUserMessage(message);
@@ -1808,7 +1832,9 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		voiceSendPending = false;
 		if (dictated) spokenTurnPending = true;
 		else if (typed) spokenTurnPending = false;
-		if (typed || spokenSend) cutReadings();
+		const preserveReading = !typed && spokenSend && reading?.preserveSpokenSend === true;
+		if (preserveReading && reading) reading.preserveSpokenSend = false;
+		if (typed || (spokenSend && !preserveReading)) cutReadings();
 	});
 	pi.on("agent_start", () => {
 		pendingReply = undefined;

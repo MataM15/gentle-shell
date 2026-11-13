@@ -326,6 +326,8 @@ export interface ListenerDictation {
 	start(): Promise<void>;
 	stop(): Promise<VoiceTranscript>;
 	cancel(): Promise<void>;
+	// Warm outcomes may precede the retiring child's microphone release.
+	waitUntilReleased?(): Promise<void>;
 }
 
 export interface ListenerDictationRequest {
@@ -1159,9 +1161,17 @@ export class VoiceListener {
 	private releaseCapture(capture: ActiveCapture, cancel = false): void {
 		if (this.capture !== capture) return;
 		this.capture = undefined;
+		let closing: Promise<void> | undefined;
 		if (cancel) {
-			let closing: Promise<void>;
 			try { closing = Promise.resolve(capture.dictation.cancel()).catch(() => {}); } catch { closing = Promise.resolve(); }
+		}
+		if (capture.dictation.waitUntilReleased) {
+			// A terminal error reports its outcome before its child exits. The warm
+			// layer's existing release promise is the microphone ownership barrier.
+			const released = capture.dictation.waitUntilReleased();
+			closing = closing ? Promise.all([closing, released]).then(() => {}) : released;
+		}
+		if (closing) {
 			this.captureClosing = closing;
 			void closing.then(() => {
 				if (this.captureClosing === closing) this.captureClosing = undefined;
@@ -1297,12 +1307,46 @@ export class VoiceListener {
 			void this.wakeByVoice().finally(() => { this.waking = false; this.refreshSpotting(); });
 			return;
 		}
-		const reason = command === "voice-off" && this.voiceSessions.length > 0 ? "whole-utterance" : command === "voice-on" ? "ignored:awake-voice-on" : "ignored:unsupported";
+		if (command === "voice-on") {
+			// Reuse the spoken-wake frame: the focused session starts the same
+			// hands-free conversation and the listener owns its cue and capture.
+			this.waking = true;
+			void this.openAwakeConversation().finally(() => { this.waking = false; this.refreshSpotting(); });
+			return;
+		}
+		const reason = command === "voice-off" && this.voiceSessions.length > 0 ? "whole-utterance" : "ignored:unsupported";
 		this.log("kws.hit", { command, reason });
 		if (reason === "whole-utterance") {
 			this.voiceOffEverywhere();
 			this.setState("asleep");
 		} else this.refreshSpotting();
+	}
+
+	// An awake hit opens only a session that already has voice on. Focus is
+	// asynchronous: a reading, capture or shutdown that wins meanwhile must not
+	// be interrupted by a late result.
+	private async openAwakeConversation(): Promise<void> {
+		let lookup: ListenerFocusResult;
+		try { lookup = await (this.options.focus ?? noFocus).focusedPaneId(); }
+		catch { lookup = { failed: true }; }
+		if (this.reading) {
+			this.log("kws.hit", { command: "voice-on", reason: "ignored:reading" });
+			return;
+		}
+		const paneId = "focused" in lookup ? lookup.focused : undefined;
+		const target = paneId === undefined ? undefined : [...this.clients.values()].find(
+			(client) => client.welcomed && client.role === "session" && client.sessionId && client.paneId === paneId && client.voiceOn,
+		);
+		if (!target) {
+			this.log("kws.hit", { command: "voice-on", reason: "ignored:no-focused-voice-session" });
+			return;
+		}
+		if (this.currentState !== "listening" || this.spotting || this.capture || this.capturePending || this.captureClosing || this.closing) {
+			this.log("kws.hit", { command: "voice-on", reason: "ignored:stale" });
+			return;
+		}
+		this.log("kws.hit", { command: "voice-on", reason: "whole-utterance" });
+		this.say(target, { type: "command", command: "voice-on", wake: true });
 	}
 
 	// A keyword heard while asleep wakes the session the owner is looking at, and
@@ -1459,9 +1503,9 @@ export class VoiceListener {
 			this.say(client, withId({ type: "busy", reason: "reading", holder: this.reading.session }, request.id));
 			return;
 		}
-		// A capture holds the microphone: the reading waits instead of recording
-		// what it says, and the requester is told who has it.
-		if (this.capture || this.capturePending) {
+		// A capture holds the microphone until cancellation has actually settled:
+		// a closing worker may still record even after the capture was released.
+		if (this.capture || this.capturePending || this.captureClosing) {
 			this.say(client, withId({ type: "busy", reason: "capture", holder: this.capture?.sessionId ?? this.capturePending?.sessionId }, request.id));
 			return;
 		}

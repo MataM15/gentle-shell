@@ -2795,6 +2795,168 @@ for (const reload of [false, true]) test(`a spoken wake reaches the focused sess
 	}
 });
 
+// Use the real listener, session link and reading-turn client, but fake the
+// worker and speaker. No audio or live voice settings are touched.
+async function awakeConversationFixture(busy: boolean) {
+	const { engine, readings } = fakeEngine();
+	const home = mkdtempSync(join(tmpdir(), "voice-command-awake-on-"));
+	const dir = join(home, "voice");
+	const requests: ListenerDictationRequest[] = [];
+	const listenerEvents: Array<{ event: string } & Record<string, unknown>> = [];
+	const cueNames: string[] = [];
+	let heard: ((command: string | undefined) => void) | undefined;
+	let spotStarts = 0;
+	const server = new VoiceListener({
+		dir,
+		dictation: (request) => {
+			requests.push(request);
+			return {
+				start: async () => request.onStateChange("recording"),
+				stop: async () => { request.onStateChange("transcribing"); request.onStateChange("finished"); return { text: "seguí por favor", truncated: false }; },
+				cancel: async () => request.onStateChange("finished"),
+			};
+		},
+		spot: () => {
+			spotStarts++;
+			let settle!: (command: string | undefined) => void;
+			const waiting = new Promise<string | undefined>((resolve) => { settle = resolve; });
+			heard = settle;
+			return { start: async () => {}, heard: () => waiting, stop: async () => settle(undefined), cancel: async () => settle(undefined) };
+		},
+		keyword: { model: { root: "/fake/kws", files: {} }, keywords: [{ tokens: "ON", command: "voice-on" }], boost: 2, threshold: 0.25, maxActivePaths: 16, trailingBlanks: 2 },
+		focus: { focusedPaneId: async () => ({ focused: "w1:p1" }) },
+		cues: { play: async (name) => { cueNames.push(name); return { name, outcome: "done", ms: 1 }; }, warm: () => {}, dispose: () => {} },
+		log: (event, fields) => listenerEvents.push({ event, ...fields }),
+	});
+	const reached = async (check: () => boolean, ms = 2_000) => {
+		const deadline = Date.now() + ms;
+		while (!check() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+		assert.ok(check(), "condition not reached");
+	};
+	await server.listen();
+	const h = harness({ installed: true, engine, voice: true, env: { HERDR_PANE_ID: "w1:p1", GENTLE_PI_CONFIG_HOME: home } });
+	delete (h.deps as { createSession?: unknown }).createSession;
+	delete (h.deps as { readingTurn?: unknown }).readingTurn;
+	const pi = register(h);
+	const ui = fakeContext({}, "tui", true, "session-alpha", () => !busy);
+	// Pi emits an input event for a sent voice message. Exercise that event too:
+	// it must not discard a reply that is waiting for this very capture.
+	const api = pi.pi as unknown as { sendUserMessage(content: unknown, options?: unknown): void };
+	const send = api.sendUserMessage.bind(api);
+	api.sendUserMessage = (content, options) => { send(content, options); void pi.fire("input", ui.ctx, { source: "extension", text: content }); };
+	await pi.fire("session_start", ui.ctx);
+	await reached(() => server.sessionIds.includes("session-alpha") && spotStarts > 0 && heard !== undefined);
+	(ui.ctx.ui as unknown as { setEditorText(text: string): void }).setEditorText("");
+	return {
+		h, pi, ui, requests, readings, listenerEvents, cueNames, reached,
+		hearOn: () => heard!("voice-on"),
+		close: async () => { await pi.fire("session_shutdown", ui.ctx); await server.close(); rmSync(home, { recursive: true, force: true }); },
+	};
+}
+
+for (const busy of [false, true]) test(`awake voice-on opens a hands-free spoken turn ${busy ? "while the agent is answering" : "while idle"} (S15, S2)`, async () => {
+	const f = await awakeConversationFixture(busy);
+	try {
+		if (busy) await f.pi.fire("agent_start", f.ui.ctx);
+		f.hearOn();
+		await f.reached(() => f.requests.length === 1 || f.listenerEvents.some((entry) => entry.event === "kws.hit"));
+		assert.deepEqual(f.listenerEvents.filter((entry) => entry.event === "kws.hit").map(({ command, reason }) => ({ command, reason })), [{ command: "voice-on", reason: "whole-utterance" }]);
+		await f.reached(() => f.requests.length === 1);
+		assert.equal(f.requests[0]!.mode, "conversation");
+		assert.deepEqual(f.requests[0]!.endpoint, CONVERSATION_ENDPOINT);
+		assert.deepEqual(f.cueNames, ["open"]);
+		assert.deepEqual(f.h.voice.writes, [], "voice was already on");
+		assert.ok(f.listenerEvents.some((entry) => entry.event === "capture.begin" && entry.sessionId === "session-alpha" && entry.mode === "conversation"));
+		f.requests[0]!.onStateChange("finished");
+		await f.reached(() => f.pi.sent.length === 1);
+		assert.deepEqual(f.pi.sent, [{ content: "seguí por favor", options: busy ? { deliverAs: "followUp" } : undefined }]);
+		assert.equal(f.ui.editor(), "");
+		await settleReply(f.pi, f.ui.ctx, "Respuesta al turno hablado.");
+		await f.reached(() => f.readings.length === 1);
+		f.readings[0]!.finish("done");
+		await f.reached(() => f.requests.length === 2);
+		assert.equal(f.requests[1]!.mode, "conversation", "the sent transcript counts as spoken for reopen");
+	} finally {
+		await f.close();
+	}
+});
+
+for (const source of ["shortcut", "awake voice-on"] as const) test(`a reply ready during ${source} capture waits, survives its spoken send and is read afterwards (S15, JD-A-002)`, async () => {
+	const f = await awakeConversationFixture(true);
+	try {
+		// The shortcut covers the same existing path independently of the keyword;
+		// the other case exercises the complete new spot-to-reading sequence.
+		const pressed = source === "shortcut" ? f.pi.shortcuts.get("alt+m")!.handler(f.ui.ctx) : undefined;
+		if (source === "awake voice-on") f.hearOn();
+		await f.reached(() => f.requests.length === 1);
+		await settleReply(f.pi, f.ui.ctx, "La respuesta que terminó mientras dictaba.");
+		await f.reached(() => f.ui.statuses.includes("Waiting to read · esc skip"));
+		await new Promise((resolve) => setTimeout(resolve, 250));
+		assert.equal(f.readings.length, 0, "the speaker never starts over the open microphone");
+		assert.equal(f.listenerEvents.some((entry) => entry.event === "reading.begin"), false);
+		f.requests[0]!.onStateChange("finished");
+		await pressed;
+		await f.reached(() => f.pi.sent.length === 1);
+		assert.deepEqual(f.pi.sent, [{ content: "seguí por favor", options: { deliverAs: "followUp" } }]);
+		await f.reached(() => f.readings.length === 1);
+		assert.equal(f.readings[0]!.text, "La respuesta que terminó mientras dictaba.");
+		assert.ok(f.listenerEvents.findIndex((entry) => entry.event === "capture.end") < f.listenerEvents.findIndex((entry) => entry.event === "reading.begin"));
+		f.readings[0]!.finish("done");
+		await f.reached(() => f.requests.length === 2);
+		assert.equal(f.requests[1]!.mode, "conversation");
+	} finally {
+		await f.close();
+	}
+});
+
+test("a reply keeps waiting past the old two-minute limit while an awake voice-on capture remains open (S15)", async () => {
+	const f = await awakeConversationFixture(true);
+	const realNow = Date.now;
+	try {
+		f.hearOn();
+		await f.reached(() => f.requests.length === 1);
+		await settleReply(f.pi, f.ui.ctx, "Esperá hasta que termine de hablar.");
+		await f.reached(() => f.ui.statuses.includes("Waiting to read · esc skip") && f.listenerEvents.some((entry) => entry.event === "listener.hello" && entry.role === "reading"));
+		// The first read-begin has been refused for the open capture. Move the
+		// clock, not the wall time, past the old two-minute reading deadline.
+		await new Promise((resolve) => setTimeout(resolve, 230));
+		Date.now = () => realNow() + 121_000;
+		await new Promise((resolve) => setTimeout(resolve, 250));
+		Date.now = realNow;
+		assert.equal(f.readings.length, 0);
+		assert.equal(f.ui.statuses.at(-1), "Waiting to read · esc skip", "the reply was not dropped at the old deadline");
+		f.requests[0]!.onStateChange("finished");
+		await f.reached(() => f.readings.length === 1);
+		assert.equal(f.readings[0]!.text, "Esperá hasta que termine de hablar.");
+		f.readings[0]!.finish("done");
+	} finally {
+		Date.now = realNow;
+		await f.close();
+	}
+});
+
+test("a reply waiting for an awake voice-on capture stays held if its session loses focus (S12, S15)", async () => {
+	const f = await awakeConversationFixture(true);
+	try {
+		f.hearOn();
+		await f.reached(() => f.requests.length === 1);
+		await settleReply(f.pi, f.ui.ctx, "No hablar fuera del foco.");
+		await f.reached(() => f.ui.statuses.includes("Waiting to read · esc skip"));
+		f.h.focus.state = "unfocused";
+		f.requests[0]!.onStateChange("finished");
+		await f.reached(() => f.pi.sent.length === 1);
+		await f.reached(() => f.readings.length > 0 || f.h.events.some((entry) => entry.event === "reading.held"));
+		assert.equal(f.readings.length, 0, "a delayed reading cannot speak in an unfocused session");
+		assert.ok(f.h.events.some((entry) => entry.event === "reading.held"));
+		f.h.focus.state = "focused";
+		await f.reached(() => f.readings.length === 1);
+		assert.equal(f.readings[0]!.text, "No hablar fuera del foco.");
+		f.readings[0]!.finish("done");
+	} finally {
+		await f.close();
+	}
+});
+
 test("after a reply to a spoken turn is read, the microphone reopens hands-free in the focused pane, and the next answer is sent", async () => {
 	const { engine, readings } = fakeEngine();
 	const h = harness({ installed: true, engine, voice: true });

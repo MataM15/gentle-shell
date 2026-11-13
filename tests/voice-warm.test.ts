@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import nodeTest from "node:test";
-import { parseWorkerLine, VoiceSessionError, VOICE_WORKER_SCHEMA, type VoiceSessionState } from "../lib/voice-session.ts";
+import { parseWorkerLine, VoiceSessionError, VOICE_SESSION_DEFAULTS, VOICE_WORKER_SCHEMA, type VoiceSessionState } from "../lib/voice-session.ts";
 import { createWarmVoiceWorker } from "../lib/voice-warm.ts";
 
 // The warm dictation worker (S11): one worker process kept alive between
@@ -213,6 +213,121 @@ test("an error leaves the next capture waiting until the old child has exited", 
 	h.workers[1]!.say({ type: "command", command: "voice-off" });
 	assert.equal(await heard, "voice-off", "the old close did not fail the new capture");
 	await h.warm.close();
+});
+
+test("a terminal error settles its result before the capture reports microphone release", async () => {
+	const h = harness();
+	const capture = h.warm.session({ onStateChange: () => {} });
+	const started = capture.start();
+	await h.until(() => h.workers.length === 1 && h.workers[0]!.received.length === 1);
+	const child = h.workers[0]!;
+	try {
+		child.say({ type: "recording" });
+		await started;
+		const outcome = capture.stop();
+		child.say({ type: "error", code: "decode" });
+		await assert.rejects(outcome, (error: unknown) => error instanceof VoiceSessionError && error.code === "decode");
+		let released = false;
+		const waiting = capture.waitUntilReleased().then(() => { released = true; });
+		await Promise.resolve();
+		assert.equal(released, false, "the error is not the child's exit");
+		child.exit();
+		await waiting;
+		assert.equal(released, true);
+	} finally {
+		child.exit();
+		await h.warm.close();
+	}
+});
+
+nodeTest("a terminal error kills a stuck child at the existing grace timeout before releasing the microphone", { timeout: 5_000 }, async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const h = harness();
+	const capture = h.warm.session({ onStateChange: () => {} });
+	const started = capture.start();
+	await Promise.resolve();
+	const child = h.workers[0]!;
+	try {
+		child.say({ type: "recording" });
+		await started;
+		const outcome = capture.stop();
+		child.say({ type: "error", code: "decode" });
+		await assert.rejects(outcome, (error: unknown) => error instanceof VoiceSessionError && error.code === "decode");
+		let released = false;
+		const waiting = capture.waitUntilReleased().then(() => { released = true; });
+		t.mock.timers.tick(VOICE_SESSION_DEFAULTS.exitGraceMs - 1);
+		await Promise.resolve();
+		assert.deepEqual(child.signals, []);
+		assert.equal(released, false);
+		t.mock.timers.tick(1);
+		await waiting;
+		assert.deepEqual(child.signals, ["SIGKILL"]);
+		assert.equal(child.exited, true);
+		assert.equal(released, true);
+	} finally {
+		child.exit();
+		await h.warm.close();
+	}
+});
+
+test("a normal result releases the capture while retaining the warm worker for the next recording", async () => {
+	const h = harness();
+	const capture = h.warm.session({ onStateChange: () => {} });
+	const started = capture.start();
+	await h.until(() => h.workers.length === 1 && h.workers[0]!.received.length === 1);
+	const child = h.workers[0]!;
+	try {
+		child.say({ type: "recording" });
+		await started;
+		let released = false;
+		const waiting = capture.waitUntilReleased().then(() => { released = true; });
+		await Promise.resolve();
+		assert.equal(released, false);
+		const outcome = capture.stop();
+		child.say({ type: "transcribing" });
+		child.say({ type: "result", text: "hola", truncated: false });
+		assert.deepEqual(await outcome, { text: "hola", truncated: false });
+		await waiting;
+		assert.equal(released, true);
+		assert.equal(child.exited, false);
+		(child.received[0] as { _seen?: boolean })._seen = true;
+		assert.equal((await record(h, "otra vez")).worker, child);
+	} finally {
+		child.exit();
+		await h.warm.close();
+	}
+});
+
+test("a retried busy dictation reports release for its own recording, not the former owner", async () => {
+	const h = harness();
+	const first = h.warm.session({ onStateChange: () => {} });
+	const started = first.start();
+	await h.until(() => h.workers.length === 1 && h.workers[0]!.received.length === 1);
+	h.workers[0]!.say({ type: "recording" });
+	await started;
+	const second = h.warm.session({ onStateChange: () => {} });
+	try {
+		await assert.rejects(second.start(), (error: unknown) => error instanceof VoiceSessionError && error.code === "invalid-state");
+		await first.cancel();
+		const retried = second.start();
+		await h.until(() => h.workers.length === 2 && h.workers[1]!.received.length === 1);
+		const child = h.workers[1]!;
+		child.say({ type: "recording" });
+		await retried;
+		let released = false;
+		const waiting = second.waitUntilReleased().then(() => { released = true; });
+		await Promise.resolve();
+		assert.equal(released, false, "the retried recording still owns the microphone");
+		const outcome = second.stop();
+		child.say({ type: "transcribing" });
+		child.say({ type: "result", text: "hola", truncated: false });
+		await outcome;
+		await waiting;
+		assert.equal(released, true);
+	} finally {
+		for (const child of h.workers) child.exit();
+		await h.warm.close();
+	}
 });
 
 test("a refused spot start can wait for the owning warm capture to finish cancellation", async () => {

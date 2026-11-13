@@ -48,6 +48,8 @@ export interface WarmDictation {
 	start(): Promise<void>;
 	stop(): Promise<VoiceTranscript>;
 	cancel(): Promise<void>;
+	// The result can arrive before a retiring worker releases the microphone.
+	waitUntilReleased(): Promise<void>;
 }
 
 // A spot-only capture (S7): the microphone open for the keyword spotter alone.
@@ -379,6 +381,8 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 					return capture.state;
 				},
 				result: () => resultPromise,
+				// Reuse the capture release that the busy-spot retry already waits for.
+				waitUntilReleased: () => blockedBy ?? released,
 				waitUntilSettled: () => blockedBy ?? Promise.resolve(),
 				async start() {
 					if (capture.state !== "idle") throw fail("invalid-state");
@@ -386,6 +390,7 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 						blockedBy = current.released;
 						throw fail("invalid-state");
 					}
+					blockedBy = undefined;
 					current = capture;
 					setState(capture, "starting");
 					if (idleTimer) clearTimeout(idleTimer);

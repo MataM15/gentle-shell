@@ -2127,7 +2127,7 @@ test("a voice-on hello or update wakes idle spotting; voice-off and a voice-off 
 	quiet.socket.destroy();
 });
 
-test("awake spotting ignores voice-on, logs each hit and turns voice off everywhere without a transcript", async (t) => {
+test("awake spotting logs a voice-on without a focused session and still turns voice off everywhere", async (t) => {
 	const spot = fakeSpotting();
 	const overlay = fakeOverlay();
 	const started = await startListener(scratch(), { keyword: keywordOption(), spot: spot.factory, overlay: overlay.overlay, cues: cuePlayer() });
@@ -2155,7 +2155,7 @@ test("awake spotting ignores voice-on, logs each hit and turns voice off everywh
 	assert.deepEqual(started.events.filter((entry) => entry.event === "kws.hit").map((entry) => entry.fields), [
 		{ command: "voice-off", reason: "rejected:lead" },
 		{ command: "voice-off", reason: "rejected:speech-after" },
-		{ command: "voice-on", reason: "ignored:awake-voice-on" },
+		{ command: "voice-on", reason: "ignored:no-focused-voice-session" },
 		{ command: "voice-off", reason: "whole-utterance" },
 	]);
 	assert.deepEqual([...framesOf(first, "transcript"), ...framesOf(second, "transcript"), ...framesOf(first, "capture"), ...levelFrames(first)], []);
@@ -2164,6 +2164,130 @@ test("awake spotting ignores voice-on, logs each hit and turns voice off everywh
 	assert.deepEqual(cueLog(started.events), []);
 	first.socket.destroy();
 	second.socket.destroy();
+});
+
+test("awake voice-on opens a conversation only for the focused voice-on session (S15)", async (t) => {
+	const spot = fakeSpotting();
+	const capture = fakeCapture({ text: "seguí por favor" });
+	const overlay = fakeOverlay();
+	const started = await startListener(scratch(), {
+		keyword: keywordOption(), spot: spot.factory, dictation: capture.factory,
+		cues: cuePlayer(), overlay: overlay.overlay,
+		focus: { focusedPaneId: async () => ({ focused: "w1:p2" }) },
+	});
+	t.after(() => started.listener.close());
+	const other = await started.client();
+	const focused = await started.client();
+	other.hello("s-1", "w1:p1", true);
+	focused.hello("s-2", "w1:p2", true);
+	await waitFor(() => framesOf(other, "welcome").length === 1 && framesOf(focused, "welcome").length === 1 && spot.starts === 1);
+	spot.hearing("voice-on");
+	await waitFor(() => started.events.some((entry) => entry.event === "kws.hit"));
+	assert.deepEqual(started.events.filter((entry) => entry.event === "kws.hit").map((entry) => entry.fields), [{ command: "voice-on", reason: "whole-utterance" }]);
+	assert.deepEqual(await awaitFrame(focused, (frame) => frame.type === "command"), { type: "command", command: "voice-on", wake: true });
+	assert.deepEqual(framesOf(other, "command"), [], "no other session starts a capture");
+	assert.deepEqual(started.listener.voiceSessions, ["s-1", "s-2"], "the hit does not change voice settings");
+	focused.send({ type: "dictate", id: "d", mode: "conversation", endpoint: { endOfSpeechMs: 2500, noSpeechMs: 8000 } });
+	assert.equal((await awaitFrame(focused, (frame) => "id" in frame && frame.id === "d")).type, "ok");
+	assert.equal(capture.requests[0]?.mode, "conversation");
+	assert.deepEqual(capture.requests[0]?.endpoint, { endOfSpeechMs: 2500, noSpeechMs: 8000 });
+	assert.ok(overlay.snapshots.some((snapshot) => snapshot.state === "listening" && snapshot.recording && snapshot.paneId === "w1:p2"));
+	assert.deepEqual(cueLog(started.events).map((cue) => [cue?.name, cue?.sessionId]), [["open", "s-2"]]);
+	assert.deepEqual(started.events.filter((entry) => entry.event === "capture.begin").map((entry) => entry.fields), [{ sessionId: "s-2", mode: "conversation", clients: 2 }]);
+	focused.send({ type: "stop", id: "s" });
+	await awaitFrame(focused, (frame) => "id" in frame && frame.id === "s");
+	assert.deepEqual(framesOf(focused, "transcript"), [{ type: "transcript", text: "seguí por favor" }]);
+	assert.deepEqual(framesOf(other, "transcript"), []);
+});
+
+test("awake voice-on with no focused voice-on session is ignored without changing state (S15)", async (t) => {
+	for (const scenario of ["unknown", "failed", "absent", "off", "reader-only"] as const) {
+		await t.test(scenario, async (st) => {
+			const spot = fakeSpotting();
+			const capture = fakeCapture();
+			const overlay = fakeOverlay();
+			const focus: ListenerFocus = { focusedPaneId: async () => scenario === "failed" ? { failed: true } : { focused: scenario === "unknown" ? undefined : scenario === "absent" ? "w9:p9" : "w1:p2" } };
+			const started = await startListener(scratch(), { keyword: keywordOption(), spot: spot.factory, dictation: capture.factory, cues: cuePlayer(), overlay: overlay.overlay, focus });
+			st.after(() => started.listener.close());
+			const voiced = await started.client();
+			voiced.hello("s-1", "w1:p1", true);
+			const other = await started.client();
+			other.hello("s-2", "w1:p2", scenario === "reader-only", scenario === "reader-only" ? "reading" : "session");
+			await waitFor(() => framesOf(voiced, "welcome").length === 1 && framesOf(other, "welcome").length === 1 && spot.starts === 1);
+			const voiceBefore = [...started.listener.voiceSessions];
+			spot.hearing("voice-on");
+			await waitFor(() => started.events.some((entry) => entry.event === "kws.hit"));
+			assert.deepEqual(started.events.filter((entry) => entry.event === "kws.hit").map((entry) => entry.fields), [{ command: "voice-on", reason: "ignored:no-focused-voice-session" }]);
+			await waitFor(() => spot.starts === 2);
+			assert.deepEqual(started.listener.voiceSessions, voiceBefore);
+			assert.equal(started.listener.state, "listening");
+			assert.deepEqual([...framesOf(voiced, "command"), ...framesOf(other, "command"), ...framesOf(voiced, "transcript"), ...framesOf(other, "transcript")], []);
+			assert.deepEqual(capture.calls, []);
+			assert.deepEqual(cueLog(started.events), []);
+			assert.ok(overlay.snapshots.every((snapshot) => !snapshot.recording));
+		});
+	}
+});
+
+test("a reading that starts while an awake voice-on focus lookup is pending wins (S14, JD-A-002)", async (t) => {
+	let release!: () => void;
+	let asked = false;
+	const gate = new Promise<void>((resolve) => { release = resolve; });
+	const spot = fakeSpotting();
+	const started = await startListener(scratch(), {
+		keyword: keywordOption(), spot: spot.factory,
+		focus: { focusedPaneId: async () => { asked = true; await gate; return { focused: "w1:p1" }; } },
+	});
+	t.after(() => { release(); return started.listener.close(); });
+	const client = await started.client();
+	client.hello("s-1", "w1:p1", true);
+	await waitFor(() => framesOf(client, "welcome").length === 1 && spot.starts === 1);
+	spot.hearing("voice-on");
+	await waitFor(() => asked || started.events.some((entry) => entry.event === "kws.hit"));
+	assert.equal(asked, true, "a voice-on hit resolves the focus");
+	client.send({ type: "read-begin", id: "r", readingId: "read-1", chars: 30 });
+	assert.equal((await awaitFrame(client, (frame) => "id" in frame && frame.id === "r")).type, "granted");
+	release();
+	await waitFor(() => started.events.some((entry) => entry.event === "kws.hit"));
+	assert.deepEqual(started.events.filter((entry) => entry.event === "kws.hit").map((entry) => entry.fields), [{ command: "voice-on", reason: "ignored:reading" }]);
+	assert.deepEqual(framesOf(client, "command"), []);
+	assert.equal(started.listener.readingSession, "s-1");
+});
+
+test("an awake voice-on focus result cannot revive an off session or open over a newer capture", async (t) => {
+	for (const change of ["voice-off", "voice-off-last", "capture"] as const) {
+		await t.test(change, async (st) => {
+			let release!: () => void;
+			let asked = false;
+			const gate = new Promise<void>((resolve) => { release = resolve; });
+			const spot = fakeSpotting();
+			const capture = fakeCapture();
+			const started = await startListener(scratch(), {
+				keyword: keywordOption(), spot: spot.factory, dictation: capture.factory,
+				focus: { focusedPaneId: async () => { asked = true; await gate; return { focused: "w1:p1" }; } },
+			});
+			st.after(() => { release(); return started.listener.close(); });
+			const focused = await started.client();
+			const other = await started.client();
+			focused.hello("s-1", "w1:p1", true);
+			other.hello("s-2", "w1:p2", change !== "voice-off-last");
+			await waitFor(() => framesOf(focused, "welcome").length === 1 && framesOf(other, "welcome").length === 1 && spot.starts === 1);
+			spot.hearing("voice-on");
+			await waitFor(() => asked);
+			if (change !== "capture") {
+				focused.send({ type: "session-voice", voiceOn: false });
+				await waitFor(() => !started.listener.voiceSessions.includes("s-1"));
+			} else {
+				other.send({ type: "dictate", id: "d", mode: "conversation" });
+				assert.equal((await awaitFrame(other, (frame) => "id" in frame && frame.id === "d")).type, "ok");
+			}
+			release();
+			await waitFor(() => started.events.some((entry) => entry.event === "kws.hit"));
+			assert.deepEqual(started.events.filter((entry) => entry.event === "kws.hit").map((entry) => entry.fields), [{ command: "voice-on", reason: change === "capture" ? "ignored:stale" : "ignored:no-focused-voice-session" }]);
+			assert.deepEqual([...framesOf(focused, "command"), ...framesOf(other, "command")], []);
+			assert.equal(capture.calls.filter((call) => call === "start").length, change === "capture" ? 1 : 0);
+		});
+	}
 });
 
 test("awake spotting is replaced by asleep spotting when the last session leaves or is rejected", async (t) => {
@@ -2439,7 +2563,7 @@ test("awake spotting settles before dictation and resumes only after that captur
 test("all commands during an unknown reading and its audible tail are ignored and logged (S14, L21)", async (t) => {
 	const spot = fakeSpotting();
 	const overlay = fakeOverlay();
-	const started = await startListener(scratch(), { keyword: keywordOption(), spot: spot.factory, overlay: overlay.overlay, readTailMs: 100 });
+	const started = await startListener(scratch(), { keyword: keywordOption(), spot: spot.factory, overlay: overlay.overlay, readTailMs: 500 });
 	t.after(() => started.listener.close());
 	const reader = await started.client();
 	reader.hello("s-1", "w1:p1", true);
@@ -2453,9 +2577,15 @@ test("all commands during an unknown reading and its audible tail are ignored an
 	starts += 1;
 	await waitFor(() => spot.starts === starts);
 	assert.equal(started.listener.readingSession, "s-1");
+	spot.hearing("voice-on");
+	starts += 1;
+	await waitFor(() => spot.starts === starts);
 	reader.send({ type: "read-end", id: "e", readingId: "read-1", outcome: "done" });
 	await awaitFrame(reader, (frame) => "id" in frame && frame.id === "e");
 	spot.hearing("voice-off");
+	starts += 1;
+	await waitFor(() => spot.starts === starts);
+	spot.hearing("voice-on");
 	await waitFor(() => spot.starts === starts + 1);
 	await waitFor(() => started.listener.state === "listening");
 	assert.deepEqual(started.listener.voiceSessions, ["s-1"]);
@@ -2463,7 +2593,9 @@ test("all commands during an unknown reading and its audible tail are ignored an
 	assert.deepEqual(framesOf(reader, "transcript"), []);
 	assert.deepEqual(started.events.filter((entry) => entry.event === "kws.hit").map((entry) => entry.fields), [
 		{ command: "voice-off", reason: "ignored:reading" },
+		{ command: "voice-on", reason: "ignored:reading" },
 		{ command: "voice-off", reason: "ignored:reading" },
+		{ command: "voice-on", reason: "ignored:reading" },
 	]);
 	assert.ok(overlay.snapshots.every((snapshot) => !snapshot.recording));
 	assert.deepEqual(overlay.levels, []);
@@ -2725,10 +2857,40 @@ test("a reading cannot start over a dictation reserved while the spotter stops (
 	client.socket.destroy();
 });
 
+test("a reading waits for a cancelled capture's microphone teardown (S15, JD-A-002/003)", async (t) => {
+	let release!: () => void;
+	const gate = new Promise<void>((resolve) => { release = resolve; });
+	let cancelStarted = false;
+	const started = await startListener(scratch(), {
+		dictation: (request) => ({
+			start: async () => request.onStateChange("recording"),
+			stop: async () => ({ text: "", truncated: false }),
+			cancel: async () => { cancelStarted = true; await gate; request.onStateChange("finished"); },
+		}),
+	});
+	t.after(() => { release(); return started.listener.close(); });
+	const client = await started.client();
+	client.hello("s-1", "w1:p1", true);
+	await awaitFrame(client, (frame) => frame.type === "welcome");
+	client.send({ type: "dictate", id: "d", mode: "conversation" });
+	await awaitFrame(client, (frame) => "id" in frame && frame.id === "d");
+	client.send({ type: "cancel", id: "c" });
+	await awaitFrame(client, (frame) => "id" in frame && frame.id === "c");
+	assert.equal(cancelStarted, true);
+	client.send({ type: "read-begin", id: "r1", readingId: "read-1", chars: 30 });
+	assert.deepEqual(await awaitFrame(client, (frame) => "id" in frame && frame.id === "r1"), { type: "busy", id: "r1", reason: "capture" });
+	assert.equal(started.listener.readingSession, undefined, "the closing worker still owns the microphone");
+	release();
+	await new Promise((resolve) => setTimeout(resolve, 5));
+	client.send({ type: "read-begin", id: "r2", readingId: "read-1", chars: 30 });
+	assert.equal((await awaitFrame(client, (frame) => "id" in frame && frame.id === "r2")).type, "granted");
+});
+
 // Exercise the real warm-worker handoff with fake child processes: a cancelled
 // child deliberately holds its microphone until the test emits its close.
 class GatedWarmChild extends EventEmitter {
 	readonly received: Array<Record<string, unknown>> = [];
+	readonly signals: string[] = [];
 	readonly stdout = new EventEmitter();
 	readonly stderr = new EventEmitter();
 	exited = false;
@@ -2744,9 +2906,99 @@ class GatedWarmChild extends EventEmitter {
 		},
 	};
 	say(message: Record<string, unknown>) { this.stdout.emit("data", `${JSON.stringify({ schema: VOICE_WORKER_SCHEMA, ...message })}\n`); }
-	kill() { this.exit(); return true; }
+	kill(signal: string) { this.signals.push(signal); this.exit(); return true; }
 	exit() { if (!this.exited) { this.exited = true; this.emit("close", 0, null); } }
 }
+
+test("a reading waits for a failed warm worker to exit before taking the microphone (S15, L37)", async (t) => {
+	const children: GatedWarmChild[] = [];
+	const warm = createWarmVoiceWorker({
+		target: "linux-x64", env: {},
+		prepare: async () => ({ root: "/fake", request: { schema: VOICE_WORKER_SCHEMA, type: "start" } }),
+		spawn: () => { const child = new GatedWarmChild(); children.push(child); return child; },
+	});
+	const started = await startListener(scratch(), {
+		dictation: ({ onStateChange, endpoint, levels, onLevel, kws, onKeywordRejected }) => warm.session({ onStateChange, endpoint, levels, onLevel, kws, onKeywordRejected }),
+	});
+	t.after(async () => { for (const child of children) child.exit(); await started.listener.close(); await warm.close(); });
+	const client = await started.client();
+	client.hello("s-1", "w1:p1", true);
+	await awaitFrame(client, (frame) => frame.type === "welcome");
+	client.send({ type: "dictate", id: "d", mode: "conversation" });
+	assert.equal((await awaitFrame(client, (frame) => "id" in frame && frame.id === "d")).type, "ok");
+	children[0]!.say({ type: "error", code: "no-input-device" });
+	await awaitFrame(client, (frame) => frame.type === "capture" && frame.phase === "failed");
+	assert.equal(children[0]!.exited, false, "the terminal error precedes the child's exit");
+	client.send({ type: "read-begin", id: "r1", readingId: "read-1", chars: 30 });
+	assert.deepEqual(await awaitFrame(client, (frame) => "id" in frame && frame.id === "r1"), { type: "busy", id: "r1", reason: "capture" });
+	children[0]!.exit();
+	await new Promise((resolve) => setTimeout(resolve, 5));
+	client.send({ type: "read-begin", id: "r2", readingId: "read-1", chars: 30 });
+	assert.equal((await awaitFrame(client, (frame) => "id" in frame && frame.id === "r2")).type, "granted");
+});
+
+test("a reading stays blocked until a terminal-error worker is killed at its grace timeout", async (t) => {
+	const children: GatedWarmChild[] = [];
+	const warm = createWarmVoiceWorker({
+		target: "linux-x64", env: {},
+		prepare: async () => ({ root: "/fake", request: { schema: VOICE_WORKER_SCHEMA, type: "start" } }),
+		spawn: () => { const child = new GatedWarmChild(); children.push(child); return child; },
+	});
+	const started = await startListener(scratch(), {
+		dictation: ({ onStateChange, endpoint, levels, onLevel, kws, onKeywordRejected }) => warm.session({ onStateChange, endpoint, levels, onLevel, kws, onKeywordRejected }),
+	});
+	t.after(async () => { for (const child of children) child.exit(); await started.listener.close(); await warm.close(); });
+	const client = await started.client();
+	client.hello("s-1", "w1:p1", true);
+	await awaitFrame(client, (frame) => frame.type === "welcome");
+	client.send({ type: "dictate", id: "d", mode: "conversation" });
+	assert.equal((await awaitFrame(client, (frame) => "id" in frame && frame.id === "d")).type, "ok");
+	children[0]!.say({ type: "error", code: "no-input-device" });
+	await awaitFrame(client, (frame) => frame.type === "capture" && frame.phase === "failed");
+	client.send({ type: "read-begin", id: "r1", readingId: "read-1", chars: 30 });
+	assert.deepEqual(await awaitFrame(client, (frame) => "id" in frame && frame.id === "r1"), { type: "busy", id: "r1", reason: "capture" });
+	assert.equal(started.listener.readingSession, undefined);
+	await waitFor(() => children[0]!.exited, 3_000);
+	assert.deepEqual(children[0]!.signals, ["SIGKILL"]);
+	client.send({ type: "read-begin", id: "r2", readingId: "read-1", chars: 30 });
+	assert.equal((await awaitFrame(client, (frame) => "id" in frame && frame.id === "r2")).type, "granted");
+});
+
+test("awake voice-on hands the real warm worker from spotting to capture and back (S15, L37)", async (t) => {
+	const children: GatedWarmChild[] = [];
+	const warm = createWarmVoiceWorker({
+		target: "linux-x64", env: {},
+		prepare: async () => ({ root: "/fake", request: { schema: VOICE_WORKER_SCHEMA, type: "start" } }),
+		spawn: () => { const child = new GatedWarmChild(); children.push(child); return child; },
+	});
+	const kws = keywordOption();
+	const started = await startListener(scratch(), {
+		keyword: kws,
+		spot: (onKeywordRejected) => warm.spot({ kws, onKeywordRejected }),
+		dictation: ({ onStateChange, endpoint, levels, onLevel, kws: option, onKeywordRejected }) => warm.session({ onStateChange, endpoint, levels, onLevel, kws: option, onKeywordRejected }),
+		focus: { focusedPaneId: async () => ({ focused: "w1:p1" }) },
+	});
+	t.after(async () => { for (const child of children) child.exit(); await started.listener.close(); await warm.close(); });
+	const client = await started.client();
+	client.hello("s-1", "w1:p1", true);
+	await waitFor(() => framesOf(client, "welcome").length === 1 && children[0]?.received.some((message) => message.spot === true) === true);
+	children[0]!.say({ type: "command", command: "voice-on" });
+	await waitFor(() => started.events.some((entry) => entry.event === "kws.hit"));
+	assert.deepEqual(started.events.filter((entry) => entry.event === "kws.hit").map((entry) => entry.fields), [{ command: "voice-on", reason: "whole-utterance" }]);
+	assert.deepEqual(await awaitFrame(client, (frame) => frame.type === "command"), { type: "command", command: "voice-on", wake: true });
+	client.send({ type: "dictate", id: "d", mode: "conversation" });
+	assert.equal((await awaitFrame(client, (frame) => "id" in frame && frame.id === "d")).type, "ok");
+	const starts = children[0]!.received.filter((message) => message.type === "start");
+	assert.equal(starts.at(-1)?.spot, undefined, "the warm spotter releases before the conversation starts");
+	children[0]!.say({ type: "transcribing" });
+	children[0]!.say({ type: "result", text: "hola", truncated: false });
+	await awaitFrame(client, (frame) => frame.type === "capture" && frame.phase === "delivered");
+	await waitFor(() => children[0]!.received.filter((message) => message.type === "start" && message.spot === true).length >= 2);
+	assert.equal(started.events.some((entry) => entry.event === "kws.failed"), false);
+	children[0]!.say({ type: "command", command: "voice-off" });
+	assert.deepEqual(await awaitFrame(client, (frame) => frame.type === "command" && frame.command === "voice-off"), { type: "command", command: "voice-off" });
+	assert.deepEqual(framesOf(client, "transcript"), [{ type: "transcript", text: "hola" }]);
+});
 
 test("cancel and owner disconnect wait for the real warm child before reopening spotting (JD-A-003)", async (t) => {
 	for (const ending of ["asleep-cancel", "awake-cancel", "awake-disconnect", "last-disconnect", "last-update"] as const) {
