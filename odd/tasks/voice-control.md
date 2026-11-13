@@ -31,7 +31,7 @@ Base: `personal/main` @ `e815d8936`. Worktree `gentle-shell-worktrees/voice-cont
 | T7 | S8 | after T5 | pending |
 | T8 | S9 | after T2 and T5 | pending |
 | T9 | S11 | after T4 and T6 | pending |
-| T11 | S13 | research gentle-ai-worker → odd/notes/voice-echo-bargein.md | pending |
+| T11 | S13 | research done (odd/notes/voice-echo-bargein.md); implement after slice C, AEC before KWS | this commit |
 | T10 | S12 | gentle-ai-worker, per-session voice | this commit |
 
 ## Log
