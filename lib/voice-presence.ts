@@ -1,11 +1,10 @@
 import { execFile } from "node:child_process";
-import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-
 // Where voice may act (docs/voice.md, "Voice in a session"). The microphone
 // reopens only in the pane the user is looking at, a reply is read only there
 // (a reply from any other pane is held, S12), and readings from every Pi
-// process take turns instead of talking over each other.
+// process take turns instead of talking over each other, a turn the voice
+// listener arbitrates (lib/voice-listener.ts) and this module only falls back to
+// locally when that listener cannot be reached.
 
 export type CommandRunner = (command: string, args: string[]) => Promise<string>;
 
@@ -44,88 +43,59 @@ export async function paneFocus(options: { env?: NodeJS.ProcessEnv; run?: Comman
 	}
 }
 
-export const READING_TURN_FILE = "reading-turn.json";
-
-export interface ReadingTurnOptions {
-	// The voice home, shared by every Pi process of this user.
-	dir: string;
-	signal: AbortSignal;
-	pid?: number;
-	isAlive?: (pid: number) => boolean;
-	pollMs?: number;
-	maxWaitMs?: number;
+// The reading turn a session falls back to when the voice listener cannot be
+// reached (S6, slice B): one reply at a time inside this process. The shared
+// turn across sessions is the listener's; this one is never a second arbiter.
+interface LocalWaiter {
+	signal?: AbortSignal;
+	resolve: (release: (() => void) | undefined) => void;
+	abandon: () => void;
 }
 
-const processAlive = (pid: number): boolean => {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		return (error as NodeJS.ErrnoException).code === "EPERM";
-	}
+const localQueue: LocalWaiter[] = [];
+let localHolder: (() => void) | undefined;
+
+const makeRelease = (): (() => void) => {
+	let released = false;
+	return () => {
+		if (released) return;
+		released = true;
+		localHolder = undefined;
+		nextLocalTurn();
+	};
 };
 
-const holderOf = (path: string): number | undefined => {
-	try {
-		const pid: unknown = (JSON.parse(readFileSync(path, "utf8")) as { pid?: unknown } | null)?.pid;
-		return Number.isSafeInteger(pid) && (pid as number) > 0 ? (pid as number) : undefined;
-	} catch {
-		return undefined;
-	}
-};
-
-// Waits for the one reading turn shared by every Pi process and returns its
-// release, or undefined when the reading was cancelled or waited past
-// maxWaitMs. The turn is a file created exclusively; a turn whose process is
-// gone, or whose file cannot be read, is taken over.
-export async function acquireReadingTurn(options: ReadingTurnOptions): Promise<(() => void) | undefined> {
-	const path = join(options.dir, READING_TURN_FILE);
-	const pid = options.pid ?? process.pid;
-	const isAlive = options.isAlive ?? processAlive;
-	const pollMs = options.pollMs ?? 250;
-	const deadline = Date.now() + (options.maxWaitMs ?? 180_000);
-	try {
-		mkdirSync(options.dir, { recursive: true, mode: 0o700 });
-	} catch {
-		/* the exclusive create below reports a real failure */
-	}
-	for (;;) {
-		if (options.signal.aborted) return undefined;
-		try {
-			writeFileSync(path, JSON.stringify({ pid }), { flag: "wx", mode: 0o600 });
-			let released = false;
-			return () => {
-				if (released) return;
-				released = true;
-				// Only our own turn is removed, never one another process took over.
-				if (holderOf(path) !== pid) return;
-				try {
-					unlinkSync(path);
-				} catch {
-					/* already gone */
-				}
-			};
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") return undefined;
-		}
-		const holder = holderOf(path);
-		if (holder === undefined || !isAlive(holder)) {
-			try {
-				unlinkSync(path);
-			} catch {
-				/* someone else cleared it first */
-			}
+function nextLocalTurn(): void {
+	while (localQueue.length > 0) {
+		const waiter = localQueue.shift()!;
+		waiter.signal?.removeEventListener("abort", waiter.abandon);
+		if (waiter.signal?.aborted) {
+			waiter.resolve(undefined);
 			continue;
 		}
-		if (Date.now() >= deadline) return undefined;
-		await new Promise<void>((resolve) => {
-			const timer = setTimeout(done, pollMs);
-			function done() {
-				clearTimeout(timer);
-				options.signal.removeEventListener("abort", done);
-				resolve();
-			}
-			options.signal.addEventListener("abort", done, { once: true });
-		});
+		localHolder = makeRelease();
+		waiter.resolve(localHolder);
+		return;
 	}
+}
+
+// Resolves with the release of the local reading turn, or undefined when the
+// reading was cancelled while it waited. A waiting reading keeps its place in
+// order, so a cancelled one never lets a later reading start first.
+export function acquireLocalReadingTurn(options: { signal?: AbortSignal } = {}): Promise<(() => void) | undefined> {
+	if (localHolder === undefined) {
+		localHolder = makeRelease();
+		return Promise.resolve(localHolder);
+	}
+	if (options.signal?.aborted) return Promise.resolve(undefined);
+	return new Promise((resolve) => {
+		const waiter: LocalWaiter = { signal: options.signal, resolve, abandon: () => undefined };
+		waiter.abandon = () => {
+			const index = localQueue.indexOf(waiter);
+			if (index >= 0) localQueue.splice(index, 1);
+			resolve(undefined);
+		};
+		options.signal?.addEventListener("abort", waiter.abandon, { once: true });
+		localQueue.push(waiter);
+	});
 }

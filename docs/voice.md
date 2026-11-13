@@ -183,10 +183,14 @@ In a voice session:
   too. A focus herdr cannot report counts as focused, so a broken lookup never
   silences a reply; outside herdr there is one terminal and it counts as
   focused.
-- Readings from all Pi processes take turns through `reading-turn.json` in the
-  voice directory: one reads, the others wait with the footer `Waiting to read
-  · esc skip`. A turn left by a process that is gone is taken over, and a
-  reading waits at most three minutes.
+- Readings take turns through the voice listener, so two sessions never speak
+  at once: the one that asks first reads, and the others wait with the footer
+  `Waiting to read · esc skip`, behind the turn for at most three minutes. The
+  reading session renews its turn while it speaks; a turn whose session stopped
+  renewing, went away or ended is free again within seconds, and any session can
+  cut the reading (turning voice off in one does). Without a listener to reach,
+  a session falls back to its own turn: one reading at a time inside it, exactly
+  as before the listener existed.
 - The dictation shortcut starts a hands-free conversation instead of pasting
   (see Conversation below). In a session without voice it keeps dictating into
   the draft exactly as before.
@@ -381,15 +385,30 @@ opens no microphone yet.
 - **Protocol.** `gentle.voice-listener/v1`, JSON on one line each way, at most
   64 KiB per line. A connection starts with a hello carrying the session id and
   the herdr pane id, then answers status and reports the state:
-  `asleep`, `listening`, `transcribing`, `reading`.
+  `asleep`, `listening`, `transcribing`, `reading`. The reading turn is part of
+  it: `read-begin` asks for it, `read-heartbeat` renews it, `read-end` gives it
+  back with how the reading ended (`done`, `skipped`, `cancelled`) and
+  `read-cut` takes it from any session. The answer is one `granted` or a `busy`
+  naming the session that holds it (or `asleep`, when nothing has voice on),
+  and every session hears the `reading` events, so a waiting one knows the turn
+  is free.
 - **One target.** A transcript goes only to the session whose pane herdr
   reports focused when the recording ends; with nobody focused it goes to the
   single registered session, and otherwise it is dropped and logged. A failed
   herdr lookup never guesses, so it never opens a microphone for the wrong pane.
+- **One reading.** The listener hands the reading turn to one session at a time
+  and never speaks itself: the session reads through PowerShell exactly as it
+  did before. The turn is renewed every 5 seconds against a 15-second lease, so
+  a session that crashed, was closed or lost its listener frees it without
+  anybody waiting for the lease, and the state stays `reading` for a short tail
+  after the end so the next reading never starts over the last sentence. A
+  session starts the listener when none is running, and reads through its own
+  local turn only when no listener can be reached at all.
 
-Nothing in a session uses it yet: per-session voice keeps working as described
-above. A reply is read only in the focused pane (S12) inside each session for
-now; the listener takes that decision over once it owns the reading.
+A session reads through the listener: the lock, the socket and the turn are
+live. Capture, the keyword spotter, cues and the overlay are still to come, so
+the microphone is opened per session exactly as described above, and a reply is
+read only in the pane herdr reports focused (S12).
 
 ## Natural voice with Kokoro
 

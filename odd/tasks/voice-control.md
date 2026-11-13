@@ -25,7 +25,7 @@ Base: `personal/main` @ `e815d8936`. Worktree `gentle-shell-worktrees/voice-cont
 | T2 | S3 | gentle-ai-worker research | this commit (odd/notes/voice-stt-spanish.md) |
 | T3 | S2, S4, S10 | gentle-ai-worker | this commit |
 | T4 | S5 | after T3 | pending |
-| T5 | S6 | design `df4200889`; slice A `dda1e9e31`+`6519fcd7b`, review fix `2d6ed4499` (review-96bf85039fdb322a approved); slices B-C pending | in progress |
+| T5 | S6 | design `df4200889`; slice A `dda1e9e31`+`6519fcd7b`, review fix `2d6ed4499` (review-96bf85039fdb322a approved); slice B in the next two commits; slice C pending | in progress |
 | T6 | S7 | after T5 | pending |
 | T7 | S8 | after T5 | pending |
 | T8 | S9 | after T2 and T5 | pending |

@@ -9,7 +9,9 @@ import { createVoiceSession, VoiceSessionError, type VoiceEndpoint, type VoiceSe
 import { installKokoro, installMiro, KOKORO_MANIFESTS, KOKORO_NOTICES, kokoroBytes, MIRO_MANIFEST, MIRO_NOTICE, miroBytes, readKokoroStatus, readMiroStatus, type KokoroStatus } from "./voice-kokoro.ts";
 import { createReplyReader, defaultSpeechEngineResolver, lastAssistantText, replyLanguage } from "./voice-reply-speech.ts";
 import { createVoiceSpeechPublisher, type VoiceSpeechReading } from "./voice-speech-events.ts";
-import { acquireReadingTurn, paneFocus as herdrPaneFocus, paneFocused as herdrPaneFocused, type PaneFocus } from "./voice-presence.ts";
+import { acquireLocalReadingTurn, paneFocus as herdrPaneFocus, paneFocused as herdrPaneFocused, type PaneFocus } from "./voice-presence.ts";
+import { cutListenerReading, listenerReadingTurn, startVoiceListenerProcess, type ListenerReading, type ListenerSession } from "./voice-listener-client.ts";
+import type { ReadingReleaseReason } from "./voice-listener-protocol.ts";
 import { createCuePlayer, type CueName, type CuePlayer, type CueResult } from "./voice-cues.ts";
 import { createVoiceLog, type VoiceLog } from "./voice-diagnostics.ts";
 import { matchSpokenCommand } from "./voice-spoken-command.ts";
@@ -99,7 +101,11 @@ export interface VoiceCommandDeps {
 	// Both have a fixed production value; the tests only shorten them.
 	holdPollMs?: number;
 	holdStaleMs?: number;
-	readingTurn?: (signal: AbortSignal) => Promise<(() => void) | undefined>;
+	// The one reading turn: the voice listener arbitrates it across sessions, and a
+	// session that cannot reach the listener reads through its own local turn.
+	readingTurn?: ReadingTurn;
+	// Cuts whatever the listener is reading, wherever it is spoken.
+	readCut?: (sessionId: string) => void;
 	// Releases the dictation worker kept alive for hands-free recordings.
 	releaseWarm?: () => Promise<void>;
 	// The microphone cues; one player per process, created on first use.
@@ -386,6 +392,61 @@ interface Run {
 	abort(): void | Promise<void>;
 }
 
+// How a reading ended, as the listener records it: the session's own outcome
+// ("skipped" keeps a spoken turn), never its local failure words.
+export type ReadingEnd = "done" | "skipped" | "cancelled";
+
+export interface ReadingTurnHooks {
+	sessionId?: string;
+	chars?: number;
+	// The listener took the turn back (a cut, a lost lease): the reading stops.
+	onCut?: (reason: ReadingReleaseReason) => void;
+}
+
+export type ReadingTurn = (signal: AbortSignal, hooks?: ReadingTurnHooks) => Promise<((outcome?: ReadingEnd) => void) | undefined>;
+
+export interface CreateReadingTurnOptions {
+	// The voice home, shared by every Pi process of this user.
+	dir: string;
+	// The listener route and the local fallback; both have production defaults.
+	turn?: (options: { dir: string; session: ListenerSession; chars?: number; signal: AbortSignal; onCut?: (reason: ReadingReleaseReason) => void }) => Promise<ListenerReading | undefined>;
+	local?: (options: { signal: AbortSignal }) => Promise<(() => void) | undefined>;
+	start?: () => void | Promise<void>;
+}
+
+// The reading turn a session asks for (S6, slice B): the listener decides who
+// reads, and a listener that cannot be reached at all leaves the session exactly
+// where it was before the listener existed. A refusal is obeyed, never routed
+// around, so two sessions cannot both read through different turns.
+export function createReadingTurn(options: CreateReadingTurnOptions): ReadingTurn {
+	const turn = options.turn ?? ((request: Parameters<NonNullable<CreateReadingTurnOptions["turn"]>>[0]) => listenerReadingTurn({ ...request, start: options.start }));
+	const local = options.local ?? acquireLocalReadingTurn;
+	return async (signal, hooks = {}) => {
+		if (hooks.sessionId) {
+			let answer: ListenerReading | undefined;
+			try {
+				answer = await turn({ dir: options.dir, session: { sessionId: hooks.sessionId, voiceOn: true }, chars: hooks.chars, signal, onCut: hooks.onCut });
+			} catch {
+				answer = { kind: "unavailable" };
+			}
+			if (answer?.kind === "granted") {
+				const granted = answer;
+				let released = false;
+				return (outcome?: ReadingEnd) => {
+					if (released) return;
+					released = true;
+					granted.release(outcome ?? "done");
+				};
+			}
+			// A refusal or a cancelled wait is the listener's answer: nothing reads.
+			if (!answer || answer.kind !== "unavailable") return undefined;
+		}
+		return local({ signal });
+	};
+}
+
+const readingEndFor = (outcome: string | undefined): ReadingEnd => (outcome === "skipped" ? "skipped" : outcome === undefined || outcome === "done" || outcome === "empty" ? "done" : "cancelled");
+
 export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = {}): void {
 	const env = deps.env ?? process.env;
 	const probe = deps.probe ?? readVoicePlatformProbe;
@@ -494,7 +555,10 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	};
 	const paneFocused = deps.paneFocused ?? (() => herdrPaneFocused({ env }));
 	const paneFocus = deps.paneFocus ?? (() => herdrPaneFocus({ env }));
-	const readingTurn = deps.readingTurn ?? ((signal: AbortSignal) => acquireReadingTurn({ dir: resolveVoiceHome(env), signal }));
+	const readingTurn = deps.readingTurn ?? createReadingTurn({ dir: resolveVoiceHome(env), start: () => startVoiceListenerProcess(env) });
+	const readCut = deps.readCut ?? ((sessionId: string) => {
+		void cutListenerReading({ dir: resolveVoiceHome(env), session: { sessionId, voiceOn: false } }).catch(() => {});
+	});
 	const sessionIdOf = (ctx: ExtensionContext | undefined): string | undefined => {
 		try {
 			const id = ctx?.sessionManager?.getSessionId?.();
@@ -708,13 +772,20 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			}
 		});
 		setVoiceFooter(ctx, live, "Waiting to read · esc skip");
-		let release: (() => void) | undefined;
+		let release: ((outcome?: ReadingEnd) => void) | undefined;
+		let ended: ReadingOutcome | undefined;
 		let started: VoiceSpeechReading | undefined;
 		// The voice that speaks this reading, as the log and the event report it.
 		let voice: string | undefined;
 		try {
-			// One reading at a time across every Pi process: wait for the turn.
-			release = await readingTurn(current.controller.signal);
+			// One reading at a time across every Pi process: wait for the turn. The
+			// listener hands it to one session, and tells that session when it takes
+			// it back, so a cut or a lost lease stops the speech here.
+			release = await readingTurn(current.controller.signal, {
+				sessionId: sessionIdOf(ctx),
+				chars: markdown.length,
+				onCut: () => cutReadings(),
+			});
 			// Voice may have been turned off, in any Pi process, while this waited.
 			if (!release || !live() || !voiceOn(ctx)) return skipped ? "skipped" : "cancelled";
 			setVoiceFooter(ctx, live, voiceReadingStatus(toggleShortcut));
@@ -732,6 +803,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 				retry: ({ attempt, failure }) => voiceLog("reading.retry", { session: sessionIdOf(ctx), voice, attempt, failure }),
 			});
 			const outcome: ReadingOutcome = read === "cancelled" && skipped ? "skipped" : read;
+			ended = outcome;
 			voiceLog("reading.end", { session: sessionIdOf(ctx), outcome, voice });
 			started?.end(outcome);
 			lastReadingEndedAt = Date.now();
@@ -741,6 +813,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			}
 			return outcome;
 		} catch (error) {
+			ended = "error";
 			voiceLog("reading.end", { session: sessionIdOf(ctx), outcome: "error", voice, failure: speechFailureCode(error) });
 			started?.end("error");
 			lastReadingEndedAt = Date.now();
@@ -749,7 +822,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		} finally {
 			// A reading that ended by any path still pairs its start with one end.
 			started?.end("error");
-			release?.();
+			release?.(readingEndFor(ended));
 			if (reading === current) stopReading();
 		}
 	};
@@ -773,6 +846,8 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		}
 		if (!enabled) {
 			cutReadings();
+			// Another session may be the one speaking: the listener tells it to stop.
+			readCut(id);
 			spokenTurnPending = false;
 			void releaseWarm().catch(() => {});
 			say("Voice is off in this session.", "info");

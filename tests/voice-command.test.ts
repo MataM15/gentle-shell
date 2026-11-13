@@ -5,7 +5,8 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import gentleVoice from "../extensions/gentle-voice.ts";
 import { VoiceInstallError, type VoiceInstallProgress, type VoiceInstallResult } from "../lib/voice-install.ts";
 import { VoiceSessionError, type VoiceSessionState, type VoiceTranscript } from "../lib/voice-session.ts";
-import { HELD_REPLY_POLL_MS, HELD_REPLY_STALE_MS, VOICE_COMMAND_NAME, type VoiceCommandDeps, type VoiceDictation } from "../lib/voice-command.ts";
+import { createReadingTurn, HELD_REPLY_POLL_MS, HELD_REPLY_STALE_MS, VOICE_COMMAND_NAME, type VoiceCommandDeps, type VoiceDictation } from "../lib/voice-command.ts";
+import { VoiceListener } from "../lib/voice-listener.ts";
 import type { PaneFocus } from "../lib/voice-presence.ts";
 import type { CuePlayer } from "../lib/voice-cues.ts";
 import type { PushToTalkTimers } from "../lib/voice-push-to-talk.ts";
@@ -203,7 +204,9 @@ interface Harness {
 	settings: { enabled: boolean; reads: number; writes: boolean[] };
 	voice: { sessions: string[]; writes: string[][] };
 	focus: { state: PaneFocus; asks: number };
-	turn: { held: boolean; waiting: Array<() => void>; acquired: number; released: number };
+	turn: { held: boolean; waiting: Array<() => void>; acquired: number; released: number; cut?: () => void };
+	// The readings this session cut elsewhere when its voice was turned off.
+	readCuts: string[];
 	warmReleases: number;
 	cues: string[];
 	events: Array<{ event: string } & Record<string, unknown>>;
@@ -224,7 +227,7 @@ function harness(overrides: { platform?: string; arch?: string; installed?: bool
 	const voice: Harness["voice"] = { sessions: overrides.voice ? ["session-alpha"] : [], writes: [] };
 	const focus: Harness["focus"] = { state: overrides.focus ?? "focused", asks: 0 };
 	const turn: Harness["turn"] = { held: overrides.turnHeld ?? false, waiting: [], acquired: 0, released: 0 };
-	const harnessRef = { warmReleases: 0, cues: [] as string[], events: [] as Array<{ event: string } & Record<string, unknown>> };
+	const harnessRef = { warmReleases: 0, cues: [] as string[], readCuts: [] as string[], events: [] as Array<{ event: string } & Record<string, unknown>> };
 	const kokoro: Harness["kokoro"] = { state: overrides.kokoro ?? "missing", installs: [] };
 	const miro: Harness["miro"] = { state: overrides.miro ?? "missing", installs: [] };
 	const clock = manualClock();
@@ -280,14 +283,16 @@ function harness(overrides: { platform?: string; arch?: string; installed?: bool
 		releaseWarm: async () => { harnessRef.warmReleases++; },
 		log: (event, fields) => { harnessRef.events.push({ event, ...fields }); },
 		cues: overrides.cues ?? { play: (name) => { harnessRef.cues.push(name); return Promise.resolve({ name, outcome: "done" as const, ms: 12 }); }, warm: () => { harnessRef.cues.push("warm"); }, dispose: () => { harnessRef.cues.push("dispose"); } },
-		// The shared reading turn, faked: free unless a test holds it.
-		readingTurn: (signal) => new Promise((resolve) => {
-			const take = () => { turn.acquired++; resolve(() => { turn.released++; }); };
+		// The shared reading turn, faked: free unless a test holds it. The listener
+		// hands its cut back through the hooks, so a test can cut like it does.
+		readingTurn: (signal, hooks) => new Promise((resolve) => {
+			const take = () => { turn.acquired++; turn.cut = () => hooks?.onCut?.("cut"); resolve(() => { turn.released++; }); };
 			if (!turn.held) return take();
 			const wait = () => { turn.held = false; take(); };
 			turn.waiting.push(wait);
 			signal.addEventListener("abort", () => resolve(undefined), { once: true });
 		}),
+		readCut: (sessionId) => { harnessRef.readCuts.push(sessionId); },
 	};
 	return Object.assign(harnessRef, { deps, calls, sessions, endpoints, warms, installs, settings, voice, focus, turn, kokoro, miro, clock });
 }
@@ -2333,27 +2338,99 @@ test("stopping a hands-free recording with the shortcut before speaking pauses w
 	assert.equal(pi.counts.sends, 0);
 });
 
-test("the default reading turn takes and releases the shared turn file in the voice home", async () => {
+test("the default reading turn asks the voice listener in the voice home instead of a turn file", async () => {
 	const { mkdtempSync, existsSync, rmSync, mkdirSync } = await import("node:fs");
 	const { join } = await import("node:path");
 	const scratchRoot = join(import.meta.dirname, "..", "tmp");
 	mkdirSync(scratchRoot, { recursive: true });
 	const home = mkdtempSync(join(scratchRoot, "voice-command-turn-"));
+	// The release tail is the listener's; shortened so the test does not wait it out.
+	const server = new VoiceListener({ dir: join(home, "voice"), readTailMs: 5 });
 	try {
+		await server.listen();
 		const { engine, readings } = fakeEngine();
 		const h = harness({ voice: true, engine, env: { GENTLE_PI_CONFIG_HOME: home } });
 		delete h.deps.readingTurn;
 		const pi = register(h);
 		const ui = fakeContext();
 		await pi.fire("session_start", ui.ctx);
-		await settleReply(pi, ui.ctx, "Con el turno real.");
+		await settleReply(pi, ui.ctx, "Con el turno del listener.");
 		await until(() => readings.length === 1);
-		assert.equal(existsSync(join(home, "voice", "reading-turn.json")), true, "the turn is held while reading");
+		assert.equal(server.state, "reading", "the listener owns the one reading turn");
+		assert.equal(existsSync(join(home, "voice", "reading-turn.json")), false, "reading-turn.json is retired");
 		readings[0]!.finish("done");
-		await until(() => !existsSync(join(home, "voice", "reading-turn.json")));
+		await until(() => server.state !== "reading");
+		assert.ok(h.events.some((event) => event.event === "reading.end"), "the reading reports its outcome as before");
 	} finally {
+		await server.close();
 		rmSync(home, { recursive: true, force: true });
 	}
+});
+
+test("a session that cannot reach the listener still reads through the local turn", async () => {
+	const signal = new AbortController().signal;
+	let asked = 0;
+	let local = 0;
+	let released = 0;
+	// The listener route, as the listener answers it: granted, refused, or gone.
+	const route = (answer: "granted" | "refused" | "unavailable") => async (options: { dir: string; session: { sessionId: string }; chars?: number }) => {
+		asked += 1;
+		assert.equal(options.session.sessionId, "session-alpha", "the listener is told which session reads");
+		if (answer === "granted") return { kind: "granted" as const, release: () => { released += 1; } };
+		return answer === "refused" ? undefined : { kind: "unavailable" as const };
+	};
+	const localTurn = async () => { local += 1; return () => { released += 1; }; };
+
+	const fallback = createReadingTurn({ dir: "/nonexistent/voice", turn: route("unavailable"), local: localTurn });
+	const release = await fallback(signal, { sessionId: "session-alpha", chars: 12 });
+	assert.equal(asked, 1, "the listener is asked first");
+	assert.equal(local, 1, "an unreachable listener is not a broken voice");
+	assert.equal(typeof release, "function");
+	release?.();
+	assert.equal(released, 1);
+
+	// A listener that refuses the turn is obeyed: nothing reads behind its back.
+	assert.equal(await createReadingTurn({ dir: "/x", turn: route("refused"), local: localTurn })(signal, { sessionId: "session-alpha" }), undefined);
+	assert.equal(local, 1, "a refusal is never replaced by a local reading");
+
+	// A granted turn is the listener's release, and a session with no id reads
+	// through the local turn without asking anybody.
+	const granted = await createReadingTurn({ dir: "/x", turn: route("granted"), local: localTurn })(signal, { sessionId: "session-alpha" });
+	assert.equal(typeof granted, "function");
+	granted?.();
+	assert.equal(released, 2);
+	// A session with no id has no place in the listener registry: not even asked.
+	const anonymous = await createReadingTurn({ dir: "/x", turn: route("granted"), local: localTurn })(signal, {});
+	assert.equal(typeof anonymous, "function");
+	anonymous?.();
+	assert.equal(released, 3);
+	assert.equal(asked, 3, "a session with no id never asks the listener");
+});
+
+test("a reading the listener releases elsewhere stops speaking at once", async () => {
+	const { engine, readings } = fakeEngine();
+	const h = harness({ engine, voice: true });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	await settleReply(pi, ui.ctx, "Esto se corta en otra sesión.");
+	await until(() => readings.length === 1);
+	assert.equal(h.turn.released, 0, "the turn is held while the reply is read");
+	// Another session turned voice off or cut the reading: the listener says so.
+	h.turn.cut?.();
+	await until(() => readings[0]!.options.signal.aborted);
+	await until(() => ui.statuses.at(-1) === undefined);
+	assert.equal(h.turn.released, 1, "the turn goes back to the listener");
+});
+
+test("turning voice off cuts a reading that another session is speaking", async () => {
+	const { engine } = fakeEngine();
+	const h = harness({ engine, installed: true, voice: true });
+	const pi = register(h);
+	const ui = fakeContext({ select: pick(/^Voice in this session \(on\): turn off$/) });
+	await pi.fire("session_start", ui.ctx);
+	await run(pi, ui);
+	assert.deepEqual(h.readCuts, ["session-alpha"], "the listener is told to cut whatever it is reading");
 });
 
 test("the kept-alive dictation worker is released when voice is turned off and when the session ends", async () => {
