@@ -1,0 +1,10 @@
+{
+  "title": "Gentle Voice overlay",
+  "brief": "Ventana de Windows (WPF, siempre encima, transparente a clics, sin foco) que muestra de un vistazo si Gentle Voice escucha, a qué sesión van las palabras y en qué idioma. Estados: escuchando, transcribiendo, leyendo, dormido, confirmar (cuenta regresiva ~3 s) y modo inglés. La onda sale de un único nivel de micrófono (0..1, 20-30 Hz).",
+  "feature": "odd/tasks/voice-control.md",
+  "artboards": [
+    { "file": "01-card-central.html", "title": "Tarjeta central", "tradeoff": "La más legible y simple de construir en WPF; ocupa un bloque de 760 × 330 px sobre el contenido y exige mirarla de frente", "width": 1896, "height": 1163 },
+    { "file": "02-banda-central.html", "title": "Banda a todo el ancho", "tradeoff": "Onda enorme y visible de reojo, cubre solo 132 px de alto; tapa una franja entera de terminales mientras está activa", "width": 1896, "height": 1163 },
+    { "file": "03-bordes-y-pildora.html", "title": "Bordes de pantalla + píldora", "tradeoff": "Mejor señal periférica y casi no tapa contenido; requiere una ventana a pantalla completa y es más difícil de ajustar en WPF", "width": 1896, "height": 1163 }
+  ]
+}

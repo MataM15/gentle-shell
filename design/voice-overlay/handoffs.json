@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "chosen": "03-bordes-y-pildora.html",
+  "handoffs": {
+    "03-bordes-y-pildora.html": {
+      "status": "in_progress",
+      "queued": false,
+      "sentAt": "2026-11-13T03:36:15.891Z",
+      "startedAt": "2026-11-13T03:37:34.664Z",
+      "implementedAt": null,
+      "feature": "odd/tasks/voice-control.md",
+      "note": "T12: ventana de Windows (PowerShell/WPF) detrás del puerto del oído; escribe el agente visual en Sonnet 5.5."
+    }
+  }
+}
