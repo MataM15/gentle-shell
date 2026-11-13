@@ -5,7 +5,10 @@ import { resolveVoiceHome } from "../../lib/voice-install.ts";
 import { prepareVoiceWorkerLaunch, VoiceSessionError } from "../../lib/voice-session.ts";
 import { createWarmVoiceWorker } from "../../lib/voice-warm.ts";
 
-const USAGE = `Uso: node --experimental-strip-types odd/probes/voice-cmd-asr-probe.mjs [--help]
+const USAGE = `Uso: node --experimental-strip-types odd/probes/voice-cmd-asr-probe.mjs [--frases] [--help]
+
+--frases  repite solo las frases en español y los silencios (sin «cancel» ni «stop»),
+          para medir si una frase común dispara un comando sin querer.
 
 Antes de empezar, apagá la voz en Pi: el listener podría tener el micrófono ocupado.
 Se harán 5 intentos de «cancel», 5 de «stop», 5 frases y 3 de silencio.
@@ -16,7 +19,7 @@ Ctrl+C interrumpe la prueba y cierra el micrófono.`;
 const FIXED = new Map([["cancel", "cancel"], ["stop", "stop"]]);
 const LOOSE = new Map([
 	["cancel", "cancel"], ["cancell", "cancel"], ["cancels", "cancel"],
-	["stop", "stop"], ["stops", "stop"], ["top", "stop"], ["estop", "stop"],
+	["stop", "stop"], ["stops", "stop"], ["top", "stop"], ["estop", "stop"], ["стоп", "stop"], ["stopstop", "stop"],
 ]);
 const SENTENCES = [
 	"Cancelá la reunión de mañana.",
@@ -25,12 +28,27 @@ const SENTENCES = [
 	"El tren sale temprano esta mañana.",
 	"Mañana seguimos hablando de ese tema.",
 ];
-const ATTEMPTS = [
-	...Array.from({ length: 5 }, () => ({ prompt: "cancel", expected: "cancel" })),
-	...Array.from({ length: 5 }, () => ({ prompt: "stop", expected: "stop" })),
-	...SENTENCES.map((prompt) => ({ prompt, expected: "frase" })),
+// --frases: ordinary Spanish speech only, the false-accept half of the measure.
+const MORE_SENTENCES = [
+	"Pará, pará, que me perdí.",
+	"Hay que cancelar el turno del médico.",
+	"Esto es un stock de prueba.",
+	"Tengo que estudiar para el examen.",
+	"Después vemos lo del cartel de la entrada.",
+];
+const SENTENCE_PROMPT = (sentence) => `leé esta frase en voz alta, NO digas «cancel» ni «stop»: ${sentence}`;
+const PHRASE_ATTEMPTS = [
+	...[...SENTENCES, ...MORE_SENTENCES].map((sentence) => ({ prompt: SENTENCE_PROMPT(sentence), expected: "frase" })),
 	...Array.from({ length: 3 }, () => ({ prompt: "[silencio: no hables durante 6 segundos]", expected: "silencio" })),
 ];
+const FULL_ATTEMPTS = [
+	...Array.from({ length: 5 }, () => ({ prompt: "cancel", expected: "cancel" })),
+	...Array.from({ length: 5 }, () => ({ prompt: "stop", expected: "stop" })),
+	...SENTENCES.map((sentence) => ({ prompt: SENTENCE_PROMPT(sentence), expected: "frase" })),
+	...Array.from({ length: 3 }, () => ({ prompt: "[silencio: no hables durante 6 segundos]", expected: "silencio" })),
+];
+const PHRASES_ONLY = process.argv.slice(2).includes("--frases");
+const ATTEMPTS = PHRASES_ONLY ? PHRASE_ATTEMPTS : FULL_ATTEMPTS;
 
 // Compare the whole normalized transcript, never a substring or free text.
 function normalize(text) {
@@ -163,7 +181,7 @@ async function runProbe() {
 const args = process.argv.slice(2);
 if (args.length === 1 && args[0] === "--help") {
 	console.log(USAGE);
-} else if (args.length) {
+} else if (args.length && !(args.length === 1 && args[0] === "--frases")) {
 	console.error(`Opción no reconocida.\n${USAGE}`);
 	process.exitCode = 2;
 } else if (!process.stdin.isTTY) {
