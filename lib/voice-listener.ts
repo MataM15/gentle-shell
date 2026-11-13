@@ -410,6 +410,9 @@ interface ActiveCapture {
 	readonly mode: CaptureMode;
 	readonly dictation: ListenerDictation;
 	collecting: boolean;
+	// Stop requests that arrived while the outcome was being collected: answered
+	// once it is known, so a requester has its transcript when its stop returns.
+	readonly afterCollect: Array<() => void>;
 	cue: "none" | "open" | "closed";
 }
 
@@ -895,7 +898,7 @@ export class VoiceListener {
 			onLevel: (rms) => this.publishLevel(rms),
 			kws: this.options.keyword,
 		});
-		const capture: ActiveCapture = { client, sessionId, mode: request.mode, dictation, collecting: false, cue: "none" };
+		const capture: ActiveCapture = { client, sessionId, mode: request.mode, dictation, collecting: false, afterCollect: [], cue: "none" };
 		this.capture = capture;
 		// The meter of a new capture starts empty.
 		this.levelMeter.reset();
@@ -938,6 +941,11 @@ export class VoiceListener {
 			this.say(client, { type: "capture", phase: "transcribing" });
 		}
 		this.playCue("close", capture);
+		// The worker ended the recording by itself: it heard the end of speech,
+		// reached its limit, or failed. Nobody asked to stop, so nobody else will
+		// ever collect the outcome: without this the listener waits for a stop
+		// while the session waits for a transcript.
+		this.collectCapture(capture);
 	}
 
 	// The recording ends. The transcript is handed to whoever has the focus at
@@ -945,23 +953,33 @@ export class VoiceListener {
 	private endCapture(client: Client, id?: string): void {
 		const capture = this.refuseUnlessOwner(client, id, this.capture);
 		if (!capture) return;
+		// The requester always learns the outcome, then the request is answered: a
+		// client waiting on stop already has its transcript when it returns. That
+		// holds as well for a stop that finds the outcome already being collected.
+		capture.afterCollect.push(() => this.answer(client, "stop", id));
+		if (capture.collecting) return;
+		this.collectCapture(capture, () => this.captureState(client, "transcribing"));
+	}
+
+	// Collects the outcome of a recording once, whoever ended it: the session
+	// that asked to stop, or the worker itself. The transcript goes to whoever
+	// has the focus now; a command or a failure is settled in its own way.
+	private collectCapture(capture: ActiveCapture, beforeStop?: () => void): void {
 		if (capture.collecting) return;
 		capture.collecting = true;
-		this.captureState(client, "transcribing");
+		beforeStop?.();
 		void (async () => {
 			let transcript: VoiceTranscript;
 			try {
 				transcript = await capture.dictation.stop();
 			} catch (error) {
 				this.failCapture(capture, error);
-				this.answer(client, "stop", id);
 				return;
 			}
 			// What was said was a command, not speech (S4): nothing is delivered, and
 			// the requester gets the same frames a capture with no speech gives it.
 			if (transcript.command !== undefined) {
 				this.captureCommand(capture, transcript.command);
-				this.answer(client, "stop", id);
 				return;
 			}
 			const target = await this.deliverTranscript(transcript.text, transcript.truncated === true, () => this.capture !== capture);
@@ -969,13 +987,14 @@ export class VoiceListener {
 			if (this.capture === capture) {
 				const phase = target === undefined ? "dropped" : target === capture.sessionId ? "delivered" : "elsewhere";
 				this.log("capture.end", { sessionId: capture.sessionId, mode: capture.mode, phase, target });
-				// The requester always learns the outcome, then the request is answered: a
-				// client waiting on stop already has its transcript when it returns.
 				this.say(capture.client, phase === "elsewhere" && target ? { type: "capture", phase, target } : { type: "capture", phase });
 				this.releaseCapture(capture);
 			}
-			this.answer(client, "stop", id);
-		})();
+		})()
+			.catch(() => {})
+			.finally(() => {
+				for (const answer of capture.afterCollect.splice(0)) answer();
+			});
 	}
 
 	private failCapture(capture: ActiveCapture, error: unknown): void {

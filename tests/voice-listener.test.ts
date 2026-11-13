@@ -1880,3 +1880,125 @@ test("the ten minute asleep exit closes the spot capture with everything else (L
 	client.socket.destroy();
 	await started.listener.close();
 });
+
+// A hands-free recording ends by itself: the worker hears the end of speech (or
+// reaches its limit) and reports it. Nobody asks to stop, so the listener must
+// collect the transcript on its own, or it waits for a stop that never comes
+// while the session waits for a transcript that is never sent.
+function selfEndingCapture(options: { text?: string; error?: VoiceSessionErrorCode; command?: string } = {}) {
+	const calls: string[] = [];
+	let notify: (state: VoiceSessionState) => void = () => {};
+	return {
+		calls,
+		// The worker's own edges, as the warm worker reports them without a stop.
+		endsByItself: (finished = true) => {
+			notify("transcribing");
+			if (finished) notify("finished");
+		},
+		dies: () => notify("finished"),
+		factory: (request: ListenerDictationRequest): ListenerDictation => {
+			notify = request.onStateChange;
+			return {
+				start: async () => {
+					calls.push("start");
+					notify("recording");
+				},
+				// The outcome is already known: stop only hands it over.
+				stop: async () => {
+					calls.push("stop");
+					if (options.error) throw new VoiceSessionError(options.error);
+					return { text: options.text ?? "hola", truncated: false, ...(options.command === undefined ? {} : { command: options.command }) };
+				},
+				cancel: async () => {
+					calls.push("cancel");
+				},
+			};
+		},
+	};
+}
+
+test("a recording the worker ends by itself is transcribed and delivered without anyone asking to stop", async () => {
+	const capture = selfEndingCapture({ text: "seguí con eso" });
+	const cues = { player: cuePlayer() };
+	const started = await startListener(scratch(), { dictation: capture.factory, cues: cues.player, focus: { focusedPaneId: async () => ({ focused: "w1:p1" }) } });
+	const asker = await started.client();
+	asker.hello("s-1", "w1:p1");
+	await waitFor(() => framesOf(asker, "welcome").length === 1);
+	asker.send({ type: "dictate", id: "d1", mode: "conversation" });
+	await awaitFrame(asker, (frame) => "id" in frame && frame.id === "d1");
+
+	capture.endsByItself();
+	const transcript = await awaitFrame(asker, (frame) => frame.type === "transcript");
+	assert.deepEqual(transcript, { type: "transcript", text: "seguí con eso" });
+	await awaitFrame(asker, (frame) => frame.type === "capture" && frame.phase === "delivered");
+	assert.deepEqual(capture.calls, ["start", "stop"], "the listener collected it once, by itself");
+	await waitFor(() => cueLog(started.events).length === 2);
+	assert.deepEqual(cueLog(started.events).map((cue) => cue?.name), ["open", "close"]);
+	await waitFor(() => started.listener.state === "listening");
+	assert.deepEqual(states(started.events).slice(-2), ["transcribing", "listening"], "it never stays in transcribing");
+	assert.equal(started.events.some((entry) => entry.event === "capture.end" && entry.fields?.phase === "delivered"), true);
+
+	// A stop that arrives after that is answered, and the next capture starts.
+	asker.send({ type: "stop", id: "s1" });
+	await awaitFrame(asker, (frame) => "id" in frame && frame.id === "s1");
+	asker.send({ type: "dictate", id: "d2", mode: "conversation" });
+	const second = await awaitFrame(asker, (frame) => "id" in frame && frame.id === "d2");
+	assert.equal(second.type, "ok");
+	asker.socket.destroy();
+	await started.listener.close();
+});
+
+test("a stop that arrives while the listener is already collecting is answered once the outcome is known", async () => {
+	const capture = selfEndingCapture({ text: "hola" });
+	let releaseFocus!: () => void;
+	const focusGate = new Promise<void>((resolve) => { releaseFocus = resolve; });
+	const started = await startListener(scratch(), { dictation: capture.factory, focus: { focusedPaneId: async () => { await focusGate; return { focused: "w1:p1" }; } } });
+	const asker = await started.client();
+	asker.hello("s-1", "w1:p1");
+	await waitFor(() => framesOf(asker, "welcome").length === 1);
+	asker.send({ type: "dictate", id: "d1", mode: "dictation" });
+	await awaitFrame(asker, (frame) => "id" in frame && frame.id === "d1");
+
+	capture.endsByItself();
+	await waitFor(() => capture.calls.includes("stop"));
+	asker.send({ type: "stop", id: "s1" });
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.equal(asker.frames.some((frame) => "id" in frame && frame.id === "s1"), false, "not answered before the transcript went out");
+	releaseFocus();
+	await awaitFrame(asker, (frame) => "id" in frame && frame.id === "s1");
+	const order = asker.frames.map((frame) => (frame.type === "transcript" ? "transcript" : "id" in frame && frame.id === "s1" ? "stop-answer" : "")).filter(Boolean);
+	assert.deepEqual(order, ["transcript", "stop-answer"]);
+	assert.deepEqual(capture.calls, ["start", "stop"], "collected once");
+	asker.socket.destroy();
+	await started.listener.close();
+});
+
+test("a recording that fails on its own, or ends on a spoken command, is settled without a stop as well", async () => {
+	const failing = selfEndingCapture({ error: "no-speech" });
+	const first = await startListener(scratch(), { dictation: failing.factory, focus: { focusedPaneId: async () => ({ focused: "w1:p1" }) } });
+	const asker = await first.client();
+	asker.hello("s-1", "w1:p1");
+	await waitFor(() => framesOf(asker, "welcome").length === 1);
+	asker.send({ type: "dictate", id: "d1", mode: "conversation" });
+	await awaitFrame(asker, (frame) => "id" in frame && frame.id === "d1");
+	// The worker ended without ever reporting transcribing.
+	failing.dies();
+	const failed = await awaitFrame(asker, (frame) => frame.type === "capture" && frame.phase === "failed");
+	assert.equal((failed as { code?: string }).code, "no-speech");
+	await waitFor(() => first.listener.state === "listening");
+	asker.socket.destroy();
+	await first.listener.close();
+
+	const spoken = selfEndingCapture({ text: "", command: "voice-off" });
+	const second = await startListener(scratch(), { dictation: spoken.factory, focus: { focusedPaneId: async () => ({ focused: "w1:p1" }) } });
+	const other = await second.client();
+	other.hello("s-2", "w1:p1");
+	await waitFor(() => framesOf(other, "welcome").length === 1);
+	other.send({ type: "dictate", id: "d1", mode: "conversation" });
+	await awaitFrame(other, (frame) => "id" in frame && frame.id === "d1");
+	spoken.endsByItself();
+	await waitFor(() => second.listener.state === "asleep");
+	assert.equal(other.frames.some((frame) => frame.type === "transcript"), false, "a command is never delivered as text");
+	other.socket.destroy();
+	await second.listener.close();
+});
