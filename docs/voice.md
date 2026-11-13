@@ -449,6 +449,19 @@ a session that asks for a capture only receives the transcript.
   the holder of that reading is accepted, and the end of the reading, a cut, a
   lapsed lease or a disconnect stops it at once. The microphone meter and the
   speech events outside consumers receive are unchanged.
+- **Spoken commands in the worker (nothing asks for them yet).** A start request
+  may carry a `kws` option: the pinned keyword spotter model with its digests,
+  the keyword lines with the command each one stands for, and the tuning values.
+  The worker then verifies that model before the microphone opens and runs one
+  keyword spotter on the same audio it records. The spotter fires on a phrase
+  wherever it is said, so the worker applies the whole-utterance rule itself: a
+  hit is a command only when no more speech came before it than the phrase
+  takes (2.6 s from the start of the utterance) and 0.4 s of silence follows
+  within a second, or the recording ends. A command ends that capture with a
+  `command` message naming it (`voice-on`, `voice-off`, `cancel`) in place of a
+  transcript, so the phrase never reaches the dictation model; a phrase inside a
+  sentence changes nothing and is dictated like any other words. Without the
+  option the worker loads no spotter and its output is unchanged.
 - **The overlay port.** `lib/voice-overlay.ts` is the seam the window plugs into:
   the listener hands it a snapshot of the display (state, language, owning session) on every change and the smoothed level while recording. The
   meter lives there, never in the detector: the same worker RMS is normalized

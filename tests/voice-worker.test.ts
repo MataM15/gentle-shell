@@ -22,12 +22,15 @@ const CPAL_ENTRY = "node_modules/node-cpal/index.js";
 const PULSE_ENTRY = "node_modules/node-cpal/backend-pulseaudio.js";
 const PULSE_NATIVE = "node_modules/node-cpal/bin/backend-pulseaudio/linux-x64/index.node";
 const NATIVE = "node_modules/sherpa-onnx-linux-x64/sherpa-onnx.node";
+const KWS_ENTRY = "node_modules/sherpa-onnx-node/keyword-spotter.js";
 const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
 
 interface Install {
 	runtimeRoot: string;
 	modelRoot: string;
 	modelFiles: Record<string, { name: string; size: number; sha256: string }>;
+	kwsRoot: string;
+	kwsFiles: Record<string, { name: string; size: number; sha256: string }>;
 }
 
 function install(t: test.TestContext): Install {
@@ -36,7 +39,7 @@ function install(t: test.TestContext): Install {
 	const dir = mkdtempSync(join(base, "voice-worker-"));
 	t.after(() => rmSync(dir, { recursive: true, force: true }));
 	const runtimeRoot = join(dir, "runtime");
-	for (const file of [SHERPA_ENTRY, CPAL_ENTRY, NATIVE, PULSE_ENTRY, PULSE_NATIVE]) {
+	for (const file of [SHERPA_ENTRY, CPAL_ENTRY, NATIVE, PULSE_ENTRY, PULSE_NATIVE, KWS_ENTRY]) {
 		mkdirSync(dirname(join(runtimeRoot, file)), { recursive: true });
 		writeFileSync(join(runtimeRoot, file), `// ${file}\n`);
 	}
@@ -48,7 +51,33 @@ function install(t: test.TestContext): Install {
 		writeFileSync(join(modelRoot, name), data);
 		modelFiles[role] = { name, size: data.length, sha256: createHash("sha256").update(data).digest("hex") };
 	}
-	return { runtimeRoot, modelRoot, modelFiles };
+	const kwsRoot = join(dir, "kws");
+	mkdirSync(kwsRoot);
+	const kwsFiles: Install["kwsFiles"] = {};
+	for (const [role, name] of [["encoder", "kws-encoder.int8.onnx"], ["decoder", "kws-decoder.int8.onnx"], ["joiner", "kws-joiner.int8.onnx"], ["tokens", "tokens.txt"]]) {
+		const data = Buffer.from(`kws ${role} weights`);
+		writeFileSync(join(kwsRoot, name), data);
+		kwsFiles[role] = { name, size: data.length, sha256: createHash("sha256").update(data).digest("hex") };
+	}
+	return { runtimeRoot, modelRoot, modelFiles, kwsRoot, kwsFiles };
+}
+
+// The keyword option of a start request (S7): the pinned spotter model, the
+// keyword lines with the command each one stands for, and the tuning values.
+function kwsOption(paths: Install, overrides: Record<string, unknown> = {}) {
+	return {
+		model: { root: paths.kwsRoot, files: paths.kwsFiles },
+		keywords: [
+			{ tokens: "▁G ENT LE ▁ VO IC E ▁ON", command: "voice-on" },
+			{ tokens: "▁G ENT LE ▁ VO IC E ▁OF F", command: "voice-off" },
+			{ tokens: "▁C AN CE L", command: "cancel" },
+		],
+		boost: 2,
+		threshold: 0.25,
+		maxActivePaths: 16,
+		trailingBlanks: 2,
+		...overrides,
+	};
 }
 
 function startRequest(paths: Install, overrides: Record<string, unknown> = {}) {
@@ -77,6 +106,9 @@ interface FakeOptions {
 	loadError?: string;
 	recognizerError?: string;
 	text?: string;
+	// The fake keyword spotter reports `keyword` once it was fed `at` samples of
+	// 16 kHz audio in total (counted across streams, in the order given).
+	fires?: Array<{ at: number; keyword: string }>;
 }
 
 function harness(t: test.TestContext, fake: FakeOptions = {}, io: Record<string, unknown> = {}) {
@@ -117,6 +149,45 @@ function harness(t: test.TestContext, fake: FakeOptions = {}, io: Record<string,
 			return { text: fake.text ?? "  hello world  " };
 		}
 	}
+	const spotters: Array<{ config: any; fed: number; streams: number; resets: number }> = [];
+	const fires = [...(fake.fires ?? [])];
+	class KeywordSpotter {
+		config: any;
+		fed = 0;
+		streams = 0;
+		resets = 0;
+		constructor(config: unknown) {
+			this.config = config;
+			spotters.push(this);
+		}
+		createStream() {
+			this.streams++;
+			const stream = {
+				pending: 0,
+				keyword: "",
+				acceptWaveform: (wave: { sampleRate: number; samples: Float32Array }) => {
+					assert.equal(wave.sampleRate, 16000);
+					stream.pending += wave.samples.length;
+				},
+			};
+			return stream;
+		}
+		isReady(stream: { pending: number }) {
+			return stream.pending > 0;
+		}
+		decode(stream: { pending: number; keyword: string }) {
+			this.fed += stream.pending;
+			stream.pending = 0;
+			if (fires.length > 0 && this.fed >= fires[0]!.at) stream.keyword = fires.shift()!.keyword;
+		}
+		getResult(stream: { keyword: string }) {
+			return { keyword: stream.keyword };
+		}
+		reset(stream: { keyword: string }) {
+			this.resets++;
+			stream.keyword = "";
+		}
+	}
 	const done: Promise<void> = runVoiceWorker({
 		input,
 		write: (line: string) => {
@@ -130,6 +201,7 @@ function harness(t: test.TestContext, fake: FakeOptions = {}, io: Record<string,
 			loaded.push(file);
 			if (fake.loadError) throw new Error(fake.loadError);
 			if (file === join(paths.runtimeRoot, ...SHERPA_ENTRY.split("/"))) return { OfflineRecognizer };
+			if (file === join(paths.runtimeRoot, ...KWS_ENTRY.split("/"))) return { KeywordSpotter };
 			if ([CPAL_ENTRY, PULSE_ENTRY].some((entry) => file === join(paths.runtimeRoot, ...entry.split("/")))) return { convenience };
 			throw new Error(`unexpected module ${file}`);
 		},
@@ -145,7 +217,7 @@ function harness(t: test.TestContext, fake: FakeOptions = {}, io: Record<string,
 		assert.ok(predicate(), `timed out waiting for ${label}; messages: ${JSON.stringify(messages)}`);
 	};
 	const types = () => messages.map((message) => message.type);
-	return { paths, input, messages, raw, loaded, streams, recognizers, done, send, waitFor, types, exitCode: () => exitCode };
+	return { paths, input, messages, raw, loaded, streams, recognizers, spotters, done, send, waitFor, types, exitCode: () => exitCode };
 }
 
 test("WSL uses the shipped PulseAudio backend without loading ALSA", async (t) => {
@@ -794,4 +866,205 @@ test("levels must be exactly true when present", async (t) => {
 		assert.deepEqual(worker.messages, [{ schema: SCHEMA, type: "error", code: "invalid-request" }], String(levels));
 		assert.deepEqual(worker.loaded, []);
 	}
+});
+
+// Keyword spotting during a dictation capture (S7), opt-in through `kws`. The
+// spotter fires on a phrase wherever it is said, so the worker decides with the
+// speech activity it measures whether the phrase was the whole utterance (S4).
+const kwsStart = (worker: ReturnType<typeof harness>, overrides: Record<string, unknown> = {}, kws: Record<string, unknown> = {}) =>
+	startRequest(worker.paths, { kws: kwsOption(worker.paths, kws), ...overrides });
+// Samples of 16 kHz audio the spotter was fed after `seconds` of capture.
+const fedAfter = (seconds: number) => Math.round(seconds * 16000);
+const feed = (stream: FakeStream, windows: number, level: number) => {
+	for (let i = 0; i < windows; i++) stream.options.onData(chunk(100, level));
+};
+
+test("a phrase that is the whole utterance is reported as its command and never transcribed", async (t) => {
+	const worker = harness(t, { ...mono8k, fires: [{ at: fedAfter(1.7), keyword: "voice-off" }] });
+	worker.send(kwsStart(worker));
+	await worker.waitFor(() => worker.types().includes("recording"));
+	const [stream] = worker.streams;
+	feed(stream!, 3, 0);
+	feed(stream!, 12, 0.3);
+	feed(stream!, 3, 0);
+	await settle();
+	assert.deepEqual(worker.types(), ["recording"], "a hit waits for the silence that closes the utterance");
+	feed(stream!, 1, 0);
+	await worker.done;
+	assert.deepEqual(worker.messages, [
+		{ schema: SCHEMA, type: "recording" },
+		{ schema: SCHEMA, type: "command", command: "voice-off" },
+	]);
+	assert.equal(worker.exitCode(), 0);
+	assert.equal(stream!.closes, 1);
+	assert.equal(worker.recognizers.length, 0, "the phrase never reaches the dictation model");
+	const [spotter] = worker.spotters;
+	assert.equal(worker.spotters.length, 1);
+	assert.equal(spotter!.config.keywordsBuf, "▁G ENT LE ▁ VO IC E ▁ON @voice-on\n▁G ENT LE ▁ VO IC E ▁OF F @voice-off\n▁C AN CE L @cancel\n");
+	assert.equal(spotter!.config.keywordsBufSize, Buffer.byteLength(spotter!.config.keywordsBuf));
+	assert.deepEqual([spotter!.config.keywordsScore, spotter!.config.keywordsThreshold, spotter!.config.maxActivePaths, spotter!.config.numTrailingBlanks], [2, 0.25, 16, 2]);
+	assert.equal(spotter!.config.modelConfig.numThreads, 1);
+	assert.equal(spotter!.config.modelConfig.tokens, join(worker.paths.kwsRoot, "tokens.txt"));
+	assert.ok(worker.loaded.includes(join(worker.paths.runtimeRoot, ...KWS_ENTRY.split("/"))));
+});
+
+test("a phrase said after other speech in the same utterance is an embedded mention: dictation goes on", async (t) => {
+	const worker = harness(t, { ...mono8k, fires: [{ at: fedAfter(4.5), keyword: "voice-off" }] });
+	worker.send(kwsStart(worker));
+	await worker.waitFor(() => worker.types().includes("recording"));
+	const [stream] = worker.streams;
+	feed(stream!, 3, 0);
+	feed(stream!, 40, 0.3);
+	feed(stream!, 8, 0);
+	await settle();
+	assert.deepEqual(worker.types(), ["recording"]);
+	assert.equal(worker.spotters[0]!.resets, 1, "the hit was heard and dropped");
+	worker.send({ schema: SCHEMA, type: "stop" });
+	await worker.done;
+	assert.deepEqual(worker.types(), ["recording", "transcribing", "result"]);
+	assert.deepEqual(worker.messages.at(-1), { schema: SCHEMA, type: "result", text: "hello world", truncated: false });
+});
+
+test("a phrase followed by more speech is an embedded mention too", async (t) => {
+	const worker = harness(t, { ...mono8k, fires: [{ at: fedAfter(1.5), keyword: "voice-on" }] });
+	worker.send(kwsStart(worker));
+	await worker.waitFor(() => worker.types().includes("recording"));
+	const [stream] = worker.streams;
+	feed(stream!, 3, 0);
+	feed(stream!, 30, 0.3);
+	feed(stream!, 8, 0);
+	await settle();
+	assert.deepEqual(worker.types(), ["recording"]);
+	worker.send({ schema: SCHEMA, type: "stop" });
+	await worker.done;
+	assert.deepEqual(worker.types(), ["recording", "transcribing", "result"]);
+});
+
+test("a keyword the request did not name is ignored", async (t) => {
+	const worker = harness(t, { ...mono8k, fires: [{ at: fedAfter(1.7), keyword: "mystery" }] });
+	worker.send(kwsStart(worker));
+	await worker.waitFor(() => worker.types().includes("recording"));
+	const [stream] = worker.streams;
+	feed(stream!, 3, 0);
+	feed(stream!, 12, 0.3);
+	feed(stream!, 8, 0);
+	await settle();
+	assert.deepEqual(worker.types(), ["recording"]);
+	worker.send({ schema: SCHEMA, type: "stop" });
+	await worker.done;
+	assert.deepEqual(worker.types(), ["recording", "transcribing", "result"]);
+});
+
+test("a recording stopped right after the phrase still ends as its command", async (t) => {
+	// The spotter needs a little audio after the words; the worker gives it
+	// silence when the recording ends, so the hit lands on the padding.
+	const worker = harness(t, { ...mono8k, fires: [{ at: fedAfter(1.5) + 1, keyword: "cancel" }] });
+	worker.send(kwsStart(worker));
+	await worker.waitFor(() => worker.types().includes("recording"));
+	const [stream] = worker.streams;
+	feed(stream!, 3, 0);
+	feed(stream!, 12, 0.3);
+	worker.send({ schema: SCHEMA, type: "stop" });
+	await worker.done;
+	assert.deepEqual(worker.messages, [
+		{ schema: SCHEMA, type: "recording" },
+		{ schema: SCHEMA, type: "command", command: "cancel" },
+	]);
+	assert.equal(worker.recognizers.length, 0);
+});
+
+test("a malformed keyword option is refused before anything is loaded", async (t) => {
+	const bad: Array<[string, (paths: Install) => unknown]> = [
+		["not an object", () => true],
+		["unknown field", (paths) => ({ ...kwsOption(paths), extra: 1 })],
+		["missing tuning", (paths) => { const { boost: _boost, ...rest } = kwsOption(paths); return rest; }],
+		["no keywords", (paths) => kwsOption(paths, { keywords: [] })],
+		["too many keywords", (paths) => kwsOption(paths, { keywords: Array.from({ length: 17 }, () => ({ tokens: "▁ON", command: "voice-on" })) })],
+		["a label in the tokens", (paths) => kwsOption(paths, { keywords: [{ tokens: "▁ON @voice-off", command: "voice-on" }] })],
+		["a boost in the tokens", (paths) => kwsOption(paths, { keywords: [{ tokens: "▁ON :9", command: "voice-on" }] })],
+		["a line break in the tokens", (paths) => kwsOption(paths, { keywords: [{ tokens: "▁ON\n▁OF F", command: "voice-on" }] })],
+		["a command that is not an id", (paths) => kwsOption(paths, { keywords: [{ tokens: "▁ON", command: "Voice On" }] })],
+		["a relative model root", (paths) => kwsOption(paths, { model: { root: "kws", files: paths.kwsFiles } })],
+		["a model file without a digest", (paths) => kwsOption(paths, { model: { root: paths.kwsRoot, files: { ...paths.kwsFiles, tokens: { name: "tokens.txt", size: 1 } } } })],
+		["a boost out of range", (paths) => kwsOption(paths, { boost: 50 })],
+		["a threshold out of range", (paths) => kwsOption(paths, { threshold: 0 })],
+		["too many paths", (paths) => kwsOption(paths, { maxActivePaths: 1000 })],
+		["no trailing blanks", (paths) => kwsOption(paths, { trailingBlanks: 0 })],
+	];
+	for (const [label, build] of bad) {
+		const worker = harness(t, mono8k);
+		worker.send(startRequest(worker.paths, { kws: build(worker.paths) }));
+		await worker.done;
+		assert.deepEqual(worker.messages, [{ schema: SCHEMA, type: "error", code: "invalid-request" }], label);
+		assert.deepEqual(worker.loaded, [], label);
+	}
+});
+
+test("a spotter model that does not match its digests is refused before the microphone opens", async (t) => {
+	const worker = harness(t, mono8k);
+	writeFileSync(join(worker.paths.kwsRoot, "kws-encoder.int8.onnx"), "tampered");
+	worker.send(kwsStart(worker));
+	await worker.done;
+	assert.deepEqual(worker.messages, [{ schema: SCHEMA, type: "error", code: "model-invalid" }]);
+	assert.equal(worker.streams.length, 0);
+	assert.equal(worker.spotters.length, 0);
+});
+
+test("without the keyword option no spotter is loaded and the output is unchanged", async (t) => {
+	const worker = harness(t, { ...mono8k, fires: [{ at: 1, keyword: "voice-off" }] });
+	worker.send(startRequest(worker.paths));
+	await worker.waitFor(() => worker.types().includes("recording"));
+	const [stream] = worker.streams;
+	feed(stream!, 3, 0);
+	feed(stream!, 12, 0.3);
+	feed(stream!, 8, 0);
+	worker.send({ schema: SCHEMA, type: "stop" });
+	await worker.done;
+	assert.deepEqual(worker.raw, [`{"schema":"${SCHEMA}","type":"recording"}\n`, `{"schema":"${SCHEMA}","type":"transcribing"}\n`, `{"schema":"${SCHEMA}","type":"result","text":"hello world","truncated":false}\n`]);
+	assert.equal(worker.spotters.length, 0);
+	assert.ok(!worker.loaded.includes(join(worker.paths.runtimeRoot, ...KWS_ENTRY.split("/"))));
+});
+
+test("with the keyword option, levels are still published and the endpoint still ends the recording when it did", async (t) => {
+	const worker = harness(t, mono8k);
+	worker.send(kwsStart(worker, { levels: true, endpoint: ENDPOINT }));
+	await worker.waitFor(() => worker.types().includes("recording"));
+	const [stream] = worker.streams;
+	feed(stream!, 2, 0);
+	feed(stream!, 5, 0.3);
+	feed(stream!, 4, 0.001);
+	await settle();
+	assert.deepEqual(worker.types().filter((type) => type !== "level"), ["recording"], "a pause shorter than the endpoint keeps recording");
+	feed(stream!, 1, 0.3);
+	feed(stream!, 5, 0);
+	await worker.done;
+	assert.deepEqual(worker.types().filter((type) => type !== "level"), ["recording", "transcribing", "result"]);
+	assert.equal(levelMessages(worker.messages).length, 17, "one level per chunk, for every chunk of the recording");
+	assert.equal(worker.recognizers[0]!.waves[0]!.samples.length, 2 * 8000 * 1.7, "the same audio reaches the dictation model");
+});
+
+test("a warm worker reports a command, takes the next recording and keeps its one spotter", async (t) => {
+	const worker = harness(t, { ...mono8k, fires: [{ at: fedAfter(1.7), keyword: "voice-off" }] });
+	worker.send(kwsStart(worker, { keepAlive: true }));
+	await worker.waitFor(() => worker.types().includes("recording"));
+	feed(worker.streams[0]!, 3, 0);
+	feed(worker.streams[0]!, 12, 0.3);
+	feed(worker.streams[0]!, 4, 0);
+	await worker.waitFor(() => worker.types().includes("command"));
+	assert.deepEqual(worker.types(), ["recording", "command"]);
+	assert.equal(worker.streams[0]!.closes, 1, "the microphone is released with the command");
+	assert.equal(worker.exitCode(), undefined, "a warm worker stays for the next recording");
+	worker.send(kwsStart(worker, { keepAlive: true }));
+	await worker.waitFor(() => worker.types().filter((type) => type === "recording").length === 2);
+	feed(worker.streams[1]!, 5, 0.3);
+	worker.send({ schema: SCHEMA, type: "stop" });
+	await worker.waitFor(() => worker.types().includes("result"));
+	assert.deepEqual(worker.types(), ["recording", "command", "recording", "transcribing", "result"]);
+	assert.equal(worker.spotters.length, 1, "one spotter for the process lifetime");
+	assert.equal(worker.spotters[0]!.streams, 2, "one stream per capture");
+	// The binding cannot free a spotter, so a different configuration is refused.
+	worker.send(kwsStart(worker, { keepAlive: true }, { threshold: 0.5 }));
+	await worker.done;
+	assert.deepEqual(worker.messages.at(-1), { schema: SCHEMA, type: "error", code: "invalid-request" });
+	assert.equal(worker.spotters.length, 1);
 });

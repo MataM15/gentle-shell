@@ -36,6 +36,8 @@ const MODEL_ROLES = ["encoder", "decoder", "joiner", "tokens"];
 // only where it is selected.
 const SHERPA_ENTRY = "node_modules/sherpa-onnx-node/non-streaming-asr.js";
 const CPAL_ENTRY = "node_modules/node-cpal/index.js";
+// The keyword spotter of the same runtime, loaded only when a start asks for it.
+const KWS_ENTRY = "node_modules/sherpa-onnx-node/keyword-spotter.js";
 // The PulseAudio facade loads its own native file: bin/backend-pulseaudio/<target>/index.node.
 const PULSE_ENTRY = "node_modules/node-cpal/backend-pulseaudio.js";
 const pulseNative = (target) => `node_modules/node-cpal/bin/backend-pulseaudio/${target}/index.node`;
@@ -77,12 +79,46 @@ const isInteger = (value, min, max) => Number.isSafeInteger(value) && value >= m
 
 const START_KEYS = ["schema", "type", "target", "maxRecordingMs", "numThreads", "runtime", "model"];
 
+const KWS_KEYS = ["model", "keywords", "boost", "threshold", "maxActivePaths", "trailingBlanks"];
+const KWS_MAX_KEYWORDS = 16;
+// What a hit is reported as: a short opaque id such as "voice-off".
+const KWS_COMMAND = /^[a-z][a-z0-9-]{0,31}$/;
+// One keyword spelling: token pieces separated by spaces. The characters the
+// spotter reads as per-line modifiers (":" boost, "#" threshold, "@" label)
+// and line breaks are refused, so a line can only ever name its own command.
+const KWS_TOKENS = /^[^\s:#@][^\r\n:#@]{0,255}$/;
+const isNumber = (value, min, max) => typeof value === "number" && Number.isFinite(value) && value >= min && value <= max;
+
+// The keyword option of a start request (S7): the spotter model with its
+// digests, the keyword lines with the command each stands for, and the tuning.
+function parseKws(kws) {
+	if (!hasExactKeys(kws, KWS_KEYS)) fail("invalid-request");
+	const { model, keywords } = kws;
+	if (!hasExactKeys(model, ["root", "files"]) || typeof model.root !== "string" || !path.isAbsolute(model.root)) fail("invalid-request");
+	if (!hasExactKeys(model.files, MODEL_ROLES)) fail("invalid-request");
+	for (const role of MODEL_ROLES) {
+		const file = model.files[role];
+		const valid = hasExactKeys(file, ["name", "size", "sha256"]) && isSafeRelative(file.name) && !file.name.includes("/") && isInteger(file.size, 1, Number.MAX_SAFE_INTEGER) && /^[0-9a-f]{64}$/.test(file.sha256);
+		if (!valid) fail("invalid-request");
+	}
+	if (!Array.isArray(keywords) || keywords.length < 1 || keywords.length > KWS_MAX_KEYWORDS) fail("invalid-request");
+	for (const keyword of keywords) {
+		const valid = hasExactKeys(keyword, ["tokens", "command"]) && typeof keyword.tokens === "string" && KWS_TOKENS.test(keyword.tokens) && typeof keyword.command === "string" && KWS_COMMAND.test(keyword.command);
+		if (!valid) fail("invalid-request");
+	}
+	if (!isNumber(kws.boost, 0, 10) || !isNumber(kws.threshold, 0.01, 1)) fail("invalid-request");
+	if (!isInteger(kws.maxActivePaths, 1, 64) || !isInteger(kws.trailingBlanks, 1, 8)) fail("invalid-request");
+}
+
 function parseStart(message) {
 	const withEndpoint = isRecord(message) && Object.hasOwn(message, "endpoint");
 	const withKeepAlive = isRecord(message) && Object.hasOwn(message, "keepAlive");
 	const withLevels = isRecord(message) && Object.hasOwn(message, "levels");
-	const keys = [...START_KEYS, ...(withEndpoint ? ["endpoint"] : []), ...(withKeepAlive ? ["keepAlive"] : []), ...(withLevels ? ["levels"] : [])];
+	const withKws = isRecord(message) && Object.hasOwn(message, "kws");
+	const keys = [...START_KEYS, ...(withEndpoint ? ["endpoint"] : []), ...(withKeepAlive ? ["keepAlive"] : []), ...(withLevels ? ["levels"] : []), ...(withKws ? ["kws"] : [])];
 	if (!hasExactKeys(message, keys)) fail("invalid-request");
+	// Opt-in as well: without it no spotter is loaded and nothing changes.
+	if (withKws) parseKws(message.kws);
 	// A warm worker stays alive after each result for the next recording.
 	if (withKeepAlive && message.keepAlive !== true) fail("invalid-request");
 	// Opt-in: without it the worker publishes exactly the messages it always did.
@@ -257,6 +293,23 @@ const QUIET = 0;
 const SPEECH = 1;
 const SPIKE = 2;
 
+// The whole-utterance rule (S4). The spotter fires on a phrase wherever it is
+// said, so a hit is a command only when the phrase was the utterance itself.
+// Quiet this long closes an utterance, and is the silence a command must be
+// followed by.
+const KWS_QUIET_WINDOWS = 4;
+// From the start of the utterance to the hit: the longest phrase (about 1.6 s)
+// plus the spotter's own delay after the words (0.65 s at most when measured)
+// and a margin. More speech than that before the hit means the phrase came
+// inside a sentence.
+const KWS_MAX_LEAD_SECONDS = 2.6;
+// A hit not followed by that silence within this long had more speech after
+// it: an embedded mention as well.
+const KWS_CONFIRM_SECONDS = 1;
+// Silence fed to the spotter when a recording ends, so a phrase said right
+// before the end is still decoded.
+const KWS_TAIL_SECONDS = 0.5;
+
 class Endpointer {
 	constructor(sampleRate, endpoint) {
 		this.windowFrames = Math.round(sampleRate * WINDOW_SECONDS);
@@ -362,6 +415,11 @@ class WorkerSession {
 		this.levelWindowFrames = 1;
 		this.levelEnergy = 0;
 		this.levelFrames = 0;
+		// The keyword spotter (S7): one for the process lifetime, because the
+		// binding cannot free one, and the state of the capture it listens to.
+		this.spotter = undefined;
+		this.spotterKey = undefined;
+		this.kws = undefined;
 	}
 
 	send(message) {
@@ -415,9 +473,13 @@ class WorkerSession {
 		const usePulse = io.platform === "linux" && /microsoft/i.test(io.kernelRelease ?? "");
 		const captureEntry = usePulse ? PULSE_ENTRY : CPAL_ENTRY;
 		// A cancel can arrive during any await; each step re-checks before going on.
-		await validateRuntime(request.runtime, io.uid, usePulse ? [PULSE_ENTRY, pulseNative(request.target)] : []);
+		await validateRuntime(request.runtime, io.uid, [...(usePulse ? [PULSE_ENTRY, pulseNative(request.target)] : []), ...(request.kws ? [KWS_ENTRY] : [])]);
 		if (this.state !== "loading") return;
 		this.request = request;
+		if (request.kws) {
+			await this.prepareSpotter(request);
+			if (this.state !== "loading") return;
+		}
 		let cpal;
 		try {
 			cpal = io.loadModule(this.fromRuntime(captureEntry));
@@ -444,6 +506,154 @@ class WorkerSession {
 
 	fromRuntime(entry) {
 		return path.join(this.request.runtime.root, ...entry.split("/"));
+	}
+
+	// Verifies the spotter model and builds the spotter before the microphone
+	// opens; a later start with the same runtime and option reuses it.
+	async prepareSpotter(request) {
+		const { kws } = request;
+		const key = JSON.stringify([request.runtime, kws]);
+		if (this.spotter && this.spotterKey === key) return;
+		// A second spotter could never be freed: a changed option needs a new worker.
+		if (this.spotter) fail("invalid-request");
+		await validateModel(kws.model, this.io.uid, this.io.openRead ?? createReadStream, this.verification.signal);
+		if (this.state !== "loading") return;
+		const fromModel = (role) => path.join(kws.model.root, kws.model.files[role].name);
+		let spotterModule;
+		try {
+			spotterModule = this.io.loadModule(this.fromRuntime(KWS_ENTRY));
+		} catch {
+			fail("runtime-load");
+		}
+		// Each line carries its command as the label the spotter reports back.
+		const keywordsBuf = kws.keywords.map((keyword) => `${keyword.tokens} @${keyword.command}\n`).join("");
+		try {
+			this.spotter = new spotterModule.KeywordSpotter({
+				featConfig: { sampleRate: TARGET_RATE, featureDim: 80 },
+				modelConfig: {
+					transducer: { encoder: fromModel("encoder"), decoder: fromModel("decoder"), joiner: fromModel("joiner") },
+					tokens: fromModel("tokens"),
+					numThreads: 1,
+					provider: "cpu",
+					debug: 0,
+				},
+				keywordsBuf,
+				keywordsBufSize: Buffer.byteLength(keywordsBuf),
+				keywordsScore: kws.boost,
+				keywordsThreshold: kws.threshold,
+				maxActivePaths: kws.maxActivePaths,
+				numTrailingBlanks: kws.trailingBlanks,
+			});
+		} catch {
+			fail("model-load");
+		}
+		this.spotterKey = key;
+	}
+
+	// What the spotter needs to know about one capture: its stream, the audio
+	// not yet handed over, and the speech activity the whole-utterance rule reads.
+	openKws(sampleRate) {
+		let stream;
+		try {
+			stream = this.spotter.createStream();
+		} catch {
+			fail("model-load");
+		}
+		return {
+			stream,
+			sampleRate,
+			commands: new Set(this.request.kws.keywords.map((keyword) => keyword.command)),
+			windowFrames: Math.max(1, Math.round(sampleRate * WINDOW_SECONDS)),
+			chunks: [],
+			frames: 0,
+			energy: 0,
+			floor: Infinity,
+			// Audio time handed to the spotter, in seconds.
+			time: 0,
+			// A capture starts as if silence came before it.
+			quietRun: KWS_QUIET_WINDOWS,
+			utteranceStart: undefined,
+			pending: undefined,
+		};
+	}
+
+	// Hands the collected audio to the spotter and returns the keyword it
+	// reports, or "". Audio goes over in whole 100 ms windows, so the 16 kHz
+	// conversion never drops a fraction of a sample per device chunk.
+	decodeKws(extraSeconds = 0) {
+		const kws = this.kws;
+		const block = new Float32Array(kws.frames + Math.round(kws.sampleRate * extraSeconds));
+		let at = 0;
+		for (const chunk of kws.chunks) {
+			block.set(chunk, at);
+			at += chunk.length;
+		}
+		kws.chunks = [];
+		kws.frames = 0;
+		kws.energy = 0;
+		if (block.length === 0) return "";
+		try {
+			kws.stream.acceptWaveform({ sampleRate: TARGET_RATE, samples: resample(block, kws.sampleRate) });
+			while (this.spotter.isReady(kws.stream)) {
+				this.spotter.decode(kws.stream);
+				const keyword = this.spotter.getResult(kws.stream)?.keyword;
+				if (typeof keyword !== "string" || keyword.trim().length === 0) continue;
+				this.spotter.reset(kws.stream);
+				return keyword.trim();
+			}
+		} catch {
+			fail("decode");
+		}
+		return "";
+	}
+
+	// True when a hit at the current audio time can be the whole utterance:
+	// a named command, with no more speech before it than the phrase itself.
+	isWholeUtterance(keyword) {
+		const kws = this.kws;
+		if (!kws.commands.has(keyword) || kws.utteranceStart === undefined) return false;
+		return kws.time - kws.utteranceStart <= KWS_MAX_LEAD_SECONDS;
+	}
+
+	// Called for every device chunk of a capture that asked for keywords.
+	// Returns the command once a hit turned out to be the whole utterance.
+	pushKws() {
+		const kws = this.kws;
+		const chunk = this.recorder.chunks.at(-1);
+		if (!chunk || chunk.length === 0) return undefined;
+		kws.chunks.push(chunk);
+		kws.frames += chunk.length;
+		kws.energy += this.recorder.lastLevel * this.recorder.lastLevel * chunk.length;
+		if (kws.frames < kws.windowFrames) return undefined;
+		const rms = Math.sqrt(kws.energy / kws.frames);
+		const windows = Math.max(1, Math.round(kws.frames / kws.windowFrames));
+		kws.floor = Math.min(kws.floor, rms);
+		const loud = rms >= Math.max(MIN_SPEECH_LEVEL, kws.floor * SPEECH_FLOOR_RATIO);
+		if (loud) {
+			if (kws.quietRun >= KWS_QUIET_WINDOWS) kws.utteranceStart = kws.time;
+			kws.quietRun = 0;
+		} else {
+			kws.quietRun += windows;
+		}
+		kws.time += windows * WINDOW_SECONDS;
+		const keyword = this.decodeKws();
+		if (keyword) kws.pending = this.isWholeUtterance(keyword) ? { command: keyword, deadline: kws.time + KWS_CONFIRM_SECONDS } : undefined;
+		if (!kws.pending) return undefined;
+		if (kws.quietRun >= KWS_QUIET_WINDOWS) return kws.pending.command;
+		// Speech went on after the phrase: it was part of a sentence.
+		if (kws.time >= kws.pending.deadline) kws.pending = undefined;
+		return undefined;
+	}
+
+	// When the recording ends: the end itself is the silence after the phrase,
+	// so a hit still waiting for it counts, and so does a phrase said right
+	// before the end, which the spotter only reports after a little more audio.
+	finalKwsCommand() {
+		const kws = this.kws;
+		if (kws.pending) return kws.pending.command;
+		kws.time += kws.frames / kws.sampleRate;
+		const keyword = this.decodeKws(KWS_TAIL_SECONDS);
+		return keyword && this.isWholeUtterance(keyword) ? keyword : undefined;
 	}
 
 	// Loads sherpa-onnx and the recognizer; only called once the model verified.
@@ -493,6 +703,7 @@ class WorkerSession {
 		this.levelWindowFrames = Math.max(1, Math.round(config.sampleRate * LEVEL_WINDOW_SECONDS));
 		this.levelEnergy = 0;
 		this.levelFrames = 0;
+		this.kws = this.request?.kws ? this.openKws(config.sampleRate) : undefined;
 		try {
 			// The native layer holds the stream weakly; this session keeps it alive.
 			this.stream = await convenience.createInputStream({
@@ -534,6 +745,19 @@ class WorkerSession {
 		if (this.state !== "recording" || !ArrayBuffer.isView(data)) return;
 		const room = this.recorder.append(data);
 		this.publishLevel();
+		if (this.kws) {
+			let command;
+			try {
+				command = this.pushKws();
+			} catch (error) {
+				void this.fail(error);
+				return;
+			}
+			if (command) {
+				void this.finishCommand(command).catch((error) => this.fail(error));
+				return;
+			}
+		}
 		if (!room) {
 			this.truncated = true;
 			void this.transcribe().catch((error) => this.fail(error));
@@ -543,6 +767,8 @@ class WorkerSession {
 	}
 
 	async transcribe() {
+		const command = this.kws ? this.finalKwsCommand() : undefined;
+		if (command) return this.finishCommand(command);
 		this.state = "transcribing";
 		this.send({ type: "transcribing" });
 		await this.closeStream();
@@ -578,9 +804,27 @@ class WorkerSession {
 		if (!this.request.keepAlive) return this.end(result);
 		// Warm: the microphone was already released; wait for the next start.
 		this.send(result);
+		this.resetCapture();
+	}
+
+	// A spoken command ends the capture in place of a transcript (S4: the
+	// command is never sent to the model): the client sees `recording`, then
+	// `command`, and nothing else for this capture.
+	async finishCommand(command) {
+		const message = { type: "command", command };
+		if (!this.request.keepAlive) return this.end(message);
+		this.state = "closing";
+		await this.closeStream();
+		if (this.state !== "closing") return;
+		this.send(message);
+		this.resetCapture();
+	}
+
+	resetCapture() {
 		this.state = "waiting";
 		this.recorder = undefined;
 		this.endpointer = undefined;
+		this.kws = undefined;
 		this.truncated = false;
 	}
 
