@@ -21,7 +21,7 @@ const STEPS = [
 	{ title: "reading, bars follow the speech", state: "reading", language: "es", label: "voice-control", seconds: 8, level: "output" },
 	{ title: "asleep", state: "asleep", language: "es", seconds: 5 },
 	{ title: "listening in English", state: "listening", language: "en", label: "Gentle Voice", seconds: 5, recording: true, level: "display" },
-	{ title: "awake, microphone closed", state: "listening", language: "es", label: "Gentle Voice", seconds: 5 },
+	{ title: "awake, microphone closed (nothing on screen)", state: "listening", language: "es", label: "Gentle Voice", seconds: 5 },
 ];
 
 // A speech-like envelope, 0..1: syllables inside phrases, with pauses.

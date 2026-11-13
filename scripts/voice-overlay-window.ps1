@@ -16,8 +16,9 @@
 # and scaled by the DPI of the monitor the window opens on.
 #
 # Honesty (S10): the screen-edge glow and the live wave are drawn only while
-# `rec 1` holds. A listener that is awake but not recording shows the quiet
-# resting pill, and no state at all (quit, closed stdin) means no window.
+# `rec 1` holds. A listener that is awake but not recording shows nothing at
+# all (no pill, no edges, no timer running), and so does no state (quit, closed
+# stdin): no window.
 # Nothing here logs, stores or echoes a level, a label or a transcript.
 
 $ErrorActionPreference = 'Stop'
@@ -146,8 +147,8 @@ $edges = @{
 $sweepRoot = Parse "<Grid $NS Width='476' Height='40'><Border Name='Bar' Width='420' Height='10' CornerRadius='5' HorizontalAlignment='Left' VerticalAlignment='Top' Margin='28,0,0,0' Background='#E6BB62'><Border.Effect><DropShadowEffect x:Name='Glow' BlurRadius='28' ShadowDepth='0' Color='#E6BB62' Opacity='1'/></Border.Effect></Border></Grid>"
 $sweep = New-OverlayWindow $sweepRoot
 
-# The pill: badge, label, session, mini wave, language chip; plus the resting
-# and asleep forms. Every state reuses the same elements.
+# The pill: badge, label, session, mini wave, language chip; plus the asleep
+# form. Every state reuses the same elements.
 $pillXaml = @"
 <Grid $NS Name='Box' Width='676' Height='160' TextOptions.TextFormattingMode='Ideal'>
   <Border Name='Pill' Margin='28' CornerRadius='22' BorderThickness='2' Background='#EB1A1116' BorderBrush='#D35E6B'>
@@ -194,7 +195,6 @@ $pillXaml = @"
     <Viewbox Width='24' Height='24' VerticalAlignment='Center'>
       <Canvas Width='24' Height='24'>
         <Path Name='RestMoon' Data='M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z' Stroke='#B0A29A' StrokeThickness='1.8' StrokeStartLineCap='Round' StrokeEndLineCap='Round' StrokeLineJoin='Round'/>
-        <Path Name='RestMic' Data='M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3z M6 11v1a6 6 0 0 0 12 0v-1M12 18v3' Stroke='#B0A29A' StrokeThickness='1.8' StrokeStartLineCap='Round' StrokeEndLineCap='Round' StrokeLineJoin='Round'/>
       </Canvas>
     </Viewbox>
     <StackPanel Name='RestTag' Orientation='Horizontal' Margin='12,0,0,0' VerticalAlignment='Center'/>
@@ -205,7 +205,7 @@ $pillXaml = @"
 $pillRoot = Parse $pillXaml
 $pill = New-OverlayWindow $pillRoot
 $ui = @{}
-foreach ($name in 'Box', 'Pill', 'Shadow', 'Active', 'BadgeDisc', 'BadgeSq', 'BadgeRing', 'IcoMic', 'IcoSpin', 'IcoSpk', 'MicA', 'MicB', 'SpinA', 'SpkA', 'SpkB', 'Spin', 'Label', 'Session', 'Prep', 'Name', 'Mini', 'Chip', 'ChipText', 'Rest', 'RestMoon', 'RestMic', 'RestTag', 'RestText') { $ui[$name] = $pillRoot.FindName($name) }
+foreach ($name in 'Box', 'Pill', 'Shadow', 'Active', 'BadgeDisc', 'BadgeSq', 'BadgeRing', 'IcoMic', 'IcoSpin', 'IcoSpk', 'MicA', 'MicB', 'SpinA', 'SpkA', 'SpkB', 'Spin', 'Label', 'Session', 'Prep', 'Name', 'Mini', 'Chip', 'ChipText', 'Rest', 'RestMoon', 'RestTag', 'RestText') { $ui[$name] = $pillRoot.FindName($name) }
 $ui.Box.LayoutTransform = New-Object System.Windows.Media.ScaleTransform(1, 1)
 $sweepBorder = $sweepRoot.FindName('Bar'); $sweepGlow = $sweepRoot.FindName('Glow')
 $sweepRoot.LayoutTransform = New-Object System.Windows.Media.ScaleTransform(1, 1)
@@ -330,21 +330,18 @@ function Show-Badge([string]$kind, [string]$c) {
   }
 }
 
-function Show-Resting([string]$paletteKey, [string]$tag, [string]$text, [bool]$moon) {
+function Show-Resting([string]$paletteKey, [string]$tag) {
   $p = $PALETTE[$paletteKey]
   $ui.Active.Visibility = 'Collapsed'; $ui.Rest.Visibility = 'Visible'
   $ui.Pill.Background = New-Object System.Windows.Media.SolidColorBrush((Alpha $INK 0.86))
   $ui.Pill.BorderBrush = Brush $p[1]
-  $ui.RestMoon.Visibility = $(if ($moon) { 'Visible' } else { 'Collapsed' })
-  $ui.RestMic.Visibility = $(if ($moon) { 'Collapsed' } else { 'Visible' })
+  $ui.RestMoon.Visibility = 'Visible'
   Set-Spaced $ui.RestTag $tag 13 'Normal' $SOFT
   $ui.RestText.Inlines.Clear()
-  if ($moon) {
-    $ui.RestText.Inlines.Add((New-Object System.Windows.Documents.Run('di ')))
-    $q = New-Object System.Windows.Documents.Run([string]::Concat([char]0xAB, 'Gentle Voice on', [char]0xBB))
-    $q.Foreground = Brush $PINK; $q.FontWeight = 'SemiBold'
-    $ui.RestText.Inlines.Add($q)
-  } else { $ui.RestText.Inlines.Add((New-Object System.Windows.Documents.Run($text))) }
+  $ui.RestText.Inlines.Add((New-Object System.Windows.Documents.Run('di ')))
+  $q = New-Object System.Windows.Documents.Run([string]::Concat([char]0xAB, 'Gentle Voice on', [char]0xBB))
+  $q.Foreground = Brush $PINK; $q.FontWeight = 'SemiBold'
+  $ui.RestText.Inlines.Add($q)
   Place-Pill 400 56 $false
 }
 
@@ -367,7 +364,7 @@ function Apply([bool]$fresh) {
   switch ($state) {
     'asleep' {
       Show-Edges @() 0 '#000000' 0
-      Show-Resting 'asleep' 'Dormido' '' $true
+      Show-Resting 'asleep' 'Dormido'
     }
     'listening' {
       if ($script:rec) {
@@ -381,9 +378,9 @@ function Apply([bool]$fresh) {
         Place-Pill 620 104 $true
         Start-Animation
       } else {
-        # Awake, but nothing records: no glow, no wave, and no claim of listening.
+        # Awake, but nothing records: nothing on screen (S10) and no timer.
         Show-Edges @() 0 '#000000' 0
-        Show-Resting 'asleep' 'Voz activa' ([string]::Concat('micr', [char]0xF3, 'fono cerrado')) $false
+        Hide-All
       }
     }
     'transcribing' {
@@ -510,7 +507,7 @@ function Handle([string]$line) {
     'rec' {
       if ($script:state -eq 'listening' -and $parts.Count -eq 2) {
         $on = $parts[1] -eq '1'
-        if ($on -ne $script:rec) { $script:rec = $on; $script:level = 0.0; [Array]::Clear($script:history, 0, $MIRROR_BARS); try { Apply $false } catch { } }
+        if ($on -ne $script:rec) { $script:rec = $on; $script:level = 0.0; [Array]::Clear($script:history, 0, $MIRROR_BARS); try { Apply $on } catch { } }
       }
     }
     'level' {
