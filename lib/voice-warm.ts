@@ -57,7 +57,10 @@ export interface WarmVoiceWorkerOptions {
 }
 
 export interface WarmVoiceWorker {
-	session(options: { onStateChange(state: VoiceSessionState): void; endpoint?: VoiceEndpoint }): WarmDictation;
+	// `levels`: the worker publishes the microphone RMS for a display, and it is
+	// handed to `onLevel` while recording. A session that does not ask sends
+	// exactly the request it always did.
+	session(options: { onStateChange(state: VoiceSessionState): void; endpoint?: VoiceEndpoint; levels?: boolean; onLevel?: (rms: number) => void }): WarmDictation;
 	// Closes the worker, killing it if it has not exited within graceMs.
 	close(graceMs?: number): Promise<void>;
 }
@@ -73,6 +76,8 @@ interface Live {
 interface Capture {
 	state: VoiceSessionState;
 	onStateChange(state: VoiceSessionState): void;
+	levels: boolean;
+	onLevel?: (rms: number) => void;
 	recording: { resolve(): void; reject(error: unknown): void };
 	result: { resolve(transcript: VoiceTranscript): void; reject(error: unknown): void };
 	settled: boolean;
@@ -146,6 +151,16 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 		const capture = current;
 		if (!capture) return;
 		switch (message.type) {
+			case "level":
+				// A display stream: only a session that asked for it is handed one,
+				// and a callback that throws can never disturb the recording.
+				if (!capture.levels) return;
+				try {
+					capture.onLevel?.(message.rms);
+				} catch {
+					/* the display is advisory */
+				}
+				return;
 			case "recording":
 				if (capture.state !== "starting") return protocolError();
 				setState(capture, "recording");
@@ -243,14 +258,14 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 
 	return {
 		close,
-		session({ onStateChange, endpoint }) {
+		session({ onStateChange, endpoint, levels, onLevel }) {
 			let recording!: Capture["recording"];
 			let result!: Capture["result"];
 			const recordingPromise = new Promise<void>((resolve, reject) => { recording = { resolve, reject }; });
 			const resultPromise = new Promise<VoiceTranscript>((resolve, reject) => { result = { resolve, reject }; });
 			recordingPromise.catch(() => {});
 			resultPromise.catch(() => {});
-			const capture: Capture = { state: "idle", onStateChange, recording, result, settled: false };
+			const capture: Capture = { state: "idle", onStateChange, levels: levels === true, onLevel, recording, result, settled: false };
 			return {
 				get state() {
 					return capture.state;
@@ -274,6 +289,7 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 						...prepared.request,
 						numThreads: WARM_WORKER_DEFAULTS.numThreads,
 						...(endpoint ? { endpoint: { endOfSpeechMs: endpoint.endOfSpeechMs, noSpeechMs: endpoint.noSpeechMs } } : {}),
+						...(levels === true ? { levels: true } : {}),
 						keepAlive: true,
 					});
 					return recordingPromise;

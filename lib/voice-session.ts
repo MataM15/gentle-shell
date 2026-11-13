@@ -126,6 +126,10 @@ export interface VoiceSessionOptions {
 	// Hands-free recording (conversation mode): the worker stops by itself after
 	// endOfSpeechMs of quiet that follows speech, or after noSpeechMs with none.
 	endpoint?: VoiceEndpoint;
+	// Mic levels for a display (S5): the worker publishes them only when asked,
+	// and a session that does not ask sends exactly the request it always did.
+	levels?: boolean;
+	onLevel?: (rms: number) => void;
 	startTimeoutMs?: number;
 	transcribeTimeoutMs?: number;
 	exitGraceMs?: number;
@@ -138,7 +142,14 @@ export interface VoiceSessionOptions {
 	nodeVersion?: string;
 }
 
-export type WorkerMessage = { type: "recording" } | { type: "transcribing" } | { type: "result"; text: string; truncated: boolean } | { type: "error"; code: WorkerErrorCode };
+export type WorkerMessage =
+	| { type: "recording" }
+	| { type: "transcribing" }
+	| { type: "result"; text: string; truncated: boolean }
+	| { type: "error"; code: WorkerErrorCode }
+	// A display level, never part of the transcript protocol: 0..1, one per 50 ms
+	// of audio, and only after a start request asked for it.
+	| { type: "level"; rms: number };
 
 const hasExactKeys = (value: Record<string, unknown>, keys: string[]) => Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
 
@@ -163,6 +174,12 @@ export function parseWorkerLine(line: string): WorkerMessage | undefined {
 		case "error":
 			if (!hasExactKeys(record, ["schema", "type", "code"]) || !WORKER_ERROR_CODES.includes(record.code as WorkerErrorCode)) return undefined;
 			return { type: "error", code: record.code as WorkerErrorCode };
+		case "level":
+			// A number and nothing else: a value that could not be drawn is refused
+			// as a malformed line, exactly like a broken transcript message.
+			if (!hasExactKeys(record, ["schema", "type", "rms"]) || typeof record.rms !== "number") return undefined;
+			if (!Number.isFinite(record.rms) || record.rms < 0 || record.rms > 1) return undefined;
+			return { type: "level", rms: record.rms };
 		default:
 			return undefined;
 	}
@@ -326,9 +343,18 @@ export class VoiceSession {
 			while ((newline = buffered.indexOf("\n")) !== -1) {
 				const line = buffered.slice(0, newline);
 				buffered = buffered.slice(newline + 1);
-				const message = ++lines <= MAX_LINES && line.length <= MAX_LINE ? parseWorkerLine(line) : undefined;
-				if (message) this.onMessage(message);
-				else this.abort("protocol");
+				const message = line.length <= MAX_LINE ? parseWorkerLine(line) : undefined;
+				// Levels are a display stream, not part of the transcript: they never
+				// count against the line budget and never end a session.
+				if (message?.type === "level") {
+					this.onLevel(message.rms);
+					continue;
+				}
+				if (!message || ++lines > MAX_LINES) {
+					this.abort("protocol");
+					continue;
+				}
+				this.onMessage(message);
 			}
 			if (buffered.length > MAX_LINE) this.abort("protocol");
 		};
@@ -352,6 +378,17 @@ export class VoiceSession {
 		});
 		this.send(request);
 		this.arm(this.options.startTimeoutMs ?? VOICE_SESSION_DEFAULTS.startTimeoutMs);
+	}
+
+	// Only a session that asked for levels is ever handed one, and a display
+	// callback that throws can never disturb the recording.
+	private onLevel(rms: number): void {
+		if (this.options.levels !== true) return;
+		try {
+			this.options.onLevel?.(rms);
+		} catch {
+			/* the display is advisory */
+		}
 	}
 
 	private onMessage(message: WorkerMessage): void {
@@ -461,6 +498,7 @@ export async function prepareVoiceWorkerLaunch(options: VoiceSessionOptions): Pr
 		maxRecordingMs: options.maxRecordingMs ?? VOICE_SESSION_DEFAULTS.maxRecordingMs,
 		numThreads: VOICE_SESSION_DEFAULTS.numThreads,
 		...(options.endpoint ? { endpoint: { endOfSpeechMs: options.endpoint.endOfSpeechMs, noSpeechMs: options.endpoint.noSpeechMs } } : {}),
+		...(options.levels === true ? { levels: true } : {}),
 		runtime: { root, files: runtime.packages.flatMap((pkg) => pkg.requiredFiles.map((file) => `node_modules/${pkg.name}/${file}`)) },
 		model: {
 			root: voiceComponentPath(voiceHome, "model", model),

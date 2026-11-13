@@ -1,13 +1,15 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import type { Socket } from "node:net";
 import { join } from "node:path";
 import test, { after } from "node:test";
 import { fileURLToPath } from "node:url";
-import { createSessionListenerLink, cutListenerReading, ensureListener, LISTENER_DICTATE_TIMEOUT_MS, ListenerDeliveryError, listenerReadingTurn, VoiceListenerClient, type SessionDictation } from "../lib/voice-listener-client.ts";
+import { createSessionListenerLink, cutListenerReading, ensureListener, LISTENER_DICTATE_TIMEOUT_MS, ListenerDeliveryError, listenerReadingTurn, sessionDisplayLabel, SESSION_LABEL_MAX, VoiceListenerClient, type ListenerSession, type SessionDictation } from "../lib/voice-listener-client.ts";
 import { VoiceSessionError, type VoiceSessionErrorCode, type VoiceSessionState } from "../lib/voice-session.ts";
 import { listenerPaths, readListenerLock, takeListenerLock, VoiceListener, type ListenerDictation, type ListenerDictationRequest } from "../lib/voice-listener.ts";
-import type { ListenerFrame } from "../lib/voice-listener-protocol.ts";
+import { encodeListenerFrame, type ListenerFrame } from "../lib/voice-listener-protocol.ts";
 
 // The session side of the one voice listener (S6, slice A): join the running
 // listener, start it once when it is not there, survive a stale socket or a
@@ -421,4 +423,49 @@ test("a listener with no worker leaves the capture to the session", async () => 
 	assert.deepEqual([dictation.owner, ...own.calls], ["session", "start"], "an unsupported platform records in the session as before");
 	link.close();
 	await server.close();
+});
+
+// --- the session display label (T4, S5) -----------------------------------------------
+
+test("a session label is the session name, or the working directory's, sanitized and short", () => {
+	assert.equal(sessionDisplayLabel({ name: "voice work" }), "voice work");
+	assert.equal(sessionDisplayLabel({ name: "  ", cwd: "/home/someone/proyectos/gentle-shell" }), "gentle-shell", "no name: the directory's");
+	assert.equal(sessionDisplayLabel({ cwd: "/home/someone/proyectos/gentle-shell/" }), "gentle-shell", "a trailing separator is not a segment");
+	assert.equal(sessionDisplayLabel({ cwd: "C:\\Users\\someone\\repo" }), "repo", "a Windows path keeps its last segment");
+	assert.equal(sessionDisplayLabel({ name: "repo\u0007\u001b[31m title" }), "repo title", "control characters and escapes never reach a window");
+	assert.equal(sessionDisplayLabel({ name: "  many   spaces  " }), "many spaces", "whitespace collapses");
+	assert.equal(sessionDisplayLabel({}), undefined, "nothing to show");
+	assert.equal(sessionDisplayLabel({ cwd: "///" }), undefined, "a path without a segment is nothing");
+	const long = sessionDisplayLabel({ name: "x".repeat(500) });
+	assert.equal(long?.length, SESSION_LABEL_MAX);
+	assert.ok(SESSION_LABEL_MAX <= 256, "well inside the protocol's field bound");
+});
+
+test("the hello carries the display label the session sends", async () => {
+	const written: Array<Record<string, unknown>> = [];
+	class FakeSocket extends EventEmitter {
+		destroyed = false;
+		setEncoding() {}
+		on(event: string, listener: (...args: unknown[]) => void) {
+			return super.on(event, listener);
+		}
+		write(chunk: string) {
+			const request = JSON.parse(chunk) as Record<string, unknown>;
+			written.push(request);
+			queueMicrotask(() => super.emit("data", encodeListenerFrame({ type: "welcome", id: request.id as string, listenerPid: 1, proto: 1, state: "asleep" })));
+			return true;
+		}
+		destroy() {
+			this.destroyed = true;
+			return this;
+		}
+	}
+	const socket = new FakeSocket();
+	const session: ListenerSession = { sessionId: "s-1", paneId: "w1:p1", label: "gentle-shell", voiceOn: true };
+	const client = new VoiceListenerClient({ dir: scratch(), session, dial: () => socket as unknown as Socket });
+	queueMicrotask(() => socket.emit("connect"));
+	assert.equal(await client.connect(), "asleep");
+	assert.equal(written[0]!.type, "hello");
+	assert.equal(written[0]!.label, "gentle-shell");
+	client.close();
 });

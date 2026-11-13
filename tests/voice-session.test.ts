@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { gzipSync } from "node:zlib";
 import { VOICE_TARGETS, type VoiceModelManifest, type VoiceNpmPackage, type VoiceRuntimeManifest, type VoiceTarget } from "../lib/voice-artifacts.ts";
 import { installVoiceModel, installVoiceRuntime, voiceComponentPath, type VoiceFetch } from "../lib/voice-install.ts";
-import { createVoiceSession, VOICE_WORKER_SCHEMA, VoiceSessionError, type VoiceSessionOptions, type VoiceSessionState, type VoiceWorkerSpawnOptions } from "../lib/voice-session.ts";
+import { createVoiceSession, parseWorkerLine, VOICE_WORKER_SCHEMA, VoiceSessionError, type VoiceSessionOptions, type VoiceSessionState, type VoiceWorkerSpawnOptions } from "../lib/voice-session.ts";
 
 // The voice session (S1-S3) owns one worker process per dictation. Most tests
 // replace the process with a scripted fake; the last ones run the real
@@ -256,6 +256,54 @@ test("an endpoint is forwarded to the worker only when it is asked for", async (
 	await handsFree.until(() => handsFree.workers.length === 1 && handsFree.worker().received.length === 1);
 	assert.deepEqual((handsFree.worker().received[0] as Record<string, unknown>).endpoint, { endOfSpeechMs: 1200, noSpeechMs: 8000 });
 	await handsFree.session.cancel();
+});
+
+// --- levels (T4, S5) -----------------------------------------------------------------
+
+const levelLine = (rms: unknown, extra: Record<string, unknown> = {}) => JSON.stringify({ schema: VOICE_WORKER_SCHEMA, type: "level", rms, ...extra });
+
+test("a level line carries a microphone RMS and nothing else, and malformed ones are refused", () => {
+	assert.deepEqual(parseWorkerLine(levelLine(0.25)), { type: "level", rms: 0.25 });
+	assert.deepEqual(parseWorkerLine(levelLine(0)), { type: "level", rms: 0 });
+	assert.deepEqual(parseWorkerLine(levelLine(1)), { type: "level", rms: 1 });
+	const malformed = [levelLine(-0.1), levelLine(1.5), levelLine(1e9), levelLine("0.2"), levelLine(null), levelLine(undefined), levelLine(true), levelLine(0.2, { extra: 1 }), JSON.stringify({ schema: VOICE_WORKER_SCHEMA, type: "level" })];
+	for (const line of malformed) assert.equal(parseWorkerLine(line), undefined, line);
+});
+
+test("a session that asks for levels receives them while recording and still transcribes", async (t) => {
+	const fixture = await installFixture(t, "linux-x64");
+	const levels: number[] = [];
+	const run = scripted(fixture, { levels: true, onLevel: (rms) => levels.push(rms) });
+	const started = run.session.start();
+	await run.until(() => run.workers.length === 1 && run.worker().received.length === 1);
+	assert.equal((run.worker().received[0] as any).levels, true, "the start request asks for them");
+	run.worker().say({ type: "recording" });
+	await started;
+	// More frames than the protocol's terminal-line budget: levels are not
+	// terminal messages, so they never count against it.
+	for (let i = 0; i < 40; i++) run.worker().say({ type: "level", rms: i / 100 });
+	assert.deepEqual(levels.length, 40);
+	const stopped = run.session.stop();
+	run.worker().say({ type: "transcribing" });
+	run.worker().say({ type: "result", text: "hola", truncated: false });
+	assert.deepEqual(await stopped, { text: "hola", truncated: false });
+});
+
+test("a session that does not ask for levels sends exactly the request it always did", async (t) => {
+	const fixture = await installFixture(t, "linux-x64");
+	const levels: number[] = [];
+	const run = scripted(fixture, { onLevel: (rms) => levels.push(rms) });
+	const started = run.session.start();
+	await run.until(() => run.workers.length === 1 && run.worker().received.length === 1);
+	assert.equal(Object.hasOwn(run.worker().received[0] as object, "levels"), false, "no levels key in the start request");
+	run.worker().say({ type: "recording" });
+	await started;
+	run.worker().say({ type: "level", rms: 0.5 });
+	const stopped = run.session.stop();
+	run.worker().say({ type: "transcribing" });
+	run.worker().say({ type: "result", text: "ok", truncated: false });
+	assert.deepEqual(await stopped, { text: "ok", truncated: false });
+	assert.deepEqual(levels, [], "a session that never asked for levels is never given one");
 });
 
 test("cancel discards the transcript, ignores late results and leaves no worker", async (t) => {

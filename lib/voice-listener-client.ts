@@ -44,8 +44,38 @@ const PROBE_INTERVAL_MS = 50;
 export interface ListenerSession {
 	sessionId: string;
 	paneId?: string;
+	// What a window calls this session (S5). Display only.
 	label?: string;
 	voiceOn: boolean;
+}
+
+// A display label has to fit a window, not a log line: 48 characters is a title,
+// and well inside the protocol's field bound.
+export const SESSION_LABEL_MAX = 48;
+
+const ANSI_ESCAPE = /\u001b\[[0-9;?]*[ -/]*[@-~]/g;
+const CONTROL = /[\u0000-\u001f\u007f-\u009f]/g;
+
+// One line a window can draw: escapes and control characters gone (a title with
+// an escape could move a cursor), whitespace collapsed, cut to size.
+const cleanLabel = (value: string): string =>
+	value
+		.replace(ANSI_ESCAPE, "")
+		.replace(CONTROL, "")
+		.replace(/\s+/g, " ")
+		.trim()
+		.slice(0, SESSION_LABEL_MAX);
+
+// The label a session shows in the overlay: the name Pi keeps for it, or, when
+// it has none, the last segment of the directory it runs in. Production never
+// set one before, so this is the only place it is chosen.
+export function sessionDisplayLabel(session: { name?: string; cwd?: string }): string | undefined {
+	const named = typeof session.name === "string" ? cleanLabel(session.name) : "";
+	if (named) return named;
+	if (typeof session.cwd !== "string") return undefined;
+	const segment = session.cwd.split(/[\\/]+/).filter((part) => part.length > 0).at(-1);
+	if (segment === undefined) return undefined;
+	return cleanLabel(segment) || undefined;
 }
 
 export interface VoiceListenerClientOptions {

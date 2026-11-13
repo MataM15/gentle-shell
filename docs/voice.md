@@ -426,14 +426,42 @@ a session that asks for a capture only receives the transcript.
   the session that holds the microphone, and so is a reading begun while a
   capture is live; `stop` and `cancel` from any other session are refused too.
   A session that leaves frees the microphone at once.
+- **Levels for a display.** The worker publishes its microphone level only when
+  something draws it: the listener starts a capture with the worker's `levels`
+  option when an overlay is present or a session subscribed, and without it the
+  worker speaks exactly the messages it always did. A session subscribes with
+  `levels { on: true }` (answered with an `ok`) and receives `level` frames
+  while the capture records: `{ rms, at }`, one per 50 ms of audio and never
+  more than twenty a second, whatever the device chunk size is. Unsubscribing,
+  disconnecting or the recording ending stops them for that session. The value
+  is a number and nothing else: it is never logged, and no audio is stored.
+- **One label per session.** The hello always carried a `label` that production
+  never set. A session now sends a short display label — the name Pi keeps for
+  it, or the last segment of the directory it runs in, stripped of control
+  characters and cut to 48 characters — and every `state` frame names the
+  language and the session that owns the capture or the reading (`language`
+  with its `paneId` and `label`), so a window labels the microphone without
+  asking. Display only: nothing routes a transcript by it.
+- **The overlay port.** `lib/voice-overlay.ts` is the seam the window will plug
+  into: the listener hands it a snapshot of the display (state, language,
+  owning session) on every change and the smoothed level while recording. The
+  meter lives there, never in the detector: the same worker RMS is normalized
+  between the measured WSLg floor (0.0031) and measured speech (0.016) and
+  smoothed fast up, slow down, so the endpointer's own thresholds are
+  untouched. An overlay that throws, rejects or never answers is logged once
+  (`overlay.failed`, the event name only, never a level or a transcript) and
+  dropped for good; capture, transcripts, cues and readings carry on without
+  it.
 
 A session dictates through the listener: the lock, the socket, the turn and the
 microphone are live, and a reply is read only in the pane herdr reports focused
 (S12). A session that cannot reach a listener records itself, exactly as
 described above, and a session that is not focused receives neither a transcript
-nor a reading. The keyword spotter, the overlay and the echo cancellation the
-design defers (§5) are still to come; the capture path is shaped so a reference
-stream can be tapped into it when they arrive.
+nor a reading. The overlay window itself is still to come, behind this port: no
+window is created yet, so the levels are published to the sessions that ask for
+them and to the port, and nowhere else. The keyword spotter and the echo
+cancellation the design defers (§5) are still to come; the capture path is
+shaped so a reference stream can be tapped into it when they arrive.
 
 ## Natural voice with Kokoro
 

@@ -17,8 +17,9 @@ import {
 	type ListenerDictationRequest,
 	type ListenerFocus,
 } from "../lib/voice-listener.ts";
-import { encodeListenerFrame, parseListenerFrameLine, VOICE_LISTENER_SCHEMA, type ListenerFrame, type ListenerRequest } from "../lib/voice-listener-protocol.ts";
+import { encodeListenerFrame, parseListenerFrameLine, VOICE_LISTENER_SCHEMA, type ListenerFrame, type ListenerLanguage, type ListenerRequest } from "../lib/voice-listener-protocol.ts";
 import type { CuePlayer } from "../lib/voice-cues.ts";
+import type { VoiceOverlay, VoiceOverlaySnapshot } from "../lib/voice-overlay.ts";
 import { VoiceSessionError, type VoiceSessionErrorCode, type VoiceSessionState } from "../lib/voice-session.ts";
 
 // One voice listener for every Pi session (S6, slice A): the single-instance
@@ -108,7 +109,18 @@ interface Started {
 
 async function startListener(
 	dir: string,
-	options: { idleMs?: number; asleepIdleMs?: number; focus?: ListenerFocus; readLeaseMs?: number; readTailMs?: number; dictation?: (request: ListenerDictationRequest) => ListenerDictation; cues?: CuePlayer } = {},
+	options: {
+		idleMs?: number;
+		asleepIdleMs?: number;
+		focus?: ListenerFocus;
+		readLeaseMs?: number;
+		readTailMs?: number;
+		dictation?: (request: ListenerDictationRequest) => ListenerDictation;
+		cues?: CuePlayer;
+		now?: () => number;
+		overlay?: VoiceOverlay;
+		language?: ListenerLanguage;
+	} = {},
 ): Promise<Started> {
 	const events: Array<{ event: string; fields?: Record<string, unknown> }> = [];
 	const listener = new VoiceListener({
@@ -119,6 +131,9 @@ async function startListener(
 		readTailMs: options.readTailMs,
 		dictation: options.dictation,
 		cues: options.cues,
+		now: options.now,
+		overlay: options.overlay,
+		language: options.language,
 		log: (event, fields) => events.push({ event, fields }),
 		focus: options.focus ?? { focusedPaneId: async () => ({ focused: undefined }) },
 	});
@@ -603,15 +618,21 @@ test("a session with voice off cannot read while the listener is asleep, and a f
 // worker rejects a recording that heard nothing.
 interface FakeCapture {
 	readonly calls: string[];
+	// Every request the listener made, so a test sees what it asked the worker for
+	// and drives the levels the worker would have published.
+	readonly requests: ListenerDictationRequest[];
 	readonly factory: (request: ListenerDictationRequest) => ListenerDictation;
 }
 
 function fakeCapture(options: { text?: string; truncated?: boolean; error?: VoiceSessionErrorCode } = {}): FakeCapture {
 	const calls: string[] = [];
+	const requests: ListenerDictationRequest[] = [];
 	let notify: (state: VoiceSessionState) => void = () => {};
 	return {
 		calls,
+		requests,
 		factory: (request) => {
+			requests.push(request);
 			notify = request.onStateChange;
 			return {
 				start: async () => {
@@ -832,4 +853,232 @@ test("a session that goes away mid-recording gives the microphone back", async (
 	assert.equal((await awaitFrame(next, (frame) => "id" in frame && frame.id === "n1")).type, "ok");
 	next.socket.destroy();
 	await started.listener.close();
+});
+
+// --- levels and the overlay port (slice D, T4) --------------------------------
+
+const levelFrames = (client: Client) => client.frames.filter((frame) => frame.type === "level");
+
+interface FakeOverlay {
+	readonly snapshots: VoiceOverlaySnapshot[];
+	readonly levels: number[];
+	readonly overlay: VoiceOverlay;
+	disposed(): number;
+}
+
+function fakeOverlay(): FakeOverlay {
+	const snapshots: VoiceOverlaySnapshot[] = [];
+	const levels: number[] = [];
+	let disposed = 0;
+	return {
+		snapshots,
+		levels,
+		disposed: () => disposed,
+		overlay: {
+			show: (snapshot) => {
+				snapshots.push(snapshot);
+			},
+			level: (value) => {
+				levels.push(value);
+			},
+			dispose: () => {
+				disposed += 1;
+			},
+		},
+	};
+}
+
+test("levels reach only the sessions that asked for them, never more than twenty a second", async () => {
+	const dir = scratch();
+	let clock = 0;
+	const capture = fakeCapture();
+	const started = await startListener(dir, { dictation: capture.factory, now: () => clock });
+	const asker = await started.client();
+	asker.hello("s-1", "w1:p1");
+	const watcher = await started.client();
+	watcher.hello("s-2", "w1:p2");
+	const leaving = await started.client();
+	leaving.hello("s-3", "w1:p3");
+	await waitFor(() => [asker, watcher, leaving].every((client) => framesOf(client, "welcome").length === 1));
+	watcher.send({ type: "levels", id: "l1", on: true });
+	await awaitFrame(watcher, (frame) => "id" in frame && frame.id === "l1");
+	leaving.send({ type: "levels", id: "l2", on: true });
+	await awaitFrame(leaving, (frame) => "id" in frame && frame.id === "l2");
+
+	asker.send({ type: "dictate", id: "d1", mode: "conversation" });
+	await awaitFrame(asker, (frame) => "id" in frame && frame.id === "d1");
+	await awaitFrame(asker, (frame) => frame.type === "capture" && frame.phase === "recording");
+	const request = capture.requests.at(-1)!;
+	assert.equal(request.levels, true, "a subscriber makes the listener ask the worker for levels");
+
+	request.onLevel(0.02);
+	await awaitFrame(watcher, (frame) => frame.type === "level");
+	assert.deepEqual(levelFrames(watcher), [{ type: "level", rms: 0.02, at: 0 }]);
+	assert.deepEqual(levelFrames(asker), [], "the session that records without asking receives none");
+
+	// Whatever the worker publishes, the listener itself stays under 20 a second.
+	for (let i = 0; i < 30; i++) request.onLevel(0.02);
+	assert.equal(levelFrames(watcher).length, 1, "one message per 50 ms of audio at most");
+	clock = 50;
+	request.onLevel(0.03);
+	await awaitFrame(watcher, (frame) => frame.type === "level" && frame.rms === 0.03);
+	assert.equal(levelFrames(watcher).length, 2);
+
+	// A session that closes stops receiving them; an unsubscribed one too.
+	leaving.socket.destroy();
+	await waitFor(() => started.listener.clientCount === 2);
+	watcher.send({ type: "levels", id: "l3", on: false });
+	await awaitFrame(watcher, (frame) => "id" in frame && frame.id === "l3");
+	clock = 100;
+	request.onLevel(0.04);
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.equal(levelFrames(watcher).length, 2, "unsubscribing stops the events for that session");
+	assert.deepEqual(levelFrames(leaving), [
+		{ type: "level", rms: 0.02, at: 0 },
+		{ type: "level", rms: 0.03, at: 50 },
+	], "a session that left receives nothing more");
+
+	// Levels only while a capture records.
+	watcher.send({ type: "levels", id: "l4", on: true });
+	await awaitFrame(watcher, (frame) => "id" in frame && frame.id === "l4");
+	asker.send({ type: "stop", id: "d2" });
+	await awaitFrame(asker, (frame) => "id" in frame && frame.id === "d2");
+	clock = 200;
+	request.onLevel(0.05);
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.equal(levelFrames(watcher).length, 2, "levels only while a capture records");
+	watcher.socket.destroy();
+	asker.socket.destroy();
+	await started.listener.close();
+});
+
+test("the worker is asked for levels only when an overlay or a subscriber needs them", async () => {
+	const without = fakeCapture();
+	const plain = await startListener(scratch(), { dictation: without.factory });
+	const asker = await plain.client();
+	asker.hello("s-1", "w1:p1");
+	await waitFor(() => framesOf(asker, "welcome").length === 1);
+	asker.send({ type: "dictate", id: "d1", mode: "conversation" });
+	await awaitFrame(asker, (frame) => "id" in frame && frame.id === "d1");
+	assert.equal(without.requests[0]!.levels, false, "nothing needs levels, so the worker is not asked");
+	asker.socket.destroy();
+	await plain.listener.close();
+
+	const overlay = fakeOverlay();
+	const withOverlay = fakeCapture();
+	const windowed = await startListener(scratch(), { dictation: withOverlay.factory, overlay: overlay.overlay });
+	const second = await windowed.client();
+	second.hello("s-2", "w1:p2");
+	await waitFor(() => framesOf(second, "welcome").length === 1);
+	second.send({ type: "dictate", id: "d2", mode: "conversation" });
+	await awaitFrame(second, (frame) => "id" in frame && frame.id === "d2");
+	assert.equal(withOverlay.requests[0]!.levels, true, "the overlay alone is enough");
+	second.socket.destroy();
+	await windowed.listener.close();
+});
+
+test("the overlay sees every state change, the owning session and the smoothed level", async () => {
+	const dir = scratch();
+	const overlay = fakeOverlay();
+	const capture = fakeCapture({ text: "hola" });
+	const started = await startListener(dir, {
+		dictation: capture.factory,
+		now: () => 7,
+		overlay: overlay.overlay,
+		focus: { focusedPaneId: async () => ({ focused: "w1:p1" }) },
+	});
+	const asker = await started.client();
+	asker.send({ type: "hello", proto: 1, sessionId: "s-1", paneId: "w1:p1", voiceOn: true, label: "repo" });
+	await waitFor(() => framesOf(asker, "welcome").length === 1);
+
+	asker.send({ type: "dictate", id: "d1", mode: "conversation" });
+	await awaitFrame(asker, (frame) => "id" in frame && frame.id === "d1");
+	await awaitFrame(asker, (frame) => frame.type === "capture" && frame.phase === "recording");
+	assert.deepEqual(overlay.snapshots, [{ state: "listening", language: "es", label: "repo", paneId: "w1:p1" }]);
+	// The state frame names the same owning session, so a session can label it.
+	assert.deepEqual(framesOf(asker, "state"), [{ type: "state", state: "listening", language: "es", paneId: "w1:p1", label: "repo", at: 7 }]);
+
+	capture.requests.at(-1)!.onLevel(0.016);
+	assert.deepEqual(overlay.levels, [0.6], "speech is a full bar, smoothed from empty");
+	asker.send({ type: "stop", id: "d2" });
+	await awaitFrame(asker, (frame) => "id" in frame && frame.id === "d2");
+	await awaitFrame(asker, (frame) => frame.type === "capture" && frame.phase === "delivered");
+	assert.deepEqual(
+		overlay.snapshots.map((snapshot) => snapshot.state),
+		["listening", "transcribing", "listening"],
+		"every state change, and nothing invented in between",
+	);
+	assert.deepEqual(overlay.snapshots.at(-1), { state: "listening", language: "es" }, "no session owns the microphone between captures");
+	asker.socket.destroy();
+	await started.listener.close();
+	assert.equal(overlay.disposed(), 1, "the overlay is disposed with the listener");
+});
+
+test("an overlay that throws is logged once and never breaks the capture", async () => {
+	const dir = scratch();
+	let calls = 0;
+	const overlay: VoiceOverlay = {
+		show: () => {
+			calls += 1;
+			throw new Error("the window is gone");
+		},
+		level: () => {
+			calls += 1;
+			throw new Error("the window is gone");
+		},
+		dispose: () => {
+			throw new Error("the window is gone");
+		},
+	};
+	const capture = fakeCapture({ text: "hola mundo" });
+	const started = await startListener(dir, { dictation: capture.factory, overlay, cues: cuePlayer(), focus: { focusedPaneId: async () => ({ focused: "w1:p1" }) } });
+	const asker = await started.client();
+	asker.hello("s-1", "w1:p1");
+	await waitFor(() => framesOf(asker, "welcome").length === 1);
+	asker.send({ type: "dictate", mode: "conversation" });
+	await awaitFrame(asker, (frame) => frame.type === "capture" && frame.phase === "recording");
+	capture.requests.at(-1)!.onLevel(0.02);
+	asker.send({ type: "stop" });
+	assert.deepEqual(await awaitFrame(asker, (frame) => frame.type === "capture" && frame.phase === "delivered"), { type: "capture", phase: "delivered" });
+	assert.deepEqual(framesOf(asker, "transcript"), [{ type: "transcript", text: "hola mundo" }]);
+	assert.deepEqual(cueLog(started.events).map((cue) => cue?.name), ["open", "close"], "the cues are unaffected");
+	const failures = started.events.filter((entry) => entry.event === "overlay.failed");
+	assert.equal(failures.length, 1, "logged once");
+	assert.equal(failures[0]!.fields, undefined, "the event name only: never a level, never a transcript");
+	assert.equal(calls, 1, "a dead overlay is never called again");
+	asker.socket.destroy();
+	await started.listener.close();
+});
+
+test("an overlay whose promises reject is dropped the same way", async () => {
+	const dir = scratch();
+	let calls = 0;
+	const overlay: VoiceOverlay = {
+		show: async () => {
+			calls += 1;
+			throw new Error("the window is gone");
+		},
+		level: async () => {
+			calls += 1;
+			throw new Error("the window is gone");
+		},
+		dispose: async () => {},
+	};
+	const capture = fakeCapture({ text: "sigue" });
+	const started = await startListener(dir, { dictation: capture.factory, overlay, focus: { focusedPaneId: async () => ({ focused: "w1:p1" }) } });
+	const asker = await started.client();
+	asker.hello("s-1", "w1:p1");
+	await waitFor(() => framesOf(asker, "welcome").length === 1);
+	asker.send({ type: "dictate", mode: "conversation" });
+	await awaitFrame(asker, (frame) => frame.type === "capture" && frame.phase === "recording");
+	capture.requests.at(-1)!.onLevel(0.02);
+	asker.send({ type: "stop" });
+	assert.deepEqual(await awaitFrame(asker, (frame) => frame.type === "capture" && frame.phase === "delivered"), { type: "capture", phase: "delivered" });
+	assert.deepEqual(framesOf(asker, "transcript"), [{ type: "transcript", text: "sigue" }]);
+	asker.socket.destroy();
+	await started.listener.close();
+	const failures = started.events.filter((entry) => entry.event === "overlay.failed");
+	assert.equal(failures.length, 1, "logged once");
+	assert.equal(failures[0]!.fields, undefined);
+	assert.equal(calls, 1, "a rejecting overlay is never called again");
 });

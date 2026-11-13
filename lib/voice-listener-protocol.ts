@@ -15,6 +15,10 @@ export const LISTENER_MAX_FRAMES_PER_SECOND = 200;
 
 export const LISTENER_STATES = ["asleep", "listening", "transcribing", "reading"] as const;
 export type ListenerState = (typeof LISTENER_STATES)[number];
+// The language the overlay speaks and listens in. It travels with the state so a
+// window shows the right one without asking; the listener knows it, not the wire.
+export const LISTENER_LANGUAGES = ["es", "en"] as const;
+export type ListenerLanguage = (typeof LISTENER_LANGUAGES)[number];
 // "off" is the absence of a listener process, never a state a listener reports.
 export const LISTENER_COMMANDS = ["voice-off", "voice-on"] as const;
 export type ListenerCommand = (typeof LISTENER_COMMANDS)[number];
@@ -95,7 +99,10 @@ export type ListenerRequest =
 	// The microphone (slice C): ask for one capture, end it, or throw it away.
 	| { type: "dictate"; id?: string; mode: CaptureMode; endpoint?: ListenerEndpoint }
 	| { type: "stop"; id?: string }
-	| { type: "cancel"; id?: string };
+	| { type: "cancel"; id?: string }
+	// The display levels (slice D): one frame per 50 ms while a capture records,
+	// sent only to the sessions that ask for them.
+	| { type: "levels"; id?: string; on: boolean };
 
 export interface WelcomeFrame {
 	type: "welcome";
@@ -109,7 +116,12 @@ export type ListenerFrame =
 	| WelcomeFrame
 	| { type: "ok"; request: string; id?: string; state?: ListenerState }
 	| { type: "snapshot"; id?: string; state: ListenerState; listenerPid: number; clients: number; sessions: string[] }
-	| { type: "state"; state: ListenerState; at: number }
+	// A state change, with the language and the session that owns the capture or
+	// the reading the listener is showing. Both optional: a frame written before
+	// the overlay existed still parses.
+	| { type: "state"; state: ListenerState; at: number; language?: ListenerLanguage; paneId?: string; label?: string }
+	// One display level: the microphone RMS, 0..1, and when it was measured.
+	| { type: "level"; rms: number; at: number }
 	| { type: "command"; command: ListenerCommand }
 	| { type: "transcript"; text: string; truncated?: boolean }
 	// What became of the capture: its phase, why it failed, and where the
@@ -138,6 +150,8 @@ type Kind =
 	| "outcome"
 	| "release"
 	| "change"
+	| "language"
+	| "rms"
 	| "busy"
 	| "mode"
 	| "phase"
@@ -163,6 +177,9 @@ const KINDS: Record<Kind, (value: unknown) => boolean> = {
 	outcome: (value) => READING_OUTCOMES.includes(value as ReadingOutcome),
 	release: (value) => READING_RELEASE_REASONS.includes(value as ReadingReleaseReason),
 	change: (value) => value === "granted" || value === "released",
+	language: (value) => LISTENER_LANGUAGES.includes(value as ListenerLanguage),
+	// Not a weight: a level the overlay could not draw is a malformed frame.
+	rms: (value) => typeof value === "number" && Number.isFinite(value) && (value as number) >= 0 && (value as number) <= 1,
 	busy: (value) => LISTENER_BUSY_REASONS.includes(value as ListenerBusyReason),
 	mode: (value) => CAPTURE_MODES.includes(value as CaptureMode),
 	phase: (value) => CAPTURE_PHASES.includes(value as CapturePhase),
@@ -198,13 +215,15 @@ const REQUEST_SPECS: Record<string, Spec> = {
 	dictate: { required: { mode: "mode" }, optional: { endpoint: "endpoint", ...ID } },
 	stop: { required: {}, optional: { ...ID } },
 	cancel: { required: {}, optional: { ...ID } },
+	levels: { required: { on: "boolean" }, optional: { ...ID } },
 };
 
 const FRAME_SPECS: Record<string, Spec> = {
 	welcome: { required: { listenerPid: "pid", proto: "proto", state: "state" }, optional: { ...ID } },
 	ok: { required: { request: "string" }, optional: { state: "state", ...ID } },
 	snapshot: { required: { state: "state", listenerPid: "pid", clients: "counter", sessions: "sessions" }, optional: { ...ID } },
-	state: { required: { state: "state", at: "number" } },
+	state: { required: { state: "state", at: "number" }, optional: { language: "language", paneId: "string", label: "string" } },
+	level: { required: { rms: "rms", at: "counter" } },
 	command: { required: { command: "command" } },
 	transcript: { required: { text: "text" }, optional: { truncated: "boolean" } },
 	// A failure always names its code, and only a failure carries one.

@@ -177,3 +177,44 @@ test("a missing install fails before any worker is started", async () => {
 	await assert.rejects(h.warm.session({ onStateChange: () => {} }).start(), (error: unknown) => error instanceof VoiceSessionError && error.code === "not-installed");
 	assert.equal(h.workers.length, 0);
 });
+
+// --- levels (T4, S5) -----------------------------------------------------------------
+
+test("a warm session asks for levels when it wants them and hands them over", async () => {
+	const h = harness();
+	const levels: number[] = [];
+	const dictation = h.warm.session({ onStateChange: () => {}, levels: true, onLevel: (rms) => levels.push(rms) });
+	const started = dictation.start();
+	await h.until(() => h.workers.length === 1 && h.workers[0]!.received.length === 1);
+	const worker = h.workers[0]!;
+	assert.equal(worker.received[0]!.levels, true, "the start request asks for them");
+	worker.say({ type: "recording" });
+	await started;
+	worker.say({ type: "level", rms: 0.02 });
+	worker.say({ type: "level", rms: 0 });
+	assert.deepEqual(levels, [0.02, 0]);
+	const stopped = dictation.stop();
+	worker.say({ type: "transcribing" });
+	worker.say({ type: "result", text: "hola", truncated: false });
+	assert.deepEqual(await stopped, { text: "hola", truncated: false });
+	assert.equal(worker.exited, false, "levels never end the kept-alive worker");
+	await h.warm.close();
+});
+
+test("without levels the warm start request is unchanged and a stray level is ignored", async () => {
+	const h = harness();
+	const first = await record(h, "hola");
+	assert.equal(Object.hasOwn(first.request, "levels"), false, "no levels key in the start request");
+	const dictation = h.warm.session({ onStateChange: () => {} });
+	const started = dictation.start();
+	await h.until(() => h.workers.at(-1)!.received.some((message) => message.type === "start" && !("_seen" in message)));
+	const worker = h.workers.at(-1)!;
+	worker.say({ type: "recording" });
+	await started;
+	worker.say({ type: "level", rms: 0.5 });
+	const stopped = dictation.stop();
+	worker.say({ type: "transcribing" });
+	worker.say({ type: "result", text: "otra", truncated: false });
+	assert.deepEqual(await stopped, { text: "otra", truncated: false }, "a level is not a protocol error");
+	await h.warm.close();
+});

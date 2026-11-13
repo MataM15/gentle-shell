@@ -190,3 +190,51 @@ test("a reading request or answer outside the fixed lists is refused", () => {
 		assert.equal(parseListenerFrameLine(line(bad)), undefined, JSON.stringify(bad));
 	}
 });
+
+// --- levels and the owning session (T4, S5) ------------------------------------------
+
+test("levels subscribe and unsubscribe, and nothing else is accepted", () => {
+	assert.deepEqual(parseListenerRequestLine(line({ type: "levels", on: true })), { type: "levels", on: true });
+	assert.deepEqual(parseListenerRequestLine(line({ type: "levels", id: "l1", on: false })), { type: "levels", id: "l1", on: false });
+	for (const bad of [{ type: "levels" }, { type: "levels", on: "yes" }, { type: "levels", on: true, rms: 0.2 }, { type: "levels", on: 1 }]) {
+		assert.equal(parseListenerRequestLine(line(bad)), undefined, JSON.stringify(bad));
+	}
+});
+
+test("a level frame carries one bounded microphone RMS and its time", () => {
+	assert.deepEqual(parseListenerFrameLine(line({ type: "level", rms: 0.31, at: 1700 })), { type: "level", rms: 0.31, at: 1700 });
+	assert.deepEqual(parseListenerFrameLine(line({ type: "level", rms: 0, at: 0 })), { type: "level", rms: 0, at: 0 });
+	assert.deepEqual(parseListenerFrameLine(line({ type: "level", rms: 1, at: 1700 })), { type: "level", rms: 1, at: 1700 });
+	for (const bad of [
+		{ type: "level", rms: -0.1, at: 1 },
+		{ type: "level", rms: 1.1, at: 1 },
+		{ type: "level", rms: 1e9, at: 1 },
+		{ type: "level", rms: "0.1", at: 1 },
+		{ type: "level", rms: 0.1 },
+		{ type: "level", rms: 0.1, at: -1 },
+		{ type: "level", at: 1 },
+		{ type: "level", rms: 0.1, at: 1, extra: 1 },
+	]) {
+		assert.equal(parseListenerFrameLine(line(bad)), undefined, JSON.stringify(bad));
+	}
+});
+
+test("a state frame names the language and the session that owns the microphone", () => {
+	assert.deepEqual(parseListenerFrameLine(line({ type: "state", state: "listening", language: "es", paneId: "w1:p1", label: "repo", at: 5 })), {
+		type: "state",
+		state: "listening",
+		language: "es",
+		paneId: "w1:p1",
+		label: "repo",
+		at: 5,
+	});
+	// A frame written before the overlay existed keeps parsing.
+	assert.deepEqual(parseListenerFrameLine(line({ type: "state", state: "asleep", at: 5 })), { type: "state", state: "asleep", at: 5 });
+	for (const bad of [
+		{ type: "state", state: "listening", language: "fr", at: 5 },
+		{ type: "state", state: "listening", label: "x".repeat(300), at: 5 },
+		{ type: "state", state: "listening", paneId: 7, at: 5 },
+	]) {
+		assert.equal(parseListenerFrameLine(line(bad)), undefined, JSON.stringify(bad));
+	}
+});

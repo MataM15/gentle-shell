@@ -747,3 +747,51 @@ test("keepAlive must be exactly true when present", async (t) => {
 		assert.deepEqual(worker.messages, [{ schema: SCHEMA, type: "error", code: "invalid-request" }], String(keepAlive));
 	}
 });
+
+// --- levels (T4, S5) -----------------------------------------------------------------
+
+const levelMessages = (messages: Array<Record<string, unknown>>) => messages.filter((message) => message.type === "level");
+
+test("a capture that asks for levels publishes at most twenty a second of audio", async (t) => {
+	const worker = harness(t, mono8k);
+	worker.send(startRequest(worker.paths, { levels: true }));
+	await worker.waitFor(() => worker.types().includes("recording"));
+	const [stream] = worker.streams;
+	// One second of 10 ms chunks: at most one message per 50 ms of audio.
+	for (let i = 0; i < 100; i++) stream!.options.onData(chunk(10, 0.016));
+	const levels = levelMessages(worker.messages);
+	assert.equal(levels.length, 20, "one message per 50 ms of audio, never one per chunk");
+	for (const message of levels) {
+		assert.deepEqual(Object.keys(message).sort(), ["rms", "schema", "type"]);
+		assert.ok(typeof message.rms === "number" && message.rms > 0.015 && message.rms < 0.017, `the microphone RMS: ${String(message.rms)}`);
+	}
+	// A chunk longer than the window is still one message, never a burst.
+	stream!.options.onData(chunk(500, 0.016));
+	assert.equal(levelMessages(worker.messages).length, 21);
+	worker.send({ schema: SCHEMA, type: "stop" });
+	await worker.done;
+	assert.equal(levelMessages(worker.messages).length, 21, "nothing is published once the recording ends");
+	assert.equal(worker.messages.at(-1)!.type, "result");
+});
+
+test("without levels the worker output is exactly what it always was", async (t) => {
+	const worker = harness(t, mono8k);
+	worker.send(startRequest(worker.paths));
+	await worker.waitFor(() => worker.types().includes("recording"));
+	const [stream] = worker.streams;
+	for (let i = 0; i < 100; i++) stream!.options.onData(chunk(10, 0.016));
+	worker.send({ schema: SCHEMA, type: "stop" });
+	await worker.done;
+	assert.deepEqual(worker.types(), ["recording", "transcribing", "result"], "no level message without the option");
+	assert.deepEqual(worker.messages.at(-1), { schema: SCHEMA, type: "result", text: "hello world", truncated: false });
+});
+
+test("levels must be exactly true when present", async (t) => {
+	for (const levels of [false, "true", 1]) {
+		const worker = harness(t, mono8k);
+		worker.send(startRequest(worker.paths, { levels }));
+		await worker.done;
+		assert.deepEqual(worker.messages, [{ schema: SCHEMA, type: "error", code: "invalid-request" }], String(levels));
+		assert.deepEqual(worker.loaded, []);
+	}
+});

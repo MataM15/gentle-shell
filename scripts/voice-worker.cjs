@@ -3,7 +3,9 @@
 // Node process, so capture callbacks, the blocking recognizer load and the decode
 // never run inside Gentle AI. It speaks JSON lines: stdin receives one `start`
 // request, then `stop` or `cancel`; stdout carries `recording`, `transcribing`,
-// and one final `result` or `error`. Errors carry a closed code only, never a
+// and one final `result` or `error`. A start request that asks for `levels`
+// also gets `level` messages while recording: the microphone RMS every 50 ms of
+// audio, for an overlay to draw. Errors carry a closed code only, never a
 // message, path or native error text.
 //
 // Capture starts as soon as the runtime files pass validation and node-cpal is
@@ -78,10 +80,13 @@ const START_KEYS = ["schema", "type", "target", "maxRecordingMs", "numThreads", 
 function parseStart(message) {
 	const withEndpoint = isRecord(message) && Object.hasOwn(message, "endpoint");
 	const withKeepAlive = isRecord(message) && Object.hasOwn(message, "keepAlive");
-	const keys = [...START_KEYS, ...(withEndpoint ? ["endpoint"] : []), ...(withKeepAlive ? ["keepAlive"] : [])];
+	const withLevels = isRecord(message) && Object.hasOwn(message, "levels");
+	const keys = [...START_KEYS, ...(withEndpoint ? ["endpoint"] : []), ...(withKeepAlive ? ["keepAlive"] : []), ...(withLevels ? ["levels"] : [])];
 	if (!hasExactKeys(message, keys)) fail("invalid-request");
 	// A warm worker stays alive after each result for the next recording.
 	if (withKeepAlive && message.keepAlive !== true) fail("invalid-request");
+	// Opt-in: without it the worker publishes exactly the messages it always did.
+	if (withLevels && message.levels !== true) fail("invalid-request");
 	if (withEndpoint) {
 		const { endpoint } = message;
 		if (!hasExactKeys(endpoint, ["endOfSpeechMs", "noSpeechMs"])) fail("invalid-request");
@@ -244,6 +249,9 @@ const MIN_SPEECH_LEVEL = 0.005;
 const SPEECH_FLOOR_RATIO = 3;
 const MIN_SPEECH_SECONDS = 0.15;
 const WINDOW_SECONDS = 0.1;
+// Published levels: one message per 50 ms of audio, so at most 20 a second
+// whatever the device chunk size is.
+const LEVEL_WINDOW_SECONDS = 0.05;
 const FORGIVEN_WINDOWS_PER = 8;
 const QUIET = 0;
 const SPEECH = 1;
@@ -349,6 +357,11 @@ class WorkerSession {
 		this.recognizer = undefined;
 		this.verification = new AbortController();
 		this.truncated = false;
+		// Published microphone levels (S5), off unless the start request asks.
+		this.levels = false;
+		this.levelWindowFrames = 1;
+		this.levelEnergy = 0;
+		this.levelFrames = 0;
 	}
 
 	send(message) {
@@ -476,6 +489,10 @@ class WorkerSession {
 		}
 		this.recorder = new MonoRecorder(config, Math.ceil((config.sampleRate * maxRecordingMs) / 1000));
 		this.endpointer = this.request?.endpoint ? new Endpointer(config.sampleRate, this.request.endpoint) : undefined;
+		this.levels = this.request?.levels === true;
+		this.levelWindowFrames = Math.max(1, Math.round(config.sampleRate * LEVEL_WINDOW_SECONDS));
+		this.levelEnergy = 0;
+		this.levelFrames = 0;
 		try {
 			// The native layer holds the stream weakly; this session keeps it alive.
 			this.stream = await convenience.createInputStream({
@@ -500,9 +517,24 @@ class WorkerSession {
 		this.verifyModel();
 	}
 
+	// At most one level per 50 ms of audio: the window is audio time, so a long
+	// chunk never becomes a burst and a short one never starves the meter.
+	publishLevel() {
+		if (!this.levels) return;
+		this.levelEnergy += this.recorder.lastLevel * this.recorder.lastLevel * this.recorder.lastFrames;
+		this.levelFrames += this.recorder.lastFrames;
+		if (this.levelFrames < this.levelWindowFrames) return;
+		const rms = Math.sqrt(this.levelEnergy / this.levelFrames);
+		this.levelEnergy = 0;
+		this.levelFrames = 0;
+		this.send({ type: "level", rms });
+	}
+
 	onData(data) {
 		if (this.state !== "recording" || !ArrayBuffer.isView(data)) return;
-		if (!this.recorder.append(data)) {
+		const room = this.recorder.append(data);
+		this.publishLevel();
+		if (!room) {
 			this.truncated = true;
 			void this.transcribe().catch((error) => this.fail(error));
 			return;

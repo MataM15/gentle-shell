@@ -33,7 +33,12 @@ const listener = new VoiceListener({
 	log,
 	cues,
 	focus: createHerdrFocus({ env }),
-	dictation: warm ? ({ onStateChange, endpoint }) => warm.session({ onStateChange, endpoint }) : undefined,
+	// The display levels travel with the capture: the listener decides whether
+	// they are needed and the warm worker publishes them only then.
+	dictation: warm ? ({ onStateChange, endpoint, levels, onLevel }) => warm.session({ onStateChange, endpoint, levels, onLevel }) : undefined,
+	// The overlay port goes here once the window exists (T12); until then the
+	// listener publishes the levels to the sessions that ask for them and to
+	// nobody else.
 });
 
 let stopping = false;

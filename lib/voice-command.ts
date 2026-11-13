@@ -10,7 +10,7 @@ import { installKokoro, installMiro, KOKORO_MANIFESTS, KOKORO_NOTICES, kokoroByt
 import { createReplyReader, defaultSpeechEngineResolver, lastAssistantText, replyLanguage } from "./voice-reply-speech.ts";
 import { createVoiceSpeechPublisher, type VoiceSpeechReading } from "./voice-speech-events.ts";
 import { acquireLocalReadingTurn, paneFocus as herdrPaneFocus, paneFocused as herdrPaneFocused, type PaneFocus } from "./voice-presence.ts";
-import { cutListenerReading, createSessionListenerLink, listenerReadingTurn, startVoiceListenerProcess, type ListenerReading, type ListenerSession, type SessionDictation, type SessionListenerLink } from "./voice-listener-client.ts";
+import { cutListenerReading, createSessionListenerLink, listenerReadingTurn, sessionDisplayLabel, startVoiceListenerProcess, type ListenerReading, type ListenerSession, type SessionDictation, type SessionListenerLink } from "./voice-listener-client.ts";
 import type { ReadingReleaseReason } from "./voice-listener-protocol.ts";
 import { createCuePlayer, type CueName, type CuePlayer, type CueResult } from "./voice-cues.ts";
 import { createVoiceLog, type VoiceLog } from "./voice-diagnostics.ts";
@@ -493,7 +493,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			start: () => startVoiceListenerProcess(env),
 			session: () => {
 				const id = sessionIdOf(sessionCtx);
-				return id ? { sessionId: id, paneId: paneIdOf(), voiceOn: voiceOn(sessionCtx) } : undefined;
+				return id ? { sessionId: id, paneId: paneIdOf(), label: labelOf(sessionCtx), voiceOn: voiceOn(sessionCtx) } : undefined;
 			},
 			onTranscript: receiveTranscript,
 		}));
@@ -609,6 +609,17 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	// a transcript against. Outside herdr nothing is set and the single session
 	// still counts as focused, exactly as lib/voice-presence.ts reads it.
 	const paneIdOf = (): string | undefined => env.HERDR_PANE_ID?.trim() || undefined;
+	// The label a window shows for this session (S5): the name Pi keeps for it, or
+	// the directory it runs in, shortened and stripped by the protocol's own rule.
+	// Display only: nothing routes a transcript by it.
+	const labelOf = (ctx: ExtensionContext | undefined): string | undefined => {
+		try {
+			const manager = ctx?.sessionManager;
+			return sessionDisplayLabel({ name: manager?.getSessionName?.(), cwd: manager?.getCwd?.() });
+		} catch {
+			return undefined;
+		}
+	};
 	// A transcript another session recorded, handed here because this pane had the
 	// focus when the recording ended (S6). It is pasted into this session's draft
 	// and never sent; a session with voice off, or no live session, drops it.

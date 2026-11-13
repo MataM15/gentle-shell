@@ -15,6 +15,7 @@ import {
 	type ListenerEndpoint,
 	type ListenerErrorCode,
 	type ListenerFrame,
+	type ListenerLanguage,
 	type ListenerRequest,
 	type ListenerState,
 	type ReadingOutcome,
@@ -22,6 +23,7 @@ import {
 	READING_OUTCOMES,
 } from "./voice-listener-protocol.ts";
 import type { CueName, CuePlayer, CueResult } from "./voice-cues.ts";
+import { createLevelMeter, type LevelMeter, type VoiceOverlay } from "./voice-overlay.ts";
 import { VoiceSessionError, type VoiceSessionState, type VoiceTranscript } from "./voice-session.ts";
 
 // One voice listener for every Pi session (S6, odd/notes/voice-listener-design.md).
@@ -31,8 +33,11 @@ import { VoiceSessionError, type VoiceSessionState, type VoiceTranscript } from 
 // through herdr, the rule that a transcript reaches the focused session only,
 // the one reading turn every session asks for, and, from slice C, the capture
 // itself: the warm dictation worker records and transcribes here, and the
-// session that asked only receives its transcript. The keyword spotter and the
-// overlay arrive in the later slices.
+// session that asked only receives its transcript. The levels a display draws
+// are published here too: one `level` frame per 50 ms of audio, from the same
+// worker RMS the detector judges, smoothed for the meter and never for the
+// detector. The keyword spotter arrives with a later slice, and so does the
+// window: this file owns the overlay port, never a window.
 
 export const LISTENER_LOCK_FILE = "listener.lock";
 export const LISTENER_SOCKET_FILE = "listener.sock";
@@ -51,6 +56,8 @@ export const READING_LEASE_MS = 15_000;
 // A released reading keeps the state for the tail still audible in the speaker
 // (design §2.4), so the next reading never starts over the last word.
 export const READING_TAIL_MS = 250;
+// The ceiling on published levels: one per 50 ms of audio, twenty a second.
+export const LEVEL_MIN_INTERVAL_MS = 50;
 
 export interface ListenerPaths {
 	readonly dir: string;
@@ -236,6 +243,8 @@ interface Client {
 	paneId?: string;
 	voiceOn: boolean;
 	label?: string;
+	// This session asked for the level frames of the capture it can see.
+	levels: boolean;
 	buffered: string;
 	window: number;
 	windowStart: number;
@@ -270,6 +279,13 @@ export interface VoiceListenerOptions {
 	dictation?: ListenerDictationFactory;
 	// The microphone cues are played here, where the microphone is.
 	cues?: CuePlayer;
+	// The display (T4): a port the listener drives with state snapshots and
+	// levels. Absent here in production until the window exists; a port that
+	// throws or rejects is logged once and dropped, never allowed to break a
+	// capture, a transcript, a cue or a reading.
+	overlay?: VoiceOverlay;
+	// The language shown and listened in, carried on every state frame.
+	language?: ListenerLanguage;
 	idleMs?: number;
 	asleepIdleMs?: number;
 	heartbeatMs?: number;
@@ -290,6 +306,12 @@ export interface ListenerDictationRequest {
 	mode: CaptureMode;
 	endpoint?: ListenerEndpoint;
 	onStateChange(state: VoiceSessionState): void;
+	// True when a display needs the microphone level: an overlay is here, or a
+	// session subscribed. False means the worker publishes exactly what it always
+	// did, and the listener never asks it for more.
+	levels: boolean;
+	// The microphone RMS while recording, 0..1, at most 20 a second.
+	onLevel(rms: number): void;
 }
 
 export type ListenerDictationFactory = (request: ListenerDictationRequest) => ListenerDictation;
@@ -314,6 +336,15 @@ const captureErrorCode = (error: unknown): CaptureErrorCode =>
 
 const withId = <T extends object>(frame: T, id?: string): T => (id === undefined ? frame : ({ ...frame, id } as T));
 
+// The display identity of the session that owns the microphone or the reading,
+// with only the fields it really has: a frame never carries an empty one.
+const displayOf = (client: { paneId?: string; label?: string }): { paneId?: string; label?: string } => {
+	const display: { paneId?: string; label?: string } = {};
+	if (client.paneId !== undefined) display.paneId = client.paneId;
+	if (client.label !== undefined) display.label = client.label;
+	return display;
+};
+
 export class VoiceListener {
 	readonly paths: ListenerPaths;
 	private readonly options: VoiceListenerOptions;
@@ -325,6 +356,18 @@ export class VoiceListener {
 	private readonly heartbeatMs: number;
 	private readonly readLeaseMs: number;
 	private readonly readTailMs: number;
+	private readonly language: ListenerLanguage;
+	// The overlay port, dropped for good the first time it fails.
+	private overlay: VoiceOverlay | undefined;
+	// True while the overlay is still answering the previous call: a window that
+	// hangs is never handed a second one, and never called again after a failure.
+	private overlayBusy = false;
+	// The last call a busy overlay could not take: a window that is a moment
+	// slow still ends up showing the newest state, never an older one.
+	private overlayPending: ((overlay: VoiceOverlay) => void | Promise<void>) | undefined;
+	private readonly levelMeter: LevelMeter = createLevelMeter();
+	// The time of the last published level, for the 20 Hz ceiling.
+	private levelAt: number | undefined;
 	private reading: ActiveReading | undefined;
 	private capture: ActiveCapture | undefined;
 	private server: Server | undefined;
@@ -348,6 +391,8 @@ export class VoiceListener {
 		this.heartbeatMs = options.heartbeatMs ?? LISTENER_HEARTBEAT_MS;
 		this.readLeaseMs = options.readLeaseMs ?? READING_LEASE_MS;
 		this.readTailMs = options.readTailMs ?? READING_TAIL_MS;
+		this.language = options.language ?? "es";
+		this.overlay = options.overlay;
 	}
 
 	get state(): ListenerState {
@@ -412,6 +457,18 @@ export class VoiceListener {
 		this.endReading("shutdown");
 		if (this.reading?.tail) clearTimeout(this.reading.tail);
 		this.reading = undefined;
+		// The window goes with the listener it drew, once. A port that already
+		// failed is never called again.
+		const overlay = this.overlay;
+		this.overlay = undefined;
+		this.overlayPending = undefined;
+		if (overlay) {
+			try {
+				void Promise.resolve(overlay.dispose()).catch(() => {});
+			} catch {
+				/* a window that cannot close changes nothing here */
+			}
+		}
 		// A capture ends with the listener: its worker is a child of this process.
 		const capture = this.capture;
 		this.capture = undefined;
@@ -514,7 +571,7 @@ export class VoiceListener {
 			socket.destroy();
 			return;
 		}
-		const client: Client = { socket, voiceOn: false, buffered: "", window: 0, windowStart: this.now() };
+		const client: Client = { socket, voiceOn: false, levels: false, buffered: "", window: 0, windowStart: this.now() };
 		this.clients.set(socket, client);
 		socket.setEncoding("utf8");
 		socket.on("data", (chunk: string) => this.receive(client, chunk));
@@ -664,6 +721,11 @@ export class VoiceListener {
 				this.say(client, withId({ type: "ok", request: "read-cut", state: this.currentState }, request.id));
 				return;
 			}
+			case "levels":
+				client.levels = request.on;
+				this.say(client, withId({ type: "ok", request: "levels", state: this.currentState }, request.id));
+				this.log("listener.levels", { sessionId: client.sessionId, on: request.on });
+				return;
 			case "dictate":
 				this.beginCapture(client, request);
 				return;
@@ -701,9 +763,21 @@ export class VoiceListener {
 			return;
 		}
 		this.options.cues?.warm();
-		const dictation = factory({ mode: request.mode, endpoint: request.endpoint, onStateChange: (state) => this.captureState(client, state) });
+		// Levels are asked for only when something draws them: the worker then
+		// publishes one message per 50 ms of audio, and nothing at all otherwise.
+		const levels = this.needsLevels();
+		const dictation = factory({
+			mode: request.mode,
+			endpoint: request.endpoint,
+			levels,
+			onStateChange: (state) => this.captureState(client, state),
+			onLevel: (rms) => this.publishLevel(rms),
+		});
 		const capture: ActiveCapture = { client, sessionId, mode: request.mode, dictation, collecting: false, cue: "none" };
 		this.capture = capture;
+		// The meter of a new capture starts empty.
+		this.levelMeter.reset();
+		this.levelAt = undefined;
 		this.setState("listening");
 		this.log("capture.begin", { sessionId, mode: request.mode, clients: this.clients.size });
 		void dictation.start().then(
@@ -800,6 +874,9 @@ export class VoiceListener {
 	private releaseCapture(capture: ActiveCapture): void {
 		if (this.capture !== capture) return;
 		this.capture = undefined;
+		// The meter of a recording ends with it: the next one starts empty.
+		this.levelMeter.reset();
+		this.levelAt = undefined;
 		// The microphone closed without a stop: the close cue still marks it.
 		if (capture.cue === "open") {
 			capture.cue = "closed";
@@ -808,6 +885,74 @@ export class VoiceListener {
 		// The microphone is free again, and the listener is awake as long as a
 		// session that has voice is still here.
 		this.setState([...this.clients.values()].some((entry) => entry.sessionId && entry.voiceOn) ? "listening" : "asleep");
+	}
+
+	// True when a display needs the levels: an overlay to draw them, or a session
+	// that subscribed. Evaluated once per capture, so the worker is never asked
+	// for a stream nobody reads.
+	private needsLevels(): boolean {
+		if (this.overlay) return true;
+		for (const client of this.clients.values()) if (client.sessionId && client.levels) return true;
+		return false;
+	}
+
+	// One published level: the meter sees every value, the subscribers see at
+	// most one per 50 ms of audio, and a capture that already stopped sees none.
+	// The value is a number only: never logged, never stored.
+	private publishLevel(rms: number): void {
+		const capture = this.capture;
+		if (!capture || capture.cue !== "open") return;
+		const at = this.now();
+		if (this.levelAt !== undefined && at - this.levelAt < LEVEL_MIN_INTERVAL_MS) return;
+		this.levelAt = at;
+		const level = this.levelMeter.push(rms);
+		this.drawOverlay((overlay) => overlay.level(level));
+		for (const client of this.clients.values()) if (client.sessionId && client.levels) this.say(client, { type: "level", rms, at });
+	}
+
+	// The overlay port, driven but never trusted: one call at a time, and the
+	// first throw or rejection drops it for the rest of the listener's life.
+	private drawOverlay(call: (overlay: VoiceOverlay) => void | Promise<void>): void {
+		const overlay = this.overlay;
+		if (!overlay) return;
+		// One call at a time: what arrives while the window is still answering
+		// waits, and only the newest of those is ever called.
+		if (this.overlayBusy) {
+			this.overlayPending = call;
+			return;
+		}
+		let result: void | Promise<void>;
+		try {
+			result = call(overlay);
+		} catch {
+			this.dropOverlay(overlay);
+			return;
+		}
+		if (!(result instanceof Promise)) return;
+		this.overlayBusy = true;
+		void result.then(
+			() => this.overlayIdle(),
+			() => {
+				this.overlayIdle();
+				this.dropOverlay(overlay);
+			},
+		);
+	}
+
+	private overlayIdle(): void {
+		this.overlayBusy = false;
+		const pending = this.overlayPending;
+		this.overlayPending = undefined;
+		if (pending) this.drawOverlay(pending);
+	}
+
+	private dropOverlay(overlay: VoiceOverlay): void {
+		if (this.overlay !== overlay) return;
+		this.overlay = undefined;
+		this.overlayBusy = false;
+		this.overlayPending = undefined;
+		// The event name only: never a level value, never a transcript.
+		this.log("overlay.failed");
 	}
 
 	private answer(client: Client, request: string, id?: string): void {
@@ -902,8 +1047,23 @@ export class VoiceListener {
 		}
 		this.currentState = next;
 		this.log("listener.state", { state: next });
-		this.broadcast({ type: "state", state: next, at: this.now() });
+		// The frame and the snapshot name the same owning session, so a window and
+		// a session label the microphone identically (design §2.2).
+		const owner = this.stateOwner();
+		this.broadcast({ type: "state", state: next, language: this.language, ...owner, at: this.now() });
+		this.drawOverlay((overlay) => overlay.show({ state: next, language: this.language, ...owner }));
 		this.armIdle();
+	}
+
+	// Who owns what the listener is showing: the session that asked for the
+	// capture, or the one holding the reading. Nobody when it is only listening.
+	private stateOwner(): { paneId?: string; label?: string } {
+		const capture = this.capture;
+		if (capture) return displayOf(capture.client);
+		const session = this.reading && !this.reading.ended ? this.reading.session : undefined;
+		if (session === undefined) return {};
+		for (const client of this.clients.values()) if (client.sessionId === session) return displayOf(client);
+		return {};
 	}
 
 	private broadcast(frame: ListenerFrame): void {
