@@ -100,6 +100,8 @@ export interface HelloRequest {
 
 export type ListenerRequest =
 	| HelloRequest
+	// A session publishes its own current flag without changing the other sessions.
+	| { type: "session-voice"; voiceOn: boolean }
 	| { type: "set-voice"; id?: string; voiceOn: boolean }
 	| { type: "wake"; id?: string }
 	| { type: "sleep"; id?: string }
@@ -234,6 +236,7 @@ const REQUEST_SPECS: Record<string, Spec> = {
 		required: { proto: "proto", sessionId: "session", voiceOn: "boolean" },
 		optional: { paneId: "string", label: "string", role: "role", ...ID },
 	},
+	"session-voice": { required: { voiceOn: "boolean" } },
 	"set-voice": { required: { voiceOn: "boolean" }, optional: { ...ID } },
 	wake: { required: {}, optional: { ...ID } },
 	sleep: { required: {}, optional: { ...ID } },

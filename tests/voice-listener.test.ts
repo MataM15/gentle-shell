@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createConnection, type Socket } from "node:net";
+import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import test, { after } from "node:test";
 import {
@@ -30,11 +31,10 @@ import { createWarmVoiceWorker } from "../lib/voice-warm.ts";
 // One voice listener for every Pi session (S6, slice A): the single-instance
 // lock, the unix-socket registry, the state edges, focus resolution and the
 // rule that a transcript reaches the focused session only. Every socket lives
-// in a scratch voice home under tmp/; the real ~/.pi/gentle-ai/voice is never
-// touched and no microphone is opened in this slice.
+// in a scratch voice home under the system temp directory; the real voice home
+// is never touched and no microphone is opened in this slice.
 
-const scratchRoot = join(import.meta.dirname, "..", "tmp");
-mkdirSync(scratchRoot, { recursive: true });
+const scratchRoot = tmpdir();
 const dirs: string[] = [];
 const scratch = () => {
 	const dir = mkdtempSync(join(scratchRoot, "voice-listener-"));
@@ -2165,7 +2165,7 @@ test("awake spotting ignores voice-on, logs each hit and turns voice off everywh
 	second.socket.destroy();
 });
 
-test("awake spotting stops when the last session leaves and restarts when voice rejoins", async (t) => {
+test("awake spotting is replaced by asleep spotting when the last session leaves or is rejected", async (t) => {
 	const spot = fakeSpotting();
 	const started = await startListener(scratch(), { keyword: keywordOption(), spot: spot.factory });
 	t.after(() => started.listener.close());
@@ -2175,17 +2175,178 @@ test("awake spotting stops when the last session leaves and restarts when voice 
 	first.send({ type: "wake", id: "w" });
 	await awaitFrame(first, (frame) => "id" in frame && frame.id === "w");
 	first.socket.destroy();
-	await waitFor(() => spot.calls.includes("spot.stop") && started.listener.clientCount === 0);
+	await waitFor(() => spot.starts === 2 && started.listener.clientCount === 0);
+	assert.equal(started.listener.state, "asleep");
 	const second = await started.client();
 	second.hello("s-2", "w1:p2", true);
 	await awaitFrame(second, (frame) => frame.type === "welcome");
-	await waitFor(() => spot.starts === 2);
+	assert.equal(started.listener.state, "listening");
 	assert.deepEqual(spot.calls, ["spot.start", "spot.stop", "spot.start"]);
 	assert.deepEqual(framesOf(second, "transcript"), []);
 	second.socket.write("not-json\n");
 	await second.closed;
-	await waitFor(() => spot.calls.filter((call) => call === "spot.stop").length === 2);
+	await waitFor(() => spot.starts === 3);
+	assert.deepEqual(spot.calls, ["spot.start", "spot.stop", "spot.start", "spot.stop", "spot.start"]);
+	assert.equal(started.listener.state, "asleep");
 	assert.equal(started.listener.voiceSessions.length, 0, "rejecting the last client releases awake spotting too");
+});
+
+let sessionVoiceBarrier = 0;
+async function sendSessionVoice(client: Client, voiceOn: boolean): Promise<void> {
+	const id = `session-voice-barrier-${sessionVoiceBarrier++}`;
+	client.socket.write(`${JSON.stringify({ schema: VOICE_LISTENER_SCHEMA, type: "session-voice", voiceOn })}\n`);
+	client.send({ type: "status", id });
+	const answer = await awaitFrame(client, (frame) => frame.type === "error" || ("id" in frame && frame.id === id));
+	assert.equal(answer.type, "snapshot", `session-voice must not close the link: ${JSON.stringify(answer)}`);
+}
+
+test("session-voice updates only its session across both connection roles, without a broadcast", async (t) => {
+	const spot = fakeSpotting();
+	const started = await startListener(scratch(), { keyword: keywordOption(), spot: spot.factory });
+	t.after(() => started.listener.close());
+	const first = await started.client();
+	const reading = await started.client();
+	const second = await started.client();
+	first.hello("s-1", "w1:p1", true, "session");
+	reading.hello("s-1", "w1:p1", true, "reading");
+	second.hello("s-2", "w1:p2", true);
+	await waitFor(() => [first, reading, second].every((client) => framesOf(client, "welcome").length === 1) && spot.starts === 1);
+	await sendSessionVoice(first, false);
+	assert.deepEqual(started.listener.voiceSessions, ["s-2"]);
+	assert.equal(started.listener.state, "listening");
+	assert.deepEqual([...framesOf(first, "command"), ...framesOf(reading, "command"), ...framesOf(second, "command")], []);
+	assert.deepEqual(spot.calls, ["spot.start"], "another session keeps awake spotting open");
+	second.socket.destroy();
+	await waitFor(() => started.listener.state === "asleep" && spot.starts === 2);
+	assert.deepEqual(started.listener.voiceSessions, [], "the reading connection cannot retain a stale voice-on flag");
+	assert.deepEqual(framesOf(first, "transcript"), []);
+});
+
+test("session-voice false on the last session waits for spot teardown before wake spotting", async (t) => {
+	let release!: () => void;
+	const gate = new Promise<void>((resolve) => { release = resolve; });
+	const spot = fakeSpotting({ stopGate: gate });
+	const started = await startListener(scratch(), { keyword: keywordOption(), spot: spot.factory, cues: cuePlayer(), focus: { focusedPaneId: async () => ({ focused: "w1:p2" }) } });
+	t.after(() => { release(); return started.listener.close(); });
+	const first = await started.client();
+	const focused = await started.client();
+	first.hello("s-1", "w1:p1", true);
+	focused.hello("s-2", "w1:p2", false);
+	await waitFor(() => framesOf(first, "welcome").length === 1 && framesOf(focused, "welcome").length === 1 && spot.starts === 1);
+	await sendSessionVoice(first, false);
+	assert.equal(started.listener.state, "asleep");
+	assert.deepEqual(started.listener.voiceSessions, []);
+	assert.deepEqual(spot.calls, ["spot.start", "spot.stop"]);
+	assert.deepEqual([...framesOf(first, "command"), ...framesOf(focused, "command")], []);
+	spot.hearing("voice-on");
+	await waitFor(() => started.events.some((entry) => entry.event === "kws.hit"));
+	assert.deepEqual(started.events.filter((entry) => entry.event === "kws.hit").map((entry) => entry.fields), [{ command: "voice-on", reason: "ignored:stale" }]);
+	assert.equal(spot.starts, 1, "the old microphone is still closing");
+	release();
+	await waitFor(() => spot.starts === 2);
+	spot.hearing("voice-on");
+	assert.deepEqual(await awaitFrame(focused, (frame) => frame.type === "command"), { type: "command", command: "voice-on", wake: true });
+	assert.deepEqual(started.listener.voiceSessions, ["s-2"]);
+	assert.equal(started.listener.state, "listening");
+	assert.deepEqual(framesOf(first, "command"), [{ type: "command", command: "voice-on" }]);
+	assert.deepEqual([...framesOf(first, "transcript"), ...framesOf(focused, "transcript")], []);
+	assert.deepEqual(cueLog(started.events), []);
+});
+
+test("session-voice true while asleep wakes idle without a cue or command", async (t) => {
+	const spot = fakeSpotting();
+	const overlay = fakeOverlay();
+	const started = await startListener(scratch(), { keyword: keywordOption(), spot: spot.factory, overlay: overlay.overlay, cues: cuePlayer() });
+	t.after(() => started.listener.close());
+	const client = await started.client();
+	client.hello("s-1", "w1:p1", false);
+	await waitFor(() => framesOf(client, "welcome").length === 1 && spot.starts === 1);
+	await sendSessionVoice(client, true);
+	assert.equal(started.listener.state, "listening");
+	assert.deepEqual(started.listener.voiceSessions, ["s-1"]);
+	assert.deepEqual(framesOf(client, "command"), []);
+	assert.deepEqual(cueLog(started.events), []);
+	assert.deepEqual(spot.calls, ["spot.start"]);
+	assert.deepEqual(overlay.snapshots.at(-1), { state: "listening", language: "es", recording: false });
+});
+
+test("session-voice before hello is rejected without changing voice", async (t) => {
+	const started = await startListener(scratch());
+	t.after(() => started.listener.close());
+	const client = await started.client();
+	client.socket.write(`${JSON.stringify({ schema: VOICE_LISTENER_SCHEMA, type: "session-voice", voiceOn: true })}\n`);
+	assert.deepEqual(await awaitFrame(client, (frame) => frame.type === "error"), { type: "error", code: "bad-hello" });
+	await client.closed;
+	assert.deepEqual(started.listener.voiceSessions, []);
+	assert.equal(started.listener.state, "asleep");
+});
+
+test("session-voice last-owner graceful close, disconnect and rejection wait for awake spot teardown", async (t) => {
+	for (const ending of ["close", "disconnect", "reject"] as const) {
+		await t.test(ending, async (st) => {
+			let release!: () => void;
+			const gate = new Promise<void>((resolve) => { release = resolve; });
+			const spot = fakeSpotting({ stopGate: gate });
+			const started = await startListener(scratch(), { keyword: keywordOption(), spot: spot.factory, focus: { focusedPaneId: async () => ({ focused: "w1:p2" }) } });
+			st.after(() => { release(); return started.listener.close(); });
+			const owner = await started.client();
+			const quiet = await started.client();
+			owner.hello("s-1", "w1:p1", true);
+			quiet.hello("s-2", "w1:p2", false);
+			await waitFor(() => framesOf(owner, "welcome").length === 1 && framesOf(quiet, "welcome").length === 1 && spot.starts === 1);
+			if (ending === "close") owner.socket.end();
+			else if (ending === "disconnect") owner.socket.destroy();
+			else owner.socket.write("not-json\n");
+			await waitFor(() => spot.calls.includes("spot.stop") && started.listener.clientCount === 1);
+			assert.equal(started.listener.state, "asleep");
+			assert.deepEqual(started.listener.voiceSessions, []);
+			assert.equal(spot.starts, 1, "the old spotter still owns the microphone");
+			assert.deepEqual(framesOf(quiet, "command"), []);
+			release();
+			await waitFor(() => spot.starts === 2);
+			spot.hearing("voice-on");
+			assert.deepEqual(await awaitFrame(quiet, (frame) => frame.type === "command"), { type: "command", command: "voice-on", wake: true });
+			assert.deepEqual(started.listener.voiceSessions, ["s-2"]);
+		});
+	}
+});
+
+test("session-voice replacement keeps an on-to-on connection awake and sleeps for on-to-off", async (t) => {
+	const spot = fakeSpotting();
+	const started = await startListener(scratch(), { keyword: keywordOption(), spot: spot.factory });
+	t.after(() => started.listener.close());
+	const first = await started.client();
+	first.hello("s-1", "w1:p1", true);
+	await waitFor(() => framesOf(first, "welcome").length === 1 && spot.starts === 1);
+	const replacement = await started.client();
+	replacement.hello("s-1", "w1:p1", true);
+	await awaitFrame(replacement, (frame) => frame.type === "welcome");
+	assert.deepEqual(await awaitFrame(first, (frame) => frame.type === "bye"), { type: "bye", reason: "replaced" });
+	assert.equal(started.listener.state, "listening");
+	assert.deepEqual(spot.calls, ["spot.start"], "an equivalent reload never churns the microphone");
+	const quiet = await started.client();
+	quiet.hello("s-1", "w1:p1", false);
+	await awaitFrame(quiet, (frame) => frame.type === "welcome");
+	assert.deepEqual(await awaitFrame(replacement, (frame) => frame.type === "bye"), { type: "bye", reason: "replaced" });
+	await waitFor(() => started.listener.state === "asleep" && spot.starts === 2);
+	assert.deepEqual(started.listener.voiceSessions, []);
+	assert.deepEqual(framesOf(quiet, "command"), []);
+});
+
+test("session-voice replacement of an active reader receives welcome before any other frame", async (t) => {
+	const started = await startListener(scratch(), { readTailMs: 50 });
+	t.after(() => started.listener.close());
+	const original = await started.client();
+	original.hello("s-1", "w1:p1", true, "reading");
+	await awaitFrame(original, (frame) => frame.type === "welcome");
+	original.send({ type: "read-begin", id: "r", readingId: "read-1", chars: 30 });
+	await awaitFrame(original, (frame) => "id" in frame && frame.id === "r");
+	const replacement = await started.client();
+	replacement.hello("s-1", "w1:p1", true, "reading");
+	await awaitFrame(replacement, (frame) => frame.type === "welcome");
+	assert.equal(replacement.frames[0]?.type, "welcome", "no old-reading release precedes the handshake");
+	assert.deepEqual(await awaitFrame(original, (frame) => frame.type === "bye"), { type: "bye", reason: "replaced" });
+	assert.deepEqual(started.listener.voiceSessions, ["s-1"]);
 });
 
 test("awake spotting settles before dictation and resumes only after that capture ends", async (t) => {
@@ -2283,6 +2444,146 @@ test("a hit from a reading cannot arrive late and turn voice off after its tail 
 	assert.deepEqual(await awaitFrame(reader, (frame) => frame.type === "command" && frame.command === "voice-off"), { type: "command", command: "voice-off" });
 	assert.deepEqual(started.listener.voiceSessions, []);
 	reader.socket.destroy();
+});
+
+test("JD-A-006: a command from a dictation started in the reading tail is ignored, even when reported late", async (t) => {
+	for (const timing of ["in tail", "after tail"] as const) {
+		await t.test(timing, async (st) => {
+			const spot = fakeSpotting();
+			const capture = selfEndingCapture({ text: "never delivered", command: "voice-off" });
+			const overlay = fakeOverlay();
+			const started = await startListener(scratch(), { keyword: keywordOption(), spot: spot.factory, dictation: capture.factory, cues: cuePlayer(), overlay: overlay.overlay, readTailMs: 1_000 });
+			st.after(() => started.listener.close());
+			const reader = await started.client();
+			const other = await started.client();
+			reader.hello("s-1", "w1:p1", true);
+			other.hello("s-2", "w1:p2", true);
+			await waitFor(() => framesOf(reader, "welcome").length === 1 && framesOf(other, "welcome").length === 1 && spot.starts === 1);
+			reader.send({ type: "read-begin", id: "r", readingId: "read-1", chars: 30 });
+			assert.equal((await awaitFrame(reader, (frame) => "id" in frame && frame.id === "r")).type, "granted");
+			reader.send({ type: "read-end", id: "e", readingId: "read-1", outcome: "done" });
+			await awaitFrame(reader, (frame) => "id" in frame && frame.id === "e");
+			reader.send({ type: "dictate", id: "d", mode: "dictation" });
+			assert.equal((await awaitFrame(reader, (frame) => "id" in frame && frame.id === "d")).type, "ok");
+			assert.deepEqual(capture.calls, ["start"], "Alt+M records immediately during the tail");
+			reader.send({ type: "read-begin", id: "tail-check", readingId: "read-2", chars: 1 });
+			assert.deepEqual(await awaitFrame(reader, (frame) => "id" in frame && frame.id === "tail-check"), { type: "busy", id: "tail-check", reason: "reading", holder: "s-1" });
+			if (timing === "after tail") {
+				await sleep(1_100);
+				reader.send({ type: "read-begin", id: "after-check", readingId: "read-2", chars: 1 });
+				assert.deepEqual(await awaitFrame(reader, (frame) => "id" in frame && frame.id === "after-check"), { type: "busy", id: "after-check", reason: "capture", holder: "s-1" }, "the tail really expired while the capture stayed open");
+			}
+			capture.dies();
+			assert.deepEqual(await awaitFrame(reader, (frame) => frame.type === "capture" && frame.phase === "failed"), { type: "capture", phase: "failed", code: "no-speech" });
+			await waitFor(() => spot.starts >= 2);
+			other.send({ type: "status", id: "barrier" });
+			await awaitFrame(other, (frame) => "id" in frame && frame.id === "barrier");
+			const hits = started.events.filter((entry) => entry.event === "kws.hit").map((entry) => entry.fields);
+			assert.equal(hits.length, 1);
+			assert.equal(hits[0]?.command, "voice-off");
+			assert.ok(hits[0]?.reason === "ignored:reading" || hits[0]?.reason === "ignored:stale", `unsafe hit was ${String(hits[0]?.reason)}`);
+			assert.deepEqual(started.listener.voiceSessions, ["s-1", "s-2"]);
+			assert.equal(started.listener.state, "listening");
+			assert.deepEqual([...framesOf(reader, "command"), ...framesOf(other, "command")], []);
+			assert.deepEqual([...framesOf(reader, "transcript"), ...framesOf(other, "transcript")], []);
+			assert.deepEqual(phases(reader), ["recording", "failed"]);
+			assert.deepEqual(capture.calls, ["start", "stop"]);
+			assert.deepEqual(spot.calls.slice(0, 2), ["spot.start", "spot.stop"]);
+			assert.equal(spot.calls.at(-1), "spot.start", "spotting resumes after capture releases the microphone");
+			await waitFor(() => cueLog(started.events).length === 2);
+			assert.deepEqual(cueLog(started.events).map((cue) => cue?.name), ["open", "close"]);
+			assert.ok(overlay.snapshots.some((snapshot) => snapshot.recording));
+			assert.equal(overlay.snapshots.at(-1)?.recording, false);
+		});
+	}
+});
+
+test("JD-A-006: a capture started after the tail accepts voice off and hands the mic back", async (t) => {
+	const spot = fakeSpotting();
+	const capture = selfEndingCapture({ text: "never delivered", command: "voice-off" });
+	const started = await startListener(scratch(), { keyword: keywordOption(), spot: spot.factory, dictation: capture.factory, readTailMs: 50 });
+	t.after(() => started.listener.close());
+	const reader = await started.client();
+	const other = await started.client();
+	reader.hello("s-1", "w1:p1", true);
+	other.hello("s-2", "w1:p2", true);
+	await waitFor(() => framesOf(reader, "welcome").length === 1 && framesOf(other, "welcome").length === 1 && spot.starts === 1);
+	reader.send({ type: "read-begin", id: "r", readingId: "read-1", chars: 30 });
+	await awaitFrame(reader, (frame) => "id" in frame && frame.id === "r");
+	reader.send({ type: "read-end", id: "e", readingId: "read-1", outcome: "done" });
+	await awaitFrame(reader, (frame) => "id" in frame && frame.id === "e");
+	await waitFor(() => spot.starts === 2, 3_000);
+	reader.send({ type: "dictate", id: "d", mode: "dictation" });
+	assert.equal((await awaitFrame(reader, (frame) => "id" in frame && frame.id === "d")).type, "ok");
+	capture.dies();
+	assert.deepEqual(await awaitFrame(reader, (frame) => frame.type === "capture" && frame.phase === "failed"), { type: "capture", phase: "failed", code: "no-speech" });
+	assert.deepEqual(await awaitFrame(other, (frame) => frame.type === "command"), { type: "command", command: "voice-off" });
+	assert.deepEqual(framesOf(reader, "command"), [{ type: "command", command: "voice-off" }]);
+	assert.deepEqual(started.listener.voiceSessions, []);
+	assert.equal(started.listener.state, "asleep");
+	assert.deepEqual([...framesOf(reader, "transcript"), ...framesOf(other, "transcript")], []);
+	assert.deepEqual(started.events.filter((entry) => entry.event === "kws.hit").map((entry) => entry.fields), [{ command: "voice-off", reason: "whole-utterance" }]);
+	await waitFor(() => spot.starts === 3);
+	assert.deepEqual(spot.calls, ["spot.start", "spot.stop", "spot.start", "spot.stop", "spot.start"]);
+});
+
+test("JD-A-006: ordinary dictation still records and delivers text during the tail", async (t) => {
+	const spot = fakeSpotting();
+	const capture = fakeCapture({ text: "hola durante la cola" });
+	const started = await startListener(scratch(), { keyword: keywordOption(), spot: spot.factory, dictation: capture.factory, readTailMs: 1_000, focus: { focusedPaneId: async () => ({ focused: "w1:p1" }) } });
+	t.after(() => started.listener.close());
+	const reader = await started.client();
+	reader.hello("s-1", "w1:p1", true);
+	await waitFor(() => framesOf(reader, "welcome").length === 1 && spot.starts === 1);
+	reader.send({ type: "read-begin", id: "r", readingId: "read-1", chars: 30 });
+	await awaitFrame(reader, (frame) => "id" in frame && frame.id === "r");
+	reader.send({ type: "read-end", id: "e", readingId: "read-1", outcome: "done" });
+	await awaitFrame(reader, (frame) => "id" in frame && frame.id === "e");
+	reader.send({ type: "dictate", id: "d", mode: "dictation" });
+	assert.equal((await awaitFrame(reader, (frame) => "id" in frame && frame.id === "d")).type, "ok");
+	reader.send({ type: "read-begin", id: "check", readingId: "read-2", chars: 1 });
+	assert.deepEqual(await awaitFrame(reader, (frame) => "id" in frame && frame.id === "check"), { type: "busy", id: "check", reason: "reading", holder: "s-1" });
+	reader.send({ type: "stop", id: "s" });
+	assert.equal((await awaitFrame(reader, (frame) => "id" in frame && frame.id === "s")).type, "ok");
+	assert.deepEqual(framesOf(reader, "transcript"), [{ type: "transcript", text: "hola durante la cola" }]);
+	assert.deepEqual(phases(reader), ["recording", "transcribing", "delivered"]);
+	assert.deepEqual(capture.calls, ["start", "stop"]);
+	assert.deepEqual(framesOf(reader, "command"), []);
+	assert.deepEqual(started.listener.voiceSessions, ["s-1"]);
+	await waitFor(() => spot.starts === 2);
+});
+
+test("JD-A-006: a request in the tail whose capture starts after spot teardown is not tainted", async (t) => {
+	let release!: () => void;
+	const gate = new Promise<void>((resolve) => { release = resolve; });
+	const spot = fakeSpotting({ stopGate: gate });
+	const capture = selfEndingCapture({ command: "voice-off" });
+	const started = await startListener(scratch(), { keyword: keywordOption(), spot: spot.factory, dictation: capture.factory, readTailMs: 100 });
+	t.after(() => { release(); return started.listener.close(); });
+	const reader = await started.client();
+	reader.hello("s-1", "w1:p1", true);
+	await waitFor(() => framesOf(reader, "welcome").length === 1 && spot.starts === 1);
+	reader.send({ type: "read-begin", id: "r", readingId: "read-1", chars: 30 });
+	await awaitFrame(reader, (frame) => "id" in frame && frame.id === "r");
+	reader.send({ type: "read-end", id: "e", readingId: "read-1", outcome: "done" });
+	await awaitFrame(reader, (frame) => "id" in frame && frame.id === "e");
+	reader.send({ type: "dictate", id: "d", mode: "dictation" });
+	await waitFor(() => spot.calls.includes("spot.stop"));
+	assert.deepEqual(capture.calls, []);
+	reader.send({ type: "read-begin", id: "tail-check", readingId: "read-2", chars: 1 });
+	assert.deepEqual(await awaitFrame(reader, (frame) => "id" in frame && frame.id === "tail-check"), { type: "busy", id: "tail-check", reason: "reading", holder: "s-1" });
+	await sleep(150);
+	reader.send({ type: "read-begin", id: "after-check", readingId: "read-2", chars: 1 });
+	assert.deepEqual(await awaitFrame(reader, (frame) => "id" in frame && frame.id === "after-check"), { type: "busy", id: "after-check", reason: "capture", holder: "s-1" });
+	release();
+	assert.equal((await awaitFrame(reader, (frame) => "id" in frame && frame.id === "d")).type, "ok");
+	capture.dies();
+	assert.deepEqual(await awaitFrame(reader, (frame) => frame.type === "capture" && frame.phase === "failed"), { type: "capture", phase: "failed", code: "no-speech" });
+	assert.deepEqual(framesOf(reader, "command"), [{ type: "command", command: "voice-off" }]);
+	assert.deepEqual(started.listener.voiceSessions, []);
+	assert.deepEqual(framesOf(reader, "transcript"), []);
+	assert.deepEqual(started.events.filter((entry) => entry.event === "kws.hit").map((entry) => entry.fields), [{ command: "voice-off", reason: "whole-utterance" }]);
+	await waitFor(() => spot.starts === 2);
 });
 
 test("a command collected after cancellation is logged as stale and cannot turn voice off", async (t) => {
@@ -2395,7 +2696,7 @@ class GatedWarmChild extends EventEmitter {
 }
 
 test("cancel and owner disconnect wait for the real warm child before reopening spotting (JD-A-003)", async (t) => {
-	for (const ending of ["asleep-cancel", "awake-cancel", "awake-disconnect"] as const) {
+	for (const ending of ["asleep-cancel", "awake-cancel", "awake-disconnect", "last-disconnect", "last-update"] as const) {
 		await t.test(ending, async (st) => {
 			const children: GatedWarmChild[] = [];
 			const warm = createWarmVoiceWorker({
@@ -2415,7 +2716,7 @@ test("cancel and owner disconnect wait for the real warm child before reopening 
 			const owner = await started.client();
 			const other = await started.client();
 			owner.hello("s-1", "w1:p1", ending !== "asleep-cancel");
-			other.hello("s-2", "w1:p2", ending !== "asleep-cancel");
+			other.hello("s-2", "w1:p2", ending !== "asleep-cancel" && ending !== "last-disconnect" && ending !== "last-update");
 			await waitFor(() => framesOf(owner, "welcome").length === 1 && framesOf(other, "welcome").length === 1);
 			if (ending !== "asleep-cancel") {
 				owner.send({ type: "wake", id: "w" });
@@ -2429,7 +2730,13 @@ test("cancel and owner disconnect wait for the real warm child before reopening 
 			await waitFor(() => started.events.some((entry) => entry.event === "kws.hit"));
 			assert.deepEqual(started.events.filter((entry) => entry.event === "kws.hit").map((entry) => entry.fields), [{ command: "voice-off", reason: "rejected:lead" }]);
 			assert.deepEqual(framesOf(other, "command"), []);
-			if (ending === "awake-disconnect") owner.socket.destroy();
+			if (ending === "last-update") {
+				await sendSessionVoice(owner, false);
+				assert.equal(started.listener.state, "asleep");
+				assert.deepEqual(started.listener.voiceSessions, []);
+				assert.equal(children[0]!.received.filter((message) => message.type === "start").length, 2, "the active capture is not replaced by a spotter");
+			}
+			if (ending === "awake-disconnect" || ending === "last-disconnect") owner.socket.destroy();
 			else {
 				owner.send({ type: "cancel", id: "c" });
 				assert.equal((await awaitFrame(owner, (frame) => "id" in frame && frame.id === "c")).type, "ok");
@@ -2441,7 +2748,7 @@ test("cancel and owner disconnect wait for the real warm child before reopening 
 			children[0]!.exit();
 			await waitFor(() => children.length === 2 && children[1]!.received.some((message) => message.spot === true));
 			assert.equal(started.events.some((entry) => entry.event === "kws.failed"), false);
-			if (ending === "asleep-cancel") {
+			if (ending === "asleep-cancel" || ending === "last-disconnect" || ending === "last-update") {
 				children[1]!.say({ type: "command", command: "voice-on" });
 				assert.deepEqual(await awaitFrame(other, (frame) => frame.type === "command" && frame.command === "voice-on"), { type: "command", command: "voice-on", wake: true });
 				assert.deepEqual(started.listener.voiceSessions, ["s-2"]);

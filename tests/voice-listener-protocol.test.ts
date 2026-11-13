@@ -35,6 +35,22 @@ test("a hello is accepted with and without its optional fields", () => {
 	assert.deepEqual(parseListenerRequestLine(line({ type: "set-voice", voiceOn: true })), { type: "set-voice", voiceOn: true });
 });
 
+test("session-voice accepts exactly a boolean voiceOn and no other fields", () => {
+	for (const voiceOn of [true, false]) {
+		const request = { type: "session-voice" as const, voiceOn };
+		assert.deepEqual(parseListenerRequestLine(line(request)), request);
+		assert.equal(encodeListenerFrame(request), `${line(request)}\n`);
+	}
+	for (const bad of [
+		{ type: "session-voice" },
+		{ type: "session-voice", voiceOn: "true" },
+		{ type: "session-voice", voiceOn: 1 },
+		{ type: "session-voice", voiceOn: false, extra: 1 },
+		{ type: "session-voice", voiceOn: false, id: "not-allowed" },
+		{ type: "session-voice", voiceOn: true, sessionId: "s-2" },
+	]) assert.equal(parseListenerRequestLine(line(bad)), undefined, JSON.stringify(bad));
+});
+
 test("an unknown field, a wrong type, a missing field or a foreign schema is refused", () => {
 	const hello = { type: "hello", proto: 1, sessionId: "s-1", voiceOn: true };
 	assert.deepEqual(parseListenerRequestLine(line(hello)), hello);

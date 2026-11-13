@@ -247,6 +247,9 @@ export interface ListenerFocus {
 
 interface Client {
 	readonly socket: Socket;
+	// A replacement may be registered for voice accounting before its welcome,
+	// but it must not receive broadcasts until the handshake has been sent.
+	welcomed: boolean;
 	sessionId?: string;
 	paneId?: string;
 	voiceOn: boolean;
@@ -423,6 +426,9 @@ interface ActiveCapture {
 	readonly sessionId: string;
 	readonly mode: CaptureMode;
 	readonly dictation: ListenerDictation;
+	// A command from this capture may have come from the reading's audible tail,
+	// even if the worker reports it only after that tail is gone.
+	readonly overlapsReading: boolean;
 	collecting: boolean;
 	// Stop requests that arrived while the outcome was being collected: answered
 	// once it is known, so a requester has its transcript when its stop returns.
@@ -713,7 +719,7 @@ export class VoiceListener {
 			socket.destroy();
 			return;
 		}
-		const client: Client = { socket, voiceOn: false, levels: false, buffered: "", window: 0, windowStart: this.now(), role: "session" };
+		const client: Client = { socket, welcomed: false, voiceOn: false, levels: false, buffered: "", window: 0, windowStart: this.now(), role: "session" };
 		this.clients.set(socket, client);
 		socket.setEncoding("utf8");
 		socket.on("data", (chunk: string) => this.receive(client, chunk));
@@ -770,6 +776,13 @@ export class VoiceListener {
 	private register(client: Client, hello: Extract<ListenerRequest, { type: "hello" }>): void {
 		// A hello written before the role existed is the session's own connection.
 		const role = hello.role ?? "session";
+		// Publish the replacement before retiring its old socket, so an unchanged
+		// voice-on reload never briefly looks like the last session went away.
+		client.sessionId = hello.sessionId;
+		client.paneId = hello.paneId;
+		client.voiceOn = hello.voiceOn;
+		client.label = hello.label;
+		client.role = role;
 		for (const other of [...this.clients.values()]) {
 			// One session, one live socket per role: a reloaded session replaces its
 			// stale one, while the connection its reading is held on survives, and a
@@ -783,12 +796,8 @@ export class VoiceListener {
 				socket.once("close", () => clearTimeout(timer));
 			});
 		}
-		client.sessionId = hello.sessionId;
-		client.paneId = hello.paneId;
-		client.voiceOn = hello.voiceOn;
-		client.label = hello.label;
-		client.role = role;
 		this.say(client, withId({ type: "welcome", listenerPid: this.pid, proto: 1, state: this.currentState }, hello.id));
+		client.welcomed = true;
 		this.log("listener.hello", { sessionId: hello.sessionId, role, voiceOn: hello.voiceOn, clients: this.clients.size });
 		if (hello.voiceOn && this.currentState === "asleep") this.setState("listening");
 		else this.refreshSpotting();
@@ -797,6 +806,17 @@ export class VoiceListener {
 
 	private apply(client: Client, request: Exclude<ListenerRequest, { type: "hello" }>): void {
 		switch (request.type) {
+			case "session-voice": {
+				// One session may have a separate reading connection: its flag must not
+				// keep that same session awake after the session turns voice off.
+				for (const other of this.clients.values()) if (other.sessionId === client.sessionId) other.voiceOn = request.voiceOn;
+				this.log("listener.voice", { sessionId: client.sessionId, voiceOn: request.voiceOn });
+				if (request.voiceOn && this.currentState === "asleep") this.setState("listening");
+				else if (!request.voiceOn && this.voiceSessions.length === 0) this.sleepWithoutVoice();
+				else this.refreshSpotting();
+				this.armIdle();
+				return;
+			}
 			case "set-voice": {
 				client.voiceOn = request.voiceOn;
 				this.log("listener.voice", { sessionId: client.sessionId, voiceOn: request.voiceOn });
@@ -946,7 +966,7 @@ export class VoiceListener {
 			kws: this.options.keyword,
 			onKeywordRejected: (hit) => this.logKeywordRejection(hit),
 		});
-		const capture: ActiveCapture = { client, sessionId, mode: request.mode, dictation, collecting: false, afterCollect: [], cue: "none" };
+		const capture: ActiveCapture = { client, sessionId, mode: request.mode, dictation, overlapsReading: this.reading !== undefined, collecting: false, afterCollect: [], cue: "none" };
 		this.capture = capture;
 		this.capturePending = undefined;
 		// The meter of a new capture starts empty.
@@ -1066,8 +1086,9 @@ export class VoiceListener {
 		}
 		// The event name and the command id only: the audio is never kept.
 		this.log("capture.command", { sessionId: capture.sessionId, mode: capture.mode, command });
-		this.log("kws.hit", { command, reason: command === "voice-off" ? "whole-utterance" : command === "voice-on" ? "ignored:awake-voice-on" : "ignored:unsupported" });
-		if (command === "voice-off") this.voiceOffEverywhere();
+		const reason = capture.overlapsReading || this.reading ? "ignored:reading" : command === "voice-off" ? "whole-utterance" : command === "voice-on" ? "ignored:awake-voice-on" : "ignored:unsupported";
+		this.log("kws.hit", { command, reason });
+		if (reason === "whole-utterance") this.voiceOffEverywhere();
 		// The same outcome as a recording that heard nothing: the close cue, the
 		// failed frame with `no-speech`, and the microphone handed back.
 		this.failCapture(capture, new VoiceSessionError("no-speech"));
@@ -1164,6 +1185,17 @@ export class VoiceListener {
 	private refreshSpotting(): void {
 		if (this.shouldSpot()) this.startSpotting();
 		else void this.stopSpotting();
+	}
+
+	// Once the last voiced session leaves, retire the awake spotter before
+	// opening an asleep one. startSpotting waits for the same teardown promise.
+	private sleepWithoutVoice(): void {
+		if (this.voiceSessions.length > 0 || this.currentState === "asleep") {
+			this.refreshSpotting();
+			return;
+		}
+		void this.stopSpotting();
+		this.setState("asleep");
 	}
 
 	private logKeywordRejection(hit: KeywordRejection): void {
@@ -1552,7 +1584,7 @@ export class VoiceListener {
 	}
 
 	private broadcast(frame: ListenerFrame): void {
-		for (const client of [...this.clients.values()]) if (client.sessionId) this.say(client, frame);
+		for (const client of [...this.clients.values()]) if (client.sessionId && client.welcomed) this.say(client, frame);
 	}
 
 	private say(client: Client, frame: ListenerFrame): void {
@@ -1565,11 +1597,9 @@ export class VoiceListener {
 
 	// One error frame and the connection closes, with the frame flushed first.
 	private reject(client: Client, code: ListenerErrorCode): void {
-		if (!this.clients.delete(client.socket)) return;
-		client.socket.end(encodeListenerFrame({ type: "error", code }));
+		if (!this.clients.has(client.socket)) return;
+		this.forget(client, (socket) => socket.end(encodeListenerFrame({ type: "error", code })));
 		this.log("listener.rejected", { code, sessionId: client.sessionId });
-		this.refreshSpotting();
-		this.armIdle();
 	}
 
 	private forget(client: Client, close: (socket: Socket) => void = (socket) => socket.destroy()): void {
@@ -1584,7 +1614,8 @@ export class VoiceListener {
 		if (this.capturePending?.client === client) this.capturePending.cancelled = true;
 		close(client.socket);
 		this.log("listener.client-closed", { sessionId: client.sessionId, clients: this.clients.size });
-		this.refreshSpotting();
+		if (client.voiceOn && this.voiceSessions.length === 0) this.sleepWithoutVoice();
+		else this.refreshSpotting();
 		this.armIdle();
 	}
 
