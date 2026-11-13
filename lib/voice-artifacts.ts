@@ -250,7 +250,9 @@ export interface VoiceKeywordSet {
 // one starting with `#` is a comment. One command may hold several lines, so a
 // pronunciation variant can be added and re-measured without touching code. The
 // global keywordsScore/keywordsThreshold tune every line, so a per-line `:boost` or
-// `#threshold` suffix is refused here instead of being half read.
+// `#threshold` suffix is refused here instead of being half read, and `@` is refused
+// too because the spotter's own file writes `pieces @label` there: a line that
+// carries one would be read as a different keyword than the one this file names.
 export function parseVoiceKeywords(text: string): VoiceKeywordSet {
 	const commands = new Map<string, VoiceKeywordCommand>();
 	const lines: string[] = [];
@@ -266,7 +268,7 @@ export function parseVoiceKeywords(text: string): VoiceKeywordSet {
 		if (!(VOICE_KEYWORD_COMMANDS as readonly string[]).includes(name)) throw new VoiceKeywordError("unknown-command", `line ${line} names the unknown command \`${name}\`.`);
 		const pieces = trimmed.slice(colon + 1).trim();
 		if (pieces === "") throw new VoiceKeywordError("syntax", `line ${line} gives no keyword for \`${name}\`.`);
-		if (/[:#\u0000-\u001f]/.test(pieces)) throw new VoiceKeywordError("syntax", `line ${line} may not use a per-line boost or threshold; the spotter is tuned globally.`);
+		if (/[:#@\u0000-\u001f]/.test(pieces)) throw new VoiceKeywordError("syntax", `line ${line} may not use a per-line boost, threshold or label; the spotter is tuned globally.`);
 		const keyword = pieces.split(/\s+/).join(" ");
 		const previous = firstLine.get(keyword.toLowerCase());
 		if (previous !== undefined) throw new VoiceKeywordError("duplicate", `line ${line} repeats the spelling given on line ${previous}.`, line);

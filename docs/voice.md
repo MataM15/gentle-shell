@@ -267,20 +267,27 @@ still open.
 
 Some whole utterances are commands. Only an utterance that is exactly one of
 them runs one: the same words inside a longer sentence are sent to the model as
-ordinary text. The current list has one command:
+ordinary text. The current list has two commands:
 
 | Said | Effect |
 |------|--------|
-| `Gentle Voice off` | Turns voice off in this session, exactly as **Voice in this session (on): turn off** does in `/gentle:voice`: spoken replies stop being read, a reading in progress is cut, the pending spoken turn is cleared and the kept-alive dictation worker is closed. Nothing is sent to the model and nothing is pasted. The draft is left as it was. |
+| `Gentle Voice off` | Turns voice off in this session, exactly as **Voice in this session (on): turn off** does in `/gentle:voice`: spoken replies stop being read, a reading in progress is cut, the pending spoken turn is cleared and the kept-alive dictation worker is closed. Nothing is sent to the model and nothing is pasted. The draft is left as it was. Voice goes off in every session, not only in this one, and the microphone stays owned by the listener, which listens for `Gentle Voice on` from then on. |
+| `Gentle Voice on` | Works only while voice is asleep, and wakes only the session herdr reports focused: that session turns voice on as **turn on** does in `/gentle:voice`, the open cue plays and the window shows it. With no focused session connected nothing turns on and the listener keeps listening. Said while voice is already on, it does nothing. |
 
 Case, accents, punctuation and extra spaces never decide whether a command was
 spoken: `gentle voice, off.` and `Gentle  voice  OFF` are the same command. A
 likely transcription still counts, such as `gentle voz off`, `yentel voice off`
-or `gentel voice of`, because the matcher accepts a small fixed set of words at
-each position. It never accepts a different sentence: `quiero que digas gentle
-voice off`, `gentle voice offset` and `gentle voice` are all text, and
-`gentle voice on` is not a command yet: turning voice on by voice arrives in a
-later phase.
+or `gentel voice of`, because the transcription matcher accepts a small fixed
+set of words at each position. It never accepts a different sentence: `quiero
+que digas gentle voice off`, `gentle voice offset` and `gentle voice` are all
+text.
+
+Two things hear a command, and only one of them can fire for a single recording.
+The keyword spotter inside the worker hears the phrase in every capture the
+listener starts, hands-free or not, and ends that capture with the command
+instead of a transcript, so no text exists to match. The text matcher above is
+the fallback for a recording that was transcribed: a session that reached no
+listener and records itself, or a phrase the spotter did not catch.
 
 The command is checked in every place a transcript arrives: a hands-free
 conversation turn, the dictation shortcut when voice is off (which pastes), a
@@ -290,8 +297,8 @@ the transcript.
 
 Voice never runs free text as a command. The list is fixed in
 `lib/voice-spoken-command.ts` and only a matcher hit does anything, so nothing
-you say can invent an action; later phases (voice on, agent navigation, English
-mode) add entries to that same list instead of matching free text.
+you say can invent an action; later phases (agent navigation, English mode) add
+entries to that same list instead of matching free text.
 
 ### Microphone cues
 
@@ -374,7 +381,7 @@ answers reuses its own worker the same way:
 | Release | The worker closes after 10 idle minutes, when voice is turned off in every session and when the listener exits. On its own, a session follows the same rules and ends with the Pi session. A cancel or any error ends it, and the next recording starts a fresh one. |
 | Noise | With no speech heard by the end-of-speech detector, the recognizer is not asked at all and the transcript is blank, because Parakeet can turn noise into a word such as "Yeah." that would otherwise be sent. |
 
-## Voice listener (in progress)
+## Voice listener
 
 One listener per user owns the microphone for every session, so a session that
 is not focused still hears nothing and two panes never record at once. It owns
@@ -449,28 +456,67 @@ a session that asks for a capture only receives the transcript.
   the holder of that reading is accepted, and the end of the reading, a cut, a
   lapsed lease or a disconnect stops it at once. The microphone meter and the
   speech events outside consumers receive are unchanged.
-- **Spoken commands in the worker (nothing asks for them yet).** A start request
-  may carry a `kws` option: the pinned keyword spotter model with its digests,
-  the keyword lines with the command each one stands for, and the tuning values.
-  The worker then verifies that model before the microphone opens and runs one
-  keyword spotter on the same audio it records. The spotter fires on a phrase
-  wherever it is said, so the worker applies the whole-utterance rule itself: a
-  hit is a command only when no more speech came before it than the phrase
-  takes (2.6 s from the start of the utterance) and 0.4 s of silence follows
-  within a second, or the recording ends. A command ends that capture with a
-  `command` message naming it (`voice-on`, `voice-off`, `cancel`) in place of a
-  transcript, so the phrase never reaches the dictation model; a phrase inside a
-  sentence changes nothing and is dictated like any other words. Without the
-  option the worker loads no spotter and its output is unchanged. With
-  `spot: true` as well, the capture is for the spotter alone: it answers
-  `spotting`, keeps no audio, has no time limit, never verifies or loads the
-  dictation model, and ends with a `command`, or with `stopped` when it is told
-  to stop. It is what will listen while voice is asleep and while a reply is
-  read aloud. The warm worker (`lib/voice-warm.ts`) carries both: a session
-  given `kws` resolves with `command` set and an empty text when the capture
-  ended on a command, and `spot()` opens a spot-only capture whose `heard()`
-  resolves with the command, or with nothing when it was stopped. A session
-  that did not ask ignores a stray `command`.
+- **Spoken commands in the worker.** Every capture the listener starts carries a
+  `kws` option: the pinned keyword spotter model with its digests, the keyword
+  lines with the command each one stands for, and the tuning values (score 2,
+  threshold 0.25, 16 active paths, 2 trailing blanks). The worker verifies that
+  model before the microphone opens and runs one keyword spotter on the same
+  audio it records. The spotter fires on a phrase wherever it is said, so the
+  worker applies the whole-utterance rule itself: a hit is a command only when
+  no more speech came before it than the phrase takes (2.6 s from the start of
+  the utterance) and 0.4 s of silence follows within a second, or the recording
+  ends. A command ends that capture with a `command` message naming it
+  (`voice-on`, `voice-off`, `cancel`) in place of a transcript, so the phrase
+  never reaches the dictation model; a phrase inside a sentence changes nothing
+  and is dictated like any other words. Without the option the worker loads no
+  spotter and its output is unchanged. With `spot: true` as well, the capture is
+  for the spotter alone: it answers `spotting`, keeps no audio, has no time
+  limit, never verifies or loads the dictation model, and ends with a `command`,
+  or with `stopped` when it is told to stop. It is what listens while voice is
+  asleep. The warm worker (`lib/voice-warm.ts`) carries both: a session given
+  `kws` resolves with `command` set and an empty text when the capture ended on a
+  command, and `spot()` opens a spot-only capture whose `heard()` resolves with
+  the command, or with nothing when it was stopped. A session that did not ask
+  ignores a stray `command`.
+- **A spoken command ends its capture, not a text.** A capture that ends on a
+  command delivers nothing: no transcript to the focused pane, so the text
+  matcher in the session can never also fire for it, and the requester gets
+  exactly what a recording that heard nothing gets (a `failed` capture with
+  `no-speech`). `Gentle Voice off` turns voice off in every session and cuts a
+  reading, exactly as a session's own voice off does, and the listener stays
+  asleep with the microphone for the keyword only. Any other command leaves
+  voice as it was. The log carries one `capture.command` event with the session,
+  the mode and the command id: never audio, never a level, never a transcript.
+- **Asleep keeps listening.** While the listener is asleep and the spotter is
+  installed, it keeps a spot-only capture open: the microphone stays open for the
+  keyword alone, with no transcript and no cue. `Gentle Voice on` wakes the
+  session herdr reports focused, and only that one: its voice turns on, every
+  session hears the `command: voice-on` broadcast it already knew, the state
+  becomes `listening`, the open cue plays and the window draws it. With no
+  focused pane, a failed lookup or a focused pane with no session, nothing turns
+  on and the listener opens another spot-only capture; anything else it hears
+  (a `voice-off`, a `cancel`, an unknown id) changes nothing and listens again.
+  Ten minutes of being asleep with no session that has voice on still closes the
+  listener, and the spot-only capture closes with it.
+- **One microphone.** The spotter owns the microphone only while nothing else
+  needs it: a `dictate` from any session stops the spot-only capture and waits
+  until it closed before the recording opens, and spotting resumes when that
+  recording ends with no session that has voice on (a wake, or voice that was on,
+  leaves the listener awake instead). A reading stops the spotter too: a reply is
+  never read while the microphone is open for a keyword, and spotting starts
+  again after the reading's tail. Leaving `asleep` for any reason stops it, and
+  so does closing the listener. A spotter that cannot open the microphone, or
+  that dies, is logged once (`kws.failed`, the event name only) and dropped for
+  the rest of the listener's life: it stays asleep without spotting, and capture,
+  transcripts, cues and readings carry on as before.
+- **No spotter, no keyword.** The option is built by
+  `buildVoiceKeywordOption()` from the installed component, the pinned digests
+  and `assets/voice/kws-keywords.txt`. When the spotter is not installed, is half
+  extracted, or the keyword file does not parse, the listener gets no keyword at
+  all, logs `listener.keyword-unavailable` once at startup and behaves exactly
+  as it did before the spotter existed. Keyword hits and wakes are logged as
+  event names, command ids and session ids only: no audio, no text and no
+  level is ever stored.
 - **The overlay port.** `lib/voice-overlay.ts` is the seam the window plugs into:
   the listener hands it a snapshot of the display (state, language, owning session) on every change and the smoothed level while recording. The
   meter lives there, never in the detector: the same worker RMS is normalized
@@ -540,9 +586,11 @@ A session dictates through the listener: the lock, the socket, the turn and the
 microphone are live, and a reply is read only in the pane herdr reports focused
 (S12). A session that cannot reach a listener records itself, exactly as
 described above, and a session that is not focused receives neither a transcript
-nor a reading. The keyword spotter and the echo cancellation the design defers
-(§5) are still to come; the capture path is shaped so a reference stream can be
-tapped into it when they arrive.
+nor a reading. The keyword spotter is live for the spoken commands and the wake
+word; the echo cancellation the design defers (§5) is still to come, and with it
+a phrase that cuts a reply being read: nothing listens while a reading speaks, so
+`Gentle Voice off` does not cut a reply aloud yet. The capture path is shaped so
+a reference stream can be tapped into it when it arrives.
 
 ## Natural voice with Kokoro
 
@@ -672,12 +720,12 @@ The model is the sherpa-onnx export
 `csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8`: `encoder.int8.onnx`,
 `decoder.int8.onnx`, `joiner.int8.onnx` and `tokens.txt`.
 
-### Wake-word keyword spotter (pinned, nothing uses it yet)
+### Wake-word keyword spotter
 
-"Gentle Voice on" and "Gentle Voice off" are meant to be heard by a local keyword
-spotter, and the model it needs is pinned next to the dictation model. No run-time
-code reads it yet: the wake word is not enabled, so having it installed changes no
-behavior.
+"Gentle Voice on" and "Gentle Voice off" are heard by a local keyword spotter,
+and the model it needs is pinned next to the dictation model. The listener uses
+it: the wake word is live, so the command is heard while voice is asleep without
+any transcription, and installing it is what makes that work.
 
 | Topic | Fact |
 |-------|------|
@@ -699,7 +747,10 @@ One command may appear on several lines, so another pronunciation can be added a
 measured without a code change. The known commands are `voice-on`, `voice-off` and
 `cancel`; the shipped file has lines for the first two only, because the spoken word
 for `cancel` is still being measured, and a file without one is valid. A malformed
-line, an unknown command and the same spelling twice are refused by the parser.
+line, an unknown command and the same spelling twice are refused by the parser. So
+is a per-line suffix: the spotter is tuned globally by the listener (`2`, `0.25`,
+`16`, `2`), so `:boost`, `#threshold` and the `@label` the spotter's own files use
+ever start a keyword here.
 
 ## Where it is stored
 

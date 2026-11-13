@@ -88,6 +88,11 @@ test("a line that does not name a command is refused", () => {
 	// fields tune every line, so a colon or hash inside one is a mistake.
 	refuses(`voice-on: ${ON}:2.0`, "syntax");
 	refuses(`voice-on: ${ON}#0.25`, "syntax");
+	// `@` is how the spotter's own file writes a keyword's label; the worker refuses
+	// a line that carries one, so the parser refuses it before it is ever written
+	// (review of T14, R3-001).
+	refuses(`voice-on: ${ON} @voice-on`, "syntax");
+	refuses(`voice-on: ${ON}@voice-on`, "syntax");
 });
 
 test("a command the parser does not know is refused", () => {

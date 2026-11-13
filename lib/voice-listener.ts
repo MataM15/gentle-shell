@@ -1,8 +1,10 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { chmodSync, linkSync, lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
 	encodeListenerFrame,
 	CAPTURE_ERRORS,
@@ -23,8 +25,10 @@ import {
 	READING_OUTCOMES,
 } from "./voice-listener-protocol.ts";
 import type { CueName, CuePlayer, CueResult } from "./voice-cues.ts";
+import { KWS_MODEL_MANIFEST, KWS_SPOTTER_FILES, parseVoiceKeywords, VOICE_KEYWORD_ASSET, type VoiceKeywordCommand, type VoiceKeywordSet, type VoiceModelFile } from "./voice-artifacts.ts";
+import { resolveVoiceKeywordSpotterPaths, type VoiceKeywordSpotterPaths } from "./voice-install.ts";
 import { createLevelMeter, type LevelMeter, type VoiceOverlay, type VoiceOverlaySnapshot } from "./voice-overlay.ts";
-import { VoiceSessionError, type VoiceSessionState, type VoiceTranscript } from "./voice-session.ts";
+import { VoiceSessionError, type VoiceKeywordOption, type VoiceSessionState, type VoiceTranscript } from "./voice-session.ts";
 
 // One voice listener for every Pi session (S6, odd/notes/voice-listener-design.md).
 // It owns the process, the microphone and the shared turn: a single instance per
@@ -36,8 +40,10 @@ import { VoiceSessionError, type VoiceSessionState, type VoiceTranscript } from 
 // session that asked only receives its transcript. The levels a display draws
 // are published here too: one `level` frame per 50 ms of audio, from the same
 // worker RMS the detector judges, smoothed for the meter and never for the
-// detector. The keyword spotter arrives with a later slice, and so does the
-// window: this file owns the overlay port, never a window.
+// detector. The keyword spotter reads the microphone while the listener is
+// asleep (S7): every capture it starts hears the spoken commands, and a spoken
+// "Gentle Voice off" reaches the same path a session's voice off does. The
+// window itself lives outside this file, behind the overlay port.
 
 export const LISTENER_LOCK_FILE = "listener.lock";
 export const LISTENER_SOCKET_FILE = "listener.sock";
@@ -281,6 +287,13 @@ export interface VoiceListenerOptions {
 	// production, a fake in the tests. Without one, dictate is refused and the
 	// session records itself, exactly as before.
 	dictation?: ListenerDictationFactory;
+	// The keyword option every capture carries (S7): absent when the spotter is
+	// not installed or the keyword file does not parse, and then the listener
+	// behaves exactly as it did before the spotter existed.
+	keyword?: VoiceKeywordOption;
+	// The spot-only capture the listener keeps open while it is asleep (S7), on
+	// the same warm worker in production and a fake in the tests.
+	spot?: ListenerSpotFactory;
 	// The microphone cues are played here, where the microphone is.
 	cues?: CuePlayer;
 	// The display (T4): a port the listener drives with state snapshots and
@@ -316,9 +329,78 @@ export interface ListenerDictationRequest {
 	levels: boolean;
 	// The microphone RMS while recording, 0..1, at most 20 a second.
 	onLevel(rms: number): void;
+	// What the capture hears for its keyword spotter (S7): the worker reports a
+	// spoken command instead of words, so no transcript ever carries one.
+	kws?: VoiceKeywordOption;
 }
 
 export type ListenerDictationFactory = (request: ListenerDictationRequest) => ListenerDictation;
+
+// A spot-only capture (S7): the microphone open for the keyword spotter alone,
+// no transcript and no end of its own. The warm worker gives exactly this.
+export interface ListenerSpotting {
+	start(): Promise<void>;
+	// The command that was heard, or undefined when the capture was stopped.
+	heard(): Promise<string | undefined>;
+	stop(): Promise<void>;
+	cancel(): Promise<void>;
+}
+
+export type ListenerSpotFactory = () => ListenerSpotting;
+
+// The tuning measured in odd/notes/voice-kws.md §5: one global score and
+// threshold for every line, and the decoding window the spotter uses.
+export const VOICE_KEYWORD_TUNING = { boost: 2, threshold: 0.25, maxActivePaths: 16, trailingBlanks: 2 } as const;
+
+export type VoiceKeywordOptionSource = { option: VoiceKeywordOption } | { reason: "not-installed" | "keywords-invalid" };
+
+const pinnedFile = (file: VoiceModelFile) => ({ name: file.name, size: file.size, sha256: file.sha256 });
+
+// The option a worker takes, or why there is none (S7). Nothing throws: a spotter
+// that is not installed, half extracted or paired with a keyword file that does
+// not parse leaves the listener with no keyword at all, which is the behaviour it
+// had before the spotter existed. The digests come from the pinned manifest, so
+// the worker verifies the same files the installer verified.
+export async function buildVoiceKeywordOption(options: {
+	voiceHome: string;
+	resolvePaths?: (options: { voiceHome: string }) => Promise<VoiceKeywordSpotterPaths | undefined>;
+	readKeywords?: () => Promise<string>;
+}): Promise<VoiceKeywordOptionSource> {
+	const readKeywords = options.readKeywords ?? (() => readFile(fileURLToPath(new URL(`../${VOICE_KEYWORD_ASSET}`, import.meta.url)), "utf8"));
+	let paths: VoiceKeywordSpotterPaths | undefined;
+	try {
+		paths = await (options.resolvePaths ?? resolveVoiceKeywordSpotterPaths)({ voiceHome: options.voiceHome });
+	} catch {
+		return { reason: "not-installed" };
+	}
+	if (!paths) return { reason: "not-installed" };
+	// The option must name the files it points at: a resolved path that is not the
+	// pinned name under one root would hand the worker a model it cannot load.
+	const root = dirname(paths.encoder);
+	const pinned = new Map(KWS_MODEL_MANIFEST.files.map((file) => [file.name, file]));
+	const pin = (role: keyof VoiceKeywordSpotterPaths) => {
+		const file = pinned.get(KWS_SPOTTER_FILES[role]);
+		if (!file || dirname(paths[role]) !== root || !paths[role].endsWith(file.name)) return undefined;
+		return pinnedFile(file);
+	};
+	const encoder = pin("encoder");
+	const decoder = pin("decoder");
+	const joiner = pin("joiner");
+	const tokens = pin("tokens");
+	if (!encoder || !decoder || !joiner || !tokens) return { reason: "not-installed" };
+	let keywords: VoiceKeywordSet;
+	try {
+		keywords = parseVoiceKeywords(await readKeywords());
+	} catch {
+		return { reason: "keywords-invalid" };
+	}
+	const lines = keywords.lines.flatMap((tokens) => {
+		const command: VoiceKeywordCommand | undefined = keywords.commands.get(tokens);
+		return command === undefined ? [] : [{ tokens, command }];
+	});
+	if (lines.length === 0) return { reason: "keywords-invalid" };
+	return { option: { model: { root, files: { encoder, decoder, joiner, tokens } }, keywords: lines, ...VOICE_KEYWORD_TUNING } };
+}
 
 // The capture in progress: who asked, how it records, and what it already told
 // its requester. A capture the listener no longer holds reports nothing.
@@ -374,6 +456,12 @@ export class VoiceListener {
 	private levelAt: number | undefined;
 	private reading: ActiveReading | undefined;
 	private capture: ActiveCapture | undefined;
+	// The spot-only capture while the listener is asleep (S7), and the release of
+	// the one just stopped: the microphone is handed over only once it is free.
+	private spotting: ListenerSpotting | undefined;
+	// A spotter that failed once is never asked again: voice carries on without it.
+	private spotDisabled = false;
+	private spottingStop: Promise<void> | undefined;
 	// True only while the capture really records, from the worker's own report to
 	// the moment the recording ends (S10). Levels never change it.
 	private recording = false;
@@ -415,6 +503,12 @@ export class VoiceListener {
 		return this.reading && !this.reading.ended ? this.reading.session : undefined;
 	}
 
+	// The sessions whose voice is on, as the registry knows them: L10 reads this
+	// when voice off has to reach everyone, and when a keyword wakes one session.
+	get voiceSessions(): readonly string[] {
+		return [...this.clients.values()].flatMap((client) => (client.sessionId && client.voiceOn ? [client.sessionId] : []));
+	}
+
 	// Binds the socket. Exactly one process can do this per voice home: the lock
 	// alone is not enough because a starting session writes one too, so the
 	// second listener fails here and stops before it owns anything.
@@ -451,6 +545,9 @@ export class VoiceListener {
 		heartbeat.unref?.();
 		this.heartbeat = heartbeat;
 		this.log("listener.listen", { pid: this.pid });
+		// A listener that starts while nobody has voice is asleep, and asleep listens
+		// for the keyword: the microphone opens here, not on a later edge.
+		if (this.currentState === "asleep") this.startSpotting();
 		this.armIdle();
 	}
 
@@ -479,6 +576,8 @@ export class VoiceListener {
 		// A capture ends with the listener: its worker is a child of this process.
 		const capture = this.capture;
 		this.capture = undefined;
+		// The spotter holds the microphone too, and it goes with the listener.
+		void this.stopSpotting();
 		// The window is being disposed below, but the flag never outlives the recording.
 		this.recording = false;
 		if (capture) void capture.dictation.cancel().catch(() => {});
@@ -656,14 +755,13 @@ export class VoiceListener {
 				client.voiceOn = request.voiceOn;
 				this.log("listener.voice", { sessionId: client.sessionId, voiceOn: request.voiceOn });
 				this.say(client, withId({ type: "ok", request: "set-voice" }, request.id));
-				// L10: voice off from any session turns voice off everywhere: every
-				// registered flag is cleared with it, or armIdle never arms the exit.
-				if (!request.voiceOn) for (const other of this.clients.values()) other.voiceOn = false;
-				this.broadcast({ type: "command", command: request.voiceOn ? "voice-on" : "voice-off" });
-				// Voice off everywhere cuts a reading that is speaking: nothing is on
-				// to hear it. The reading session is told, so it stops its own speech.
-				if (!request.voiceOn) this.endReading("cut");
-				if (!request.voiceOn) this.setState("asleep");
+				if (request.voiceOn) this.turnVoiceOn(client);
+				else {
+					// L10: voice off from any session turns voice off everywhere, and the
+					// listener is asleep from here.
+					this.voiceOffEverywhere();
+					this.setState("asleep");
+				}
 				this.armIdle();
 				return;
 			}
@@ -739,7 +837,7 @@ export class VoiceListener {
 				this.log("listener.levels", { sessionId: client.sessionId, on: request.on });
 				return;
 			case "dictate":
-				this.beginCapture(client, request);
+				void this.beginCapture(client, request);
 				return;
 			case "stop":
 				this.endCapture(client, request.id);
@@ -756,7 +854,7 @@ export class VoiceListener {
 	// and transcribes; the requester only learns where its transcript went. A
 	// worker that cannot record answers the same request with a failed capture
 	// carrying the worker's own code, so the session reports it as it always did.
-	private beginCapture(client: Client, request: { id?: string; mode: CaptureMode; endpoint?: ListenerEndpoint }): void {
+	private async beginCapture(client: Client, request: { id?: string; mode: CaptureMode; endpoint?: ListenerEndpoint }): Promise<void> {
 		const sessionId = client.sessionId;
 		if (!sessionId) return;
 		if (this.capture) {
@@ -774,6 +872,17 @@ export class VoiceListener {
 			this.say(client, withId({ type: "error", code: "unknown-request" }, request.id));
 			return;
 		}
+		// One microphone (S7): while the listener is asleep the spotter holds it, so
+		// the recording waits until that capture closed before it opens its own.
+		if (this.spotting || this.spottingStop) {
+			await this.stopSpotting();
+			// The wait is a turn of its own: another capture may hold the microphone now.
+			if (this.capture) {
+				this.say(client, withId({ type: "busy", reason: "capture", holder: this.capture.sessionId }, request.id));
+				return;
+			}
+			if (!this.clients.has(client.socket)) return;
+		}
 		this.options.cues?.warm();
 		// Levels are asked for only when something draws them: the worker then
 		// publishes one message per 50 ms of audio, and nothing at all otherwise.
@@ -784,6 +893,7 @@ export class VoiceListener {
 			levels,
 			onStateChange: (state) => this.captureState(client, state),
 			onLevel: (rms) => this.publishLevel(rms),
+			kws: this.options.keyword,
 		});
 		const capture: ActiveCapture = { client, sessionId, mode: request.mode, dictation, collecting: false, cue: "none" };
 		this.capture = capture;
@@ -847,6 +957,13 @@ export class VoiceListener {
 				this.answer(client, "stop", id);
 				return;
 			}
+			// What was said was a command, not speech (S4): nothing is delivered, and
+			// the requester gets the same frames a capture with no speech gives it.
+			if (transcript.command !== undefined) {
+				this.captureCommand(capture, transcript.command);
+				this.answer(client, "stop", id);
+				return;
+			}
 			const target = await this.deliverTranscript(transcript.text, transcript.truncated === true, () => this.capture !== capture);
 			// A cancel inside that lookup released the capture and already answered.
 			if (this.capture === capture) {
@@ -868,6 +985,37 @@ export class VoiceListener {
 		this.log("capture.failed", { sessionId: capture.sessionId, mode: capture.mode, code });
 		this.say(capture.client, { type: "capture", phase: "failed", code });
 		this.releaseCapture(capture);
+	}
+
+	// A capture that heard a command ends here instead of being transcribed: no
+	// text is delivered, and the command has exactly the effect it has when a
+	// session asks for it. "Gentle Voice off" is the only one that does anything
+	// (L10); anything else leaves voice as it was, as if nothing had been said.
+	private captureCommand(capture: ActiveCapture, command: string): void {
+		if (this.capture !== capture) return;
+		// The event name and the command id only: the audio is never kept.
+		this.log("capture.command", { sessionId: capture.sessionId, mode: capture.mode, command });
+		if (command === "voice-off") this.voiceOffEverywhere();
+		// The same outcome as a recording that heard nothing: the close cue, the
+		// failed frame with `no-speech`, and the microphone handed back.
+		this.failCapture(capture, new VoiceSessionError("no-speech"));
+	}
+
+	// Voice on for one session, through the broadcast a session's own voice on
+	// sends: the flag armIdle and the overlay read, and the frame every session
+	// already receives when voice turns on.
+	private turnVoiceOn(client: Client): void {
+		client.voiceOn = true;
+		this.broadcast({ type: "command", command: "voice-on" });
+	}
+
+	// L10: voice off from any source reaches every session, and a reading that is
+	// speaking is cut with it, because nothing is on to hear it. The state is the
+	// caller's: a voice off from a capture leaves it to the release.
+	private voiceOffEverywhere(): void {
+		for (const other of this.clients.values()) other.voiceOn = false;
+		this.broadcast({ type: "command", command: "voice-off" });
+		this.endReading("cut");
 	}
 
 	// A cancelled capture keeps nothing: no stop, no transcript, no delivery.
@@ -905,7 +1053,115 @@ export class VoiceListener {
 		}
 		// The microphone is free again, and the listener is awake as long as a
 		// session that has voice is still here.
-		this.setState([...this.clients.values()].some((entry) => entry.sessionId && entry.voiceOn) ? "listening" : "asleep");
+		this.setState(this.voiceSessions.length > 0 ? "listening" : "asleep");
+	}
+
+	// --- the keyword spotter (S7) --------------------------------------------------
+
+	// Asleep is the only state that listens for the keyword: the microphone stays
+	// open for the spotter alone, with no transcript and no cue of its own.
+	private startSpotting(): void {
+		const factory = this.options.spot;
+		if (!this.options.keyword || !factory || this.spotDisabled || this.closing) return;
+		if (this.spotting || this.currentState !== "asleep") return;
+		// A capture that is still closing holds the microphone: the next one waits.
+		const stopping = this.spottingStop;
+		if (stopping) {
+			void stopping.then(() => this.startSpotting());
+			return;
+		}
+		let capture: ListenerSpotting;
+		try {
+			capture = factory();
+		} catch {
+			this.failSpotting();
+			return;
+		}
+		this.spotting = capture;
+		void capture.start().then(
+			() => this.awaitSpotting(capture),
+			() => {
+				if (this.spotting !== capture) return;
+				this.spotting = undefined;
+				this.failSpotting();
+			},
+		);
+	}
+
+	// The command the open spotter heard, or nothing when it was stopped here.
+	private awaitSpotting(capture: ListenerSpotting): void {
+		void capture.heard().then(
+			(command) => this.spottingHeard(capture, command),
+			() => {
+				if (this.spotting !== capture) return;
+				this.spotting = undefined;
+				this.failSpotting();
+			},
+		);
+	}
+
+	private spottingHeard(capture: ListenerSpotting, command: string | undefined): void {
+		if (this.spotting !== capture) return;
+		this.spotting = undefined;
+		if (command === undefined) return;
+		// The event name and the command id only: never audio, never a level.
+		this.log("kws.hit", { command });
+		// Only a wake does anything with what it heard: every other keyword leaves the
+		// listener asleep and listening again, as if nothing had been said.
+		if (command !== "voice-on") {
+			this.startSpotting();
+			return;
+		}
+		void this.wakeByVoice();
+	}
+
+	// A keyword heard while asleep wakes the session the owner is looking at, and
+	// only that one (S10, L10): asleep with nobody focused stays asleep, listening.
+	private async wakeByVoice(): Promise<void> {
+		if (this.currentState !== "asleep") return;
+		const lookup = await (this.options.focus ?? noFocus).focusedPaneId();
+		// The owner may have opened a capture, or started a reading, while the focus
+		// was read: a wake never fights another path into the microphone.
+		if (this.currentState !== "asleep" || this.spotting || this.capture || this.reading || this.closing) return;
+		const paneId = "focused" in lookup ? lookup.focused : undefined;
+		const target = paneId === undefined ? undefined : [...this.clients.values()].find((client) => client.sessionId && client.paneId === paneId);
+		if (!target) {
+			// Nobody to wake: nothing turns on and the listener keeps listening.
+			this.startSpotting();
+			return;
+		}
+		this.log("kws.wake", { sessionId: target.sessionId });
+		this.turnVoiceOn(target);
+		this.setState("listening");
+		// The wake is audible where the window makes it visible.
+		this.playCue("open", { sessionId: target.sessionId });
+	}
+
+	// A spotter that cannot open the microphone is dropped for the rest of the
+	// listener's life: voice keeps working, asleep and without spotting.
+	private failSpotting(): void {
+		if (this.spotDisabled) return;
+		this.spotDisabled = true;
+		this.log("kws.failed");
+	}
+
+	// Releasing the microphone is asynchronous: a capture that must start waits on
+	// this promise instead of opening a second one.
+	private stopSpotting(): Promise<void> {
+		const capture = this.spotting;
+		if (!capture) return this.spottingStop ?? Promise.resolve();
+		this.spotting = undefined;
+		let stopping: Promise<void>;
+		try {
+			stopping = capture.stop().catch(() => {});
+		} catch {
+			stopping = Promise.resolve();
+		}
+		this.spottingStop = stopping;
+		void stopping.then(() => {
+			if (this.spottingStop === stopping) this.spottingStop = undefined;
+		});
+		return stopping;
 	}
 
 	// True when a display needs the levels: an overlay to draw them, or a session
@@ -983,8 +1239,9 @@ export class VoiceListener {
 	}
 
 	// The cues belong to the microphone, so they are played here, and a player
-	// that throws or answers with nothing never breaks the capture.
-	private playCue(name: CueName, capture: ActiveCapture): void {
+	// that throws or answers with nothing never breaks the capture. A wake plays
+	// the open cue for the session it woke, with no capture to log it against.
+	private playCue(name: CueName, owner: { sessionId?: string; mode?: CaptureMode }): void {
 		const cues = this.options.cues;
 		if (!cues) return;
 		let playing: Promise<CueResult | undefined>;
@@ -996,7 +1253,7 @@ export class VoiceListener {
 		void playing
 			.then((result) => {
 				if (!result) return;
-				this.log("cue", { sessionId: capture.sessionId, name: result.name, outcome: result.outcome, ms: result.ms, mode: capture.mode });
+				this.log("cue", { sessionId: owner.sessionId, name: result.name, outcome: result.outcome, ms: result.ms, ...(owner.mode === undefined ? {} : { mode: owner.mode }) });
 			})
 			.catch(() => {});
 	}
@@ -1014,7 +1271,7 @@ export class VoiceListener {
 			this.say(client, withId({ type: "busy", reason: "capture", holder: this.capture.sessionId }, request.id));
 			return;
 		}
-		if (this.currentState === "asleep" && ![...this.clients.values()].some((entry) => entry.sessionId && entry.voiceOn)) {
+		if (this.currentState === "asleep" && this.voiceSessions.length === 0) {
 			this.say(client, withId({ type: "busy", reason: "asleep" }, request.id));
 			return;
 		}
@@ -1129,6 +1386,10 @@ export class VoiceListener {
 		const owner = this.stateOwner();
 		this.broadcast({ type: "state", state: next, language: this.language, ...owner, at: this.now() });
 		this.drawSnapshot();
+		// The spotter lives in asleep and nowhere else (S7): every other state needs
+		// the microphone itself, and a capture that ends may hand it back.
+		if (next === "asleep") this.startSpotting();
+		else this.stopSpotting();
 		this.armIdle();
 	}
 
@@ -1203,7 +1464,7 @@ export class VoiceListener {
 			this.idleTimer = undefined;
 		}
 		if (!this.server || this.closing) return;
-		const wantsVoice = [...this.clients.values()].some((client) => client.sessionId && client.voiceOn);
+		const wantsVoice = this.voiceSessions.length > 0;
 		let delay: number | undefined;
 		if (this.clients.size === 0) delay = this.idleMs;
 		else if (this.currentState === "asleep" && !wantsVoice) delay = this.asleepIdleMs;

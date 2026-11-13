@@ -8,7 +8,7 @@
 import { createCuePlayer } from "../lib/voice-cues.ts";
 import { createVoiceLog } from "../lib/voice-diagnostics.ts";
 import { resolveVoiceHome } from "../lib/voice-install.ts";
-import { createHerdrFocus, VoiceListener } from "../lib/voice-listener.ts";
+import { buildVoiceKeywordOption, createHerdrFocus, VoiceListener } from "../lib/voice-listener.ts";
 import { createOverlayForEnvironment } from "../lib/voice-overlay-windows.ts";
 import { diagnoseVoicePlatform, readVoicePlatformProbe } from "../lib/voice-platform.ts";
 import { createWarmVoiceWorker } from "../lib/voice-warm.ts";
@@ -33,6 +33,15 @@ const cues = createCuePlayer({ env });
 const overlay = createOverlayForEnvironment({ env });
 // Focus comes from herdr; a failed lookup focuses nothing, so nothing is
 // delivered and the microphone stays closed.
+//
+// The keyword option (S7): built from the spotter that is installed here, its
+// pinned digests and the keyword file that ships with the package. Without it no
+// capture hears a spoken command and the listener behaves exactly as before, so a
+// spotter that is missing or half extracted only costs the keyword.
+const keyword = await buildVoiceKeywordOption({ voiceHome: dir });
+const keywordOption = "option" in keyword ? keyword.option : undefined;
+if (!keywordOption) log("listener.keyword-unavailable");
+
 const listener = new VoiceListener({
 	dir,
 	log,
@@ -40,7 +49,11 @@ const listener = new VoiceListener({
 	focus: createHerdrFocus({ env }),
 	// The display levels travel with the capture: the listener decides whether
 	// they are needed and the warm worker publishes them only then.
-	dictation: warm ? ({ onStateChange, endpoint, levels, onLevel }) => warm.session({ onStateChange, endpoint, levels, onLevel }) : undefined,
+	dictation: warm ? ({ onStateChange, endpoint, levels, onLevel, kws }) => warm.session({ onStateChange, endpoint, levels, onLevel, kws }) : undefined,
+	// The spot-only capture keeps the microphone open while the listener is asleep,
+	// on the same warm worker and its one spotter.
+	keyword: keywordOption,
+	spot: warm && keywordOption ? () => warm.spot({ kws: keywordOption }) : undefined,
 	// Without a window the listener publishes the levels to the sessions that ask
 	// for them and to nobody else.
 	overlay,
