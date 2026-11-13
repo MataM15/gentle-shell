@@ -11,7 +11,7 @@ import { createReplyReader, defaultSpeechEngineResolver, lastAssistantText, repl
 import { createVoiceSpeechPublisher, type VoiceSpeechChunk, type VoiceSpeechReading } from "./voice-speech-events.ts";
 import { acquireLocalReadingTurn, paneFocus as herdrPaneFocus, paneFocused as herdrPaneFocused, type PaneFocus } from "./voice-presence.ts";
 import { cutListenerReading, createSessionListenerLink, listenerReadingTurn, sessionDisplayLabel, startVoiceListenerProcess, type ListenerReading, type ListenerSession, type SessionDictation, type SessionListenerLink } from "./voice-listener-client.ts";
-import type { ReadingReleaseReason } from "./voice-listener-protocol.ts";
+import type { ReadingReleaseReason, CaptureMode } from "./voice-listener-protocol.ts";
 import { createCuePlayer, type CueName, type CuePlayer, type CueResult } from "./voice-cues.ts";
 import { createVoiceLog, type VoiceLog } from "./voice-diagnostics.ts";
 import { matchSpokenCommand } from "./voice-spoken-command.ts";
@@ -87,7 +87,7 @@ export interface VoiceCommandDeps {
 	readStatus?: (target: VoiceTarget) => Promise<VoiceStatusSnapshot>;
 	installRuntime?: (options: VoiceInstallRequest & { target: VoiceTarget }) => Promise<VoiceInstallResult>;
 	installModel?: (options: VoiceInstallRequest) => Promise<VoiceInstallResult>;
-	createSession?: (options: { target: VoiceTarget; onStateChange(state: VoiceSessionState): void; endpoint?: VoiceEndpoint; warm?: boolean }) => VoiceDictation;
+	createSession?: (options: { target: VoiceTarget; onStateChange(state: VoiceSessionState): void; endpoint?: VoiceEndpoint; warm?: boolean; mode?: CaptureMode }) => VoiceDictation;
 	// The persisted push-to-talk toggle.
 	settings?: { read(): boolean; write(enabled: boolean): void };
 	pushToTalk?: PushToTalkOptions;
@@ -259,7 +259,7 @@ function deliver(ctx: ExtensionContext, result: Outcome, platform: string, start
 // The microphone is claimed at start(), not at creation: creation is inert, and
 // start() first waits for the capture that is still closing, so two workers can
 // never be alive at once, however long the platform takes to release the device.
-function runDictation(createSession: NonNullable<VoiceCommandDeps["createSession"]>, target: VoiceTarget, onState: (state: VoiceSessionState) => void, admission?: () => Promise<void> | undefined, options: { endpoint?: VoiceEndpoint; warm?: boolean } = {}) {
+function runDictation(createSession: NonNullable<VoiceCommandDeps["createSession"]>, target: VoiceTarget, onState: (state: VoiceSessionState) => void, admission?: () => Promise<void> | undefined, options: { endpoint?: VoiceEndpoint; warm?: boolean; mode?: CaptureMode } = {}) {
 	let settled = false;
 	let stopping = false;
 	let cancelled = false;
@@ -301,7 +301,7 @@ function runDictation(createSession: NonNullable<VoiceCommandDeps["createSession
 			/* the observer is advisory */
 		}
 	};
-	const session = createSession({ target, onStateChange, endpoint: options.endpoint, warm: options.warm });
+	const session = createSession({ target, onStateChange, endpoint: options.endpoint, warm: options.warm, mode: options.mode });
 	const begin = () => {
 		// A run cancelled, stopped or settled while it waited never starts.
 		if (cancelled || settled) return;
@@ -510,11 +510,22 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 				return id ? { sessionId: id, paneId: paneIdOf(), label: labelOf(sessionCtx), voiceOn: voiceOn(sessionCtx) } : undefined;
 			},
 			onTranscript: receiveTranscript,
+			onVoice: (command, wake) => {
+				const ctx = sessionCtx;
+				if (!ctx) return;
+				if (command === "voice-off") {
+					if (voiceOn(ctx)) setVoice(ctx, false, (message, type) => ctx.ui.notify(message, type));
+					return;
+				}
+				// Voice on reaches every session; only the one a voice woke starts
+				// listening, so a menu or a set-voice never opens a microphone.
+				if (wake) wakeConversation(ctx);
+			},
 		}));
 	const createSession: NonNullable<VoiceCommandDeps["createSession"]> = deps.createSession ?? ((options) => listener().dictate({
 		// A recording with an endpoint is the hands-free conversation; the listener
-		// uses the mode for its cues and its log.
-		mode: options.endpoint ? "conversation" : "dictation",
+		// uses the mode for its own request to the worker and for its log.
+		mode: options.mode ?? (options.endpoint ? "conversation" : "dictation"),
 		endpoint: options.endpoint,
 		onStateChange: options.onStateChange,
 		fallback: () => localDictation(options),
@@ -1499,7 +1510,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 				say("Voice dictation is not installed. Run /gentle:voice to download it.", "warning");
 				return;
 			}
-			const dictation = runDictation(createSession, found.target, (state) => display(state), captureSlot, { endpoint: current.send ? CONVERSATION_ENDPOINT : DICTATION_ENDPOINT, warm: current.send });
+			const dictation = runDictation(createSession, found.target, (state) => display(state), captureSlot, { endpoint: current.send ? CONVERSATION_ENDPOINT : DICTATION_ENDPOINT, warm: current.send, mode: current.send ? "conversation" : "dictation" });
 			current.dictation = dictation;
 			current.run.abort = dictation.cancel;
 			display("starting");
@@ -1590,6 +1601,22 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		void runToggle(openToggle(ctx, true));
 	};
 
+	// A wake by voice leaves the session where the shortcut leaves it (S7, S11):
+	// voice on, and the same hands-free conversation recording, so the listener's
+	// capture plays the one open cue and the transcript is sent. A session that
+	// cannot record right now only turns voice on: nothing beeps and nothing is
+	// claimed for a microphone it never opened.
+	const wakeConversation = (ctx: ExtensionContext): void => {
+		if (!supportedSession(ctx)) return;
+		// The session may have voice off and still be the one that was woken: the
+		// listener turned its flag on, and the session follows with its own setting.
+		if (!voiceOn(ctx)) setVoice(ctx, true, (message, type) => ctx.ui.notify(message, type));
+		const busy = !voiceOn(ctx) ? "voice-refused" : toggling ? "dictation-running" : active ? "voice-busy" : reading ? "reading" : undefined;
+		voiceLog("wake.conversation", { session: sessionIdOf(ctx), result: busy ? "skipped" : "opened", reason: busy });
+		if (busy) return;
+		void runToggle(openToggle(ctx, true));
+	};
+
 	// Ends every voice activity one session owned. The generation moves first, so
 	// no run of it can publish or paint again even before its capture finishes
 	// cancelling; then the footer and the display go idle under that session's own
@@ -1597,6 +1624,13 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	const endSession = (ctx: ExtensionContext | undefined): void => {
 		cutReadings();
 		void releaseWarm().catch(() => {});
+		// A reload keeps the same session id, so its connection goes with the
+		// instance that owned it: a client that outlives its session comes back and
+		// evicts the new instance's for ever (S6).
+		if (ctx) {
+			sessionLink?.close();
+			sessionLink = undefined;
+		}
 		if (cuesUsed) {
 			cuesUsed = false;
 			cuePlayer?.dispose();

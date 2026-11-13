@@ -95,6 +95,32 @@ test("every listener frame parses and re-encodes as exactly one line", () => {
 	assert.deepEqual(parseListenerFrameLine(encoded.trimEnd()), { type: "state", state: "reading", at: 1 });
 });
 
+test("a wake says so on the voice-on frame, and a frame written before it still parses (S7, S11)", () => {
+	// A session hears voice-on from the menu, from its own set-voice and from a
+	// spoken wake alike; only the spoken one starts a conversation, so only it
+	// carries the flag. A peer that does not know the field ignores it.
+	const plain = { type: "command", command: "voice-on" };
+	assert.deepEqual(parseListenerFrameLine(line(plain)), plain);
+	const wake = { ...plain, wake: true };
+	assert.deepEqual(parseListenerFrameLine(line(wake)), wake, "the flag survives a round trip");
+	assert.equal(parseListenerFrameLine(line({ ...plain, wake: "yes" })), undefined, "it is a boolean and nothing else");
+	assert.equal(parseListenerFrameLine(line({ type: "command", command: "voice-off", wake: true })), undefined, "only a wake is a wake");
+});
+
+test("a hello names the role its connection plays, and an older hello still means the session's own (S6)", () => {
+	// One session holds two connections at once: its long-lived one and the one a
+	// reading is held on. The listener replaces a socket by session and role, so
+	// the role has to be on the wire; its absence keeps the meaning it had.
+	const hello = { type: "hello", proto: 1, sessionId: "s-1", voiceOn: true };
+	assert.deepEqual(parseListenerRequestLine(line(hello)), hello, "an inherited hello is the session's own connection");
+	for (const role of ["session", "reading"] as const) {
+		const named = { ...hello, role };
+		assert.deepEqual(parseListenerRequestLine(line(named)), named, role);
+	}
+	assert.equal(parseListenerRequestLine(line({ ...hello, role: "capture" })), undefined, "a role the listener does not know is refused");
+	assert.equal(parseListenerRequestLine(line({ ...hello, role: 1 })), undefined);
+});
+
 test("unknown states, commands, reasons and oversized transcript text are refused", () => {
 	assert.equal(parseListenerFrameLine(line({ type: "state", state: "off", at: 1 })), undefined, "off is the absence of a listener, not a state");
 	assert.equal(parseListenerFrameLine(line({ type: "command", command: "reboot" })), undefined);

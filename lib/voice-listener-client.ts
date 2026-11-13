@@ -18,6 +18,8 @@ import {
 	LISTENER_MAX_LEVELS,
 	LISTENER_MAX_LINE,
 	type CaptureMode,
+	type ListenerCommand,
+	type ListenerConnectionRole,
 	type ListenerFrame,
 	type ListenerRequest,
 	type ListenerState,
@@ -84,6 +86,10 @@ export function sessionDisplayLabel(session: { name?: string; cwd?: string }): s
 export interface VoiceListenerClientOptions {
 	dir: string;
 	session: ListenerSession;
+	// Which of the session's connections this is (S6). Omitted, it is the
+	// session's own long-lived one, which is what every caller wrote before the
+	// role existed; a reading turn declares its own so it is never replaced by it.
+	role?: ListenerConnectionRole;
 	dial?: (path: string) => Socket;
 	backoffMs?: readonly number[];
 	onFrame?: (frame: ListenerFrame) => void;
@@ -116,6 +122,10 @@ export class VoiceListenerClient {
 	private closed = false;
 	private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 	private currentState: ListenerState = "asleep";
+	// The listener replaced this connection with a newer one of its own role. It is
+	// closed for good: reconnecting would evict that newer one and the two would
+	// take turns for ever, which is what one session's reload used to do (S6).
+	private replaced = false;
 
 	constructor(options: VoiceListenerClientOptions) {
 		this.options = options;
@@ -141,6 +151,9 @@ export class VoiceListenerClient {
 	// One attempt: dials, sends hello and resolves with the state the listener
 	// reports. Throws when the listener is not there or refuses the session.
 	async connect(): Promise<ListenerState> {
+		// A connection the listener already replaced never comes back: the caller
+		// joins again with a new one instead of evicting its own replacement.
+		if (this.replaced) throw new Error("this voice listener connection was replaced");
 		const socket = (this.options.dial ?? createConnection)(this.paths.socket);
 		socket.setEncoding("utf8");
 		this.buffered = "";
@@ -153,7 +166,7 @@ export class VoiceListenerClient {
 			socket.once("error", reject);
 		});
 		const { sessionId, paneId, label, voiceOn } = this.options.session;
-		const frame = await this.request({ type: "hello", proto: 1, sessionId, paneId, label, voiceOn });
+		const frame = await this.request({ type: "hello", proto: 1, sessionId, paneId, label, voiceOn, ...(this.options.role ? { role: this.options.role } : {}) });
 		if (frame.type !== "welcome") throw new Error("the voice listener refused hello");
 		this.currentState = frame.state;
 		this.joined = true;
@@ -213,6 +226,7 @@ export class VoiceListenerClient {
 			}
 		}
 		if (frame.type === "state") this.currentState = frame.state;
+		if (frame.type === "bye" && frame.reason === "replaced") this.replaced = true;
 		for (const listener of [...this.listeners]) listener(frame);
 	}
 
@@ -221,6 +235,7 @@ export class VoiceListenerClient {
 		this.socket = undefined;
 		this.joined = false;
 		this.failPending(new Error("the voice listener connection closed"));
+		if (this.replaced) return;
 		this.scheduleReconnect();
 	}
 
@@ -233,7 +248,7 @@ export class VoiceListenerClient {
 	}
 
 	private scheduleReconnect(): void {
-		if (this.closed || this.reconnectTimer) return;
+		if (this.closed || this.replaced || this.reconnectTimer) return;
 		const delays = this.options.backoffMs ?? LISTENER_BACKOFF_MS;
 		const delay = delays[Math.min(this.attempt, delays.length - 1)];
 		this.attempt += 1;
@@ -437,7 +452,14 @@ function holdReading(client: VoiceListenerClient, readingId: string, options: Li
 export async function listenerReadingTurn(options: ListenerReadingOptions): Promise<ListenerReading | undefined> {
 	let client: VoiceListenerClient;
 	try {
-		const joined = await ensureListener({ dir: options.dir, session: options.session, start: options.start, waitMs: options.waitMs });
+		const session = options.session;
+		const joined = await ensureListener({
+			dir: options.dir,
+			session,
+			start: options.start,
+			waitMs: options.waitMs,
+			createClient: () => new VoiceListenerClient({ dir: options.dir, session, role: "reading" }),
+		});
 		client = joined.client;
 	} catch {
 		return { kind: "unavailable" };
@@ -465,7 +487,7 @@ export async function listenerReadingTurn(options: ListenerReadingOptions): Prom
 // not running means nothing is reading through it: no process is started here.
 export async function cutListenerReading(options: { dir: string; session: ListenerSession }): Promise<boolean> {
 	if (!(await probeListenerSocket(listenerPaths(options.dir).socket))) return false;
-	const client = new VoiceListenerClient({ dir: options.dir, session: options.session });
+	const client = new VoiceListenerClient({ dir: options.dir, session: options.session, role: "reading" });
 	try {
 		await client.connect();
 		const frame = await client.request({ type: "read-cut" });
@@ -528,16 +550,26 @@ export interface SessionListenerLinkOptions {
 	// A transcript the listener handed to this session: another session recorded
 	// it and this pane had the focus. It is handed over once, never buffered.
 	onTranscript?(text: string, truncated: boolean): void;
+	// The listener telling this session about its own voice: on, because it was
+	// woken by voice (the frame says so) or because another session turned it on,
+	// and off when voice off reached every session (S7, L10).
+	onVoice?(command: ListenerCommand, wake: boolean): void;
 }
 
 // One connection per session carries both roles: it registers the pane that the
 // focus sends a transcript to, and it asks for the microphone. A capture that
-// cannot get the listener records here instead of failing the dictation.
+// cannot get the listener records here instead of failing the dictation. Its
+// hello carries no `role`: the session's own connection is what a listener read
+// before the role existed, so only a reading declares itself (S6).
 export function createSessionListenerLink(options: SessionListenerLinkOptions): SessionListenerLink {
 	let client: VoiceListenerClient | undefined;
 	let handler: ((frame: ListenerFrame) => boolean) | undefined;
 	const route = (frame: ListenerFrame): void => {
 		if (handler?.(frame)) return;
+		if (frame.type === "command") {
+			options.onVoice?.(frame.command, frame.wake === true);
+			return;
+		}
 		// No capture of this session asked for it: the focus sent it here (S6).
 		if (frame.type === "transcript") options.onTranscript?.(frame.text, frame.truncated === true);
 	};

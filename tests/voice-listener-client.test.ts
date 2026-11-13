@@ -281,6 +281,80 @@ test("the reading turn sends the played loudness to the listener and survives a 
 	await server.close();
 });
 
+test("the listener's voice frames reach the session, and only a wake says it was one (S7, L10)", async () => {
+	const dir = scratch();
+	const server = new VoiceListener({ dir });
+	await server.listen();
+	const heard: Array<[string, boolean]> = [];
+	const link = createSessionListenerLink({ dir, session: () => session("s-1"), onVoice: (command, wake) => heard.push([command, wake]) });
+	assert.equal(await link.ensure(), true);
+	// Another session turns its own voice on: the listener tells every session, and
+	// none of them starts listening for it.
+	const other = new VoiceListenerClient({ dir, session: session("s-2", false, "w1:p2") });
+	await other.connect();
+	await other.request({ type: "set-voice", voiceOn: true });
+	await waitFor(() => heard.length === 1);
+	assert.deepEqual(heard, [["voice-on", false]], "a plain voice on is not a wake");
+	// Voice off reaches every session too.
+	await other.request({ type: "set-voice", voiceOn: false });
+	await waitFor(() => heard.length === 2);
+	assert.deepEqual(heard.at(-1), ["voice-off", false], "voice off is the other frame a session acts on");
+	other.close();
+	link.close();
+	await server.close();
+});
+
+test("a connection the listener replaced never reconnects to evict its replacement (S6)", async () => {
+	const dir = scratch();
+	const server = new VoiceListener({ dir });
+	await server.listen();
+	const stale = new VoiceListenerClient({ dir, session: session("s-1") });
+	await stale.connect();
+	const fresh = new VoiceListenerClient({ dir, session: session("s-1") });
+	await fresh.connect();
+	await waitFor(() => server.clientCount === 1, 2_000);
+	// A reload keeps the same session id, and the connection it left behind came
+	// back on its own every 250 ms to evict the one that replaced it, for ever.
+	await new Promise((resolve) => setTimeout(resolve, 800));
+	assert.equal(server.clientCount, 1, "the replaced connection stayed gone");
+	await assert.rejects(stale.request({ type: "status" }), "and it refuses to come back");
+	await assert.rejects(stale.connect());
+	assert.equal(server.clientCount, 1, "the session keeps the one connection it has");
+	fresh.close();
+	await server.close();
+});
+
+test("a reading held on its own connection survives the session's connection joining and reconnecting (S6)", async () => {
+	const dir = scratch();
+	const server = new VoiceListener({ dir, readTailMs: 5 });
+	await server.listen();
+	const cuts: string[] = [];
+	const reading = await listenerReadingTurn({ dir, session: session("s-1"), chars: 20, signal: new AbortController().signal, onCut: (reason) => cuts.push(reason) });
+	assert.ok(reading && reading.kind === "granted", "the free turn is granted");
+	// The session's own, long-lived connection: the one that carries captures, the
+	// wake and the voice frames. It joins while the reply is being read, and each
+	// hello used to evict the reading's connection, which released the reading.
+	const link = createSessionListenerLink({ dir, session: () => session("s-1") });
+	assert.equal(await link.ensure(), true, "the session joins while its reply is read");
+	await waitFor(() => server.clientCount === 2, 2_000);
+	assert.deepEqual(cuts, [], "the reading is not released by the hello of its own session");
+	assert.equal(server.readingSession, "s-1", "the turn is still held");
+
+	// A reconnect, as after a listener restart: still one reading, no churn.
+	link.close();
+	await waitFor(() => server.clientCount === 1, 2_000);
+	assert.equal(await link.ensure(), true);
+	await waitFor(() => server.clientCount === 2, 2_000);
+	await new Promise((resolve) => setTimeout(resolve, 120));
+	assert.deepEqual(cuts, [], "and it survives the reconnect");
+	assert.equal(server.readingSession, "s-1");
+
+	reading.release("done");
+	await waitFor(() => server.readingSession === undefined, 2_000);
+	link.close();
+	await server.close();
+});
+
 test("a listener that cannot be reached reports itself unavailable instead of failing", async () => {
 	const dir = scratch();
 	const turn = await listenerReadingTurn({

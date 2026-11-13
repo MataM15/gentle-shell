@@ -272,7 +272,7 @@ ordinary text. The current list has two commands:
 | Said | Effect |
 |------|--------|
 | `Gentle Voice off` | Turns voice off in this session, exactly as **Voice in this session (on): turn off** does in `/gentle:voice`: spoken replies stop being read, a reading in progress is cut, the pending spoken turn is cleared and the kept-alive dictation worker is closed. Nothing is sent to the model and nothing is pasted. The draft is left as it was. Voice goes off in every session, not only in this one, and the microphone stays owned by the listener, which listens for `Gentle Voice on` from then on. |
-| `Gentle Voice on` | Works only while voice is asleep, and wakes only the session herdr reports focused: that session turns voice on as **turn on** does in `/gentle:voice`, the open cue plays and the window shows it. With no focused session connected nothing turns on and the listener keeps listening. Said while voice is already on, it does nothing. |
+| `Gentle Voice on` | Works only while voice is asleep, and wakes only the session herdr reports focused. That session turns voice on, as **turn on** does in `/gentle:voice`, and starts listening on its own: the same hands-free conversation the `alt+m` shortcut starts, with the same end-of-speech endpoint, the transcript sent to the model and the microphone reopened after the reply is read. The open cue is the capture's own and plays once the microphone really records; the window has no resting form to draw before that. When the session cannot record right now (a dictation is already running, or a reading holds the turn) it only turns voice on: nothing plays and nothing is claimed. With no focused session connected nothing turns on and the listener keeps listening. Said while voice is already on, it does nothing. |
 
 Case, accents, punctuation and extra spaces never decide whether a command was
 spoken: `gentle voice, off.` and `Gentle  voice  OFF` are the same command. A
@@ -400,7 +400,16 @@ a session that asks for a capture only receives the transcript.
 - **Protocol.** `gentle.voice-listener/v1`, JSON on one line each way, at most
   64 KiB per line. A connection starts with a hello carrying the session id and
   the herdr pane id, then answers status and reports the state:
-  `asleep`, `listening`, `transcribing`, `reading`. The reading turn is part of
+  `asleep`, `listening`, `transcribing`, `reading`. One session holds two
+  connections at once: its own long-lived one (the microphone, the wake, the
+  voice frames) and the one a reply is read on. Only the reading connection
+  names itself (`role: "reading"`); the session's own sends no role at all, which
+  is what every peer wrote before the field existed and what an older listener
+  still reads as the session's own. The listener replaces a socket only with one
+  of the same session and role, so a hello never evicts the connection its own
+  reading is held on. A replaced connection is told why (`bye` with `replaced`)
+  and never reconnects; it joins again with a new one.
+  The reading turn is part of
   it: `read-begin` asks for it, `read-heartbeat` renews it, `read-end` gives it
   back with how the reading ended (`done`, `skipped`, `cancelled`) and
   `read-cut` takes it from any session. The answer is one `granted` or a `busy`
@@ -490,14 +499,24 @@ a session that asks for a capture only receives the transcript.
 - **Asleep keeps listening.** While the listener is asleep and the spotter is
   installed, it keeps a spot-only capture open: the microphone stays open for the
   keyword alone, with no transcript and no cue. `Gentle Voice on` wakes the
-  session herdr reports focused, and only that one: its voice turns on, every
-  session hears the `command: voice-on` broadcast it already knew, the state
-  becomes `listening`, the open cue plays and the window draws it. With no
-  focused pane, a failed lookup or a focused pane with no session, nothing turns
-  on and the listener opens another spot-only capture; anything else it hears
-  (a `voice-off`, a `cancel`, an unknown id) changes nothing and listens again.
-  Ten minutes of being asleep with no session that has voice on still closes the
-  listener, and the spot-only capture closes with it.
+  session herdr reports focused, and only that one: its voice turns on, it starts
+  the same hands-free conversation `alt+m` starts (voice `on`, the listener's
+  capture records, transcribes and sends, and the microphone reopens after the
+  reply is read), the listener state becomes `listening`, and that session alone
+  is told the frame was a wake (`command: voice-on` with `wake: true`) while every
+  other session hears the plain broadcast it already knew. The open cue is the
+  capture's own, played once the microphone really records: the wake plays none,
+  so nothing beeps before there is something to hear. A woken session that cannot
+  record (a dictation already running, a reading holding the turn) only turns
+  voice on: nothing beeps and nothing is claimed, and voice stays on for it. A
+  wake followed by silence is an ordinary hands-free turn and invents no rule of
+  its own: the capture reports `no-speech`, nothing is sent, and the session
+  notifies `Conversation paused: no speech was heard. Press alt+m to talk.`. With
+  no focused pane, a failed lookup or a focused pane with no session, nothing
+  turns on and the listener opens another spot-only capture; anything else it
+  hears (a `voice-off`, a `cancel`, an unknown id) changes nothing and listens
+  again. Ten minutes of being asleep with no session that has voice on still
+  closes the listener, and the spot-only capture closes with it.
 - **One microphone.** The spotter owns the microphone only while nothing else
   needs it: a `dictate` from any session stops the spot-only capture and waits
   until it closed before the recording opens, and spotting resumes when that
@@ -539,28 +558,33 @@ a session that asks for a capture only receives the transcript.
   truth about an open microphone, so the window never has to infer it from the
   audio. It is always on top,
   click-through (a click on it reaches the window underneath), never takes the
-  focus, and is absent from the taskbar and Alt+Tab. It appears on the monitor
-  that holds the foreground window when a state starts. Everything is local:
+  focus, and is absent from the taskbar and Alt+Tab. There is no resting form: it
+  appears on the monitor that holds the foreground window when a state starts, and
+  draws nothing while nothing is under way. Everything is local:
   nothing leaves the machine, and no level, session name or transcript is ever
   logged.
   - **Listening** (the microphone really records): the four screen edges glow in
     rose and breathe with the microphone level, and the pill shows a mic badge,
     "ESCUCHANDO", the session label, a mirrored wave and the language chip.
-  - **Awake but not recording:** a small quiet pill ("voz activa, micrófono
-    cerrado") with no glow and no wave. The full listening look is drawn from the
-    snapshot's explicit `recording` flag, never guessed from the audio: the
-    listener sets it when the worker reports that it is recording and clears it
-    when that recording ends (a stop, a cancel, a failure, the session closing or
-    the listener leaving), in every state. Levels never turn it on and a quiet
-    microphone never turns it off, so the window cannot say the microphone is
-    open when it is not, and a silent moment never hides an open microphone.
+  - **No resting form:** voice on with nothing under way draws nothing. There is
+    no pill, no badge and no glow for an armed microphone, and a wake draws no
+    window of its own; the listening form appears with the recording and goes with
+    it. The full listening
+    look is drawn from the snapshot's explicit `recording` flag, never guessed
+    from the audio: the listener sets it when the worker reports that it is
+    recording and clears it when that recording ends (a stop, a cancel, a
+    failure, the session closing or the listener leaving), in every state. Levels
+    never turn it on and a quiet microphone never turns it off, so the window
+    cannot say the microphone is open when it is not, and a silent moment never
+    hides an open microphone.
   - **Transcribing:** an amber bar sweeps along the top edge and the pill shows a
     spinner and "TRANSCRIBIENDO…".
   - **Reading:** a green glow along the bottom edge only, a speaker badge,
     "LEYENDO", "de" plus the session label, and bars rising from the baseline that
     follow the level of the speech the player actually started. If no level has
     arrived for 300 ms the bars fall back to a gentle synthesized motion.
-  - **Asleep:** no edges, a dim pill that says "Dormido, di «Gentle Voice on»".
+  - **Asleep:** nothing is drawn. The keyword is still heard by the listener,
+    which is the only thing awake, and the window has no form to show for it.
   - **Language:** the chip shows `ES`; `EN` is drawn as the filled blue English
     chip. The rest of the English mode (blue edges) and the confirmation state are
     designed but not wired yet.
@@ -672,7 +696,9 @@ spoken input, a spoken turn sent, a reply settled, a reading started and how it
 ended, a reply held for the focus or dropped instead of read, and each
 microphone reopen decision with its reason (`opened`, or
 skipped for `not-focused`, `no-spoken-turn`, `voice-off`, `reading-cancelled`,
-`reading-error`, `dictation-running`, `voice-busy`), each microphone cue
+`reading-error`, `dictation-running`, `voice-busy`), the wake decision with
+its result (`wake.conversation`: `opened`, or skipped with the reason that stopped
+it), each microphone cue
 with its `name`, `outcome` (`done`, `failed`, `unavailable`), latency, the mode that asked for it and, after a reading, `sinceReadingMs`, and each spoken command
 it ran. Lines
 carry the time, the process id and the session id, and sizes instead of text:

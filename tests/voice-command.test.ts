@@ -2,13 +2,14 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import nodeTest from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import gentleVoice from "../extensions/gentle-voice.ts";
 import { VoiceInstallError, type VoiceInstallProgress, type VoiceInstallResult } from "../lib/voice-install.ts";
 import { VoiceSessionError, type VoiceSessionState, type VoiceTranscript } from "../lib/voice-session.ts";
-import { createReadingTurn, HELD_REPLY_POLL_MS, HELD_REPLY_STALE_MS, VOICE_COMMAND_NAME, type VoiceCommandDeps, type VoiceDictation } from "../lib/voice-command.ts";
-import { VoiceListener, type ListenerDictation, type ListenerDictationRequest } from "../lib/voice-listener.ts";
+import { createReadingTurn, CONVERSATION_ENDPOINT, HELD_REPLY_POLL_MS, HELD_REPLY_STALE_MS, VOICE_COMMAND_NAME, type VoiceCommandDeps, type VoiceDictation } from "../lib/voice-command.ts";
+import { VoiceListener, type ListenerDictation, type ListenerDictationRequest, type ListenerSpotFactory } from "../lib/voice-listener.ts";
 import { createSessionListenerLink } from "../lib/voice-listener-client.ts";
 import type { PaneFocus } from "../lib/voice-presence.ts";
 import type { CuePlayer } from "../lib/voice-cues.ts";
@@ -900,6 +901,63 @@ test("a toggle dictation records through the listener and this session only past
 	} finally {
 		await server.close();
 		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("a reload closes the connection it leaves behind, so its replacement keeps the microphone (S6)", async () => {
+	const home = mkdtempSync(join(tmpdir(), "voice-command-reload-"));
+	const dir = join(home, "voice");
+	const requests: ListenerDictationRequest[] = [];
+	const dictation = (request: ListenerDictationRequest): ListenerDictation => {
+		requests.push(request);
+		return { start: async () => request.onStateChange("recording"), stop: async () => ({ text: "hola", truncated: false }), cancel: async () => request.onStateChange("finished") };
+	};
+	const server = new VoiceListener({ dir, dictation, focus: { focusedPaneId: async () => ({ focused: "w1:p1" }) } });
+	const reached = async (check: () => boolean, ms = 2_000): Promise<void> => {
+		const deadline = Date.now() + ms;
+		while (!check() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+		assert.ok(check(), "condition not reached");
+	};
+	await server.listen();
+	try {
+		const env = { HERDR_PANE_ID: "w1:p1", GENTLE_PI_CONFIG_HOME: home };
+		const join = () => createSessionListenerLink({ dir, session: () => ({ sessionId: "session-alpha", paneId: "w1:p1", voiceOn: true }) });
+		const first = harness({ installed: true, env });
+		delete (first.deps as { createSession?: unknown }).createSession;
+		first.deps.listener = join();
+		const pi = register(first);
+		const ui = fakeContext();
+		await pi.fire("session_start", ui.ctx);
+		const done = press(pi, ui);
+		await reached(() => requests.length === 1);
+		assert.equal(server.clientCount, 1, "the session is joined to the listener");
+		await press(pi, ui);
+		await done;
+
+		// A reload keeps the session id: the connection the old instance owned goes
+		// with it, so the new one is not evicted by a client nobody uses any more.
+		await pi.fire("session_shutdown", ui.ctx);
+		await reached(() => server.clientCount === 0, 2_000);
+
+		const second = harness({ installed: true, env });
+		delete (second.deps as { createSession?: unknown }).createSession;
+		second.deps.listener = join();
+		const reloaded = register(second);
+		const next = fakeContext();
+		await reloaded.fire("session_start", next.ctx);
+		const again = press(reloaded, next);
+		await reached(() => requests.length === 2);
+		assert.equal(server.clientCount, 1, "the reloaded instance holds the one connection of its session");
+		// Nothing ping-pongs: the connection settles and the dictation works.
+		await new Promise((resolve) => setTimeout(resolve, 400));
+		assert.equal(server.clientCount, 1, "no connection churn after the reload");
+		await press(reloaded, next);
+		await again;
+		assert.equal(next.editor(), "draft: hola", "a dictation through the reloaded instance reaches the draft");
+		second.deps.listener.close();
+	} finally {
+		await server.close();
+		rmSync(home, { recursive: true, force: true });
 	}
 });
 
@@ -1827,6 +1885,8 @@ test("the menu turns voice on and off for this session only and persists the cho
 	assert.ok(!ui.selects[0]!.options.some((option) => /Read replies aloud|Conversation mode/.test(option)), "the old global switches are gone");
 	assert.deepEqual(h.voice.writes, [["session-other", "session-alpha"]]);
 	assert.deepEqual(ui.notices.at(-1), { message: "Voice is on in this session: replies are read aloud, and alt+m starts a hands-free conversation. Esc skips a reading.", type: "info" });
+	assert.equal(h.calls.some((call) => call.startsWith("session:")), false, "turning voice on from the menu opens no microphone");
+	assert.equal(h.sessions.length, 0, "and nothing records: only a spoken wake starts a conversation");
 	await pi.fire("session_start", ui.ctx);
 	await settleReply(pi, ui.ctx, "Una respuesta.");
 	await until(() => readings.length === 1);
@@ -2037,6 +2097,112 @@ test("in conversation mode the toggle key sends at once, and a busy agent gets i
 	h.sessions[0]!.result.resolve({ text: "otra cosa", truncated: false });
 	await pressed;
 	assert.deepEqual(pi.sent, [{ content: "otra cosa", options: { deliverAs: "followUp" } }]);
+});
+
+test("a spoken wake leaves the focused session in the hands-free conversation alt+m starts, and only a wake does (S7, S11)", async () => {
+	const { engine, readings } = fakeEngine();
+	const home = mkdtempSync(join(tmpdir(), "voice-command-wake-"));
+	const dir = join(home, "voice");
+	const requests: ListenerDictationRequest[] = [];
+	const dictation = (request: ListenerDictationRequest): ListenerDictation => {
+		requests.push(request);
+		return {
+			start: async () => request.onStateChange("recording"),
+			stop: async () => {
+				request.onStateChange("transcribing");
+				request.onStateChange("finished");
+				return { text: request.mode === "conversation" ? "sí, te escucho" : "un dictado", truncated: false };
+			},
+			cancel: async () => request.onStateChange("finished"),
+		};
+	};
+	// Asleep keeps a spot-only capture open: hearing the wake word there is the only
+	// way a session is ever woken by voice.
+	let heard: ((command: string | undefined) => void) | undefined;
+	let spotStarts = 0;
+	const spot: ListenerSpotFactory = () => {
+		spotStarts += 1;
+		let settle!: (command: string | undefined) => void;
+		const waiting = new Promise<string | undefined>((resolve) => (settle = resolve));
+		heard = settle;
+		return { start: async () => {}, heard: () => waiting, stop: async () => settle(undefined), cancel: async () => settle(undefined) };
+	};
+	const cueNames: string[] = [];
+	const server = new VoiceListener({
+		dir,
+		dictation,
+		spot,
+		keyword: { model: { root: "/opt/gentle/voice/models/kws", files: {} }, keywords: [{ tokens: "▁G ENT LE ▁ VO IC E ▁ON", command: "voice-on" }], boost: 2, threshold: 0.25, maxActivePaths: 16, trailingBlanks: 2 },
+		focus: { focusedPaneId: async () => ({ focused: "w1:p1" }) },
+		cues: {
+			play: (name) => {
+				cueNames.push(name);
+				return Promise.resolve({ name, outcome: "done" as const, ms: 1 });
+			},
+			warm: () => {},
+			dispose: () => {},
+		},
+	});
+	// A listener round trip is a socket: it needs wall time, not just turns of the
+	// event loop, so every wait here is bounded in milliseconds.
+	const reached = async (check: () => boolean, ms = 2_000): Promise<void> => {
+		const deadline = Date.now() + ms;
+		while (!check() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+		assert.ok(check(), "condition not reached");
+	};
+	await server.listen();
+	try {
+		const h = harness({ installed: true, engine, env: { HERDR_PANE_ID: "w1:p1", GENTLE_PI_CONFIG_HOME: home } });
+		// The microphone and the reading turn both live in the listener: the session
+		// reaches it through its own link, as it does in production.
+		delete (h.deps as { createSession?: unknown }).createSession;
+		const pi = register(h);
+		const ui = fakeContext();
+		await pi.fire("session_start", ui.ctx);
+		// A session joins the listener with its first capture; voice is off, so it pastes.
+		const joining = press(pi, ui);
+		await reached(() => requests.length === 1);
+		await reached(() => /recording/i.test(ui.statuses.at(-1) ?? ""));
+		await press(pi, ui);
+		await joining;
+		assert.equal(ui.editor(), "draft: un dictado", "the session is joined to the listener");
+		(ui.ctx.ui as unknown as { setEditorText(text: string): void }).setEditorText("");
+		cueNames.length = 0;
+		// With no session that has voice on, the listener goes back to sleep and keeps
+		// its spot-only capture: that is where "Gentle Voice on" is heard.
+		await reached(() => spotStarts === 2);
+		heard!("voice-on");
+
+		// The wake leaves this session listening: the same hands-free conversation the
+		// shortcut starts, so it records, transcribes and sends on its own.
+		await reached(() => requests.length === 2);
+		assert.equal(requests[1]!.mode, "conversation", "the wake starts the conversation, not a pasting dictation");
+		assert.deepEqual(requests[1]!.endpoint, CONVERSATION_ENDPOINT, "with the endpointer the shortcut uses");
+		assert.deepEqual(h.voice.sessions, ["session-alpha"], "the wake turned voice on for the session it woke");
+		await reached(() => /conversation/i.test(ui.statuses.at(-1) ?? ""));
+		assert.match(ui.statuses.at(-1) ?? "", /conversation/i, "the footer shows the same conversation the shortcut shows");
+		assert.deepEqual(cueNames, ["open"], "one open cue, from the capture that really records");
+		assert.deepEqual(h.cues.filter((name) => name === "open" || name === "close"), [], "the session claims no cue the listener plays");
+
+		// The end of speech stops the recording and sends the transcript, exactly as it
+		// does after alt+m: the conversation has no key press to stop it.
+		requests[1]!.onStateChange("finished");
+		await reached(() => pi.sent.length === 1);
+		assert.deepEqual(pi.sent, [{ content: "sí, te escucho", options: undefined }]);
+		assert.equal(ui.editor(), "", "a conversation sends, it never pastes");
+
+		// And the microphone reopens after the reply is read, as in any conversation.
+		await settleReply(pi, ui.ctx, "Te escucho.");
+		await reached(() => readings.length === 1);
+		assert.equal(requests.length, 2, "the microphone stays closed while the reply is read");
+		readings[0]!.finish("done");
+		await reached(() => requests.length === 3);
+		assert.equal(requests[2]!.mode, "conversation", "the conversation keeps going after a reading");
+		assert.equal(spotStarts, 2, "no spot capture competes with the conversation it woke");
+	} finally {
+		await server.close();
+		rmSync(home, { recursive: true, force: true });
+	}
 });
 
 test("after a reply to a spoken turn is read, the microphone reopens hands-free in the focused pane, and the next answer is sent", async () => {

@@ -56,7 +56,7 @@ interface Client {
 	frames: ListenerFrame[];
 	closed: Promise<void>;
 	send(request: ListenerRequest): void;
-	hello(sessionId: string, paneId?: string, voiceOn?: boolean): void;
+	hello(sessionId: string, paneId?: string, voiceOn?: boolean, role?: "session" | "reading"): void;
 }
 
 async function connectClient(dir: string): Promise<Client> {
@@ -86,7 +86,7 @@ async function connectClient(dir: string): Promise<Client> {
 		frames,
 		closed,
 		send,
-		hello: (sessionId, paneId?, voiceOn = true) => send({ type: "hello", proto: 1, sessionId, paneId, voiceOn }),
+		hello: (sessionId, paneId?, voiceOn = true, role?) => send({ type: "hello", proto: 1, sessionId, paneId, voiceOn, ...(role === undefined ? {} : { role }) }),
 	};
 }
 
@@ -230,6 +230,27 @@ test("two clients both hear every state edge, and status names the sessions", as
 	});
 	first.socket.destroy();
 	second.socket.destroy();
+	await started.listener.close();
+});
+
+test("a session's own voice on still turns voice on without starting a recording (S7, S11)", async () => {
+	const dir = scratch();
+	const capture = fakeCapture({ text: "no" });
+	const started = await startListener(dir, { dictation: capture.factory, cues: cuePlayer() });
+	const client = await started.client();
+	client.hello("s-1", "w1:p1", false);
+	await waitFor(() => framesOf(client, "welcome").length === 1);
+
+	client.send({ type: "set-voice", id: "v1", voiceOn: true });
+	await waitFor(() => framesOf(client, "ok").length === 1);
+	// The frame a session already knew, with no wake flag: a menu or a set-voice
+	// voice on never starts a conversation the owner did not ask for.
+	assert.deepEqual(framesOf(client, "command"), [{ type: "command", command: "voice-on" }]);
+	assert.deepEqual(started.listener.voiceSessions, ["s-1"]);
+	assert.deepEqual(capture.calls, [], "no microphone was opened");
+	assert.equal(started.events.some((entry) => entry.event === "capture.begin"), false);
+	assert.deepEqual(cueLog(started.events), [], "and no cue claims a microphone it does not hold");
+	client.socket.destroy();
 	await started.listener.close();
 });
 
@@ -431,6 +452,51 @@ test("a second hello for the same session replaces the old socket", async () => 
 	await first.closed;
 	assert.equal(started.listener.clientCount, 1, "one session, one live socket");
 	second.socket.destroy();
+	await started.listener.close();
+});
+
+test("a reading held on its own connection coexists with the session's, and a reload still replaces its stale socket (S6)", async () => {
+	const started = await startListener(scratch());
+	// One session holds two connections: the long-lived one that carries captures,
+	// voice and the wake, and the one a reply is read on. Each hello used to evict
+	// the other, so the reading was released as "closed" and the speech stopped.
+	const link = await started.client();
+	link.hello("s-1", "w1:p1", true, "session");
+	await waitFor(() => framesOf(link, "welcome").length === 1);
+	const reading = await started.client();
+	reading.hello("s-1", "w1:p1", true, "reading");
+	await waitFor(() => framesOf(reading, "welcome").length === 1);
+	assert.deepEqual(framesOf(link, "bye"), [], "the session's connection is not evicted by its own reading");
+	assert.deepEqual(framesOf(reading, "bye"), []);
+
+	reading.send({ type: "read-begin", id: "r1", readingId: "read-1", chars: 40 });
+	assert.equal((await awaitFrame(reading, (frame) => "id" in frame && frame.id === "r1")).type, "granted");
+	assert.equal(started.listener.state, "reading");
+
+	// The same session joins again while the reply is read, as a reconnect after a
+	// listener restart does: the reading keeps its turn.
+	const reloaded = await started.client();
+	reloaded.hello("s-1", "w1:p1", true, "session");
+	await waitFor(() => framesOf(reloaded, "welcome").length === 1);
+	await link.closed;
+	assert.deepEqual(framesOf(link, "bye"), [{ type: "bye", reason: "replaced" }], "a stale connection of the same role is still replaced, and told why");
+	assert.deepEqual(framesOf(reading, "bye"), [], "the reading keeps its connection");
+	assert.equal(started.listener.state, "reading", "and its turn");
+	assert.deepEqual(
+		framesOf(reading, "reading").map((frame) => (frame as { change: string }).change),
+		["granted"],
+		"nothing released it",
+	);
+	assert.equal(started.listener.clientCount, 2, "the reloaded connection and the reading");
+	assert.equal(started.events.filter((entry) => entry.event === "listener.client-closed").length, 1, "one stale socket closed, no churn");
+
+	// The session is still named once, whatever it holds.
+	reloaded.send({ type: "status" });
+	await waitFor(() => framesOf(reloaded, "snapshot").length === 1);
+	assert.deepEqual(framesOf(reloaded, "snapshot")[0], { type: "snapshot", state: "reading", listenerPid: process.pid, clients: 2, sessions: ["s-1"] });
+
+	reading.socket.destroy();
+	reloaded.socket.destroy();
 	await started.listener.close();
 });
 
@@ -1672,7 +1738,15 @@ test("asleep keeps a spot-only capture open, and the keyword wakes the focused s
 	const dir = scratch();
 	const spot = fakeSpotting();
 	const overlay = fakeOverlay();
-	const started = await startListener(dir, { keyword: keywordOption(), spot: spot.factory, overlay: overlay.overlay, cues: cuePlayer(), focus: { focusedPaneId: async () => ({ focused: "w1:p2" }) } });
+	const capture = fakeCapture({ text: "hola" });
+	const started = await startListener(dir, {
+		keyword: keywordOption(),
+		spot: spot.factory,
+		overlay: overlay.overlay,
+		cues: cuePlayer(),
+		dictation: capture.factory,
+		focus: { focusedPaneId: async () => ({ focused: "w1:p2" }) },
+	});
 	// A fresh listener is asleep, so it listens for the keyword from the start.
 	await waitFor(() => spot.starts === 1);
 	const quiet = await started.client();
@@ -1688,13 +1762,24 @@ test("asleep keeps a spot-only capture open, and the keyword wakes the focused s
 	spot.hearing("voice-on");
 	await waitForState(started, "listening");
 	assert.deepEqual(started.listener.voiceSessions, ["s-2"], "only the focused session gets voice back");
-	assert.deepEqual(framesOf(focused, "command").at(-1), { type: "command", command: "voice-on" });
-	assert.deepEqual(cueLog(started.events).at(-1)?.name, "open", "the wake is audible");
-	assert.equal(cueLog(started.events).at(-1)?.sessionId, "s-2");
+	// The wake is addressed to the session it woke: broadcast, every session with
+	// voice on would open its own conversation over one microphone (S7).
+	assert.deepEqual(framesOf(focused, "command").at(-1), { type: "command", command: "voice-on", wake: true }, "the session that woke is told it was a wake");
+	assert.deepEqual(
+		framesOf(quiet, "command"),
+		[
+			{ type: "command", command: "voice-off" },
+			{ type: "command", command: "voice-on" },
+		],
+		"a session that did not wake only learns that voice is on: no wake flag, nothing to start",
+	);
+	// The wake itself claims nothing: nothing records yet, so no cue plays, and the
+	// window has no listening form to draw without a microphone.
+	assert.deepEqual(cueLog(started.events), [], "the wake plays no cue of its own");
 	assert.deepEqual(
 		overlay.snapshots.at(-1),
 		{ state: "listening", language: "es", recording: false },
-		"the wake is visible: the window draws the new state",
+		"the state the window gets, which it draws nothing for while nothing records",
 	);
 	assert.deepEqual(spot.calls, ["spot.start"], "the wake consumed the spot capture instead of stopping it");
 	const command = started.events.filter((entry) => entry.event.startsWith("kws."));
@@ -1702,6 +1787,16 @@ test("asleep keeps a spot-only capture open, and the keyword wakes the focused s
 		["kws.hit", { command: "voice-on" }],
 		["kws.wake", { sessionId: "s-2" }],
 	]);
+
+	// The microphone the wake session then opens is where the cue comes from: one
+	// open cue, played by the listener because it is the one recording (S10).
+	focused.send({ type: "dictate", id: "d1", mode: "conversation" });
+	assert.equal((await awaitFrame(focused, (frame) => "id" in frame && frame.id === "d1")).type, "ok");
+	assert.deepEqual(
+		cueLog(started.events).map((entry) => [entry?.name, entry?.mode, entry?.sessionId]),
+		[["open", "conversation", "s-2"]],
+		"exactly one open cue, from the capture that records",
+	);
 	quiet.socket.destroy();
 	focused.socket.destroy();
 	await started.listener.close();
@@ -1727,6 +1822,7 @@ test("a wake with nobody focused, a failed lookup or an absent pane turns nothin
 		assert.deepEqual(started.listener.voiceSessions, ["s-1"], "the session that was already awake keeps its voice");
 		assert.deepEqual(framesOf(client, "command"), []);
 		assert.deepEqual(cueLog(started.events), [], "nothing woke, so no cue plays");
+		assert.equal(started.events.some((entry) => entry.event === "capture.begin"), false, "and nothing starts a recording");
 		client.socket.destroy();
 		await started.listener.close();
 	}

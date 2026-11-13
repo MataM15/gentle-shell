@@ -14,6 +14,7 @@ import {
 	parseListenerRequestLine,
 	type CaptureErrorCode,
 	type CaptureMode,
+	type ListenerConnectionRole,
 	type ListenerEndpoint,
 	type ListenerErrorCode,
 	type ListenerFrame,
@@ -249,6 +250,10 @@ interface Client {
 	paneId?: string;
 	voiceOn: boolean;
 	label?: string;
+	// Which of the session's connections this is: its own long-lived one, or the
+	// one a reply is read on. Only a connection of the same role replaces another,
+	// so a reading is not evicted by the session that is reading it (S6).
+	role: ListenerConnectionRole;
 	// This session asked for the level frames of the capture it can see.
 	levels: boolean;
 	buffered: string;
@@ -509,7 +514,20 @@ export class VoiceListener {
 	// The sessions whose voice is on, as the registry knows them: L10 reads this
 	// when voice off has to reach everyone, and when a keyword wakes one session.
 	get voiceSessions(): readonly string[] {
-		return [...this.clients.values()].flatMap((client) => (client.sessionId && client.voiceOn ? [client.sessionId] : []));
+		// One session holds two connections at once (S6), and it keeps the listener
+		// awake once: every connection joins with the flag, and the session counts
+		// while any of them has voice on.
+		const awake = new Set<string>();
+		for (const client of this.clients.values()) if (client.sessionId && client.voiceOn) awake.add(client.sessionId);
+		return [...awake];
+	}
+
+	// The sessions connected now, named once each whatever role their
+	// connections play.
+	get sessionIds(): readonly string[] {
+		const ids = new Set<string>();
+		for (const client of this.clients.values()) if (client.sessionId) ids.add(client.sessionId);
+		return [...ids];
 	}
 
 	// Binds the socket. Exactly one process can do this per voice home: the lock
@@ -682,7 +700,7 @@ export class VoiceListener {
 			socket.destroy();
 			return;
 		}
-		const client: Client = { socket, voiceOn: false, levels: false, buffered: "", window: 0, windowStart: this.now() };
+		const client: Client = { socket, voiceOn: false, levels: false, buffered: "", window: 0, windowStart: this.now(), role: "session" };
 		this.clients.set(socket, client);
 		socket.setEncoding("utf8");
 		socket.on("data", (chunk: string) => this.receive(client, chunk));
@@ -737,18 +755,28 @@ export class VoiceListener {
 	}
 
 	private register(client: Client, hello: Extract<ListenerRequest, { type: "hello" }>): void {
+		// A hello written before the role existed is the session's own connection.
+		const role = hello.role ?? "session";
 		for (const other of [...this.clients.values()]) {
-			// One session, one live socket: a reloaded session replaces its old one.
-			if (other === client || other.sessionId !== hello.sessionId) continue;
-			this.say(other, { type: "bye", reason: "shutdown" });
-			this.forget(other);
+			// One session, one live socket per role: a reloaded session replaces its
+			// stale one, while the connection its reading is held on survives, and a
+			// session keeps talking to the listener that is reading for it.
+			if (other === client || other.sessionId !== hello.sessionId || other.role !== role) continue;
+			// Told and flushed before the socket goes: a connection replaced without
+			// hearing why reconnects, and the two evict each other for ever.
+			this.forget(other, (socket) => {
+				socket.end(encodeListenerFrame({ type: "bye", reason: "replaced" }));
+				const timer = setTimeout(() => socket.destroy(), 100);
+				socket.once("close", () => clearTimeout(timer));
+			});
 		}
 		client.sessionId = hello.sessionId;
 		client.paneId = hello.paneId;
 		client.voiceOn = hello.voiceOn;
 		client.label = hello.label;
+		client.role = role;
 		this.say(client, withId({ type: "welcome", listenerPid: this.pid, proto: 1, state: this.currentState }, hello.id));
-		this.log("listener.hello", { sessionId: hello.sessionId, voiceOn: hello.voiceOn, clients: this.clients.size });
+		this.log("listener.hello", { sessionId: hello.sessionId, role, voiceOn: hello.voiceOn, clients: this.clients.size });
 		this.armIdle();
 	}
 
@@ -785,7 +813,7 @@ export class VoiceListener {
 							state: this.currentState,
 							listenerPid: this.pid,
 							clients: this.clients.size,
-							sessions: [...this.clients.values()].flatMap((entry) => (entry.sessionId ? [entry.sessionId] : [])),
+							sessions: [...this.sessionIds],
 						},
 						request.id,
 					),
@@ -1022,10 +1050,16 @@ export class VoiceListener {
 
 	// Voice on for one session, through the broadcast a session's own voice on
 	// sends: the flag armIdle and the overlay read, and the frame every session
-	// already receives when voice turns on.
-	private turnVoiceOn(client: Client): void {
+	// already receives when voice turns on. A wake says so on the frame of the
+	// session it woke, and on no other: the others only learn that voice is on.
+	private turnVoiceOn(client: Client, wake = false): void {
 		client.voiceOn = true;
-		this.broadcast({ type: "command", command: "voice-on" });
+		if (!wake) {
+			this.broadcast({ type: "command", command: "voice-on" });
+			return;
+		}
+		for (const other of this.clients.values()) if (other !== client) this.say(other, { type: "command", command: "voice-on" });
+		this.say(client, { type: "command", command: "voice-on", wake: true });
 	}
 
 	// L10: voice off from any source reaches every session, and a reading that is
@@ -1143,17 +1177,20 @@ export class VoiceListener {
 		// was read: a wake never fights another path into the microphone.
 		if (this.currentState !== "asleep" || this.spotting || this.capture || this.reading || this.closing) return;
 		const paneId = "focused" in lookup ? lookup.focused : undefined;
-		const target = paneId === undefined ? undefined : [...this.clients.values()].find((client) => client.sessionId && client.paneId === paneId);
+		const target =
+			paneId === undefined
+				? undefined
+				: [...this.clients.values()].find((client) => client.role === "session" && client.sessionId && client.paneId === paneId);
 		if (!target) {
 			// Nobody to wake: nothing turns on and the listener keeps listening.
 			this.startSpotting();
 			return;
 		}
 		this.log("kws.wake", { sessionId: target.sessionId });
-		this.turnVoiceOn(target);
+		this.turnVoiceOn(target, true);
 		this.setState("listening");
-		// The wake is audible where the window makes it visible.
-		this.playCue("open", { sessionId: target.sessionId });
+		// No cue here: the capture the woken session starts plays the one open cue,
+		// and only once the microphone is really recording.
 	}
 
 	// A spotter that cannot open the microphone is dropped for the rest of the
@@ -1459,7 +1496,7 @@ export class VoiceListener {
 		this.armIdle();
 	}
 
-	private forget(client: Client): void {
+	private forget(client: Client, close: (socket: Socket) => void = (socket) => socket.destroy()): void {
 		if (!this.clients.delete(client.socket)) return;
 		if (this.reading && !this.reading.ended && this.reading.socket === client.socket) this.endReading("closed");
 		// The session that was recording is gone: the microphone goes with it.
@@ -1469,7 +1506,7 @@ export class VoiceListener {
 			this.log("capture.closed", { sessionId: capture.sessionId, mode: capture.mode });
 			void capture.dictation.cancel().catch(() => {});
 		}
-		client.socket.destroy();
+		close(client.socket);
 		this.log("listener.client-closed", { sessionId: client.sessionId, clients: this.clients.size });
 		this.armIdle();
 	}

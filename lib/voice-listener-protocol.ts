@@ -30,8 +30,14 @@ export const LISTENER_COMMANDS = ["voice-off", "voice-on"] as const;
 export type ListenerCommand = (typeof LISTENER_COMMANDS)[number];
 export const LISTENER_ERRORS = ["bad-frame", "bad-hello", "too-many-clients", "rate-limit", "unknown-request", "internal"] as const;
 export type ListenerErrorCode = (typeof LISTENER_ERRORS)[number];
-export const LISTENER_BYE_REASONS = ["idle", "shutdown", "error"] as const;
+export const LISTENER_BYE_REASONS = ["idle", "shutdown", "error", "replaced"] as const;
 export type ListenerByeReason = (typeof LISTENER_BYE_REASONS)[number];
+// Which connection of a session this is (S6). One session holds two at once: the
+// long-lived one that carries the microphone, the wake and the voice frames, and
+// the one a reply is read on. A hello without a role is the session's own, which
+// is what every peer wrote before the role existed.
+export const LISTENER_CONNECTION_ROLES = ["session", "reading"] as const;
+export type ListenerConnectionRole = (typeof LISTENER_CONNECTION_ROLES)[number];
 // How a reading ended. The first three are the session's own report; the rest
 // are the listener taking the turn back (a stale lease, a cut, a gone session,
 // a closing listener).
@@ -89,6 +95,7 @@ export interface HelloRequest {
 	paneId?: string;
 	voiceOn: boolean;
 	label?: string;
+	role?: ListenerConnectionRole;
 }
 
 export type ListenerRequest =
@@ -132,7 +139,7 @@ export type ListenerFrame =
 	| { type: "state"; state: ListenerState; at: number; language?: ListenerLanguage; paneId?: string; label?: string }
 	// One display level: the microphone RMS, 0..1, and when it was measured.
 	| { type: "level"; rms: number; at: number }
-	| { type: "command"; command: ListenerCommand }
+	| { type: "command"; command: ListenerCommand; wake?: boolean }
 	| { type: "transcript"; text: string; truncated?: boolean }
 	// What became of the capture: its phase, why it failed, and where the
 	// transcript went when another session had the focus.
@@ -168,7 +175,8 @@ type Kind =
 	| "mode"
 	| "phase"
 	| "capture-error"
-	| "endpoint";
+	| "endpoint"
+	| "role";
 
 const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const MAX_FIELD = 256;
@@ -186,6 +194,7 @@ const KINDS: Record<Kind, (value: unknown) => boolean> = {
 	command: (value) => LISTENER_COMMANDS.includes(value as ListenerCommand),
 	error: (value) => LISTENER_ERRORS.includes(value as ListenerErrorCode),
 	reason: (value) => LISTENER_BYE_REASONS.includes(value as ListenerByeReason),
+	role: (value) => LISTENER_CONNECTION_ROLES.includes(value as ListenerConnectionRole),
 	outcome: (value) => READING_OUTCOMES.includes(value as ReadingOutcome),
 	release: (value) => READING_RELEASE_REASONS.includes(value as ReadingReleaseReason),
 	change: (value) => value === "granted" || value === "released",
@@ -221,7 +230,10 @@ interface Spec {
 const ID: Record<string, Kind> = { id: "string" };
 
 const REQUEST_SPECS: Record<string, Spec> = {
-	hello: { required: { proto: "proto", sessionId: "session", voiceOn: "boolean" }, optional: { paneId: "string", label: "string", ...ID } },
+	hello: {
+		required: { proto: "proto", sessionId: "session", voiceOn: "boolean" },
+		optional: { paneId: "string", label: "string", role: "role", ...ID },
+	},
 	"set-voice": { required: { voiceOn: "boolean" }, optional: { ...ID } },
 	wake: { required: {}, optional: { ...ID } },
 	sleep: { required: {}, optional: { ...ID } },
@@ -243,7 +255,8 @@ const FRAME_SPECS: Record<string, Spec> = {
 	snapshot: { required: { state: "state", listenerPid: "pid", clients: "counter", sessions: "sessions" }, optional: { ...ID } },
 	state: { required: { state: "state", at: "number" }, optional: { language: "language", paneId: "string", label: "string" } },
 	level: { required: { rms: "rms", at: "counter" } },
-	command: { required: { command: "command" } },
+	// Only a voice on can be a wake: nothing else means "start listening here".
+	command: { required: { command: "command" }, optional: { wake: "boolean" }, check: (record) => record.wake === undefined || record.command === "voice-on" },
 	transcript: { required: { text: "text" }, optional: { truncated: "boolean" } },
 	// A failure always names its code, and only a failure carries one.
 	capture: { required: { phase: "phase" }, optional: { code: "capture-error", target: "session" }, check: (record) => (record.phase === "failed") === (record.code !== undefined) },
