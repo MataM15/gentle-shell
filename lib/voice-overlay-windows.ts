@@ -11,9 +11,12 @@ import { resolvePowerShell, windowsSpeechAvailable } from "./voice-speech.ts";
 // lib/voice-cues-windows.ts: the host is spawned with an encoded bootstrap that
 // reads scripts/voice-overlay-window.ps1 from the first stdin line (the script
 // is far larger than a command line allows), then every command is one short
-// line on stdin. A state change is answered `ok state`; levels and the
-// recording flag are fire and forget, written at most once per interval with
-// only the newest value ever kept.
+// line on stdin. A state change is answered `ok state`; levels are fire and
+// forget, written at most once per interval with only the newest value ever
+// kept. Whether the microphone records is never guessed from the levels: it
+// travels with the snapshot and is written as `rec 1` / `rec 0` right after the
+// state it belongs to, so a quiet microphone is never shown as a closed one and
+// a loud one never claims an open microphone (S10).
 //
 // This module never throws into the listener: a missing PowerShell, a missing
 // script, a host that exits, refuses or hangs all reject the call that was
@@ -55,17 +58,12 @@ export interface WindowsOverlayOptions {
 	idleMs?: number;
 	// Levels are written at most this often; only the newest is kept.
 	levelIntervalMs?: number;
-	// How long without a level before the microphone counts as not recording.
-	recordingTimeoutMs?: number;
 }
 
 // PowerShell and WPF take a second or two to start.
 const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_IDLE_MS = 30 * 60_000;
 const DEFAULT_LEVEL_INTERVAL_MS = 40;
-// The worker publishes a level every 50 ms while it records; a second without
-// one means the microphone is not recording.
-const DEFAULT_RECORDING_TIMEOUT_MS = 1_000;
 const KILL_GRACE_MS = 2_000;
 
 export function createWindowsOverlay(options: WindowsOverlayOptions): VoiceOverlay {
@@ -73,7 +71,6 @@ export function createWindowsOverlay(options: WindowsOverlayOptions): VoiceOverl
 	const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 	const idleMs = options.idleMs ?? DEFAULT_IDLE_MS;
 	const levelIntervalMs = options.levelIntervalMs ?? DEFAULT_LEVEL_INTERVAL_MS;
-	const recordingTimeoutMs = options.recordingTimeoutMs ?? DEFAULT_RECORDING_TIMEOUT_MS;
 	const readScript = options.readScript ?? ((path: string) => readFileSync(path, "utf8"));
 
 	let host: { proc: Proc; alive: boolean } | undefined;
@@ -86,10 +83,11 @@ export function createWindowsOverlay(options: WindowsOverlayOptions): VoiceOverl
 	// starts is worse than no window.
 	let failed: Error | undefined;
 
-	// The state the window was last told and whether the microphone records.
+	// The state the window was last told, and whether it was told the microphone
+	// records: a state line resets the window's own flag, so a false one only has
+	// to be written when the window held true.
 	let shown: VoiceOverlaySnapshot["state"] | undefined;
 	let recording = false;
-	let recordingTimer: ReturnType<typeof setTimeout> | undefined;
 	// While reading the port receives the raw RMS of the speech the player
 	// started (the listener hands it over untouched), so the overlay runs it
 	// through the output meter. In listening the listener's own microphone meter
@@ -137,9 +135,8 @@ export function createWindowsOverlay(options: WindowsOverlayOptions): VoiceOverl
 		shown = undefined;
 		recording = false;
 		latest = undefined;
-		if (recordingTimer) clearTimeout(recordingTimer);
 		if (levelTimer) clearTimeout(levelTimer);
-		recordingTimer = levelTimer = undefined;
+		levelTimer = undefined;
 		return error;
 	};
 	const start = (): NonNullable<typeof host> => {
@@ -226,11 +223,6 @@ export function createWindowsOverlay(options: WindowsOverlayOptions): VoiceOverl
 			write(current, line);
 		});
 
-	const setRecording = (value: boolean) => {
-		if (recording === value) return;
-		recording = value;
-		if (host?.alive && !failed) write(host, `rec ${value ? 1 : 0}`);
-	};
 	const flushLevel = () => {
 		levelTimer = undefined;
 		if (latest === undefined || !host?.alive || failed || disposed) return;
@@ -260,35 +252,32 @@ export function createWindowsOverlay(options: WindowsOverlayOptions): VoiceOverl
 				} catch (error) {
 					throw fail(error instanceof Error ? error : new Error("overlay host failed to start"));
 				}
-				// The new state starts without a recording: the window draws the
-				// listening presentation only after the first level proves it.
+				// A state line resets the window's recording flag, so the truth of this
+				// snapshot follows it: `rec 1` when the microphone records, and `rec 0`
+				// only to withdraw a recording the window was holding.
+				const held = recording;
 				recording = false;
-				if (recordingTimer) clearTimeout(recordingTimer);
-				recordingTimer = undefined;
 				latest = undefined;
 				shown = snapshot.state;
 				outputMeter.reset();
 				await command(current, line);
+				if (snapshot.recording === true) {
+					recording = true;
+					write(current, "rec 1");
+				} else if (held) {
+					write(current, "rec 0");
+				}
 				armIdle();
 			});
 		},
 		level: (value) => {
 			if (disposed) return;
 			if (failed) return Promise.reject(failed);
-			// A level before any window exists starts nothing, and only the two
-			// states that draw a wave take one.
+			// A level draws the wave and never says anything about the microphone:
+			// only the snapshot's `recording` flag decides that (S10). A level before
+			// any window exists starts nothing, and only the two states that draw a
+			// wave take one.
 			if (!host?.alive || (shown !== "listening" && shown !== "reading")) return;
-			if (shown === "listening") {
-				// A level proves the microphone records; a second without one does not.
-				// (A reading's levels are the played speech: no claim about the microphone.)
-				setRecording(true);
-				if (recordingTimer) clearTimeout(recordingTimer);
-				recordingTimer = setTimeout(() => {
-					recordingTimer = undefined;
-					setRecording(false);
-				}, recordingTimeoutMs);
-				recordingTimer.unref?.();
-			}
 			// Only the newest value is kept; one write per interval at most.
 			latest = shown === "reading" ? outputMeter.push(value) : value;
 			if (levelTimer) return;
@@ -304,9 +293,8 @@ export function createWindowsOverlay(options: WindowsOverlayOptions): VoiceOverl
 			if (disposed) return;
 			disposed = true;
 			if (idle) clearTimeout(idle);
-			if (recordingTimer) clearTimeout(recordingTimer);
 			if (levelTimer) clearTimeout(levelTimer);
-			recordingTimer = levelTimer = undefined;
+			levelTimer = undefined;
 			latest = undefined;
 			// A pending state change is released, not left hanging.
 			if (waiting) {

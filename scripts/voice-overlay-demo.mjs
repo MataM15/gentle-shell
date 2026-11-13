@@ -11,15 +11,16 @@ const FRAME_MS = 50;
 // The demo always ends, even if the window host hangs.
 const HARD_LIMIT_MS = 70_000;
 
-// One row per thing to look at. `level` says what the port would receive in that
-// state: a display value 0..1 while listening, the raw loudness of the played
-// speech while reading, nothing otherwise.
+// One row per thing to look at. `recording` is the listener's own word that the
+// microphone is open; `level` says what the port would receive in that state: a
+// display value 0..1 while recording, the raw loudness of the played speech
+// while reading, nothing otherwise.
 const STEPS = [
-	{ title: "listening, microphone recording", state: "listening", language: "es", label: "Gentle Voice", seconds: 8, level: "display" },
+	{ title: "listening, microphone recording", state: "listening", language: "es", label: "Gentle Voice", seconds: 8, recording: true, level: "display" },
 	{ title: "transcribing", state: "transcribing", language: "es", label: "Gentle Voice", seconds: 5 },
 	{ title: "reading, bars follow the speech", state: "reading", language: "es", label: "voice-control", seconds: 8, level: "output" },
 	{ title: "asleep", state: "asleep", language: "es", seconds: 5 },
-	{ title: "listening in English", state: "listening", language: "en", label: "Gentle Voice", seconds: 5, level: "display" },
+	{ title: "listening in English", state: "listening", language: "en", label: "Gentle Voice", seconds: 5, recording: true, level: "display" },
 	{ title: "awake, microphone closed", state: "listening", language: "es", label: "Gentle Voice", seconds: 5 },
 ];
 
@@ -59,7 +60,7 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) process.once(signal, () =>
 try {
 	for (const step of STEPS) {
 		console.log(`voice-overlay-demo: ${step.title} (${step.seconds} s)`);
-		await overlay.show({ state: step.state, language: step.language, label: step.label });
+		await overlay.show({ state: step.state, language: step.language, label: step.label, recording: step.recording === true });
 		const frames = Math.round((step.seconds * 1000) / FRAME_MS);
 		for (let frame = 0; frame < frames && !closed; frame++) {
 			if (step.level) {

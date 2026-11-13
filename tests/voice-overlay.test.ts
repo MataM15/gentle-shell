@@ -70,15 +70,18 @@ test("a display level travels as a whole percent from 0 to 100", () => {
 });
 
 test("the state line carries the label as base64 so nothing can end or split it", () => {
-	const line = encodeOverlayState({ state: "listening", language: "es", label: "Gentle\nVoice ñ" });
+	const line = encodeOverlayState({ state: "listening", language: "es", label: "Gentle\nVoice ñ", recording: false });
 	const parts = line.split(" ");
 	assert.deepEqual(parts.slice(0, 3), ["state", "listening", "es"]);
 	assert.equal(Buffer.from(parts[3]!, "base64").toString("utf8"), "Gentle Voice ñ");
 	assert.ok(!line.includes("\n"));
-	assert.equal(encodeOverlayState({ state: "asleep", language: "en" }), "state asleep en -");
-	assert.equal(encodeOverlayState({ state: "reading", language: "es", label: " \n " }), "state reading es -");
-	assert.throws(() => encodeOverlayState({ state: "confirm" as never, language: "es" }));
-	assert.throws(() => encodeOverlayState({ state: "asleep", language: "fr" as never }));
+	assert.equal(encodeOverlayState({ state: "asleep", language: "en", recording: false }), "state asleep en -");
+	assert.equal(encodeOverlayState({ state: "reading", language: "es", label: " \n ", recording: false }), "state reading es -");
+	// The recording flag is its own `rec 1` / `rec 0` line after the state, so the
+	// state line is byte for byte what it always was.
+	assert.equal(encodeOverlayState({ state: "listening", language: "es", recording: true }), "state listening es -");
+	assert.throws(() => encodeOverlayState({ state: "confirm" as never, language: "es", recording: false }));
+	assert.throws(() => encodeOverlayState({ state: "asleep", language: "fr" as never, recording: false }));
 });
 
 // The output meter (T12/T13): a reading's level is the RMS of the speech the

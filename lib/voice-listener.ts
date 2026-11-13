@@ -23,7 +23,7 @@ import {
 	READING_OUTCOMES,
 } from "./voice-listener-protocol.ts";
 import type { CueName, CuePlayer, CueResult } from "./voice-cues.ts";
-import { createLevelMeter, type LevelMeter, type VoiceOverlay } from "./voice-overlay.ts";
+import { createLevelMeter, type LevelMeter, type VoiceOverlay, type VoiceOverlaySnapshot } from "./voice-overlay.ts";
 import { VoiceSessionError, type VoiceSessionState, type VoiceTranscript } from "./voice-session.ts";
 
 // One voice listener for every Pi session (S6, odd/notes/voice-listener-design.md).
@@ -374,6 +374,9 @@ export class VoiceListener {
 	private levelAt: number | undefined;
 	private reading: ActiveReading | undefined;
 	private capture: ActiveCapture | undefined;
+	// True only while the capture really records, from the worker's own report to
+	// the moment the recording ends (S10). Levels never change it.
+	private recording = false;
 	private server: Server | undefined;
 	private readonly clients = new Map<Socket, Client>();
 	private currentState: ListenerState = "asleep";
@@ -476,6 +479,8 @@ export class VoiceListener {
 		// A capture ends with the listener: its worker is a child of this process.
 		const capture = this.capture;
 		this.capture = undefined;
+		// The window is being disposed below, but the flag never outlives the recording.
+		this.recording = false;
 		if (capture) void capture.dictation.cancel().catch(() => {});
 		for (const client of [...this.clients.values()]) {
 			// end() flushes the bye before the FIN; a client that never closes is
@@ -806,12 +811,18 @@ export class VoiceListener {
 			if (capture.cue !== "none") return;
 			capture.cue = "open";
 			this.playCue("open", capture);
+			// The microphone really records from here: the window is told so, and a
+			// recording edge alone draws a new snapshot even when the state repeats.
+			this.setRecording(true);
 			this.setState("listening");
 			this.say(client, { type: "capture", phase: "recording" });
 			return;
 		}
 		if (capture.cue !== "open") return;
 		capture.cue = "closed";
+		// The worker stopped recording: the microphone is closed before the state
+		// says what happens to the audio, so no snapshot ever pairs them.
+		this.setRecording(false);
 		if (state === "transcribing") {
 			this.setState("transcribing");
 			this.say(client, { type: "capture", phase: "transcribing" });
@@ -881,6 +892,9 @@ export class VoiceListener {
 	private releaseCapture(capture: ActiveCapture): void {
 		if (this.capture !== capture) return;
 		this.capture = undefined;
+		// Whatever ended the capture (a stop, a cancel, a failure, a worker or a
+		// session that left), the microphone is closed from this moment.
+		this.setRecording(false);
 		// The meter of a recording ends with it: the next one starts empty.
 		this.levelMeter.reset();
 		this.levelAt = undefined;
@@ -940,8 +954,10 @@ export class VoiceListener {
 		void result.then(
 			() => this.overlayIdle(),
 			() => {
-				this.overlayIdle();
+				// The overlay is dropped before a queued call is released: a window that
+				// failed is never handed another one, and `overlay.failed` is logged once.
 				this.dropOverlay(overlay);
+				if (this.overlayBusy) this.overlayIdle();
 			},
 		);
 	}
@@ -1112,8 +1128,24 @@ export class VoiceListener {
 		// a session label the microphone identically (design §2.2).
 		const owner = this.stateOwner();
 		this.broadcast({ type: "state", state: next, language: this.language, ...owner, at: this.now() });
-		this.drawOverlay((overlay) => overlay.show({ state: next, language: this.language, ...owner }));
+		this.drawSnapshot();
 		this.armIdle();
+	}
+
+	// The recording edge is a display change of its own (S10): a session that is
+	// awake with the microphone closed looks different from one that is recording,
+	// and the state alone cannot tell them apart.
+	private setRecording(value: boolean): void {
+		if (this.recording === value) return;
+		this.recording = value;
+		this.drawSnapshot();
+	}
+
+	// The snapshot is the state frame's owner plus the one thing the frame never
+	// carries, and it is drawn on a state change or on a recording change only.
+	private drawSnapshot(): void {
+		const snapshot: VoiceOverlaySnapshot = { state: this.currentState, language: this.language, recording: this.recording, ...this.stateOwner() };
+		this.drawOverlay((overlay) => overlay.show(snapshot));
 	}
 
 	// Who owns what the listener is showing: the session that asked for the

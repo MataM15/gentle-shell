@@ -167,7 +167,7 @@ $pillXaml = @"
             <Path Name='MicA' Data='M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3z' Stroke='#1A1116' StrokeThickness='1.8' StrokeStartLineCap='Round' StrokeEndLineCap='Round' StrokeLineJoin='Round'/>
             <Path Name='MicB' Data='M6 11v1a6 6 0 0 0 12 0v-1M12 18v3' Stroke='#1A1116' StrokeThickness='1.8' StrokeStartLineCap='Round' StrokeEndLineCap='Round' StrokeLineJoin='Round'/>
           </Canvas>
-          <Canvas Name='IcoSpin' RenderTransformOrigin='0.5,0.5'>
+          <Canvas Name='IcoSpin' Width='24' Height='24' RenderTransformOrigin='0.5,0.5'>
             <Canvas.RenderTransform><RotateTransform x:Name='Spin' Angle='0'/></Canvas.RenderTransform>
             <Path Name='SpinA' Data='M12 3a9 9 0 1 1-9 9' Stroke='#E6BB62' StrokeThickness='1.8' StrokeStartLineCap='Round' StrokeEndLineCap='Round' StrokeLineJoin='Round'/>
           </Canvas>

@@ -21,12 +21,17 @@ export const OVERLAY_SPEECH_RMS = 0.016;
 export const OVERLAY_ATTACK = 0.6;
 export const OVERLAY_RELEASE = 0.25;
 
-// What the overlay shows: the state, the language, and the session that owns
-// the capture or the reading, so the window can name it. All of it is display
-// data; nothing here is used to route a transcript.
+// What the overlay shows: the state, the language, whether the microphone
+// really records, and the session that owns the capture or the reading, so the
+// window can name it. All of it is display data; nothing here is used to route a
+// transcript.
 export interface VoiceOverlaySnapshot {
 	readonly state: ListenerState;
 	readonly language: ListenerLanguage;
+	// True from the moment the capture really records to the moment it stops
+	// recording, and false at every other time in every state (S10). The listener
+	// sets it from the worker's own report; a level never claims it.
+	readonly recording: boolean;
 	readonly label?: string;
 	readonly paneId?: string;
 }
@@ -105,7 +110,10 @@ const OVERLAY_STATES: readonly string[] = ["asleep", "listening", "transcribing"
 const OVERLAY_LANGUAGES: readonly string[] = ["es", "en"];
 
 // `state <state> <language> <label in base64, or - when there is none>`: the
-// label travels as base64 so no character of it can end or split the line.
+// label travels as base64 so no character of it can end or split the line. The
+// recording flag is not part of it: it is the separate `rec 1`/`rec 0` line the
+// window takes after the state was acknowledged, so the state line stays what it
+// always was.
 export function encodeOverlayState(snapshot: VoiceOverlaySnapshot): string {
 	if (!OVERLAY_STATES.includes(snapshot.state)) throw new Error("overlay: unknown state");
 	if (!OVERLAY_LANGUAGES.includes(snapshot.language)) throw new Error("overlay: unknown language");

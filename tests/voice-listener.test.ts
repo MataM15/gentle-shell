@@ -655,6 +655,41 @@ function fakeCapture(options: { text?: string; truncated?: boolean; error?: Voic
 	};
 }
 
+interface ManualCapture {
+	readonly requests: ListenerDictationRequest[];
+	// One worker edge the real worker would report.
+	state(state: VoiceSessionState): void;
+	readonly factory: (request: ListenerDictationRequest) => ListenerDictation;
+}
+
+// A capture the test drives edge by edge: the worker reports nothing until the
+// test says so, so a capture that was asked for but does not record yet is
+// visible as such.
+function manualCapture(options: { error?: VoiceSessionErrorCode } = {}): ManualCapture {
+	const requests: ListenerDictationRequest[] = [];
+	let notify: (state: VoiceSessionState) => void = () => {};
+	return {
+		requests,
+		state: (state) => notify(state),
+		factory: (request) => {
+			requests.push(request);
+			notify = request.onStateChange;
+			return {
+				start: async () => {},
+				stop: async () => {
+					notify("transcribing");
+					notify("finished");
+					if (options.error) throw new VoiceSessionError(options.error);
+					return { text: "hola", truncated: false };
+				},
+				cancel: async () => {
+					notify("finished");
+				},
+			};
+		},
+	};
+}
+
 const cuePlayer = (): CuePlayer => ({ play: async (name) => ({ name, outcome: "done", ms: 3 }), warm: () => {}, dispose: () => {} });
 const phases = (client: Client) => client.frames.flatMap((frame) => (frame.type === "capture" ? [frame.phase] : []));
 const states = (events: Array<{ event: string; fields?: Record<string, unknown> }>) => events.flatMap((entry) => (entry.event === "listener.state" ? [entry.fields?.state] : []));
@@ -994,7 +1029,12 @@ test("the overlay sees every state change, the owning session and the smoothed l
 	asker.send({ type: "dictate", id: "d1", mode: "conversation" });
 	await awaitFrame(asker, (frame) => "id" in frame && frame.id === "d1");
 	await awaitFrame(asker, (frame) => frame.type === "capture" && frame.phase === "recording");
-	assert.deepEqual(overlay.snapshots, [{ state: "listening", language: "es", label: "repo", paneId: "w1:p1" }]);
+	// The capture is asked for first and the worker reports recording second, so
+	// the window sees both edges (S10: the microphone is only shown open when it is).
+	assert.deepEqual(overlay.snapshots, [
+		{ state: "listening", language: "es", recording: false, label: "repo", paneId: "w1:p1" },
+		{ state: "listening", language: "es", recording: true, label: "repo", paneId: "w1:p1" },
+	]);
 	// The state frame names the same owning session, so a session can label it.
 	assert.deepEqual(framesOf(asker, "state"), [{ type: "state", state: "listening", language: "es", paneId: "w1:p1", label: "repo", at: 7 }]);
 
@@ -1004,14 +1044,153 @@ test("the overlay sees every state change, the owning session and the smoothed l
 	await awaitFrame(asker, (frame) => "id" in frame && frame.id === "d2");
 	await awaitFrame(asker, (frame) => frame.type === "capture" && frame.phase === "delivered");
 	assert.deepEqual(
-		overlay.snapshots.map((snapshot) => snapshot.state),
-		["listening", "transcribing", "listening"],
-		"every state change, and nothing invented in between",
+		overlay.snapshots.map((snapshot) => [snapshot.state, snapshot.recording]),
+		[
+			["listening", false],
+			["listening", true],
+			["listening", false],
+			["transcribing", false],
+			["listening", false],
+		],
+		"every state change and every recording edge, nothing invented in between",
 	);
-	assert.deepEqual(overlay.snapshots.at(-1), { state: "listening", language: "es" }, "no session owns the microphone between captures");
+	assert.deepEqual(overlay.snapshots.at(-1), { state: "listening", language: "es", recording: false }, "no session owns the microphone between captures");
 	asker.socket.destroy();
 	await started.listener.close();
 	assert.equal(overlay.disposed(), 1, "the overlay is disposed with the listener");
+});
+
+test("the snapshot says recording only between the worker's report and the end of the recording (S10)", async () => {
+	const dir = scratch();
+	const overlay = fakeOverlay();
+	const capture = manualCapture();
+	const started = await startListener(dir, {
+		dictation: capture.factory,
+		overlay: overlay.overlay,
+		now: () => 7,
+		focus: { focusedPaneId: async () => ({ focused: "w1:p1" }) },
+	});
+	const asker = await started.client();
+	asker.send({ type: "hello", proto: 1, sessionId: "s-1", paneId: "w1:p1", voiceOn: true, label: "repo" });
+	await waitFor(() => framesOf(asker, "welcome").length === 1);
+
+	asker.send({ type: "dictate", id: "d1", mode: "conversation" });
+	await awaitFrame(asker, (frame) => "id" in frame && frame.id === "d1");
+	assert.deepEqual(
+		overlay.snapshots,
+		[{ state: "listening", language: "es", recording: false, label: "repo", paneId: "w1:p1" }],
+		"a capture that has not reported recording yet is not a recording",
+	);
+
+	capture.state("recording");
+	await waitFor(() => overlay.snapshots.length === 2);
+	assert.deepEqual(
+		overlay.snapshots.at(-1),
+		{ state: "listening", language: "es", recording: true, label: "repo", paneId: "w1:p1" },
+		"recording alone is a new snapshot, because the state did not change",
+	);
+
+	// Levels are the wave, never a claim about the microphone: they arrive after
+	// the flag and add no snapshot of their own.
+	capture.requests.at(-1)!.onLevel(0.016);
+	await waitFor(() => overlay.levels.length === 1);
+	assert.equal(overlay.snapshots.length, 2, "a level never redraws the state");
+
+	asker.send({ type: "stop", id: "d2" });
+	await awaitFrame(asker, (frame) => frame.type === "capture" && frame.phase === "delivered");
+	assert.deepEqual(
+		overlay.snapshots.map((snapshot) => [snapshot.state, snapshot.recording]),
+		[
+			["listening", false],
+			["listening", true],
+			// The microphone closes before the state says what happens to the audio, so
+			// no snapshot ever shows a closed microphone as recording.
+			["listening", false],
+			["transcribing", false],
+			["listening", false],
+		],
+		"recording is true only while the worker records",
+	);
+	asker.socket.destroy();
+	await started.listener.close();
+});
+
+test("every way a capture can end publishes recording false, and never turns it back on (S10)", async () => {
+	for (const ending of ["stop", "cancel", "worker-error", "session-close"] as const) {
+		const overlay = fakeOverlay();
+		const capture = manualCapture({ error: ending === "worker-error" ? "worker-exited" : undefined });
+		const started = await startListener(scratch(), { dictation: capture.factory, overlay: overlay.overlay, focus: { focusedPaneId: async () => ({ focused: "w1:p1" }) } });
+		const asker = await started.client();
+		asker.hello("s-1", "w1:p1");
+		await waitFor(() => framesOf(asker, "welcome").length === 1);
+
+		asker.send({ type: "dictate", id: "d1", mode: "conversation" });
+		await awaitFrame(asker, (frame) => "id" in frame && frame.id === "d1");
+		capture.state("recording");
+		await waitFor(() => overlay.snapshots.some((snapshot) => snapshot.recording));
+
+		if (ending === "cancel") asker.send({ type: "cancel", id: "d2" });
+		else if (ending === "session-close") asker.socket.destroy();
+		else asker.send({ type: "stop", id: "d2" });
+
+		const phase = ending === "cancel" ? "cancelled" : ending === "worker-error" ? "failed" : "delivered";
+		if (ending === "session-close") await waitFor(() => started.listener.clientCount === 0);
+		else await awaitFrame(asker, (frame) => frame.type === "capture" && frame.phase === phase);
+
+		assert.equal(overlay.snapshots.filter((snapshot) => snapshot.recording).length, 1, `${ending}: recording was claimed exactly once`);
+		assert.equal(overlay.snapshots.at(-1)?.recording, false, `${ending}: the microphone is published closed when the capture ends`);
+		if (ending !== "session-close") asker.socket.destroy();
+		await started.listener.close();
+		assert.equal(overlay.disposed(), 1, `${ending}: the overlay still closes with the listener`);
+	}
+});
+
+test("a level is never read as the microphone recording (S10)", async () => {
+	const overlay = fakeOverlay();
+	const capture = manualCapture();
+	const started = await startListener(scratch(), { dictation: capture.factory, overlay: overlay.overlay, focus: { focusedPaneId: async () => ({ focused: "w1:p1" }) } });
+	const asker = await started.client();
+	asker.hello("s-1", "w1:p1");
+	await waitFor(() => framesOf(asker, "welcome").length === 1);
+	asker.send({ type: "dictate", id: "d1", mode: "conversation" });
+	await awaitFrame(asker, (frame) => "id" in frame && frame.id === "d1");
+
+	// The worker is not recording, so a level it publishes anyway is no evidence.
+	capture.requests.at(-1)!.onLevel(0.9);
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.deepEqual(overlay.levels, [], "no wave is drawn before the recording is reported");
+	assert.deepEqual(overlay.snapshots.map((snapshot) => snapshot.recording), [false], "and no recording is claimed");
+	asker.socket.destroy();
+	await started.listener.close();
+});
+
+test("the client's state frame is unchanged: the recording flag never reaches a session", async () => {
+	const overlay = fakeOverlay();
+	const capture = manualCapture();
+	const started = await startListener(scratch(), { dictation: capture.factory, overlay: overlay.overlay, now: () => 7, focus: { focusedPaneId: async () => ({ focused: "w1:p1" }) } });
+	const asker = await started.client();
+	asker.send({ type: "hello", proto: 1, sessionId: "s-1", paneId: "w1:p1", voiceOn: true, label: "repo" });
+	await waitFor(() => framesOf(asker, "welcome").length === 1);
+
+	asker.send({ type: "dictate", id: "d1", mode: "conversation" });
+	await awaitFrame(asker, (frame) => "id" in frame && frame.id === "d1");
+	capture.state("recording");
+	await waitFor(() => overlay.snapshots.some((snapshot) => snapshot.recording));
+	asker.send({ type: "stop", id: "d2" });
+	await awaitFrame(asker, (frame) => frame.type === "capture" && frame.phase === "delivered");
+
+	assert.deepEqual(
+		framesOf(asker, "state"),
+		[
+			{ type: "state", state: "listening", language: "es", paneId: "w1:p1", label: "repo", at: 7 },
+			{ type: "state", state: "transcribing", language: "es", paneId: "w1:p1", label: "repo", at: 7 },
+			{ type: "state", state: "listening", language: "es", at: 7 },
+		],
+		"the wire protocol is untouched: one frame per state change, never one per recording edge",
+	);
+	for (const frame of framesOf(asker, "state")) assert.ok(!("recording" in frame), "no recording field on the client protocol");
+	asker.socket.destroy();
+	await started.listener.close();
 });
 
 test("an overlay that throws is logged once and never breaks the capture", async () => {

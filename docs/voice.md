@@ -466,7 +466,10 @@ a session that asks for a capture only receives the transcript.
   `design/voice-overlay/03-bordes-y-pildora.html`). It is a WPF window started
   through PowerShell on the cue host's shape: one warm process, one short line
   per command on stdin, a state change acknowledged and the levels fire and
-  forget, at most one every 40 ms with only the newest kept. It is always on top,
+  forget, at most one every 40 ms with only the newest kept. A state line is
+  followed by `rec 1` or `rec 0`: the snapshot's `recording` flag is the only
+  truth about an open microphone, so the window never has to infer it from the
+  audio. It is always on top,
   click-through (a click on it reaches the window underneath), never takes the
   focus, and is absent from the taskbar and Alt+Tab. It appears on the monitor
   that holds the foreground window when a state starts. Everything is local:
@@ -476,9 +479,13 @@ a session that asks for a capture only receives the transcript.
     rose and breathe with the microphone level, and the pill shows a mic badge,
     "ESCUCHANDO", the session label, a mirrored wave and the language chip.
   - **Awake but not recording:** a small quiet pill ("voz activa, micrófono
-    cerrado") with no glow and no wave. The full listening look is only ever drawn
-    while levels are arriving, so it never says the microphone is open when it is
-    not; a second without a level withdraws it.
+    cerrado") with no glow and no wave. The full listening look is drawn from the
+    snapshot's explicit `recording` flag, never guessed from the audio: the
+    listener sets it when the worker reports that it is recording and clears it
+    when that recording ends (a stop, a cancel, a failure, the session closing or
+    the listener leaving), in every state. Levels never turn it on and a quiet
+    microphone never turns it off, so the window cannot say the microphone is
+    open when it is not, and a silent moment never hides an open microphone.
   - **Transcribing:** an amber bar sweeps along the top edge and the pill shows a
     spinner and "TRANSCRIBIENDO…".
   - **Reading:** a green glow along the bottom edge only, a speaker badge,
