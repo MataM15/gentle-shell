@@ -1,0 +1,19 @@
+# Keyword lines for the local keyword spotter (lib/voice-artifacts.ts, S7).
+#
+# One line per spelling: `command: pieces`. One command may have several lines, so a
+# pronunciation variant can be added here and re-measured with the offline probe in
+# odd/notes/voice-kws.md before any threshold changes.
+#
+# The pieces are the sentencepiece tokens of
+# sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01, taken from its tokens.txt. The
+# standalone `▁` between "gentle" and "voice" is required: this model splits the
+# boundary that way and folding it into the next word drops recall sharply. The leading
+# `▁` on the first piece is required too.
+#
+# The spotter is tuned globally (keywordsScore 2.0, keywordsThreshold 0.25), so this
+# file carries no per-line `:boost` or `#threshold` suffix.
+#
+# `cancel` is a known command with no line yet: the spoken word for it is still being
+# measured, and a file without it is valid.
+voice-on: ▁G ENT LE ▁ VO IC E ▁ON
+voice-off: ▁G ENT LE ▁ VO IC E ▁OF F

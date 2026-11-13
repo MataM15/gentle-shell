@@ -1,20 +1,27 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, sep } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { gzipSync } from "node:zlib";
 import { gentlePiConfigHome } from "../lib/agent-home.ts";
-import type { VoiceModelManifest, VoiceNpmPackage, VoiceRuntimeManifest } from "../lib/voice-artifacts.ts";
+import { KWS_MODEL_MANIFEST, KWS_SPOTTER_FILES, type VoiceArchiveManifest, type VoiceModelManifest, type VoiceNpmPackage, type VoiceRuntimeManifest } from "../lib/voice-artifacts.ts";
 import {
+	createTarExtractor,
+	installVoiceKeywordSpotter,
 	installVoiceModel,
 	installVoiceRuntime,
 	readVoiceComponentStatus,
+	readVoiceStatus,
 	resolveVoiceHome,
+	resolveVoiceKeywordSpotterPaths,
 	VoiceInstallError,
+	type VoiceExtractRequest,
+	type VoiceExtractor,
 	type VoiceFetch,
 	type VoiceInstallProgress,
+	type VoiceSpawn,
 } from "../lib/voice-install.ts";
 
 // Optional voice acquisition (S1-S3): the runtime and the Parakeet model are
@@ -320,4 +327,249 @@ test("a runtime is refused for a target outside the five known ones", async (t) 
 	await rejects(installVoiceRuntime({ voiceHome, target: "win32-arm64" as never, fetch }), "unsupported");
 	assert.deepEqual(calls, []);
 	assert.equal(existsSync(voiceHome), false);
+});
+
+// --- Keyword spotter archive ------------------------------------------------
+// The wake-word model (S7) ships as one .tar.bz2, so it is downloaded like the other
+// artifacts and then extracted by the system tar. Everything below injects the network
+// and the extractor: no test downloads or runs a real tar, and the real extraction was
+// proved once by hand (see docs/voice.md).
+
+const KWS_URL = "https://github.com/acme/sherpa-onnx/releases/download/kws-models/fake-kws.tar.bz2";
+const KWS_CDN = "https://release-assets.githubusercontent.com/github-production-release-asset/1/fake-kws.tar.bz2?sig=1";
+const KWS_PREFIX = "fake-kws-dir";
+
+const spotterFiles = (): Record<string, Buffer> => ({
+	[KWS_SPOTTER_FILES.encoder]: Buffer.from("encoder-bytes-".repeat(16)),
+	[KWS_SPOTTER_FILES.decoder]: Buffer.from("decoder-bytes-".repeat(8)),
+	[KWS_SPOTTER_FILES.joiner]: Buffer.from("joiner-bytes-".repeat(4)),
+	[KWS_SPOTTER_FILES.tokens]: Buffer.from("a 0\nb 1\n"),
+});
+
+function kwsFixture(options: { archive?: Buffer; served?: Buffer; files?: Record<string, Buffer> } = {}) {
+	const archive = options.archive ?? Buffer.from("pinned-archive-bytes");
+	const files = options.files ?? spotterFiles();
+	const manifest: VoiceArchiveManifest = {
+		id: "fake-kws-zipformer-2024-01-01",
+		revision: "2024-01-01",
+		archive: { url: KWS_URL, size: archive.length, sha256: sha256(archive), format: "tar.bz2", prefix: KWS_PREFIX },
+		files: Object.entries(files).map(([name, data]) => ({ name, size: data.length, sha256: sha256(data) })),
+		redirects: [{ origin: "https://release-assets.githubusercontent.com", pathPrefix: "/github-production-release-asset/" }],
+	};
+	const routes: Record<string, Route> = {
+		[KWS_URL]: { status: 302, headers: { location: KWS_CDN } },
+		[KWS_CDN]: { chunks: halves(options.served ?? archive) },
+	};
+	return { manifest, files, routes };
+}
+
+const kwsMembers = (manifest: VoiceArchiveManifest) => manifest.files.map((file) => `${KWS_PREFIX}/${file.name}`);
+
+function fakeExtractor(write: (request: VoiceExtractRequest) => void): { extract: VoiceExtractor; calls: VoiceExtractRequest[] } {
+	const calls: VoiceExtractRequest[] = [];
+	return {
+		calls,
+		extract: async (request) => {
+			calls.push(request);
+			write(request);
+		},
+	};
+}
+
+const extracting = (files: Record<string, Buffer>) => fakeExtractor((request) => {
+	for (const [name, data] of Object.entries(files)) writeFileSync(join(request.destination, name), data);
+});
+
+interface SpawnResult { code?: number | null; error?: NodeJS.ErrnoException; hang?: boolean }
+
+function fakeSpawn(result: SpawnResult): { spawn: VoiceSpawn; calls: Array<{ command: string; args: string[]; options: { shell?: boolean } }>; killed: () => number } {
+	const calls: Array<{ command: string; args: string[]; options: { shell?: boolean } }> = [];
+	let killed = 0;
+	const spawn: VoiceSpawn = (command, args, options) => {
+		calls.push({ command, args: [...args], options });
+		const listeners: Record<string, Array<(value: never) => void>> = { error: [], close: [] };
+		if (result.error) queueMicrotask(() => listeners.error!.forEach((listener) => listener(result.error as never)));
+		else if (!result.hang) queueMicrotask(() => listeners.close!.forEach((listener) => listener((result.code ?? 0) as never)));
+		return {
+			on: (event: "error" | "close", listener: (value: never) => void) => { listeners[event]!.push(listener); return undefined as never; },
+			kill: () => { killed += 1; return true; },
+		};
+	};
+	return { spawn, calls, killed: () => killed };
+}
+
+const kwsRequest = (overrides: Partial<VoiceExtractRequest> = {}): VoiceExtractRequest => ({
+	archive: "/voice/.staging-x/archive.tar.bz2",
+	destination: "/voice/.staging-x/payload",
+	members: [`${KWS_PREFIX}/${KWS_SPOTTER_FILES.encoder}`],
+	timeoutMs: 1_000,
+	signal: new AbortController().signal,
+	...overrides,
+});
+
+async function extractRejects(extract: VoiceExtractor, code: string, request = kwsRequest()): Promise<VoiceInstallError> {
+	try { await extract(request); } catch (error) {
+		assert.ok(error instanceof VoiceInstallError, String(error));
+		assert.equal(error.code, code, error.message);
+		return error;
+	}
+	assert.fail(`expected ${code}`);
+}
+
+test("the keyword spotter archive is downloaded, extracted with the pinned members and published", async (t) => {
+	const voiceHome = scratch(t);
+	const { manifest, files, routes } = kwsFixture();
+	const fake = extracting(files);
+	const progress: VoiceInstallProgress[] = [];
+	const result = await installVoiceKeywordSpotter({ voiceHome, manifest, fetch: fakeFetch(routes).fetch, extract: fake.extract, onProgress: (event) => progress.push(event) });
+	assert.equal(result.kind, "kws");
+	assert.equal(result.alreadyInstalled, false);
+	assert.equal(result.path, join(voiceHome, "models", manifest.id));
+	assert.deepEqual(readdirSync(result.path).sort(), [".gentle-voice.json", ...manifest.files.map((file) => file.name)].sort());
+	for (const [name, data] of Object.entries(files)) assert.equal(readFileSync(join(result.path, name)).equals(data), true, name);
+	assert.equal(fake.calls.length, 1);
+	const request = fake.calls[0]!;
+	assert.deepEqual(request.members, kwsMembers(manifest));
+	assert.ok(request.archive.startsWith(voiceHome + sep), "the archive is staged inside the voice home");
+	assert.ok(request.archive.endsWith(".tar.bz2"));
+	assert.ok(request.timeoutMs > 0);
+	assert.equal(progress.some((event) => event.phase === "download" && event.component === "kws"), true);
+	assert.equal(progress.some((event) => event.phase === "extract" && event.component === "kws"), true);
+	assert.equal((await readVoiceComponentStatus({ voiceHome, kind: "kws", manifest })).state, "installed");
+	assert.deepEqual(leftovers(voiceHome), []);
+});
+
+test("a second install of a valid keyword spotter is a no-op", async (t) => {
+	const voiceHome = scratch(t);
+	const { manifest, files, routes } = kwsFixture();
+	await installVoiceKeywordSpotter({ voiceHome, manifest, fetch: fakeFetch(routes).fetch, extract: extracting(files).extract });
+	const network = fakeFetch(routes);
+	const second = extracting(files);
+	const result = await installVoiceKeywordSpotter({ voiceHome, manifest, fetch: network.fetch, extract: second.extract });
+	assert.equal(result.alreadyInstalled, true);
+	assert.deepEqual(network.calls, []);
+	assert.deepEqual(second.calls, []);
+});
+
+test("an archive that does not match its pinned digest is never extracted", async (t) => {
+	const voiceHome = scratch(t);
+	const { manifest, files, routes } = kwsFixture({ served: Buffer.from("pinned-archive-byteZ") });
+	const fake = extracting(files);
+	await rejects(installVoiceKeywordSpotter({ voiceHome, manifest, fetch: fakeFetch(routes).fetch, extract: fake.extract }), "integrity");
+	assert.deepEqual(fake.calls, [], "nothing is extracted from an unverified archive");
+	assert.equal((await readVoiceComponentStatus({ voiceHome, kind: "kws", manifest })).state, "missing");
+	assert.deepEqual(leftovers(voiceHome), []);
+});
+
+test("an extracted file that does not match its pinned size or digest fails closed", async (t) => {
+	const voiceHome = scratch(t);
+	const { manifest, files, routes } = kwsFixture();
+	const tampered = { ...files, [KWS_SPOTTER_FILES.tokens]: Buffer.from("a 0\nc 2\n") };
+	const error = await rejects(installVoiceKeywordSpotter({ voiceHome, manifest, fetch: fakeFetch(routes).fetch, extract: extracting(tampered).extract }), "integrity");
+	assert.match(error.message, /does not match/);
+	assert.equal(error.message.includes(voiceHome), false, "the message names no path");
+	assert.equal((await readVoiceComponentStatus({ voiceHome, kind: "kws", manifest })).state, "missing");
+	assert.deepEqual(leftovers(voiceHome), []);
+});
+
+test("a missing member or an unexpected entry left by the extraction is refused", async (t) => {
+	const voiceHome = scratch(t);
+	const { manifest, files, routes } = kwsFixture();
+	const partial = { ...files };
+	delete (partial as Record<string, Buffer>)[KWS_SPOTTER_FILES.joiner];
+	const missing = await rejects(installVoiceKeywordSpotter({ voiceHome, manifest, fetch: fakeFetch(routes).fetch, extract: extracting(partial).extract }), "archive");
+	assert.match(missing.message, /joiner/);
+	assert.equal(missing.message.includes(voiceHome), false, "the message names no path");
+	const extra = fakeExtractor((request) => {
+		for (const [name, data] of Object.entries(files)) writeFileSync(join(request.destination, name), data);
+		writeFileSync(join(request.destination, "unexpected.bin"), "x");
+	});
+	const unexpected = await rejects(installVoiceKeywordSpotter({ voiceHome, manifest, fetch: fakeFetch(routes).fetch, extract: extra.extract }), "archive");
+	assert.match(unexpected.message, /unexpected\.bin/);
+	assert.equal((await readVoiceComponentStatus({ voiceHome, kind: "kws", manifest })).state, "missing");
+	assert.deepEqual(leftovers(voiceHome), []);
+});
+
+test("a link left by the extraction is refused instead of published", { skip: process.platform === "win32" && "needs symlinks" }, async (t) => {
+	const voiceHome = scratch(t);
+	const { manifest, files, routes } = kwsFixture();
+	const { symlinkSync } = await import("node:fs");
+	const linked = fakeExtractor((request) => {
+		for (const [name, data] of Object.entries(files)) writeFileSync(join(request.destination, name), data);
+		symlinkSync(join(request.destination, KWS_SPOTTER_FILES.encoder), join(request.destination, "linked.onnx"));
+	});
+	await rejects(installVoiceKeywordSpotter({ voiceHome, manifest, fetch: fakeFetch(routes).fetch, extract: linked.extract }), "archive");
+	assert.equal((await readVoiceComponentStatus({ voiceHome, kind: "kws", manifest })).state, "missing");
+	assert.deepEqual(leftovers(voiceHome), []);
+});
+
+test("tar extracts only the pinned members, without a shell, into the given directory", async () => {
+	const fake = fakeSpawn({ code: 0 });
+	await createTarExtractor(fake.spawn)(kwsRequest({ members: [`${KWS_PREFIX}/a.onnx`, `${KWS_PREFIX}/tokens.txt`] }));
+	assert.equal(fake.calls.length, 1);
+	const call = fake.calls[0]!;
+	assert.equal(call.command, "tar");
+	assert.deepEqual(call.args, ["-x", "-j", "-f", "/voice/.staging-x/archive.tar.bz2", "-C", "/voice/.staging-x/payload", "--strip-components=1", `${KWS_PREFIX}/a.onnx`, `${KWS_PREFIX}/tokens.txt`]);
+	assert.equal(call.options.shell, false);
+});
+
+test("a failing tar, a missing tar and a tar that never returns all fail closed with fixed messages", async () => {
+	const failing = fakeSpawn({ code: 2 });
+	const failed = await extractRejects(createTarExtractor(failing.spawn), "archive");
+	assert.match(failed.message, /tar exited with code 2/);
+	assert.equal(failed.message.includes("/voice"), false, "the message carries no path");
+	const missing = fakeSpawn({ error: Object.assign(new Error("spawn tar ENOENT"), { code: "ENOENT" }) });
+	const unsupported = await extractRejects(createTarExtractor(missing.spawn), "unsupported");
+	assert.match(unsupported.message, /tar/);
+	assert.equal(unsupported.message.includes("/voice"), false, "the message carries no path");
+	const hanging = fakeSpawn({ hang: true });
+	await extractRejects(createTarExtractor(hanging.spawn), "timeout", kwsRequest({ timeoutMs: 20 }));
+	assert.equal(hanging.killed(), 1);
+	const controller = new AbortController();
+	const running = fakeSpawn({ hang: true });
+	const pending = extractRejects(createTarExtractor(running.spawn), "aborted", kwsRequest({ signal: controller.signal }));
+	controller.abort(new VoiceInstallError("aborted", "Voice install was cancelled."));
+	await pending;
+	assert.equal(running.killed(), 1);
+});
+
+test("the keyword spotter status is reported only when the caller asks for it", async (t) => {
+	const voiceHome = scratch(t);
+	const absent = await readVoiceStatus({ voiceHome, target: "darwin-arm64", keywordSpotter: true });
+	assert.equal(absent.keywordSpotter?.state, "missing");
+	assert.equal(absent.keywordSpotter?.path, join(voiceHome, "models", KWS_MODEL_MANIFEST.id));
+	// Without the request the shape is the one that existed before this component.
+	const quiet = await readVoiceStatus({ voiceHome, target: "darwin-arm64" });
+	assert.deepEqual(Object.keys(quiet).sort(), ["model", "runtime", "voiceHome"]);
+	assert.equal("keywordSpotter" in quiet, false);
+	const withoutTarget = await readVoiceStatus({ voiceHome, keywordSpotter: true });
+	assert.deepEqual(Object.keys(withoutTarget).sort(), ["keywordSpotter", "model", "voiceHome"]);
+});
+
+test("the resolved spotter paths exist only for a valid component", async (t) => {
+	const voiceHome = scratch(t);
+	const { manifest, files, routes } = kwsFixture();
+	assert.equal(await resolveVoiceKeywordSpotterPaths({ voiceHome, manifest }), undefined);
+	const result = await installVoiceKeywordSpotter({ voiceHome, manifest, fetch: fakeFetch(routes).fetch, extract: extracting(files).extract });
+	assert.deepEqual(await resolveVoiceKeywordSpotterPaths({ voiceHome, manifest }), {
+		encoder: join(result.path, KWS_SPOTTER_FILES.encoder),
+		decoder: join(result.path, KWS_SPOTTER_FILES.decoder),
+		joiner: join(result.path, KWS_SPOTTER_FILES.joiner),
+		tokens: join(result.path, KWS_SPOTTER_FILES.tokens),
+	});
+	writeFileSync(join(result.path, KWS_SPOTTER_FILES.tokens), "changed");
+	assert.equal((await readVoiceComponentStatus({ voiceHome, kind: "kws", manifest })).state, "invalid");
+	assert.equal(await resolveVoiceKeywordSpotterPaths({ voiceHome, manifest }), undefined);
+});
+
+test("the runtime and the dictation model keep the paths and status they had", async (t) => {
+	const voiceHome = scratch(t);
+	const status = await readVoiceStatus({ voiceHome, target: "darwin-arm64" });
+	assert.equal(status.model.path, join(voiceHome, "models", "parakeet-tdt-0.6b-v3-int8-2bda32ec70b0"));
+	assert.equal(status.model.state, "missing");
+	assert.equal(status.runtime?.path, join(voiceHome, "runtime", "sherpa-onnx-1.13.8-node-cpal-1.0.0-darwin-arm64"));
+	assert.equal(status.runtime?.state, "missing");
+	assert.equal(existsSync(voiceHome), false, "status never creates the voice home");
+	// The archive component lives in its own directory and never answers for them.
+	assert.notEqual(status.model.path, join(voiceHome, "models", KWS_MODEL_MANIFEST.id));
 });

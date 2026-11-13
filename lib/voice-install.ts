@@ -1,12 +1,16 @@
 import { createHash } from "node:crypto";
-import { lstat, mkdir, mkdtemp, open, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { spawn as nodeSpawn } from "node:child_process";
+import { lstat, mkdir, mkdtemp, open, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, posix, sep } from "node:path";
 import { gunzipSync } from "node:zlib";
 import { gentlePiConfigHome } from "./agent-home.ts";
 import {
+	KWS_MODEL_MANIFEST,
+	KWS_SPOTTER_FILES,
 	PARAKEET_MODEL_MANIFEST,
 	VOICE_TARGETS,
 	voiceRuntimeManifest,
+	type VoiceArchiveManifest,
 	type VoiceModelManifest,
 	type VoiceNpmPackage,
 	type VoiceRedirectRule,
@@ -14,15 +18,17 @@ import {
 	type VoiceTarget,
 } from "./voice-artifacts.ts";
 
-// Explicit acquisition and status of the optional voice runtime and model (S1-S3).
-// Nothing runs at import: /gentle:voice calls these on request. A component is
-// downloaded into a private staging directory under the voice home, verified by
-// size and digest while it streams, and published with a single rename, with its
-// install marker written last. A failure removes only that staging directory, so
-// it never leaves a marker behind or alters a published component. Downloaded
-// code is written to disk only; it is never loaded or executed here.
+// Explicit acquisition and status of the optional voice runtime, dictation model and
+// wake-word keyword spotter (S1-S3, S7). Nothing runs at import: /gentle:voice calls
+// these on request. A component is downloaded into a private staging directory under
+// the voice home, verified by size and digest while it streams, and published with a
+// single rename, with its install marker written last. A failure removes only that
+// staging directory, so it never leaves a marker behind or alters a published
+// component. Downloaded code is written to disk only; it is never loaded or executed
+// here. The one archive this installer unpacks is extracted by the system tar into the
+// staging directory and verified file by file before anything is published.
 
-export type VoiceComponentKind = "runtime" | "model";
+export type VoiceComponentKind = "runtime" | "model" | "kws";
 
 export type VoiceInstallErrorCode = "aborted" | "timeout" | "http" | "redirect" | "size" | "integrity" | "archive" | "unsupported" | "io";
 
@@ -77,6 +83,12 @@ export interface VoiceRuntimeInstallOptions extends VoiceInstallCommonOptions {
 	manifest?: VoiceRuntimeManifest;
 }
 
+export interface VoiceKeywordSpotterInstallOptions extends VoiceInstallCommonOptions {
+	manifest?: VoiceArchiveManifest;
+	// Defaults to the system tar; tests inject a fake so none of them extract anything.
+	extract?: VoiceExtractor;
+}
+
 export interface VoiceInstallResult {
 	kind: VoiceComponentKind;
 	path: string;
@@ -94,9 +106,15 @@ const MARKER = ".gentle-voice.json";
 const MARKER_SCHEMA = 1;
 const MAX_REDIRECTS = 5;
 const IDLE_MS = 60_000;
-const TOTAL_MS: Record<VoiceComponentKind, number> = { runtime: 20 * 60_000, model: 2 * 60 * 60_000 };
+const TOTAL_MS: Record<VoiceComponentKind, number> = { runtime: 20 * 60_000, model: 2 * 60 * 60_000, kws: 10 * 60_000 };
+// Extracting a 17 MB archive is a few seconds of work; anything near this bound is stuck.
+const EXTRACT_MS = 2 * 60_000;
 const SAFE_ID = /^[a-z0-9][a-z0-9._-]*$/;
 const SAFE_FILE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+// Every component lives in one of two directories of the voice home; models of any
+// kind share `models/`, each in the directory its manifest id names.
+const COMPONENT_DIR: Record<VoiceComponentKind, string> = { runtime: "runtime", model: "models", kws: "models" };
 
 // Everything voice owns lives in one directory of the Gentle AI config home.
 export function resolveVoiceHome(env: NodeJS.ProcessEnv = process.env): string {
@@ -104,7 +122,7 @@ export function resolveVoiceHome(env: NodeJS.ProcessEnv = process.env): string {
 }
 
 export function voiceComponentPath(voiceHome: string, kind: VoiceComponentKind, manifest: { id: string }): string {
-	return join(voiceHome, kind === "model" ? "models" : "runtime", manifest.id);
+	return join(voiceHome, COMPONENT_DIR[kind], manifest.id);
 }
 
 interface Marker {
@@ -115,7 +133,9 @@ interface Marker {
 	files: Array<{ path: string; size: number }>;
 }
 
-const fingerprint = (manifest: VoiceModelManifest | VoiceRuntimeManifest) => createHash("sha256").update(JSON.stringify(manifest)).digest("hex");
+type VoiceManifest = VoiceModelManifest | VoiceRuntimeManifest | VoiceArchiveManifest;
+
+const fingerprint = (manifest: VoiceManifest) => createHash("sha256").update(JSON.stringify(manifest)).digest("hex");
 
 // Relative POSIX paths that resolve to the same file on every supported system:
 // no traversal, separators, drive or stream colons, control characters, Windows
@@ -129,7 +149,7 @@ function safeRelativeSegments(path: string): string[] | undefined {
 }
 
 // Reads only: a missing voice home is reported, never created.
-export async function readVoiceComponentStatus(options: { voiceHome: string; kind: VoiceComponentKind; manifest: VoiceModelManifest | VoiceRuntimeManifest }): Promise<VoiceComponentStatus> {
+export async function readVoiceComponentStatus(options: { voiceHome: string; kind: VoiceComponentKind; manifest: VoiceManifest }): Promise<VoiceComponentStatus> {
 	const { voiceHome, kind, manifest } = options;
 	const path = voiceComponentPath(voiceHome, kind, manifest);
 	const invalid = (reason: string): VoiceComponentStatus => ({ kind, state: "invalid", path, reason });
@@ -157,12 +177,29 @@ export async function readVoiceComponentStatus(options: { voiceHome: string; kin
 	return { kind, state: "installed", path };
 }
 
-export async function readVoiceStatus(options: { voiceHome?: string; env?: NodeJS.ProcessEnv; target?: VoiceTarget } = {}): Promise<{ voiceHome: string; model: VoiceComponentStatus; runtime?: VoiceComponentStatus }> {
+export interface VoiceStatusOptions {
+	voiceHome?: string;
+	env?: NodeJS.ProcessEnv;
+	target?: VoiceTarget;
+	// The wake-word model is optional and is not part of the dictation install, so this
+	// reader only looks for it when the caller asks; the other components never change.
+	keywordSpotter?: boolean;
+}
+
+export interface VoiceStatus {
+	voiceHome: string;
+	model: VoiceComponentStatus;
+	runtime?: VoiceComponentStatus;
+	keywordSpotter?: VoiceComponentStatus;
+}
+
+export async function readVoiceStatus(options: VoiceStatusOptions = {}): Promise<VoiceStatus> {
 	const voiceHome = options.voiceHome ?? resolveVoiceHome(options.env);
 	const model = await readVoiceComponentStatus({ voiceHome, kind: "model", manifest: PARAKEET_MODEL_MANIFEST });
-	if (!options.target || !VOICE_TARGETS.includes(options.target)) return { voiceHome, model };
+	const keywordSpotter = options.keywordSpotter ? await readVoiceComponentStatus({ voiceHome, kind: "kws", manifest: KWS_MODEL_MANIFEST }) : undefined;
+	if (!options.target || !VOICE_TARGETS.includes(options.target)) return keywordSpotter ? { voiceHome, model, keywordSpotter } : { voiceHome, model };
 	const runtime = await readVoiceComponentStatus({ voiceHome, kind: "runtime", manifest: voiceRuntimeManifest(options.target) });
-	return { voiceHome, model, runtime };
+	return keywordSpotter ? { voiceHome, model, runtime, keywordSpotter } : { voiceHome, model, runtime };
 }
 
 // --- Transfer ---------------------------------------------------------------
@@ -263,7 +300,7 @@ async function download(url: string, expected: Expected, destination: string, tr
 
 type Build = (payload: string, staging: string, transfer: Transfer) => Promise<Marker["files"]>;
 
-async function install(kind: VoiceComponentKind, manifest: VoiceModelManifest | VoiceRuntimeManifest, overallTotalBytes: number, redirects: VoiceRedirectRule[], options: VoiceInstallCommonOptions, build: Build): Promise<VoiceInstallResult> {
+async function install(kind: VoiceComponentKind, manifest: VoiceManifest, overallTotalBytes: number, redirects: VoiceRedirectRule[], options: VoiceInstallCommonOptions, build: Build): Promise<VoiceInstallResult> {
 	if (options.signal?.aborted) throw new VoiceInstallError("aborted", "Voice install was cancelled.");
 	const voiceHome = options.voiceHome ?? resolveVoiceHome(options.env);
 	const finalPath = voiceComponentPath(voiceHome, kind, manifest);
@@ -312,7 +349,7 @@ async function install(kind: VoiceComponentKind, manifest: VoiceModelManifest | 
 // One rename publishes the complete payload. An invalid previous directory is
 // first moved into this install's staging, so it is restored if the rename fails
 // and discarded with the staging once the new component is in place.
-async function publish(kind: VoiceComponentKind, manifest: VoiceModelManifest | VoiceRuntimeManifest, voiceHome: string, staging: string, payload: string, finalPath: string): Promise<VoiceInstallResult> {
+async function publish(kind: VoiceComponentKind, manifest: VoiceManifest, voiceHome: string, staging: string, payload: string, finalPath: string): Promise<VoiceInstallResult> {
 	await mkdir(dirname(finalPath), { recursive: true, mode: 0o700 });
 	const existing = await readVoiceComponentStatus({ voiceHome, kind, manifest });
 	if (existing.state === "installed") return { kind, path: finalPath, alreadyInstalled: true };
@@ -452,4 +489,156 @@ export async function installVoiceRuntime(options: VoiceRuntimeInstallOptions): 
 		}
 		return files;
 	});
+}
+
+// --- Keyword spotter ----------------------------------------------------------
+
+// One extraction written by hand, so the archive step is injectable: no test ever
+// runs tar or downloads anything.
+export interface VoiceExtractRequest {
+	// The verified archive inside the staging directory.
+	archive: string;
+	// The empty component payload the pinned members are written into.
+	destination: string;
+	// Exact member names, each `<manifest prefix>/<kept file>`; nothing else is extracted.
+	members: string[];
+	timeoutMs: number;
+	signal: AbortSignal;
+}
+
+export type VoiceExtractor = (request: VoiceExtractRequest) => Promise<void>;
+
+export type VoiceSpawnOptions = { shell: false; stdio: "ignore"; windowsHide: true };
+
+export interface VoiceSpawnHandle {
+	on(event: "error", listener: (error: NodeJS.ErrnoException) => void): unknown;
+	on(event: "close", listener: (code: number | null) => void): unknown;
+	kill(): unknown;
+}
+
+// The child process is always started without a shell and with stdin and output
+// discarded: tar writes nothing we read, and its messages never reach an error.
+export type VoiceSpawn = (command: string, args: readonly string[], options: VoiceSpawnOptions) => VoiceSpawnHandle;
+
+const spawnProcess: VoiceSpawn = (command, args, options) => nodeSpawn(command, [...args], options as Parameters<typeof nodeSpawn>[2]);
+
+// Unpacks the pinned .tar.bz2 with the system tar, which reads bzip2 through `-j`.
+// Only the pinned member names are named, the release's wrapping directory is
+// stripped, and the destination is a fresh directory inside the staging area, so no
+// entry can be created outside it. A missing tar, a non-zero exit and a stuck
+// extraction all fail closed with a fixed message; tar's own output is discarded.
+export function createTarExtractor(spawn: VoiceSpawn = spawnProcess): VoiceExtractor {
+	return (request) => new Promise<void>((resolve, reject) => {
+		const args = ["-x", "-j", "-f", request.archive, "-C", request.destination, "--strip-components=1", ...request.members];
+		let child: VoiceSpawnHandle;
+		try {
+			child = spawn("tar", args, { shell: false, stdio: "ignore", windowsHide: true });
+		} catch (error) {
+			reject(new VoiceInstallError("unsupported", "The system tar could not be started, so the wake-word model cannot be unpacked.", { cause: error }));
+			return;
+		}
+		let settled = false;
+		const finish = (error?: VoiceInstallError) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			request.signal.removeEventListener("abort", onAbort);
+			if (error) reject(error); else resolve();
+		};
+		const timer = setTimeout(() => {
+			child.kill();
+			finish(new VoiceInstallError("timeout", `Extracting the wake-word model did not finish within ${request.timeoutMs} ms.`));
+		}, request.timeoutMs);
+		const onAbort = () => {
+			child.kill();
+			const reason = request.signal.reason;
+			finish(reason instanceof VoiceInstallError ? reason : new VoiceInstallError("aborted", "Voice install was cancelled."));
+		};
+		child.on("error", (error) => {
+			finish(error?.code === "ENOENT"
+				? new VoiceInstallError("unsupported", "Unpacking the wake-word model needs the system tar with bzip2 support, and tar was not found.", { cause: error })
+				: new VoiceInstallError("unsupported", "The system tar could not be started, so the wake-word model cannot be unpacked.", { cause: error }));
+		});
+		child.on("close", (code) => {
+			if (code === 0) finish();
+			else finish(new VoiceInstallError("archive", `tar exited with code ${String(code)} while unpacking the wake-word model.`));
+		});
+		request.signal.addEventListener("abort", onAbort, { once: true });
+		if (request.signal.aborted) onAbort();
+	});
+}
+
+function assertKeywordArchive(manifest: VoiceArchiveManifest): void {
+	const invalid = (reason: string): never => { throw new VoiceInstallError("unsupported", `The keyword spotter manifest is not usable: ${reason}.`); };
+	if (!SAFE_ID.test(manifest.id)) invalid("its id is not a plain lowercase name");
+	if (manifest.archive.format !== "tar.bz2") invalid("its archive is not a .tar.bz2");
+	if (!manifest.archive.url.startsWith("https://")) invalid("its archive url is not HTTPS");
+	if (!SAFE_FILE.test(manifest.archive.prefix)) invalid("its archive prefix is not a single safe directory name");
+	if (manifest.files.length === 0) invalid("it keeps no file");
+	const seen = new Set<string>();
+	for (const file of manifest.files) {
+		if (!SAFE_FILE.test(file.name)) invalid(`${String(file.name)} is not a plain file name`);
+		if (seen.has(file.name)) invalid(`${file.name} is listed twice`);
+		seen.add(file.name);
+	}
+}
+
+// Every kept file must match its pinned size and digest, and nothing else may be
+// left in the payload: a link, a directory or an entry the manifest does not name
+// means the extraction is not the one that was pinned.
+async function verifyExtraction(payload: string, manifest: VoiceArchiveManifest): Promise<Marker["files"]> {
+	const kept = new Set(manifest.files.map((file) => file.name));
+	for (const entry of await readdir(payload)) {
+		if (!kept.has(entry)) throw new VoiceInstallError("archive", `${manifest.id}: the extraction left ${entry}, which the manifest does not pin.`);
+	}
+	const files: Marker["files"] = [];
+	for (const file of manifest.files) {
+		const path = join(payload, file.name);
+		const info = await lstat(path).catch(() => undefined);
+		if (!info) throw new VoiceInstallError("archive", `${manifest.id}: ${file.name} is missing after extraction.`);
+		if (!info.isFile()) throw new VoiceInstallError("archive", `${manifest.id}: ${file.name} is not a regular file after extraction.`);
+		if (info.size !== file.size) throw new VoiceInstallError("integrity", `${manifest.id}: ${file.name} does not match its pinned size.`);
+		const digest = createHash("sha256").update(await readFile(path)).digest("hex");
+		if (digest !== file.sha256) throw new VoiceInstallError("integrity", `${manifest.id}: ${file.name} does not match its pinned sha256 digest.`);
+		files.push({ path: file.name, size: file.size });
+	}
+	return files;
+}
+
+// Downloads the pinned archive, verifies its digest before a single byte is
+// unpacked, extracts only the pinned members with the system tar, and publishes the
+// component only when every kept file matches its own pinned size and sha256.
+export async function installVoiceKeywordSpotter(options: VoiceKeywordSpotterInstallOptions = {}): Promise<VoiceInstallResult> {
+	const manifest = options.manifest ?? KWS_MODEL_MANIFEST;
+	assertKeywordArchive(manifest);
+	const extract = options.extract ?? createTarExtractor();
+	const total = manifest.files.reduce((sum, file) => sum + file.size, 0);
+	return install("kws", manifest, manifest.archive.size, manifest.redirects, options, async (payload, staging, transfer) => {
+		const archive = join(staging, "archive.tar.bz2");
+		await download(manifest.archive.url, { item: `${manifest.id}.tar.bz2`, size: manifest.archive.size, algorithm: "sha256", digest: manifest.archive.sha256 }, archive, transfer);
+		transfer.onProgress?.({ component: "kws", phase: "extract", item: manifest.id, receivedBytes: 0, totalBytes: total, overallReceivedBytes: transfer.overallReceivedBytes, overallTotalBytes: manifest.archive.size });
+		await extract({ archive, destination: payload, members: manifest.files.map((file) => `${manifest.archive.prefix}/${file.name}`), timeoutMs: EXTRACT_MS, signal: transfer.controller.signal });
+		return verifyExtraction(payload, manifest);
+	});
+}
+
+export interface VoiceKeywordSpotterPaths {
+	encoder: string;
+	decoder: string;
+	joiner: string;
+	tokens: string;
+}
+
+// The four files the spotter loads, resolved only while the component is published
+// and valid: absent, half extracted or changed on disk all mean no keyword spotting.
+export async function resolveVoiceKeywordSpotterPaths(options: { voiceHome: string; manifest?: VoiceArchiveManifest }): Promise<VoiceKeywordSpotterPaths | undefined> {
+	const manifest = options.manifest ?? KWS_MODEL_MANIFEST;
+	const status = await readVoiceComponentStatus({ voiceHome: options.voiceHome, kind: "kws", manifest });
+	if (status.state !== "installed") return undefined;
+	return {
+		encoder: join(status.path, KWS_SPOTTER_FILES.encoder),
+		decoder: join(status.path, KWS_SPOTTER_FILES.decoder),
+		joiner: join(status.path, KWS_SPOTTER_FILES.joiner),
+		tokens: join(status.path, KWS_SPOTTER_FILES.tokens),
+	};
 }

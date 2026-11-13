@@ -650,6 +650,35 @@ The model is the sherpa-onnx export
 `csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8`: `encoder.int8.onnx`,
 `decoder.int8.onnx`, `joiner.int8.onnx` and `tokens.txt`.
 
+### Wake-word keyword spotter (pinned, nothing uses it yet)
+
+"Gentle Voice on" and "Gentle Voice off" are meant to be heard by a local keyword
+spotter, and the model it needs is pinned next to the dictation model. No run-time
+code reads it yet: the wake word is not enabled, so having it installed changes no
+behavior.
+
+| Topic | Fact |
+|-------|------|
+| What it is | `sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01`, an English keyword spotter trained on GigaSpeech XL (10,000 h): zipformer transducer, 3.3 M parameters, int8. It can only ever report the keywords this repository pins, never free text. |
+| Where it comes from | The k2-fsa sherpa-onnx release tag `kws-models`, one `.tar.bz2` of 17,626,723 bytes. The one redirect followed is `release-assets.githubusercontent.com/github-production-release-asset/...`. |
+| What is kept | `encoder-…int8.onnx`, `decoder-…int8.onnx`, `joiner-…int8.onnx` and `tokens.txt`: 5,253,530 bytes in total. `bpe.model` (only needed to encode a new keyword), the fp32 variants, the example `keywords.txt` and the test audio are dropped. |
+| Licence | Apache-2.0, stated in the README inside the archive. |
+| Extraction | The archive is checked against its pinned size and SHA-256 before anything is unpacked, then unpacked by the system `tar`, which needs bzip2 support, without a shell and with only the pinned member names. Every kept file is then checked against its own size and SHA-256. A missing file, an unexpected entry, a link, a wrong digest, a missing `tar` or bzip2, a non-zero exit and a timeout each fail the install with a fixed message and publish nothing. |
+| Where it lands | `models/kws-zipformer-gigaspeech-3.3m-int8-2024-01-01/`, published with the same one-rename-and-marker rule as the other components. Status reports it as installed, absent or invalid, and only when the caller asks for it. |
+| Never executed | Nothing from the archive is loaded or run during the install; it is only written to disk. It is also optional: a missing one is never an install failure for dictation. |
+
+### The keyword file
+
+`assets/voice/kws-keywords.txt` ships with the package; it is not downloaded. Each
+line names the command it triggers, then the model's pieces, for example
+`voice-on: ▁G ENT LE ▁ VO IC E ▁ON`. That standalone `▁` between the words is what
+this model emits, and a line whose first piece loses its leading `▁` detects nothing.
+One command may appear on several lines, so another pronunciation can be added and
+measured without a code change. The known commands are `voice-on`, `voice-off` and
+`cancel`; the shipped file has lines for the first two only, because the spoken word
+for `cancel` is still being measured, and a file without one is valid. A malformed
+line, an unknown command and the same spelling twice are refused by the parser.
+
 ## Where it is stored
 
 Everything lives in `<Gentle AI config home>/voice` (by default

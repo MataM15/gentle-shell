@@ -1,8 +1,10 @@
-// Pinned artifacts for the optional local voice dictation (S1-S3). Nothing here is
-// fetched or resolved at runtime: every version, size and digest below was read
-// from the public npm registry and Hugging Face metadata for the exact versions,
-// and the tarball layouts were inspected for the facts the comments state.
-// Installation lives in voice-install.ts; this module is data only.
+// Pinned artifacts for the optional local voice dictation (S1-S3) and the wake-word
+// keyword spotter (S7). Nothing here is fetched or resolved at runtime: every
+// version, size and digest below was read from the public npm registry, Hugging
+// Face and GitHub release metadata for the exact versions, and the tarball layouts
+// were inspected for the facts the comments state. Installation lives in
+// voice-install.ts; this module is pinned data plus the parser for the keyword file
+// that ships with the package.
 
 export type VoiceTarget = "darwin-x64" | "darwin-arm64" | "linux-x64" | "linux-arm64" | "win32-x64";
 
@@ -49,6 +51,24 @@ export interface VoiceModelManifest {
 	revision: string;
 	// Files are fetched from `${baseUrl}/${name}`.
 	baseUrl: string;
+	files: VoiceModelFile[];
+	redirects: VoiceRedirectRule[];
+}
+
+// A model that ships as one compressed archive instead of one file per request.
+export interface VoiceArchiveManifest {
+	id: string;
+	revision: string;
+	archive: {
+		url: string;
+		size: number;
+		sha256: string;
+		// The only container the installer can unpack.
+		format: "tar.bz2";
+		// The directory the release wraps every member in; it is stripped on extraction.
+		prefix: string;
+	};
+	// The files kept from the archive, named as they land in the component directory.
 	files: VoiceModelFile[];
 	redirects: VoiceRedirectRule[];
 }
@@ -156,6 +176,108 @@ export const PARAKEET_MODEL_MANIFEST: VoiceModelManifest = {
 	],
 };
 
+// --- Wake-word keyword spotter (S7) -----------------------------------------
+
+// The four files the keyword spotter loads at run time, named exactly as the
+// release names them. The same archive also ships bpe.model (only needed to
+// encode a new keyword, never to run the spotter), the example keywords.txt, the
+// fp32 variants and test audio; none of those are kept.
+export const KWS_SPOTTER_FILES = {
+	encoder: "encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
+	decoder: "decoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
+	joiner: "joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
+	tokens: "tokens.txt",
+} as const;
+
+// sherpa-onnx's English keyword spotter for "Gentle Voice on" / "Gentle Voice off":
+// a zipformer transducer trained on GigaSpeech XL (10000 h), 3.3 M parameters,
+// Apache-2.0 (stated in the README the archive ships). Pinned from the verified
+// release tarball: one download, then the int8 set plus tokens.txt (5,253,530 bytes)
+// are kept. Observed redirect: github.com answers 302 to
+// release-assets.githubusercontent.com with a short-lived signed query string; no
+// other origin was seen, so others are refused rather than guessed.
+export const KWS_MODEL_MANIFEST: VoiceArchiveManifest = {
+	id: "kws-zipformer-gigaspeech-3.3m-int8-2024-01-01",
+	revision: "2024-01-01",
+	archive: {
+		url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01.tar.bz2",
+		size: 17626723,
+		sha256: "f170013b4716e41b62b9bfd809687c207cef798ef9bc6534d524e17af9b6561a",
+		format: "tar.bz2",
+		prefix: "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01",
+	},
+	files: [
+		{ name: KWS_SPOTTER_FILES.encoder, size: 4807159, sha256: "1e721676515bcd42a186979733981213c66c80db680e1cc582dfedf3be76e678" },
+		{ name: KWS_SPOTTER_FILES.decoder, size: 277985, sha256: "e40ff43297abe815e8898494c17e71bba2152d9d40fa3eb803f75d0f7533329a" },
+		{ name: KWS_SPOTTER_FILES.joiner, size: 163380, sha256: "eae9da0c7e1e6c6a3f4cc42d167899c388f6c6701b94cb96320e4f55df79624c" },
+		{ name: KWS_SPOTTER_FILES.tokens, size: 5006, sha256: "fd2ded4050a55d2b1578870ba8697d02371980217806b7558bd0a5cc60f3ba53" },
+	],
+	redirects: [{ origin: "https://release-assets.githubusercontent.com", pathPrefix: "/github-production-release-asset/" }],
+};
+
+// A spoken command the keyword spotter may report. Free text is never one.
+export type VoiceKeywordCommand = "voice-on" | "voice-off" | "cancel";
+
+export const VOICE_KEYWORD_COMMANDS: readonly VoiceKeywordCommand[] = ["voice-on", "voice-off", "cancel"];
+
+// The keyword lines are a repository artifact, not a download: they ship in the
+// package next to the code, so they are reviewable and versioned with it.
+export const VOICE_KEYWORD_ASSET = "assets/voice/kws-keywords.txt";
+
+export type VoiceKeywordErrorCode = "syntax" | "unknown-command" | "duplicate" | "empty";
+
+export class VoiceKeywordError extends Error {
+	readonly code: VoiceKeywordErrorCode;
+	// The 1-based line the file failed on, when the failure belongs to one line.
+	readonly line?: number;
+
+	constructor(code: VoiceKeywordErrorCode, message: string, line?: number) {
+		super(message);
+		this.name = "VoiceKeywordError";
+		this.code = code;
+		this.line = line;
+	}
+}
+
+export interface VoiceKeywordSet {
+	// The lines handed to the spotter, in file order, one per spelling.
+	lines: string[];
+	// What the spotter reports back (the piece sequence it matched) to its command.
+	commands: Map<string, VoiceKeywordCommand>;
+}
+
+// One line per spelling: `<command>: <pieces separated by spaces>`. A blank line or
+// one starting with `#` is a comment. One command may hold several lines, so a
+// pronunciation variant can be added and re-measured without touching code. The
+// global keywordsScore/keywordsThreshold tune every line, so a per-line `:boost` or
+// `#threshold` suffix is refused here instead of being half read.
+export function parseVoiceKeywords(text: string): VoiceKeywordSet {
+	const commands = new Map<string, VoiceKeywordCommand>();
+	const lines: string[] = [];
+	const firstLine = new Map<string, number>();
+	const source = text.replace(/^\uFEFF/, "").split(/\r?\n/);
+	for (const [index, raw] of source.entries()) {
+		const line = index + 1;
+		const trimmed = raw.trim();
+		if (trimmed === "" || trimmed.startsWith("#")) continue;
+		const colon = trimmed.indexOf(":");
+		if (colon === -1) throw new VoiceKeywordError("syntax", `line ${line} does not name a command: expected \`command: pieces\`.`);
+		const name = trimmed.slice(0, colon).trim();
+		if (!(VOICE_KEYWORD_COMMANDS as readonly string[]).includes(name)) throw new VoiceKeywordError("unknown-command", `line ${line} names the unknown command \`${name}\`.`);
+		const pieces = trimmed.slice(colon + 1).trim();
+		if (pieces === "") throw new VoiceKeywordError("syntax", `line ${line} gives no keyword for \`${name}\`.`);
+		if (/[:#\u0000-\u001f]/.test(pieces)) throw new VoiceKeywordError("syntax", `line ${line} may not use a per-line boost or threshold; the spotter is tuned globally.`);
+		const keyword = pieces.split(/\s+/).join(" ");
+		const previous = firstLine.get(keyword.toLowerCase());
+		if (previous !== undefined) throw new VoiceKeywordError("duplicate", `line ${line} repeats the spelling given on line ${previous}.`, line);
+		firstLine.set(keyword.toLowerCase(), line);
+		lines.push(keyword);
+		commands.set(keyword, name as VoiceKeywordCommand);
+	}
+	if (lines.length === 0) throw new VoiceKeywordError("empty", "the keyword file has no keyword line.");
+	return { lines, commands };
+}
+
 export interface VoiceNotice {
 	component: string;
 	license: string;
@@ -184,5 +306,12 @@ export const VOICE_NOTICES: readonly VoiceNotice[] = [
 		license: "ISC",
 		source: "https://github.com/saeta-eth/node-cpal",
 		unresolved: "The node-cpal@1.0.0 tarball ships no LICENSE or NOTICE file, and its prebuilt binaries link Rust crates whose notices are not included.",
+	},
+	{
+		component: "sherpa-onnx-kws-zipformer-gigaspeech-3.3m",
+		license: "Apache-2.0",
+		source: "https://github.com/k2-fsa/sherpa-onnx/releases/tag/kws-models",
+		attribution: "Keyword spotter for sherpa-onnx trained on GigaSpeech XL (10000 h) by the k2-fsa project, licensed under Apache-2.0.",
+		unresolved: "The release ships one .tar.bz2 whose README states the license; there is no separate LICENSE file, and only the int8 files and tokens.txt are installed.",
 	},
 ];
