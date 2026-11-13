@@ -968,6 +968,23 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			say("The voice setting could not be saved.", "error");
 			return;
 		}
+		// The listener's registration follows this session's persisted voice. An
+		// off session never starts a listener; an on session may join/start one.
+		const liveCtx = sessionCtx;
+		if (!deps.createSession && liveCtx && sessionIdOf(liveCtx) === id) {
+			if (passiveClient?.connected) {
+				passiveClient.updateVoice(enabled);
+			} else if (sessionLink) {
+				closePassive();
+				sessionLink.updateVoice?.(enabled);
+				if (enabled) joinAtStart(liveCtx);
+			} else if (enabled) {
+				closePassive();
+				joinAtStart(liveCtx);
+			} else {
+				passiveClient?.updateVoice(false);
+			}
+		}
 		if (!enabled) {
 			cutReadings();
 			// Another session may be the one speaking: the listener tells it to stop.
@@ -1650,7 +1667,9 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			try {
 				const client = new VoiceListenerClient({
 					dir: resolveVoiceHome(env),
-					session: { sessionId: id, paneId: paneIdOf(), label: labelOf(ctx), voiceOn: false },
+					session: () => sessionIdOf(sessionCtx) === id
+						? { sessionId: id, paneId: paneIdOf(), label: labelOf(sessionCtx), voiceOn: voiceOn(sessionCtx) }
+						: undefined,
 					onFrame: (frame) => {
 						if (passiveClient !== client) return;
 						if (frame.type === "command") receiveVoice(frame.command, frame.wake === true);

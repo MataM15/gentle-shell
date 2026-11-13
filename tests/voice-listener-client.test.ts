@@ -497,6 +497,44 @@ test("dictation reuses an in-flight startup join and sends exactly one hello", a
 	}
 });
 
+test("cancelling a hung shared join settles start and permits a fresh probe without a stale hello", async () => {
+	const dir = scratch();
+	const capture = fakeCapture();
+	const hellos: string[] = [];
+	const server = new VoiceListener({ dir, dictation: capture.factory, focus: focusedOn("w1:p1"), log: (event, fields) => { if (event === "listener.hello") hellos.push(String(fields?.sessionId)); } });
+	await server.listen();
+	let release!: (value: boolean) => void;
+	const gate = new Promise<boolean>((resolve) => { release = resolve; });
+	let probes = 0;
+	const link = createSessionListenerLink({ dir, session: () => session("s-1"), probe: () => ++probes === 1 ? gate : Promise.resolve(true) });
+	const joining = link.ensure();
+	const own = localCapture();
+	const first = link.dictate({ mode: "dictation", onStateChange: () => {}, fallback: () => own.dictation });
+	const starting = first.start();
+	try {
+		await waitFor(() => probes === 1);
+		await first.cancel();
+		const settled = await Promise.race([starting.then(() => "settled"), new Promise<string>((resolve) => setTimeout(() => resolve("hung"), 100))]);
+		assert.equal(settled, "settled", "cancel settles dictate.start before the probe returns");
+		assert.equal(await joining, false, "the shared startup join was retired");
+		assert.deepEqual(capture.calls, []);
+		assert.deepEqual(own.calls, []);
+		const retry = link.dictate({ mode: "dictation", onStateChange: () => {}, fallback: () => assert.fail("the listener is reachable") });
+		await retry.start();
+		assert.equal(probes, 2, "retry used a fresh probe before the old one returned");
+		release(true);
+		await new Promise((resolve) => setTimeout(resolve, 80));
+		assert.deepEqual(hellos, ["s-1"], "the retired probe cannot send a hello");
+		assert.equal(server.clientCount, 1);
+		assert.deepEqual(await retry.stop(), { text: "hola", truncated: false });
+		assert.deepEqual(capture.calls, ["start", "stop"]);
+	} finally {
+		release(true);
+		link.close();
+		await server.close();
+	}
+});
+
 test("cancelling dictation during startup never opens a capture when the listener arrives", async () => {
 	const dir = scratch();
 	const capture = fakeCapture();
@@ -515,6 +553,7 @@ test("cancelling dictation during startup never opens a capture when the listene
 		await server.listen();
 		release();
 		await recording;
+		assert.equal(await link.ensure(), true, "a fresh join can receive later transcripts");
 		assert.deepEqual(capture.calls, [], "the listener never opens the microphone");
 		assert.deepEqual(own.calls, [], "the local fallback never opens the microphone");
 		await server.deliverTranscript("from another session");
@@ -642,6 +681,34 @@ test("a session label is the session name, or the working directory's, sanitized
 	const long = sessionDisplayLabel({ name: "x".repeat(500) });
 	assert.equal(long?.length, SESSION_LABEL_MAX);
 	assert.ok(SESSION_LABEL_MAX <= 256, "well inside the protocol's field bound");
+});
+
+test("a voice change while hello awaits welcome is sent after the join", async () => {
+	const written: Array<Record<string, unknown>> = [];
+	class FakeSocket extends EventEmitter {
+		destroyed = false;
+		setEncoding() {}
+		write(chunk: string) { written.push(JSON.parse(chunk) as Record<string, unknown>); return true; }
+		destroy() { this.destroyed = true; return this; }
+	}
+	const socket = new FakeSocket();
+	let voiceOn = true;
+	const client = new VoiceListenerClient({ dir: scratch(), session: () => session("s-1", voiceOn), dial: () => socket as unknown as Socket });
+	const connecting = client.connect();
+	try {
+		queueMicrotask(() => socket.emit("connect"));
+		await waitFor(() => written.length === 1);
+		assert.equal(written[0]!.voiceOn, true);
+		voiceOn = false;
+		assert.equal(client.updateVoice(false), false, "the socket has not completed hello");
+		assert.equal(written.length, 1, "an update is never sent before hello completes");
+		socket.emit("data", encodeListenerFrame({ type: "welcome", id: String(written[0]!.id), listenerPid: 1, proto: 1, state: "asleep" }));
+		await connecting;
+		assert.deepEqual(written[1], { schema: "gentle.voice-listener/v1", type: "session-voice", voiceOn: false });
+		assert.equal(written.length, 2);
+	} finally {
+		client.close();
+	}
 });
 
 test("the hello carries the display label the session sends", async () => {
