@@ -785,6 +785,27 @@ test("a warm worker answers several recordings, verifying and loading the model 
 	assert.deepEqual(worker.types(), ["recording", "transcribing", "result", "recording", "transcribing", "result"]);
 });
 
+// A capture can end on its own (a spoken command, the endpoint) while the
+// listener's stop for it is already on the way: that late stop must not kill
+// the warm worker, which then still answers the next start.
+test("a warm worker ignores a stop that arrives after its capture already ended", async (t) => {
+	const reads = gatedReads();
+	reads.release();
+	const worker = harness(t, mono8k, { openRead: reads.openRead });
+	worker.send(startRequest(worker.paths, { keepAlive: true }));
+	await worker.waitFor(() => worker.types().includes("recording"));
+	worker.streams[0]!.options.onData(chunk(500, 0.3));
+	worker.send({ schema: SCHEMA, type: "stop" });
+	await worker.waitFor(() => worker.types().includes("result"));
+	worker.send({ schema: SCHEMA, type: "stop" });
+	worker.send(startRequest(worker.paths, { keepAlive: true }));
+	await worker.waitFor(() => worker.types().filter((type) => type === "recording").length === 2, "second recording");
+	assert.equal(worker.exitCode(), undefined, "the late stop did not end the worker");
+	assert.deepEqual(worker.types(), ["recording", "transcribing", "result", "recording"]);
+	worker.send({ schema: SCHEMA, type: "cancel" });
+	await worker.done;
+});
+
 test("a warm worker refuses close while recording", async (t) => {
 	const reads = gatedReads();
 	reads.release();

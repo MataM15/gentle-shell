@@ -450,6 +450,10 @@ class WorkerSession {
 		if (this.state === "waiting") {
 			// Only an idle worker may be closed; it leaves without a message.
 			if (hasExactKeys(message, ["schema", "type"]) && message.schema === SCHEMA && message.type === "close") return this.end(undefined);
+			// A capture that ended on its own (a spoken command, the endpoint) can
+			// cross the client's stop for it: that late stop has nothing left to do.
+			// Before any capture a stop is still a malformed start.
+			if (this.capturesEnded > 0 && hasExactKeys(message, ["schema", "type"]) && message.schema === SCHEMA && message.type === "stop") return undefined;
 			return this.begin(parseStart(message));
 		}
 		if (!hasExactKeys(message, ["schema", "type"]) || message.schema !== SCHEMA) fail("invalid-request");
@@ -856,6 +860,7 @@ class WorkerSession {
 	}
 
 	resetCapture() {
+		this.capturesEnded = (this.capturesEnded ?? 0) + 1;
 		this.state = "waiting";
 		this.recorder = undefined;
 		this.endpointer = undefined;
