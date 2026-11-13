@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { createServer } from "node:net";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import nodeTest from "node:test";
@@ -9,8 +10,9 @@ import gentleVoice from "../extensions/gentle-voice.ts";
 import { VoiceInstallError, type VoiceInstallProgress, type VoiceInstallResult } from "../lib/voice-install.ts";
 import { VoiceSessionError, type VoiceSessionState, type VoiceTranscript } from "../lib/voice-session.ts";
 import { createReadingTurn, CONVERSATION_ENDPOINT, HELD_REPLY_POLL_MS, HELD_REPLY_STALE_MS, VOICE_COMMAND_NAME, type VoiceCommandDeps, type VoiceDictation } from "../lib/voice-command.ts";
-import { VoiceListener, type ListenerDictation, type ListenerDictationRequest, type ListenerSpotFactory } from "../lib/voice-listener.ts";
-import { createSessionListenerLink } from "../lib/voice-listener-client.ts";
+import { listenerPaths, VoiceListener, type ListenerDictation, type ListenerDictationRequest, type ListenerSpotFactory } from "../lib/voice-listener.ts";
+import { createSessionListenerLink, VoiceListenerClient } from "../lib/voice-listener-client.ts";
+import { encodeListenerFrame } from "../lib/voice-listener-protocol.ts";
 import type { PaneFocus } from "../lib/voice-presence.ts";
 import type { CuePlayer } from "../lib/voice-cues.ts";
 import type { PushToTalkTimers } from "../lib/voice-push-to-talk.ts";
@@ -869,9 +871,7 @@ test("the toggle shortcut starts a dictation and the same shortcut stops it, pas
 });
 
 test("a toggle dictation records through the listener and this session only pastes the transcript", async () => {
-	const scratchRoot = join(import.meta.dirname, "..", "tmp");
-	mkdirSync(scratchRoot, { recursive: true });
-	const dir = mkdtempSync(join(scratchRoot, "voice-command-listener-"));
+	const dir = mkdtempSync(join(tmpdir(), "voice-command-listener-"));
 	const calls: string[] = [];
 	const dictation = (request: ListenerDictationRequest): ListenerDictation => ({
 		start: async () => { calls.push("start"); request.onStateChange("recording"); },
@@ -901,6 +901,287 @@ test("a toggle dictation records through the listener and this session only past
 	} finally {
 		await server.close();
 		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("a voice-on session joins at start without capture and receives a voice-off broadcast (S14, S6)", async () => {
+	const home = mkdtempSync(join(tmpdir(), "voice-command-awake-"));
+	const dir = join(home, "voice");
+	const requests: ListenerDictationRequest[] = [];
+	const hellos: Array<Record<string, unknown>> = [];
+	const server = new VoiceListener({
+		dir,
+		dictation: (request) => { requests.push(request); throw new Error("unexpected capture"); },
+		log: (event, fields) => { if (event === "listener.hello") hellos.push(fields ?? {}); },
+	});
+	let actor: VoiceListenerClient | undefined;
+	let pi: ReturnType<typeof fakePi> | undefined;
+	const ui = fakeContext();
+	await server.listen();
+	try {
+		const { engine } = fakeEngine();
+		const h = harness({ installed: true, voice: true, engine, env: { HERDR_PANE_ID: "w1:p1", GENTLE_PI_CONFIG_HOME: home } });
+		delete (h.deps as { createSession?: unknown }).createSession;
+		pi = register(h);
+		await pi.fire("session_start", ui.ctx);
+		await until(() => server.voiceSessions.includes("session-alpha"));
+		assert.ok(hellos.some((hello) => hello.sessionId === "session-alpha" && hello.role === "session" && hello.voiceOn === true));
+		assert.equal(requests.length, 0, "startup requests no capture");
+		assert.deepEqual(h.cues.filter((name) => name === "open" || name === "close"), [], "startup plays no cue");
+		assert.deepEqual(h.voice.sessions, ["session-alpha"]);
+		assert.equal(pi.counts.sends, 0);
+		assert.equal(ui.editor(), "draft: ");
+
+		actor = new VoiceListenerClient({ dir, session: { sessionId: "other", voiceOn: false }, role: "reading" });
+		await actor.connect();
+		await actor.request({ type: "set-voice", voiceOn: false });
+		await until(() => h.voice.sessions.length === 0);
+		assert.deepEqual(h.voice.writes, [[]], "the broadcast turns the persisted setting off");
+		assert.deepEqual(ui.notices.at(-1), { message: "Voice is off in this session.", type: "info" });
+		assert.equal(requests.length, 0);
+		assert.equal(pi.counts.sends, 0);
+		assert.equal(ui.editor(), "draft: ");
+	} finally {
+		actor?.close();
+		await pi?.fire("session_shutdown", ui.ctx);
+		await server.close();
+		rmSync(home, { recursive: true, force: true });
+	}
+});
+
+test("a new session id on the same context replaces the old listener registration", async () => {
+	const home = mkdtempSync(join(tmpdir(), "voice-command-new-session-"));
+	const dir = join(home, "voice");
+	const server = new VoiceListener({ dir, dictation: () => { throw new Error("unexpected capture"); } });
+	const { engine } = fakeEngine();
+	const h = harness({ installed: true, voice: true, engine, env: { GENTLE_PI_CONFIG_HOME: home } });
+	h.voice.sessions.push("session-beta");
+	delete (h.deps as { createSession?: unknown }).createSession;
+	const pi = register(h);
+	const ui = fakeContext();
+	let id = "session-alpha";
+	(ui.ctx.sessionManager as unknown as { getSessionId(): string }).getSessionId = () => id;
+	await server.listen();
+	try {
+		await pi.fire("session_start", ui.ctx);
+		await until(() => server.sessionIds.includes("session-alpha"));
+		id = "session-beta";
+		await pi.fire("session_start", ui.ctx);
+		await until(() => server.sessionIds.includes("session-beta"));
+		assert.deepEqual(server.sessionIds, ["session-beta"], "only the new session remains registered");
+		assert.deepEqual(server.voiceSessions, ["session-beta"]);
+		assert.deepEqual(h.cues.filter((name) => name === "open" || name === "close"), []);
+		assert.deepEqual(h.voice.writes, []);
+		assert.equal(ui.editor(), "draft: ");
+		assert.equal(pi.counts.sends, 0);
+	} finally {
+		await pi.fire("session_shutdown", ui.ctx);
+		await server.close();
+		rmSync(home, { recursive: true, force: true });
+	}
+});
+
+test("an unreachable listener at startup is logged and Alt+M still records locally (S10)", async () => {
+	const home = mkdtempSync(join(tmpdir(), "voice-command-offline-"));
+	const dir = join(home, "voice");
+	const { engine } = fakeEngine();
+	const h = harness({ installed: true, voice: true, engine, env: { HERDR_PANE_ID: "w1:p1", GENTLE_PI_CONFIG_HOME: home } });
+	delete (h.deps as { createSession?: unknown }).createSession;
+	const link = createSessionListenerLink({ dir, waitMs: 0, start: () => {}, session: () => ({ sessionId: "session-alpha", paneId: "w1:p1", voiceOn: true }) });
+	let local: FakeSession | undefined;
+	h.deps.listener = {
+		ensure: () => link.ensure(),
+		close: () => link.close(),
+		dictate: (request) => link.dictate({ ...request, fallback: () => (local = Object.assign(new FakeSession(request.onStateChange), { owner: "session" as const })) }),
+	};
+	const pi = register(h);
+	const ui = fakeContext();
+	try {
+		await pi.fire("session_start", ui.ctx);
+		await until(() => h.events.some((entry) => entry.event === "listener.join" && entry.result === "unavailable"));
+		assert.equal(local, undefined, "startup does not capture locally");
+		assert.deepEqual(h.cues.filter((name) => name === "open" || name === "close"), []);
+		assert.deepEqual(h.voice.sessions, ["session-alpha"]);
+		assert.deepEqual(h.voice.writes, [], "a missing listener changes no saved voice setting");
+		assert.equal(pi.counts.sends, 0);
+		assert.equal(ui.editor(), "draft: ");
+		assert.equal(ui.notices.length, 0, "a missing listener does not interrupt the session");
+		(ui.ctx.ui as unknown as { setEditorText(text: string): void }).setEditorText("");
+		const done = press(pi, ui);
+		await until(() => local !== undefined);
+		local!.started.resolve();
+		await until(() => local!.state === "recording");
+		await press(pi, ui);
+		await until(() => local!.calls.includes("stop"));
+		local!.result.resolve({ text: "hola local", truncated: false });
+		await done;
+		assert.deepEqual(local!.calls, ["start", "stop"]);
+		assert.deepEqual(pi.sent, [{ content: "hola local", options: undefined }]);
+		assert.deepEqual(h.cues.filter((name) => name === "open" || name === "close"), ["open", "close"]);
+	} finally {
+		await pi.fire("session_shutdown", ui.ctx);
+		rmSync(home, { recursive: true, force: true });
+	}
+});
+
+test("Alt+M supersedes a hanging startup join without waiting for it", async () => {
+	const gate = deferred<boolean>();
+	const { engine } = fakeEngine();
+	const h = harness({ installed: true, voice: true, engine });
+	delete (h.deps as { createSession?: unknown }).createSession;
+	let ensures = 0;
+	let local: FakeSession | undefined;
+	h.deps.listener = {
+		ensure: () => { ensures++; return gate.promise; },
+		close: () => {},
+		dictate: (request) => (local = Object.assign(new FakeSession(request.onStateChange), { owner: "session" as const })),
+	};
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	assert.equal(ensures, 1, "joining starts without blocking session_start");
+	(ui.ctx.ui as unknown as { setEditorText(text: string): void }).setEditorText("");
+	const done = press(pi, ui);
+	await until(() => local !== undefined);
+	await tick();
+	const startedBeforeJoinSettled = local!.calls.includes("start");
+	gate.resolve(false);
+	await until(() => local!.calls.includes("start"));
+	local!.started.resolve();
+	await until(() => local!.state === "recording");
+	await press(pi, ui);
+	local!.result.resolve({ text: "hola", truncated: false });
+	await done;
+	assert.deepEqual(local!.calls, ["start", "stop"]);
+	assert.deepEqual(pi.sent, [{ content: "hola", options: undefined }]);
+	await pi.fire("session_shutdown", ui.ctx);
+	assert.equal(startedBeforeJoinSettled, true, "the first Alt+M does not wait for startup plus a retry");
+});
+
+for (const outcome of ["success", "failure"] as const) test(`shutdown aborts a still-pending startup join before its late ${outcome}`, async () => {
+	const gate = deferred<boolean>();
+	const h = harness({ installed: true, voice: true });
+	delete (h.deps as { createSession?: unknown }).createSession;
+	let closed = 0;
+	h.deps.listener = {
+		ensure: () => gate.promise,
+		close: () => { closed++; },
+		dictate: () => { throw new Error("unexpected capture"); },
+	};
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	let stopped = false;
+	const shutdown = pi.fire("session_shutdown", ui.ctx).then(() => { stopped = true; });
+	await tick();
+	assert.equal(closed, 1, "the old link is closed immediately");
+	const stoppedBeforeJoinSettled = stopped;
+	if (outcome === "success") gate.resolve(true);
+	else gate.reject(new Error("listener unreachable"));
+	await shutdown;
+	await tick();
+	assert.equal(stoppedBeforeJoinSettled, true, "shutdown does not wait for the listener timeout");
+	assert.ok(closed >= 1, "the old connection stays closed");
+	assert.equal(h.events.some((entry) => entry.event === "listener.join"), false, "a dead session logs no late failure");
+	assert.equal(pi.counts.sends, 0);
+	assert.equal(ui.editor(), "draft: ");
+});
+
+test("a replaced startup connection sends no late hello or command to the new session", async () => {
+	const home = mkdtempSync(join(tmpdir(), "voice-command-stale-"));
+	const dir = join(home, "voice");
+	mkdirSync(dir);
+	const hellos: string[] = [];
+	const server = createServer((socket) => {
+		socket.setEncoding("utf8");
+		let buffered = "";
+		socket.on("data", (chunk) => {
+			buffered += chunk;
+			const newline = buffered.indexOf("\n");
+			if (newline < 0) return;
+			const hello = JSON.parse(buffered.slice(0, newline)) as { type: string; id: string; sessionId: string };
+			if (hello.type !== "hello") return;
+			hellos.push(hello.sessionId);
+			const welcome = encodeListenerFrame({ type: "welcome", id: hello.id, listenerPid: process.pid, proto: 1, state: "asleep" });
+			// Both frames arrive together, before the pending join can close itself.
+			const stale = hello.sessionId === "session-alpha"
+				? encodeListenerFrame({ type: "transcript", text: "stale" }) + encodeListenerFrame({ type: "command", command: "voice-off" })
+				: "";
+			socket.write(welcome + stale);
+		});
+	});
+	await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(listenerPaths(dir).socket, resolve); });
+	const { engine } = fakeEngine();
+	const h = harness({ installed: true, voice: true, engine, env: { GENTLE_PI_CONFIG_HOME: home, HERDR_PANE_ID: "w1:p1" } });
+	h.voice.sessions.push("session-beta");
+	delete (h.deps as { createSession?: unknown }).createSession;
+	const pi = register(h);
+	const old = fakeContext({}, "tui", true, "session-alpha");
+	const next = fakeContext({}, "tui", true, "session-beta");
+	try {
+		// Replacement happens while the old link is still probing the socket, before
+		// its client exists and the first close can reach it.
+		const first = pi.fire("session_start", old.ctx);
+		const second = pi.fire("session_start", next.ctx);
+		await Promise.all([first, second]);
+		await until(() => hellos.includes("session-beta"));
+		assert.deepEqual(hellos, ["session-beta"], "the aborted old connection never sends its hello");
+		assert.deepEqual(h.voice.sessions, ["session-alpha", "session-beta"], "the stale command cannot turn off the replacement");
+		assert.deepEqual(h.voice.writes, []);
+		assert.equal(h.events.some((entry) => entry.event === "transcript.received"), false, "the stale transcript is discarded");
+		assert.deepEqual(next.notices, []);
+		assert.equal(pi.counts.sends, 0);
+		assert.equal(next.editor(), "draft: ");
+	} finally {
+		await pi.fire("session_shutdown", next.ctx);
+		await new Promise<void>((resolve) => server.close(() => resolve()));
+		rmSync(home, { recursive: true, force: true });
+	}
+});
+
+test("voice-off startup with no listener does not ensure, spawn, capture, or change the session", async () => {
+	const home = mkdtempSync(join(tmpdir(), "voice-command-off-no-listener-"));
+	const h = harness({ installed: true, env: { GENTLE_PI_CONFIG_HOME: home } });
+	delete (h.deps as { createSession?: unknown }).createSession;
+	let ensures = 0;
+	h.deps.listener = {
+		ensure: async () => { ensures++; return false; },
+		close: () => {},
+		dictate: () => { throw new Error("unexpected capture"); },
+	};
+	const pi = register(h);
+	const ui = fakeContext();
+	try {
+		await pi.fire("session_start", ui.ctx);
+		await tick();
+		assert.equal(ensures, 0, "voice-off startup never starts a listener");
+		assert.deepEqual(h.voice.writes, []);
+		assert.deepEqual(h.cues, []);
+		assert.equal(pi.counts.sends, 0);
+		assert.equal(ui.editor(), "draft: ");
+	} finally {
+		await pi.fire("session_shutdown", ui.ctx);
+		rmSync(home, { recursive: true, force: true });
+	}
+});
+
+test("unsupported or non-shared session paths never join a listener at startup", async () => {
+	for (const scenario of ["child", "rpc", "anonymous", "local-factory"] as const) {
+		const h = harness({ installed: true, voice: true, env: scenario === "child" ? { GENTLE_PI_AGENTS_CHILD: "1" } : {} });
+		if (scenario !== "local-factory") delete (h.deps as { createSession?: unknown }).createSession;
+		let joins = 0;
+		h.deps.listener = {
+			ensure: async () => { joins++; return true; },
+			close: () => {},
+			dictate: () => { throw new Error("unexpected capture"); },
+		};
+		const pi = register(h);
+		const ui = fakeContext({}, scenario === "rpc" ? "rpc" : "tui", true, scenario === "anonymous" ? "" : "session-alpha");
+		await pi.fire("session_start", ui.ctx);
+		assert.equal(joins, 0, scenario);
+		assert.equal(pi.counts.sends, 0, scenario);
+		assert.equal(ui.editor(), "draft: ", scenario);
+		await pi.fire("session_shutdown", ui.ctx);
 	}
 });
 
@@ -2099,7 +2380,7 @@ test("in conversation mode the toggle key sends at once, and a busy agent gets i
 	assert.deepEqual(pi.sent, [{ content: "otra cosa", options: { deliverAs: "followUp" } }]);
 });
 
-test("a spoken wake leaves the focused session in the hands-free conversation alt+m starts, and only a wake does (S7, S11)", async () => {
+for (const reload of [false, true]) test(`a spoken wake reaches the focused session immediately after ${reload ? "reload" : "session start"} without Alt+M (S7, S11)`, async () => {
 	const { engine, readings } = fakeEngine();
 	const home = mkdtempSync(join(tmpdir(), "voice-command-wake-"));
 	const dir = join(home, "voice");
@@ -2156,28 +2437,33 @@ test("a spoken wake leaves the focused session in the hands-free conversation al
 		// The microphone and the reading turn both live in the listener: the session
 		// reaches it through its own link, as it does in production.
 		delete (h.deps as { createSession?: unknown }).createSession;
-		const pi = register(h);
-		const ui = fakeContext();
+		let pi = register(h);
+		let ui = fakeContext();
 		await pi.fire("session_start", ui.ctx);
-		// A session joins the listener with its first capture; voice is off, so it pastes.
-		const joining = press(pi, ui);
-		await reached(() => requests.length === 1);
-		await reached(() => /recording/i.test(ui.statuses.at(-1) ?? ""));
-		await press(pi, ui);
-		await joining;
-		assert.equal(ui.editor(), "draft: un dictado", "the session is joined to the listener");
+		await reached(() => server.sessionIds.includes("session-alpha"));
+		if (reload) {
+			await pi.fire("session_shutdown", ui.ctx);
+			await reached(() => server.clientCount === 0);
+			pi = register(h);
+			ui = fakeContext();
+			await pi.fire("session_start", ui.ctx);
+			await reached(() => server.sessionIds.includes("session-alpha"));
+		}
+		assert.deepEqual(h.voice.sessions, [], "voice starts off");
+		assert.equal(requests.length, 0, "joining does not start a dictation");
+		assert.deepEqual(cueNames, [], "joining plays no cue");
+		assert.deepEqual(h.cues, [], "the session plays no cue");
+		assert.equal(ui.editor(), "draft: ");
+		assert.equal(pi.counts.sends, 0);
 		(ui.ctx.ui as unknown as { setEditorText(text: string): void }).setEditorText("");
-		cueNames.length = 0;
-		// With no session that has voice on, the listener goes back to sleep and keeps
-		// its spot-only capture: that is where "Gentle Voice on" is heard.
-		await reached(() => spotStarts === 2);
+		await reached(() => spotStarts >= 1 && heard !== undefined);
 		heard!("voice-on");
 
 		// The wake leaves this session listening: the same hands-free conversation the
 		// shortcut starts, so it records, transcribes and sends on its own.
-		await reached(() => requests.length === 2);
-		assert.equal(requests[1]!.mode, "conversation", "the wake starts the conversation, not a pasting dictation");
-		assert.deepEqual(requests[1]!.endpoint, CONVERSATION_ENDPOINT, "with the endpointer the shortcut uses");
+		await reached(() => requests.length === 1);
+		assert.equal(requests[0]!.mode, "conversation", "the wake starts the conversation, not a pasting dictation");
+		assert.deepEqual(requests[0]!.endpoint, CONVERSATION_ENDPOINT, "with the endpointer the shortcut uses");
 		assert.deepEqual(h.voice.sessions, ["session-alpha"], "the wake turned voice on for the session it woke");
 		await reached(() => /conversation/i.test(ui.statuses.at(-1) ?? ""));
 		assert.match(ui.statuses.at(-1) ?? "", /conversation/i, "the footer shows the same conversation the shortcut shows");
@@ -2186,7 +2472,7 @@ test("a spoken wake leaves the focused session in the hands-free conversation al
 
 		// The end of speech stops the recording and sends the transcript, exactly as it
 		// does after alt+m: the conversation has no key press to stop it.
-		requests[1]!.onStateChange("finished");
+		requests[0]!.onStateChange("finished");
 		await reached(() => pi.sent.length === 1);
 		assert.deepEqual(pi.sent, [{ content: "sí, te escucho", options: undefined }]);
 		assert.equal(ui.editor(), "", "a conversation sends, it never pastes");
@@ -2194,11 +2480,10 @@ test("a spoken wake leaves the focused session in the hands-free conversation al
 		// And the microphone reopens after the reply is read, as in any conversation.
 		await settleReply(pi, ui.ctx, "Te escucho.");
 		await reached(() => readings.length === 1);
-		assert.equal(requests.length, 2, "the microphone stays closed while the reply is read");
+		assert.equal(requests.length, 1, "the microphone stays closed while the reply is read");
 		readings[0]!.finish("done");
-		await reached(() => requests.length === 3);
-		assert.equal(requests[2]!.mode, "conversation", "the conversation keeps going after a reading");
-		assert.equal(spotStarts, 2, "no spot capture competes with the conversation it woke");
+		await reached(() => requests.length === 2);
+		assert.equal(requests[1]!.mode, "conversation", "the conversation keeps going after a reading");
 	} finally {
 		await server.close();
 		rmSync(home, { recursive: true, force: true });
@@ -2550,11 +2835,8 @@ test("stopping a hands-free recording with the shortcut before speaking pauses w
 });
 
 test("the default reading turn asks the voice listener in the voice home instead of a turn file", async () => {
-	const { mkdtempSync, existsSync, rmSync, mkdirSync } = await import("node:fs");
-	const { join } = await import("node:path");
-	const scratchRoot = join(import.meta.dirname, "..", "tmp");
-	mkdirSync(scratchRoot, { recursive: true });
-	const home = mkdtempSync(join(scratchRoot, "voice-command-turn-"));
+	const { existsSync } = await import("node:fs");
+	const home = mkdtempSync(join(tmpdir(), "voice-command-turn-"));
 	// The release tail is the listener's; shortened so the test does not wait it out.
 	const server = new VoiceListener({ dir: join(home, "voice"), readTailMs: 5 });
 	try {

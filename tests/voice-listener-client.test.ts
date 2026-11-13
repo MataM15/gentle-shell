@@ -4,6 +4,7 @@ import { EventEmitter } from "node:events";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type { Socket } from "node:net";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import test, { after } from "node:test";
 import { fileURLToPath } from "node:url";
 import { createSessionListenerLink, cutListenerReading, ensureListener, LISTENER_DICTATE_TIMEOUT_MS, ListenerDeliveryError, listenerReadingTurn, sessionDisplayLabel, SESSION_LABEL_MAX, VoiceListenerClient, type ListenerSession, type SessionDictation } from "../lib/voice-listener-client.ts";
@@ -15,16 +16,14 @@ import { encodeListenerFrame, type ListenerFrame } from "../lib/voice-listener-p
 // The session side of the one voice listener (S6, slice A): join the running
 // listener, start it once when it is not there, survive a stale socket or a
 // dead locker, and reconnect after a restart. Every socket is bound in a
-// scratch voice home under tmp/, except one test that runs the real
+// scratch voice home in the system temporary directory, except one test that runs the real
 // scripts/voice-listener.mjs entry point; every child is stopped before the
 // test ends and the real ~/.pi/gentle-ai/voice is never touched.
 
-const scratchRoot = join(import.meta.dirname, "..", "tmp");
-mkdirSync(scratchRoot, { recursive: true });
 const dirs: string[] = [];
 const children: ChildProcess[] = [];
 const scratch = () => {
-	const dir = mkdtempSync(join(scratchRoot, "voice-client-"));
+	const dir = mkdtempSync(join(tmpdir(), "voice-client-"));
 	dirs.push(dir);
 	return dir;
 };
@@ -260,7 +259,7 @@ test("the reading turn sends the played loudness to the listener and survives a 
 	await server.listen();
 	const reading = await listenerReadingTurn({ dir, session: session("s-1"), chars: 20, signal: new AbortController().signal });
 	assert.ok(reading && reading.kind === "granted", "the free turn is granted");
-	assert.deepEqual(states, ["reading"], "the overlay is already drawing the reading");
+	assert.deepEqual(states, ["listening", "reading"], "the voice-on hello wakes the listener before the overlay draws the reading");
 
 	reading.levels({ frameMs: 50, durationMs: 200, levels: [0.25, 0.5, 0.75] });
 	await waitFor(() => levels.length === 3, 2_000);
@@ -434,6 +433,97 @@ test("a session dictates through the listener and reads its own transcript back"
 	assert.deepEqual(capture.calls, ["start", "stop"]);
 	link.close();
 	await server.close();
+});
+
+for (const outcome of ["resolve", "reject"] as const) test(`closing a pending startup probe prevents a late ${outcome} from replacing a new session`, async () => {
+	const dir = scratch();
+	const hellos: string[] = [];
+	const server = new VoiceListener({ dir, log: (event, fields) => { if (event === "listener.hello") hellos.push(String(fields?.sessionId)); } });
+	await server.listen();
+	let release!: (value: boolean) => void;
+	let reject!: (reason: Error) => void;
+	let probed = false;
+	const probe = new Promise<boolean>((resolve, fail) => { release = resolve; reject = fail; });
+	probe.catch(() => {});
+	const old = createSessionListenerLink({ dir, session: () => session("s-1"), probe: () => { probed = true; return probe; } });
+	const joining = old.ensure();
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	old.close();
+	const beforeRelease = await Promise.race([joining, new Promise<string>((resolve) => setTimeout(() => resolve("timeout"), 80))]);
+	const fresh = createSessionListenerLink({ dir, session: () => session("s-1") });
+	try {
+		assert.equal(await fresh.ensure(), true);
+		if (outcome === "resolve") release(true);
+		else reject(new Error("late probe failure"));
+		await new Promise((resolve) => setTimeout(resolve, 80));
+		assert.equal(probed, true, "the first join used the pending probe");
+		assert.equal(beforeRelease, false, "close settles ensure before the probe answers");
+		assert.equal(await joining, false);
+		assert.deepEqual(hellos, ["s-1"], "the old probe sends no hello and cannot evict the replacement");
+		assert.equal(server.clientCount, 1);
+		assert.equal(await fresh.ensure(), true);
+	} finally {
+		fresh.close();
+		old.close();
+		await server.close();
+	}
+});
+
+test("dictation reuses an in-flight startup join and sends exactly one hello", async () => {
+	const dir = scratch();
+	const capture = fakeCapture();
+	const hellos: string[] = [];
+	const server = new VoiceListener({ dir, dictation: capture.factory, focus: focusedOn("w1:p1"), log: (event, fields) => { if (event === "listener.hello") hellos.push(String(fields?.sessionId)); } });
+	let release!: () => void;
+	let starts = 0;
+	const gate = new Promise<void>((resolve) => { release = resolve; });
+	const link = createSessionListenerLink({ dir, session: () => session("s-1"), start: async () => { starts++; await gate; }, waitMs: 1_000 });
+	const joining = link.ensure();
+	await waitFor(() => starts === 1);
+	const dictation = link.dictate({ mode: "dictation", onStateChange: () => {}, fallback: () => assert.fail("the listener is reachable") });
+	const recording = dictation.start();
+	try {
+		await server.listen();
+		release();
+		assert.equal(await joining, true);
+		await recording;
+		assert.deepEqual(hellos, ["s-1"]);
+		assert.equal(starts, 1);
+		assert.deepEqual(capture.calls, ["start"]);
+		assert.deepEqual(await dictation.stop(), { text: "hola", truncated: false });
+	} finally {
+		link.close();
+		await server.close();
+	}
+});
+
+test("cancelling dictation during startup never opens a capture when the listener arrives", async () => {
+	const dir = scratch();
+	const capture = fakeCapture();
+	const server = new VoiceListener({ dir, dictation: capture.factory, focus: focusedOn("w1:p1") });
+	let release!: () => void;
+	let starts = 0;
+	const gate = new Promise<void>((resolve) => { release = resolve; });
+	const received: string[] = [];
+	const link = createSessionListenerLink({ dir, session: () => session("s-1"), start: async () => { starts++; await gate; }, waitMs: 1_000, onTranscript: (text) => received.push(text) });
+	const own = localCapture();
+	const dictation = link.dictate({ mode: "dictation", onStateChange: () => {}, fallback: () => own.dictation });
+	const recording = dictation.start();
+	await waitFor(() => starts === 1);
+	await dictation.cancel();
+	try {
+		await server.listen();
+		release();
+		await recording;
+		assert.deepEqual(capture.calls, [], "the listener never opens the microphone");
+		assert.deepEqual(own.calls, [], "the local fallback never opens the microphone");
+		await server.deliverTranscript("from another session");
+		await waitFor(() => received.length === 1, 200);
+		assert.deepEqual(received, ["from another session"], "the cancelled start leaves no handler swallowing later transcripts");
+	} finally {
+		link.close();
+		await server.close();
+	}
 });
 
 test("a session with no listener keeps its own capture instead of losing voice", async () => {

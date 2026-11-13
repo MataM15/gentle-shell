@@ -154,6 +154,7 @@ export class VoiceListenerClient {
 		// A connection the listener already replaced never comes back: the caller
 		// joins again with a new one instead of evicting its own replacement.
 		if (this.replaced) throw new Error("this voice listener connection was replaced");
+		if (this.closed) throw new Error("voice listener client closed");
 		const socket = (this.options.dial ?? createConnection)(this.paths.socket);
 		socket.setEncoding("utf8");
 		this.buffered = "";
@@ -162,9 +163,15 @@ export class VoiceListenerClient {
 		socket.on("error", () => {});
 		socket.on("close", () => this.disconnected(socket));
 		await new Promise<void>((resolve, reject) => {
-			socket.once("connect", () => resolve());
-			socket.once("error", reject);
+			const cleanup = () => { socket.off("connect", connected); socket.off("error", failed); socket.off("close", closed); };
+			const connected = () => { cleanup(); resolve(); };
+			const failed = (error: Error) => { cleanup(); reject(error); };
+			const closed = () => { cleanup(); reject(new Error("voice listener client closed")); };
+			socket.once("connect", connected);
+			socket.once("error", failed);
+			socket.once("close", closed);
 		});
+		if (this.closed || this.socket !== socket) throw new Error("voice listener client closed");
 		const { sessionId, paneId, label, voiceOn } = this.options.session;
 		const frame = await this.request({ type: "hello", proto: 1, sessionId, paneId, label, voiceOn, ...(this.options.role ? { role: this.options.role } : {}) });
 		if (frame.type !== "welcome") throw new Error("the voice listener refused hello");
@@ -286,21 +293,48 @@ export interface EnsureListenerOptions {
 	// Spawns the listener process; the socket is the proof it came up.
 	start?: () => void | Promise<void>;
 	createClient?: () => VoiceListenerClient;
+	// Cancellation stops waiting and prevents a late probe from joining.
+	signal?: AbortSignal;
+	probe?: (path: string) => Promise<boolean>;
 	waitMs?: number;
 	now?: number;
 	isAlive?: (pid: number) => boolean;
 }
 
-// The poll timer stays referenced: waiting for the listener is live work, and an
-// unref'd timer would let the event loop empty in the middle of it.
-const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+const joinAborted = () => new Error("voice listener join aborted");
+const throwIfAborted = (signal?: AbortSignal): void => { if (signal?.aborted) throw joinAborted(); };
 
-async function waitForListener(path: string, waitMs: number): Promise<boolean> {
+// A probe or an injected start can finish after cancellation: settle now and
+// never continue its join when it eventually answers.
+function withAbort<T>(task: Promise<T>, signal?: AbortSignal): Promise<T> {
+	if (!signal) return task;
+	return new Promise((resolve, reject) => {
+		const aborted = () => { signal.removeEventListener("abort", aborted); reject(joinAborted()); };
+		task.then(
+			(value) => { signal.removeEventListener("abort", aborted); resolve(value); },
+			(error) => { signal.removeEventListener("abort", aborted); reject(error); },
+		);
+		if (signal.aborted) aborted();
+		else signal.addEventListener("abort", aborted, { once: true });
+	});
+}
+
+// The poll timer stays referenced while a join is live, but cancellation clears
+// it immediately so a closed session does not keep the process alive.
+const wait = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve, reject) => {
+	if (signal?.aborted) return reject(joinAborted());
+	const aborted = () => { clearTimeout(timer); signal?.removeEventListener("abort", aborted); reject(joinAborted()); };
+	const timer = setTimeout(() => { signal?.removeEventListener("abort", aborted); resolve(); }, ms);
+	signal?.addEventListener("abort", aborted, { once: true });
+});
+
+async function waitForListener(path: string, waitMs: number, probe: (path: string) => Promise<boolean>, signal?: AbortSignal): Promise<boolean> {
 	const deadline = Date.now() + waitMs;
 	for (;;) {
-		if (await probeListenerSocket(path)) return true;
+		throwIfAborted(signal);
+		if (await withAbort(probe(path), signal)) return true;
 		if (Date.now() >= deadline) return false;
-		await wait(PROBE_INTERVAL_MS);
+		await wait(PROBE_INTERVAL_MS, signal);
 	}
 }
 
@@ -310,29 +344,46 @@ async function waitForListener(path: string, waitMs: number): Promise<boolean> {
 export async function ensureListener(options: EnsureListenerOptions): Promise<{ client: VoiceListenerClient; started: boolean }> {
 	const paths = listenerPaths(options.dir);
 	const waitMs = options.waitMs ?? LISTENER_START_TIMEOUT_MS;
+	const probe = options.probe ?? probeListenerSocket;
+	const signal = options.signal;
 	const join = async (started: boolean) => {
+		throwIfAborted(signal);
 		const client = (options.createClient ?? (() => new VoiceListenerClient({ dir: options.dir, session: options.session })))();
-		await client.connect();
-		return { client, started };
+		const abort = () => client.close();
+		signal?.addEventListener("abort", abort, { once: true });
+		try {
+			throwIfAborted(signal);
+			await withAbort(client.connect(), signal);
+			throwIfAborted(signal);
+			return { client, started };
+		} catch (error) {
+			client.close();
+			throw error;
+		} finally {
+			signal?.removeEventListener("abort", abort);
+		}
 	};
-	if (await probeListenerSocket(paths.socket)) return join(false);
+	throwIfAborted(signal);
+	if (await withAbort(probe(paths.socket), signal)) return join(false);
+	throwIfAborted(signal);
 
 	// A lock somebody is renewing means a listener is starting or running: wait
 	// for its socket instead of starting a second microphone owner.
 	if (!clearStaleListenerLock(paths, { now: options.now, isAlive: options.isAlive })) {
-		if (await waitForListener(paths.socket, waitMs)) return join(false);
+		if (await waitForListener(paths.socket, waitMs, probe, signal)) return join(false);
 		throw new Error("voice_listener_busy");
 	}
 	const lock = takeListenerLock(paths, { now: options.now, socket: paths.socket });
 	if (!lock) {
-		if (await waitForListener(paths.socket, waitMs)) return join(false);
+		if (await waitForListener(paths.socket, waitMs, probe, signal)) return join(false);
 		throw new Error("voice_listener_busy");
 	}
 	// A path that is not this user's socket is refused, never unlinked.
 	clearStaleListenerSocket(paths.socket);
 	releaseListenerLock(paths, { pid: lock.pid });
-	await options.start?.();
-	if (await waitForListener(paths.socket, waitMs)) return join(true);
+	throwIfAborted(signal);
+	await withAbort(Promise.resolve().then(() => { throwIfAborted(signal); return options.start?.(); }), signal);
+	if (await waitForListener(paths.socket, waitMs, probe, signal)) return join(true);
 	throw new Error("voice_listener_missing");
 }
 
@@ -544,6 +595,7 @@ export interface SessionListenerLinkOptions {
 	session(): ListenerSession | undefined;
 	start?: () => void | Promise<void>;
 	waitMs?: number;
+	probe?: (path: string) => Promise<boolean>;
 	// How long the listener gets to accept a dictate, before the start fails.
 	dictateTimeoutMs?: number;
 	backoffMs?: readonly number[];
@@ -563,6 +615,7 @@ export interface SessionListenerLinkOptions {
 // before the role existed, so only a reading declares itself (S6).
 export function createSessionListenerLink(options: SessionListenerLinkOptions): SessionListenerLink {
 	let client: VoiceListenerClient | undefined;
+	let joining: { controller: AbortController; promise: Promise<boolean> } | undefined;
 	let handler: ((frame: ListenerFrame) => boolean) | undefined;
 	const route = (frame: ListenerFrame): void => {
 		if (handler?.(frame)) return;
@@ -574,31 +627,48 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 		if (frame.type === "transcript") options.onTranscript?.(frame.text, frame.truncated === true);
 	};
 
-	const ensure = async (): Promise<boolean> => {
-		if (client?.connected) return true;
-		const session = options.session();
-		if (!session) return false;
-		if (client) {
+	const ensure = (): Promise<boolean> => {
+		if (client?.connected) return Promise.resolve(true);
+		if (joining) return joining.promise;
+		const controller = new AbortController();
+		const pending: { controller: AbortController; promise: Promise<boolean> } = { controller, promise: undefined! };
+		joining = pending;
+		pending.promise = (async () => {
 			try {
-				await client.connect();
+				const session = options.session();
+				if (!session) return false;
+				if (client) {
+					try {
+						await withAbort(client.connect(), controller.signal);
+						throwIfAborted(controller.signal);
+						return true;
+					} catch {
+						throwIfAborted(controller.signal);
+						/* the lock or the socket is gone: start a listener below */
+					}
+				}
+				const joined = await ensureListener({
+					dir: options.dir,
+					session,
+					start: options.start,
+					waitMs: options.waitMs,
+					probe: options.probe,
+					signal: controller.signal,
+					createClient: () => {
+						throwIfAborted(controller.signal);
+						return (client = new VoiceListenerClient({ dir: options.dir, session, backoffMs: options.backoffMs, onFrame: route }));
+					},
+				});
+				throwIfAborted(controller.signal);
+				client = joined.client;
 				return true;
 			} catch {
-				/* the lock or the socket is gone: start a listener below */
+				return false;
+			} finally {
+				if (joining === pending) joining = undefined;
 			}
-		}
-		try {
-			const joined = await ensureListener({
-				dir: options.dir,
-				session,
-				start: options.start,
-				waitMs: options.waitMs,
-				createClient: () => (client = new VoiceListenerClient({ dir: options.dir, session, backoffMs: options.backoffMs, onFrame: route })),
-			});
-			client = joined.client;
-			return true;
-		} catch {
-			return false;
-		}
+		})();
+		return pending.promise;
 	};
 
 	const dictate = (request: ListenerDictationOptions): SessionDictation => {
@@ -606,6 +676,8 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 		let fallback: SessionDictation | undefined;
 		let stopSent = false;
 		let settled = false;
+		let cancelled = false;
+		let requested = false;
 		let failure: { error: unknown } | undefined;
 		let resolveTranscript!: (transcript: VoiceTranscript) => void;
 		let rejectTranscript!: (error: unknown) => void;
@@ -676,20 +748,25 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 				setState("starting");
 				handler = handle;
 				try {
-					if (!(await ensure())) return local();
+					const joined = await ensure();
+					if (cancelled) return;
+					if (!joined) return local();
 					const active = client;
 					if (!active) return local();
 					let answer: ListenerFrame;
 					try {
+						requested = true;
 						answer = await active.request({ type: "dictate", mode: request.mode, endpoint: request.endpoint }, options.dictateTimeoutMs ?? LISTENER_DICTATE_TIMEOUT_MS);
 					} catch (error) {
 						// Only confirmed unavailability records here instead: a listener that is
 						// gone, or one that answered and refused. A timeout may still be owned by
 						// the listener, so it is asked to let go and the start fails instead.
+						if (cancelled) return;
 						if (!active.connected || !(error instanceof ListenerTimeoutError)) return local();
 						void active.request({ type: "cancel" }).catch(() => {});
 						throw new VoiceSessionError("timeout");
 					}
+					if (cancelled) return;
 					// A refusal is obeyed, never routed around: another capture holds the mic.
 					if (answer.type === "busy") throw new VoiceSessionError("invalid-state");
 					if (answer.type !== "ok") throw new VoiceSessionError("protocol");
@@ -716,8 +793,13 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 				return transcript;
 			},
 			cancel: async () => {
+				if (cancelled) return;
+				cancelled = true;
 				if (fallback) return fallback.cancel();
-				if (settled) return;
+				if (settled || !requested) {
+					if (handler === handle) handler = undefined;
+					return;
+				}
 				try {
 					await client?.request({ type: "cancel" });
 				} catch {
@@ -731,6 +813,8 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 		ensure,
 		dictate,
 		close: () => {
+			joining?.controller.abort();
+			joining = undefined;
 			handler = undefined;
 			client?.close();
 			client = undefined;

@@ -10,7 +10,7 @@ import { installKokoro, installMiro, KOKORO_MANIFESTS, KOKORO_NOTICES, kokoroByt
 import { createReplyReader, defaultSpeechEngineResolver, lastAssistantText, replyLanguage } from "./voice-reply-speech.ts";
 import { createVoiceSpeechPublisher, type VoiceSpeechChunk, type VoiceSpeechReading } from "./voice-speech-events.ts";
 import { acquireLocalReadingTurn, paneFocus as herdrPaneFocus, paneFocused as herdrPaneFocused, type PaneFocus } from "./voice-presence.ts";
-import { cutListenerReading, createSessionListenerLink, listenerReadingTurn, sessionDisplayLabel, startVoiceListenerProcess, type ListenerReading, type ListenerSession, type SessionDictation, type SessionListenerLink } from "./voice-listener-client.ts";
+import { cutListenerReading, createSessionListenerLink, listenerReadingTurn, sessionDisplayLabel, startVoiceListenerProcess, VoiceListenerClient, type ListenerReading, type ListenerSession, type SessionDictation, type SessionListenerLink } from "./voice-listener-client.ts";
 import type { ReadingReleaseReason, CaptureMode } from "./voice-listener-protocol.ts";
 import { createCuePlayer, type CueName, type CuePlayer, type CueResult } from "./voice-cues.ts";
 import { createVoiceLog, type VoiceLog } from "./voice-diagnostics.ts";
@@ -30,8 +30,9 @@ import { pushToTalkStatus, voiceConversationStatus, voiceReadingStatus, voiceTog
 //
 // Push-to-talk (hold Space) is the second way to dictate. When its persisted
 // toggle is on, session start arms a raw input listener in an interactive
-// parent session; reading the toggle is the only startup work. Whether voice is
-// installed is checked at the first hold, and a missing install disarms it.
+// parent session. The session also joins the shared voice listener without
+// requesting a capture; whether dictation is installed is checked at the first
+// hold, and a missing install disarms it.
 // A hold shares the single-operation lock with the command.
 //
 // Toggle dictation is the third way: one shortcut starts listening and the same
@@ -501,35 +502,56 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	// one when there is none, and reports this session's pane so the focus can hand
 	// a transcript to it.
 	let sessionLink: SessionListenerLink | undefined = deps.listener;
-	const listener = (): SessionListenerLink =>
-		(sessionLink ??= createSessionListenerLink({
+	// A voice-off startup connects only to an existing listener: it must never
+	// start one and open the spot-only microphone on its own.
+	let passiveClient: VoiceListenerClient | undefined;
+	const closePassive = () => {
+		const client = passiveClient;
+		passiveClient = undefined;
+		client?.close();
+	};
+	const receiveVoice = (command: "voice-on" | "voice-off", wake: boolean) => {
+		const ctx = sessionCtx;
+		if (!ctx) return;
+		if (command === "voice-off") {
+			if (voiceOn(ctx)) setVoice(ctx, false, (message, type) => ctx.ui.notify(message, type));
+			return;
+		}
+		if (wake) wakeConversation(ctx);
+	};
+	const listener = (): SessionListenerLink => {
+		if (sessionLink) return sessionLink;
+		const link = createSessionListenerLink({
 			dir: resolveVoiceHome(env),
 			start: () => startVoiceListenerProcess(env),
 			session: () => {
 				const id = sessionIdOf(sessionCtx);
 				return id ? { sessionId: id, paneId: paneIdOf(), label: labelOf(sessionCtx), voiceOn: voiceOn(sessionCtx) } : undefined;
 			},
-			onTranscript: receiveTranscript,
-			onVoice: (command, wake) => {
-				const ctx = sessionCtx;
-				if (!ctx) return;
-				if (command === "voice-off") {
-					if (voiceOn(ctx)) setVoice(ctx, false, (message, type) => ctx.ui.notify(message, type));
-					return;
-				}
-				// Voice on reaches every session; only the one a voice woke starts
-				// listening, so a menu or a set-voice never opens a microphone.
-				if (wake) wakeConversation(ctx);
+			onTranscript: (text, truncated) => {
+				if (sessionLink === link) receiveTranscript(text, truncated);
 			},
-		}));
-	const createSession: NonNullable<VoiceCommandDeps["createSession"]> = deps.createSession ?? ((options) => listener().dictate({
-		// A recording with an endpoint is the hands-free conversation; the listener
-		// uses the mode for its own request to the worker and for its log.
-		mode: options.mode ?? (options.endpoint ? "conversation" : "dictation"),
-		endpoint: options.endpoint,
-		onStateChange: options.onStateChange,
-		fallback: () => localDictation(options),
-	}));
+			onVoice: (command, wake) => {
+				// An in-flight old hello can receive a frame after its session ended.
+				if (sessionLink === link) receiveVoice(command, wake);
+			},
+		});
+		sessionLink = link;
+		return link;
+	};
+	const createSession: NonNullable<VoiceCommandDeps["createSession"]> = deps.createSession ?? ((options) => {
+		// Dictation supersedes an off-session's passive connection with its normal
+		// session link; never leave two session-role connections replacing each other.
+		closePassive();
+		return listener().dictate({
+			// A recording with an endpoint is the hands-free conversation; the listener
+			// uses the mode for its own request to the worker and for its log.
+			mode: options.mode ?? (options.endpoint ? "conversation" : "dictation"),
+			endpoint: options.endpoint,
+			onStateChange: options.onStateChange,
+			fallback: () => localDictation(options),
+		});
+	});
 	const voiceLog: VoiceLog = deps.log ?? createVoiceLog({ dir: resolveVoiceHome(env) });
 	let cuePlayer = deps.cues;
 	let cuesUsed = false;
@@ -1617,6 +1639,54 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		void runToggle(openToggle(ctx, true));
 	};
 
+	// Join the same link dictation uses, with the session's current voice flag.
+	// Voice-off sessions need a connection too: wake selects the focused session
+	// from session-role connections. Joining never asks the listener to dictate.
+	const joinAtStart = (ctx: ExtensionContext): void => {
+		// An injected session factory replaces the listener as the capture path.
+		const id = sessionIdOf(ctx);
+		if (deps.createSession || !id) return;
+		if (!voiceOn(ctx)) {
+			try {
+				const client = new VoiceListenerClient({
+					dir: resolveVoiceHome(env),
+					session: { sessionId: id, paneId: paneIdOf(), label: labelOf(ctx), voiceOn: false },
+					onFrame: (frame) => {
+						if (passiveClient !== client) return;
+						if (frame.type === "command") receiveVoice(frame.command, frame.wake === true);
+						else if (frame.type === "transcript") receiveTranscript(frame.text, frame.truncated === true);
+					},
+				});
+				passiveClient = client;
+				void client.connect().catch(() => {
+					if (passiveClient === client) closePassive();
+				});
+			} catch { /* a passive join never interrupts startup */ }
+			return;
+		}
+		const owner = generation;
+		let link: SessionListenerLink;
+		try {
+			link = listener();
+		} catch {
+			try { voiceLog("listener.join", { session: sessionIdOf(ctx), result: "unavailable" }); } catch { /* logging is advisory */ }
+			return;
+		}
+		const live = () => owner === generation && sessionCtx === ctx && sessionLink === link;
+		void (async () => {
+			if (!live()) return;
+			let joined = false;
+			try { joined = await link.ensure(); } catch { /* an unreachable listener leaves voice usable */ }
+			if (!live()) {
+				try { link.close(); } catch { /* the old link is already gone */ }
+				return;
+			}
+			if (!joined) {
+				try { voiceLog("listener.join", { session: sessionIdOf(ctx), result: "unavailable" }); } catch { /* logging is advisory */ }
+			}
+		})();
+	};
+
 	// Ends every voice activity one session owned. The generation moves first, so
 	// no run of it can publish or paint again even before its capture finishes
 	// cancelling; then the footer and the display go idle under that session's own
@@ -1628,6 +1698,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		// instance that owned it: a client that outlives its session comes back and
 		// evicts the new instance's for ever (S6).
 		if (ctx) {
+			closePassive();
 			sessionLink?.close();
 			sessionLink = undefined;
 		}
@@ -1682,7 +1753,9 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		// gone, so none of its callbacks can reach this session.
 		const previous = sessionCtx;
 		sessionCtx = undefined;
-		endSession(previous && previous !== ctx ? previous : undefined);
+		// Pi can reuse the context object while its session id changes: close the
+		// old link on every replacement, not only when the object is different.
+		endSession(previous);
 		if (env.GENTLE_PI_AGENTS_CHILD === "1" || !ctx?.hasUI || ctx.mode !== "tui") return;
 		sessionCtx = ctx;
 		setVoiceFooter(ctx, () => true, undefined);
@@ -1690,6 +1763,8 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		// any footer a replacement left behind is cleared.
 		publishVoiceState(ctx, "idle");
 		if (readToggle()) arm(ctx);
+		// The session link receives wake and voice-off even before the first Alt+M.
+		joinAtStart(ctx);
 		// A voice session wakes the cue player now, so the first cue is on time.
 		if (voiceOn(ctx)) cues().warm();
 	});
