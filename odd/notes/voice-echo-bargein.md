@@ -239,3 +239,141 @@ Not justified: a new reasoning model. The barge-in decision is a threshold on a
 5. **S10.** Barge-in must keep every existing safety rule: no listening without a
    visible state, the asleep state after "off" still owns the microphone for KWS only,
    and the overlay must show that a reading was cut by voice, not crashed.
+
+## 7. Real-path probe: procedure
+
+Risk 1 above says to verify with one real recording before writing the design into
+code. This is that verification, and it is the only thing in this note that needs
+the owner's speakers and the owner's microphone. The probe lives in a scratch
+directory (`/tmp/gpLPqO91/voice-echo-probe/`), not in the repository, and nothing it
+records is kept.
+
+### What it measures
+
+One fixed Spanish reading of about 19 s goes out through the same path a reply
+takes: `lib/voice-reply-speech.ts` builds the retry chain, `lib/voice-onecore.ts`
+runs the Raul synthesis and `processRobotVoice`, `scaleWav` applies
+`GENTLE_PI_VOICE_VOLUME`, and the shared PowerShell player
+(`KOKORO_PLAYER_SCRIPT`, `System.Media.SoundPlayer`) plays one WAV line at a time.
+The probe records the *exact* base64 WAV lines that player receives — the reference
+PCM — and the time its `PLAYBACK_MARKER` arrived for each one, so every sentence has
+both its samples and the moment it started.
+
+At the same time it opens the microphone through the dictation worker's own path
+(`scripts/voice-worker.cjs` `begin` + `openCapture`: the installed voice runtime,
+node-cpal's PulseAudio facade on a Microsoft kernel, the device's default input
+config with f32 when supported, `queueCapacityBuffers: 64`, XRUN tolerated), and
+records the reading plus 2 s before and 2 s after. The dictation model is never
+loaded and no recognizer is created.
+
+Offline it feeds the pair to AEC3 (`@ai-ecoverse/wasm-webrtc-audio-processing`
+2.1.0-2, `create({ sampleRate, vad: true })`, no noise suppression) in 10 ms frames
+and prints numbers only:
+
+| measurement | how |
+| --- | --- |
+| capture rate, chunk statistics, achieved rate, XRUNs | from the stream's own callbacks |
+| room noise floor before the reading (dBFS) | frame RMS over the pre-roll |
+| echo level at the microphone during the reading (dBFS) | frame RMS over the reading window |
+| delay estimate over time | `stats().delayMs` per frame: median, p10/p90, spread, stdev, share at the median, number of changes, frames pinned at AEC3's delay-window limit (≥ 480 ms), an evenly spaced series |
+| ERLE over time | measured as the energy ratio of microphone over residual, plus the package's own `stats().erleDb` |
+| residual after cancellation (dBFS) | frame RMS of the canceller output, aligned by `latencySamples` |
+| reference completeness | `referenceDropped`, `referenceShort`, timeline overlaps, player markers vs WAV lines written |
+| convergence | first reading frame with reported ERLE ≥ 10 dB |
+| residual VAD | `stats().voice` (WebRTC GMM) fired fraction over the echo-only reading |
+| suggested barge-in gate | `max(noise_floor_p95 + 12, residual_p99 + 10)` dBFS, next to the note's -45 dBFS |
+
+### Commands
+
+Dry-run: no microphone, no audio, a synthetic room (reference delayed 250 ms,
+attenuated 12 dB, mixed with -55 dBFS noise) over the real synthesized reference.
+
+```
+node /tmp/gpLPqO91/voice-echo-probe/probe.mjs --repo /home/pablo/proyectos/gentle-shell-worktrees/voice-control --dry-run
+```
+
+Real run (speakers and microphone; run this only with the owner present):
+
+```
+node /tmp/gpLPqO91/voice-echo-probe/probe.mjs --repo /home/pablo/proyectos/gentle-shell-worktrees/voice-control --real
+```
+
+The scratch directory is temporary by design: it holds the probe and the installed
+canceller, nothing of the project, and it is deleted once the real run is recorded
+here.
+
+### What the owner does
+
+Nothing but stay quiet for about 28 seconds. Speakers at the normal volume (no
+headphones, no volume change: the echo path is what is being measured), the room as
+it usually is, no other audio playing. The probe opens the microphone, waits 2 s of
+room, says on the terminal that the reading starts in 3 s, plays the reading (~19 s),
+waits 2 s more and closes the microphone. Ctrl+C stops it at any point and also stops
+the sound. The microphone indicator is visible while it is open.
+
+### What is kept
+
+Nothing. The recording and the reference are `Float32Array`s in memory; no samples
+are ever written to a file, copied or uploaded. Both buffers are zeroed before
+anything is printed and again in the teardown, which runs on success, on error, and on
+`SIGINT`/`SIGTERM`/`SIGHUP` (abort the speech engine so the PowerShell player dies,
+close the capture stream, zero the buffers). No transcript is produced and no audio
+content is printed: measurements only.
+
+### Pass criteria
+
+Delay (risk 1 — the RDP capture path):
+
+- `at_limit=0`: the estimate never pins at AEC3's ~500 ms window.
+- `spread` (p90 - p10) ≤ 40 ms and ≥ 50 % of frames at the median: the delay is
+  stable, not wandering.
+- `achieved_rate` within 2 % of `device_rate`, and `xruns` small: the capture is not
+  dropping or reinserting audio.
+
+Cancellation (risk 3 — the level calibration):
+
+- measured ERLE over the reading ≥ 15 dB (the synthetic probe measured 22-24 dB; the
+  real room should lose some, not half of it).
+- residual p99 during the echo-only reading ≤ -45 dBFS *and* below
+  `noise_floor_p95 + 12`, so a gate at that level never fires on the reading itself.
+- `referenceDropped=0`, `referenceShort=0`, no overlapping chunks, and as many player
+  markers as WAV lines written (risk 2 — reference completeness).
+- residual VAD as a bonus signal: it must not fire on the echo when the level gate
+  does not.
+
+If delay or cancellation fails, phase 1 stays blocked and the fallback is the
+gating-only option (d) with the overlay stating it, as risk 1 of section 4 already
+says. If only the gate numbers move, they replace -45 dBFS and floor + 12 dB with
+the measured pair.
+
+### Dry-run baseline (synthetic, 2026-11-13)
+
+Evidence that the pipeline runs end to end before the real recording. Synthetic
+room, so only the pipeline is proven, not this room.
+
+| measurement | dry-run |
+| --- | --- |
+| reference | 4 player chunks, 19.39 s, start gaps p50 about 0 ms, overlap chunks 0 / samples 0 |
+| injected room | delay 250 ms, echo -12 dB, noise -55 dBFS |
+| delay estimate | median 244.0 ms, p10/p90 244/244, spread 0 ms, 96.8 % at median |
+| ERLE | measured 22.9-23.0 dB; reported median about 20.5 dB, about 0.2 dB for the first 4.6 s |
+| residual | p50 -60.0 dBFS, p99 -54.9 dBFS |
+| `referenceDropped`/`referenceShort` | 0 / 0, no frame errors |
+| residual VAD | 0.0 % of echo-only frames |
+| gate suggestion | -42.6 dBFS (floor + 12), next to the note's -45 dBFS |
+| verdict | delay stable, cancellation usable |
+
+Numbers move by a tenth of a dB between dry runs (synthesis timing); the delay and
+the timeline are the reproducible part.
+
+Two facts the design has to carry: the reported `stats().erleDb` needs about 4.6-5 s
+to rise above 10 dB while the measured ERLE is already ~23 dB, so the CONVERGED guard
+cannot be read from that statistic; and the WSLg input here is
+`pulseaudio:RDPSource` at 44100 Hz mono (i16 default, f32 supported), so the real
+capture is resampled to 48000 for AEC3 and that conversion is part of what the delay
+stability measurement is testing.
+
+### Results
+
+_Empty until the real run. Fill it with the printed block (numbers only) and one
+line saying whether the pass criteria held._
