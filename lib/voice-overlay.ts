@@ -81,3 +81,67 @@ export function createLevelMeter(): LevelMeter {
 		},
 	};
 }
+
+// ---- the host protocol codec (T12) -----------------------------------------
+// What the Windows window is told, one small line per command. Pure so the
+// bounds and the sanitizing are tested without a window.
+
+// A session label is display text only: control characters and runs of blanks
+// go, and it is cut to this many characters so a line stays small.
+export const OVERLAY_LABEL_MAX = 48;
+
+export function sanitizeOverlayLabel(label: string | undefined): string {
+	if (typeof label !== "string") return "";
+	const clean = label.replace(/[\p{C}\p{Z}]+/gu, " ").trim();
+	return [...clean].slice(0, OVERLAY_LABEL_MAX).join("").trim();
+}
+
+// A display level (0..1) as the whole percent the window takes, 0..100.
+export function levelToPercent(value: number): number {
+	return Math.round(clamp01(value) * 100);
+}
+
+const OVERLAY_STATES: readonly string[] = ["asleep", "listening", "transcribing", "reading"];
+const OVERLAY_LANGUAGES: readonly string[] = ["es", "en"];
+
+// `state <state> <language> <label in base64, or - when there is none>`: the
+// label travels as base64 so no character of it can end or split the line.
+export function encodeOverlayState(snapshot: VoiceOverlaySnapshot): string {
+	if (!OVERLAY_STATES.includes(snapshot.state)) throw new Error("overlay: unknown state");
+	if (!OVERLAY_LANGUAGES.includes(snapshot.language)) throw new Error("overlay: unknown language");
+	const label = sanitizeOverlayLabel(snapshot.label);
+	return `state ${snapshot.state} ${snapshot.language} ${label ? Buffer.from(label, "utf8").toString("base64") : "-"}`;
+}
+
+// ---- the output meter (T12, T13) -------------------------------------------
+// The reply voice publishes the loudness of the speech the player really
+// started: an RMS on a 0..1 scale, typically 0.03 to 0.3, and digital silence
+// (0) between words. The microphone meter above is tuned to a noisy WSLg input
+// (floor 0.0031, speech 0.016) and would pin every bar of a reading at full, so
+// a reading has its own preset. Same smoothing, different floor and ceiling.
+export const OVERLAY_OUTPUT_FLOOR_RMS = 0.02;
+export const OVERLAY_OUTPUT_SPEECH_RMS = 0.25;
+
+export function normalizeOutputLevel(rms: number): number {
+	const value = Number.isFinite(rms) ? rms : 0;
+	return clamp01((value - OVERLAY_OUTPUT_FLOOR_RMS) / (OVERLAY_OUTPUT_SPEECH_RMS - OVERLAY_OUTPUT_FLOOR_RMS));
+}
+
+export function createOutputLevelMeter(): LevelMeter {
+	let level = 0;
+	return {
+		push(rms) {
+			level = smoothLevel(level, normalizeOutputLevel(rms));
+			return level;
+		},
+		reset() {
+			level = 0;
+		},
+	};
+}
+
+// The meter for what the overlay is showing: the played speech while reading,
+// the microphone in every other state.
+export function createLevelMeterFor(state: ListenerState): LevelMeter {
+	return state === "reading" ? createOutputLevelMeter() : createLevelMeter();
+}

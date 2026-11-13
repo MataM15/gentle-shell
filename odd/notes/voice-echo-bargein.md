@@ -375,5 +375,52 @@ stability measurement is testing.
 
 ### Results
 
-_Empty until the real run. Fill it with the printed block (numbers only) and one
-line saying whether the pass criteria held._
+Real run 1, 2026-11-13, owner present, run from the live checkout at `4ae3e897f`
+(numbers only; the recording was discarded, 0 audio files left):
+
+```text
+capture: device_rate=44100 Hz chunk_frames=441 (min=p50=max) chunks=2773 duration_s=27.73 xruns=0 overflows=0
+reference: chunks=4 total_s=19.39 start_gaps_ms: p50=112.9 max=121.6 overlap_chunks=0
+timeline: pre_roll_ms=5902 reading_ms=19736 total_ms=27730
+noise_floor (before reading): p50=-32.9 dBFS p95=-14.4 dBFS
+echo_at_mic (during reading): p50=-52.9 dBFS p95=-40.4 dBFS
+delay_estimate: median=8.0 ms spread=0.0 ms at_median=100.0% changes=0 at_limit=0
+erle_reported: median=0.6 dB p10=0.2 p90=1.4
+erle_measured: 2.2 dB
+residual: p50=-57.8 dBFS p95=-49.9 dBFS p99=-21.3 dBFS max=-14.1 dBFS
+aec_stats: referenceDropped=0 referenceShort=0 nonFinite=0 errors=0 convergence_ms=null
+gmm_vad_on_residual: fired=38.4% of 1974 reading frames
+verdict: delay_stable=yes | cancellation_usable=no
+```
+
+The pass criteria did not hold (measured ERLE 2.2 dB against 15; residual p99 -21.3 dBFS
+against -45), but the run is **inconclusive, not a failure of AEC3**, for two reasons the
+numbers themselves show:
+
+1. The room was not quiet. The level before the reading (p50 -32.9, p95 -14.4 dBFS) is
+   louder than the level during it (p50 -52.9, p95 -40.4 dBFS), and the residual has loud
+   bursts (p99 -21.3, max -14.1 dBFS) with the voice detector firing on 38 % of the
+   frames. Something voice-like other than the reading was sounding.
+2. The reading barely reaches the microphone: a median of about -53 dBFS. The delay
+   estimate never moved from 8 ms and `convergence_ms` is null, which is what AEC3 shows
+   when it finds no echo to lock onto. Either the owner was on headphones, or the device
+   or Windows already suppresses the speaker signal before the RDP source.
+
+What it does establish: capture on the RDP source is steady (441-frame chunks, no xruns),
+the reference is complete (4 markers for 4 lines, nothing dropped or short), and the
+player adds about 113 ms between queueing a sentence and starting it. Open before any
+design decision: confirm with the owner what was sounding and whether the speakers were
+in use, then repeat in a quiet room with a per-second level series. If the echo really
+is around -53 dBFS while speech is around -15 dBFS, option (d) (a level gate plus the
+voice detector, no new dependency) may be enough for barge-in and AEC3 unnecessary.
+
+Owner's answers right after run 1 (2026-11-13): the reading sounded "Por auriculares"
+and the voice-like sound was "Estaba hablando yo". So run 1 measured the headphone
+setup with the owner speaking, not the speaker echo path: it is not valid evidence for
+or against AEC3. It does give one useful real number for the headphone setup: with
+headphones the reading reaches the microphone at about -53 dBFS (median) while the
+owner's own voice peaks around -14 dBFS, so on headphones a level gate plus the voice
+detector separates the two by tens of dB and no echo canceller is needed. The speaker
+setup still needs its own run: speakers on, owner silent.
+
+Known probe defect: `achieved_rate` printed 0.0 Hz; frames / duration gives 44100 Hz.

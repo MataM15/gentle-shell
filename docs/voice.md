@@ -442,26 +442,78 @@ a session that asks for a capture only receives the transcript.
   language and the session that owns the capture or the reading (`language`
   with its `paneId` and `label`), so a window labels the microphone without
   asking. Display only: nothing routes a transcript by it.
-- **The overlay port.** `lib/voice-overlay.ts` is the seam the window will plug
-  into: the listener hands it a snapshot of the display (state, language,
-  owning session) on every change and the smoothed level while recording. The
+- **The reading's own loudness.** While a reply is read aloud, the session that
+  holds the reading turn sends the loudness of each chunk its player begins
+  (`read-levels`: the reading id, the frame width and a bounded list of values),
+  and the listener draws it in audio time, at most twenty values a second. Only
+  the holder of that reading is accepted, and the end of the reading, a cut, a
+  lapsed lease or a disconnect stops it at once. The microphone meter and the
+  speech events outside consumers receive are unchanged.
+- **The overlay port.** `lib/voice-overlay.ts` is the seam the window plugs into:
+  the listener hands it a snapshot of the display (state, language, owning session) on every change and the smoothed level while recording. The
   meter lives there, never in the detector: the same worker RMS is normalized
   between the measured WSLg floor (0.0031) and measured speech (0.016) and
   smoothed fast up, slow down, so the endpointer's own thresholds are
-  untouched. An overlay that throws, rejects or never answers is logged once
+  untouched. A reading has its own output meter (floor 0.02, full bar at 0.25),
+  because the played speech is an RMS on a 0..1 scale and silent between words.
+  An overlay that throws, rejects or never answers is logged once
   (`overlay.failed`, the event name only, never a level or a transcript) and
   dropped for good; capture, transcripts, cues and readings carry on without
   it.
+
+- **The overlay window.** Under WSL or Windows the listener owns a small window
+  (`lib/voice-overlay-windows.ts`, `scripts/voice-overlay-window.ps1`, the design
+  `design/voice-overlay/03-bordes-y-pildora.html`). It is a WPF window started
+  through PowerShell on the cue host's shape: one warm process, one short line
+  per command on stdin, a state change acknowledged and the levels fire and
+  forget, at most one every 40 ms with only the newest kept. It is always on top,
+  click-through (a click on it reaches the window underneath), never takes the
+  focus, and is absent from the taskbar and Alt+Tab. It appears on the monitor
+  that holds the foreground window when a state starts. Everything is local:
+  nothing leaves the machine, and no level, session name or transcript is ever
+  logged.
+  - **Listening** (the microphone really records): the four screen edges glow in
+    rose and breathe with the microphone level, and the pill shows a mic badge,
+    "ESCUCHANDO", the session label, a mirrored wave and the language chip.
+  - **Awake but not recording:** a small quiet pill ("voz activa, micrófono
+    cerrado") with no glow and no wave. The full listening look is only ever drawn
+    while levels are arriving, so it never says the microphone is open when it is
+    not; a second without a level withdraws it.
+  - **Transcribing:** an amber bar sweeps along the top edge and the pill shows a
+    spinner and "TRANSCRIBIENDO…".
+  - **Reading:** a green glow along the bottom edge only, a speaker badge,
+    "LEYENDO", "de" plus the session label, and bars rising from the baseline that
+    follow the level of the speech the player actually started. If no level has
+    arrived for 300 ms the bars fall back to a gentle synthesized motion.
+  - **Asleep:** no edges, a dim pill that says "Dormido, di «Gentle Voice on»".
+  - **Language:** the chip shows `ES`; `EN` is drawn as the filled blue English
+    chip. The rest of the English mode (blue edges) and the confirmation state are
+    designed but not wired yet.
+  - **Turn it off:** `GENTLE_PI_VOICE_OVERLAY=off` before the listener starts
+    (there is no settings key). With no PowerShell, or off Windows and WSL, no
+    window is built and voice is unchanged. If the window process exits, refuses
+    or hangs, the listener logs `overlay.failed` once, drops it for the rest of
+    its life and carries on; it is never restarted in a loop. The window closes
+    with the listener, and closes by itself if the listener dies.
+  - **Known limits:** the window follows the Windows "show animations" setting
+    (off: a still spinner and sweep, no synthesized reading motion). It is drawn
+    at the DPI of the monitor it opens on; only 100% scaling was exercised. The
+    PowerShell host costs about 4 to 5% of one core while listening with a moving
+    wave (about 1% once warm), 1 to 2% while transcribing or reading, and nothing
+    when idle, and holds about 150 MiB. A full-screen game or a window that
+    outranks topmost windows can cover it.
+  - **See it without talking:**
+    `node --experimental-strip-types scripts/voice-overlay-demo.mjs` shows the
+    real window state by state for about 36 seconds with synthetic levels. It
+    opens no microphone, plays no audio and closes the window when it ends.
 
 A session dictates through the listener: the lock, the socket, the turn and the
 microphone are live, and a reply is read only in the pane herdr reports focused
 (S12). A session that cannot reach a listener records itself, exactly as
 described above, and a session that is not focused receives neither a transcript
-nor a reading. The overlay window itself is still to come, behind this port: no
-window is created yet, so the levels are published to the sessions that ask for
-them and to the port, and nowhere else. The keyword spotter and the echo
-cancellation the design defers (§5) are still to come; the capture path is
-shaped so a reference stream can be tapped into it when they arrive.
+nor a reading. The keyword spotter and the echo cancellation the design defers
+(§5) are still to come; the capture path is shaped so a reference stream can be
+tapped into it when they arrive.
 
 ## Natural voice with Kokoro
 
