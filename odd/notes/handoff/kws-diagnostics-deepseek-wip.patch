@@ -1,0 +1,148 @@
+diff --git a/scripts/voice-worker.cjs b/scripts/voice-worker.cjs
+index 43bdc941d..044622060 100644
+--- a/scripts/voice-worker.cjs
++++ b/scripts/voice-worker.cjs
+@@ -302,17 +302,26 @@ const SPIKE = 2;
+ // Quiet this long closes an utterance, and is the silence a command must be
+ // followed by.
+ const KWS_QUIET_WINDOWS = 4;
+-// From the start of the utterance to the hit: the longest phrase (about 1.6 s)
+-// plus the spotter's own delay after the words (0.65 s at most when measured)
+-// and a margin. More speech than that before the hit means the phrase came
+-// inside a sentence.
+-const KWS_MAX_LEAD_SECONDS = 2.6;
++// Quiet this long starts the next utterance. It is shorter than the boundary a
++// command must be followed by because a person leaves a reaction gap, not a
++// sentence break, before saying it: the open cue the microphone hears back, or
++// the breath before the words, would otherwise be charged to the phrase (L15:
++// the phrase then measured 1.0 s or more of other sound ahead of it and the
++// whole command was dropped in silence).
++const KWS_BOUNDARY_WINDOWS = 2;
++// From the start of the utterance to the hit: the longest phrase (about 2.2 s
++// said slowly), plus the spotter's own delay after the words (0.54-0.64 s when
++// measured on the owner's microphone, odd/notes/voice-kws.md) and a margin.
++// More speech than that before the hit means the phrase came inside a sentence.
++const KWS_MAX_LEAD_SECONDS = 3.4;
+ // A hit not followed by that silence within this long had more speech after
+ // it: an embedded mention as well.
+ const KWS_CONFIRM_SECONDS = 1;
+ // Silence fed to the spotter when a recording ends, so a phrase said right
+-// before the end is still decoded.
+-const KWS_TAIL_SECONDS = 0.5;
++// before the end is still decoded. It has to outlast the spotter's own delay
++// after the words (0.64 s at most when measured), or a phrase that ends the
++// recording is never heard.
++const KWS_TAIL_SECONDS = 1;
+ 
+ class Endpointer {
+ 	constructor(sampleRate, endpoint) {
+@@ -579,6 +588,12 @@ class WorkerSession {
+ 			quietRun: KWS_QUIET_WINDOWS,
+ 			utteranceStart: undefined,
+ 			pending: undefined,
++			// What the spotter did with this capture: counts only, never audio and
++			// never words, so a capture that lost a command can be told apart from
++			// one the spotter never heard (S10). `hits` is every phrase the spotter
++			// reported, and each hit lands in exactly one of the other counts.
++			counts: { hits: 0, commands: 0, embedded: 0, unknown: 0, late: 0 },
++			reported: false,
+ 		};
+ 	}
+ 
+@@ -604,6 +619,7 @@ class WorkerSession {
+ 				const keyword = this.spotter.getResult(kws.stream)?.keyword;
+ 				if (typeof keyword !== "string" || keyword.trim().length === 0) continue;
+ 				this.spotter.reset(kws.stream);
++				kws.counts.hits += 1;
+ 				return keyword.trim();
+ 			}
+ 		} catch {
+@@ -616,8 +632,15 @@ class WorkerSession {
+ 	// a named command, with no more speech before it than the phrase itself.
+ 	isWholeUtterance(keyword) {
+ 		const kws = this.kws;
+-		if (!kws.commands.has(keyword) || kws.utteranceStart === undefined) return false;
+-		return kws.time - kws.utteranceStart <= KWS_MAX_LEAD_SECONDS;
++		if (!kws.commands.has(keyword)) {
++			kws.counts.unknown += 1;
++			return false;
++		}
++		if (kws.utteranceStart === undefined || kws.time - kws.utteranceStart > KWS_MAX_LEAD_SECONDS) {
++			kws.counts.late += 1;
++			return false;
++		}
++		return true;
+ 	}
+ 
+ 	// Called for every device chunk of a capture that asked for keywords.
+@@ -635,7 +658,7 @@ class WorkerSession {
+ 		kws.floor = Math.min(kws.floor, rms);
+ 		const loud = rms >= Math.max(MIN_SPEECH_LEVEL, kws.floor * SPEECH_FLOOR_RATIO);
+ 		if (loud) {
+-			if (kws.quietRun >= KWS_QUIET_WINDOWS) kws.utteranceStart = kws.time;
++			if (kws.quietRun >= KWS_BOUNDARY_WINDOWS) kws.utteranceStart = kws.time;
+ 			kws.quietRun = 0;
+ 		} else {
+ 			kws.quietRun += windows;
+@@ -644,9 +667,15 @@ class WorkerSession {
+ 		const keyword = this.decodeKws();
+ 		if (keyword) kws.pending = this.isWholeUtterance(keyword) ? { command: keyword, deadline: kws.time + KWS_CONFIRM_SECONDS } : undefined;
+ 		if (!kws.pending) return undefined;
+-		if (kws.quietRun >= KWS_QUIET_WINDOWS) return kws.pending.command;
++		if (kws.quietRun >= KWS_QUIET_WINDOWS) {
++			kws.counts.commands += 1;
++			return kws.pending.command;
++		}
+ 		// Speech went on after the phrase: it was part of a sentence.
+-		if (kws.time >= kws.pending.deadline) kws.pending = undefined;
++		if (kws.time >= kws.pending.deadline) {
++			kws.pending = undefined;
++			kws.counts.embedded += 1;
++		}
+ 		return undefined;
+ 	}
+ 
+@@ -655,10 +684,25 @@ class WorkerSession {
+ 	// before the end, which the spotter only reports after a little more audio.
+ 	finalKwsCommand() {
+ 		const kws = this.kws;
+-		if (kws.pending) return kws.pending.command;
++		if (kws.pending) {
++			kws.counts.commands += 1;
++			return kws.pending.command;
++		}
+ 		kws.time += kws.frames / kws.sampleRate;
+ 		const keyword = this.decodeKws(KWS_TAIL_SECONDS);
+-		return keyword && this.isWholeUtterance(keyword) ? keyword : undefined;
++		if (!keyword || !this.isWholeUtterance(keyword)) return undefined;
++		kws.counts.commands += 1;
++		return keyword;
++	}
++
++	// What the spotter did with this capture, once, as counts (S10): the listener
++	// logs it, so a capture that ended as a transcript with a phrase in it says
++	// whether the spotter never fired, or fired and was refused.
++	sendKws() {
++		const kws = this.kws;
++		if (!kws || kws.reported) return;
++		kws.reported = true;
++		this.send({ type: "kws", counts: { ...kws.counts } });
+ 	}
+ 
+ 	// Loads sherpa-onnx and the recognizer; only called once the model verified.
+@@ -830,6 +874,7 @@ class WorkerSession {
+ 	}
+ 
+ 	async finishResult(text) {
++		this.sendKws();
+ 		const result = { type: "result", text: text.trim().slice(0, MAX_TEXT), truncated: this.truncated };
+ 		if (!this.request.keepAlive) return this.end(result);
+ 		// Warm: the microphone was already released; wait for the next start.
+@@ -847,6 +892,7 @@ class WorkerSession {
+ 	// Ends a capture that has no transcript with one last message: a command,
+ 	// or `stopped` for a spot-only capture that was asked to stop.
+ 	async finishCapture(message) {
++		this.sendKws();
+ 		if (!this.request.keepAlive) return this.end(message);
+ 		this.state = "closing";
+ 		await this.closeStream();
