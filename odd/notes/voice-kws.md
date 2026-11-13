@@ -665,3 +665,61 @@ OneCore synthesis, 200 clips), `scripts/cmd-probe.mjs` (this section's measureme
 `results/s13-cost.jsonl` (every row behind these tables). The `audio/` (258 T6 clips) and
 `audio-cmd/` (200 S13 clips) WAVs are still there, 70 MB together; `cmd-synth.mjs`
 regenerates them in four minutes.
+
+### 11.10 Real-microphone result, run 1
+
+Run by the owner on 2026-11-13 with his own voice and microphone, candidate
+"Gentle Voice cancel" alone (one keyword line, boost 2.0, threshold 0.25,
+`maxActivePaths` 16). Numbers only; the audio stayed in memory.
+
+| what was said | result |
+| --- | --- |
+| "Gentle Voice cancel." 5 times | **2/5**: no hit, no hit, no hit, hit 380 ms, hit 340 ms |
+| near-sounds said alone ("Cancelar.", "Cáncer.", "El cancel de la puerta.", "Gente, estoy.", "El stock.", "Stop.", "Off."), twice each | 0/14 fired |
+| 60 s of free Spanish speech | 0 hits |
+
+The synthetic Spanish voice was heard 5/5 (section 11.2); the owner is heard 2/5. With
+"Gentle Voice on" and "Gentle Voice off" the same voice was heard 4/5 (section 9), so the
+frame is not the problem: the word "cancel" as he says it is. The recommendation of
+section 11.8 does **not** hold for the owner's voice as measured, and nothing is added
+to the shipped keyword file on this evidence. What does hold is the other half: no
+near-sound and no ordinary speech fired the command.
+
+Second round prepared, not yet run (`real-round2.sh` in the scratch directory): the same
+phrase with seven spellings listening at once, so a spelling closer to his
+pronunciation can catch it (`CANCEL`, `CANSEL`, `KANSEL`, `CAN SELL`, `CANCELL`,
+`CONCEL`, `CANCELE`; the keyword file can carry several spellings per command), and
+then "Gentle Voice stop" on its own. Both repeat the near-sounds and 30 s of free
+speech, because more spellings can only raise the false accepts.
+
+### 11.11 Real-microphone result, run 2, and what follows
+
+Second run by the owner the same day, seven spellings of the phrase listening at once.
+(The first run of the round-2 script never reached its "Gentle Voice stop" half: the
+probe did not exit after closing the microphone, so the script waited on it. The probe
+now exits; "Gentle Voice stop" has not been measured with the owner's voice.)
+
+| what was said | result |
+| --- | --- |
+| "Gentle Voice cancel." 5 times, 7 spellings active | **3/5**: no hit, hit 380 ms, no hit, hit 400 ms, hit 500 ms — every hit through the spelling `KANSEL`, none through `CANCEL` |
+| near-sounds said alone, twice each | 0/14 fired |
+| 30 s of free Spanish speech | 0 hits |
+
+Two runs, five attempts each: 2/5 with the dictionary spelling, 3/5 with spellings
+closer to his pronunciation. That is not a real difference at this sample size, and
+neither is good enough for the one command that has to work while a reply is being
+read. The owner's own reading of it is that his English pronunciation is the cause.
+His dictation, which the product's dictation model transcribes, renders the same
+words ("cancel", "stop") correctly inside his sentences.
+
+So the keyword spotter stays for what it measured well with his voice ("Gentle Voice
+on" and "Gentle Voice off", 4/5 each, section 9), and the command that cuts a reading
+needs another route. Candidate, not yet measured: while a reply is read, hear short
+utterances with the dictation model itself and match a whole utterance against a fixed
+list that includes Spanish words ("cancelar", "pará", "basta"), the way "Gentle Voice
+off" was first heard in the transcript (T3). It follows his pronunciation because it
+is the model that already understands him, it costs a decode only when someone speaks
+during a reading, and nothing it hears is delivered or kept. Its known limit is the
+same as before: on speakers the reading itself reaches the microphone. A scratch probe
+for it (isolated words through the product's warm worker, three attempts each) is at
+`/tmp/gpLPqO91/voice-cmd-asr/run.sh`.
