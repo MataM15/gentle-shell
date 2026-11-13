@@ -3,13 +3,13 @@
   "chosen": "03-bordes-y-pildora.html",
   "handoffs": {
     "03-bordes-y-pildora.html": {
-      "status": "in_progress",
+      "status": "implemented",
       "queued": false,
       "sentAt": "2026-11-13T03:36:15.891Z",
       "startedAt": "2026-11-13T03:37:34.664Z",
-      "implementedAt": null,
+      "implementedAt": "2026-11-13T05:10:44.515Z",
       "feature": "odd/tasks/voice-control.md",
-      "note": "T12: ventana de Windows (PowerShell/WPF) detrás del puerto del oído; escribe el agente visual en Sonnet 5.5."
+      "note": "Ventana de Windows implementada, revisada (aprobada) e integrada en personal/main en afc25ef61. Demo: node --experimental-strip-types scripts/voice-overlay-demo.mjs. Falta la aprobación visual del dueño y su palabra sobre la forma de reposo \"VOZ ACTIVA · micrófono cerrado\", que no está en el diseño."
     }
   }
 }
