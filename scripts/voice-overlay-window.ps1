@@ -409,7 +409,9 @@ function Apply([bool]$fresh) {
       [Array]::Clear($script:history, 0, $MIRROR_BARS)
       Show-Wave 'base' $p[0]
       Place-Pill 620 104 $true
-      if (-not $reduced) { Start-Animation }
+      # The reading bars are the real level, so they keep drawing with
+      # animations off; the timer only skips the synthesized fallback below.
+      Start-Animation
     }
   }
 }
@@ -465,9 +467,10 @@ $timer.Add_Tick({
       'reading' {
         # The bars follow the level of the speech the player really started,
         # like listening. Only when none has arrived for 300 ms (a player that
-        # does not publish one) a gentle synthesized motion keeps the bars alive.
+        # does not publish one) a gentle synthesized motion keeps the bars alive,
+        # and only with animations on: with them off the bars hold the real level.
         $script:phase += $dt
-        if ($now - $script:levelAt -lt 0.3) { $value = $script:level }
+        if ($reduced -or $now - $script:levelAt -lt 0.3) { $value = $script:level }
         else {
           $target = 0.10 + 0.20 * (0.5 + 0.5 * [Math]::Sin($script:phase * 2 * [Math]::PI * 1.6)) * (0.85 + 0.15 * (Get-Random -Maximum 1.0))
           $script:env += ($target - $script:env) * 0.25
