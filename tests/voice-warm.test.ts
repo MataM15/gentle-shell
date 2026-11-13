@@ -329,6 +329,100 @@ test("a spot-only capture answered like a dictation is a protocol error", async 
 	await h.until(() => h.workers[0]!.exited);
 });
 
+test("keyword rejections reach the spot and dictation observers without ending either capture", async () => {
+	const h = harness();
+	const hits: Array<{ command: string; reason: string }> = [];
+	const spot = h.warm.spot({ kws: KWS, onKeywordRejected: (hit) => hits.push(hit) });
+	const started = spot.start();
+	await h.until(() => h.workers.length === 1 && h.workers[0]!.received.length === 1);
+	const worker = h.workers[0]!;
+	assert.equal(worker.received[0]!.keywordDiagnostics, true);
+	worker.say({ type: "spotting" });
+	await started;
+	worker.say({ type: "keyword-rejected", command: "voice-off", reason: "lead" });
+	worker.say({ type: "keyword-rejected", command: "voice-off", reason: "speech-after" });
+	assert.deepEqual(hits, [{ command: "voice-off", reason: "lead" }, { command: "voice-off", reason: "speech-after" }]);
+	assert.equal(spot.state, "recording");
+	const stopped = spot.stop();
+	worker.say({ type: "stopped" });
+	await stopped;
+	assert.equal(await spot.heard(), undefined);
+	const dictation = h.warm.session({ kws: KWS, onStateChange: () => {}, onKeywordRejected: (hit) => hits.push(hit) });
+	const recording = dictation.start();
+	await h.until(() => worker.received.filter((message) => message.type === "start").length === 2);
+	assert.equal(worker.received.at(-1)!.keywordDiagnostics, true);
+	worker.say({ type: "recording" });
+	await recording;
+	worker.say({ type: "keyword-rejected", command: "voice-off", reason: "lead" });
+	assert.equal(dictation.state, "recording");
+	const result = dictation.stop();
+	worker.say({ type: "transcribing" });
+	worker.say({ type: "result", text: "ordinary speech", truncated: false });
+	assert.deepEqual(await result, { text: "ordinary speech", truncated: false });
+	assert.deepEqual(hits.at(-1), { command: "voice-off", reason: "lead" });
+	await h.warm.close();
+});
+
+test("a pending keyword rejected during cancellation is still reported before the child exits", async () => {
+	const h = harness();
+	const hits: Array<{ command: string; reason: string }> = [];
+	const spot = h.warm.spot({ kws: KWS, onKeywordRejected: (hit) => hits.push(hit) });
+	const started = spot.start();
+	await h.until(() => h.workers.length === 1 && h.workers[0]!.received.length === 1);
+	const worker = h.workers[0]!;
+	worker.stubborn = true;
+	worker.say({ type: "spotting" });
+	await started;
+	const cancelled = spot.cancel();
+	worker.say({ type: "keyword-rejected", command: "voice-off", reason: "ended" });
+	worker.exit();
+	await cancelled;
+	assert.deepEqual(hits, [{ command: "voice-off", reason: "ended" }]);
+	assert.deepEqual(worker.signals, [], "a valid final diagnostic is not a protocol error");
+});
+
+test("a command crossing cancellation is reported as ignored and never becomes the capture result", async () => {
+	const h = harness();
+	const hits: Array<{ command: string; reason: string }> = [];
+	const spot = h.warm.spot({ kws: KWS, onKeywordRejected: (hit) => hits.push(hit) });
+	const started = spot.start();
+	await h.until(() => h.workers.length === 1 && h.workers[0]!.received.length === 1);
+	const worker = h.workers[0]!;
+	worker.stubborn = true;
+	worker.say({ type: "spotting" });
+	await started;
+	const heard = spot.heard();
+	heard.catch(() => {});
+	const cancelled = spot.cancel();
+	worker.say({ type: "command", command: "voice-off" });
+	worker.exit();
+	await cancelled;
+	await assert.rejects(heard, (error: unknown) => error instanceof VoiceSessionError && error.code === "cancelled");
+	assert.deepEqual(hits, [{ command: "voice-off", reason: "cancelled" }]);
+	assert.deepEqual(worker.signals, []);
+});
+
+test("malformed rejection messages with extra data or invalid fields fail the warm protocol", async () => {
+	for (const bad of [
+		{ type: "keyword-rejected", command: "voice-off", reason: "lead", text: "private" },
+		{ type: "keyword-rejected", command: "Voice Off", reason: "lead" },
+		{ type: "keyword-rejected", command: "voice-off", reason: "not-a-reason" },
+		{ type: "keyword-rejected", command: "voice-off" },
+	]) {
+		const h = harness();
+		const spot = h.warm.spot({ kws: KWS, onKeywordRejected: () => assert.fail("no malformed hit") });
+		const started = spot.start();
+		await h.until(() => h.workers.length === 1 && h.workers[0]!.received.length === 1);
+		const worker = h.workers[0]!;
+		worker.say({ type: "spotting" });
+		await started;
+		const heard = spot.heard();
+		worker.say(bad);
+		await assert.rejects(heard, (error: unknown) => error instanceof VoiceSessionError && error.code === "protocol");
+		await h.until(() => worker.exited);
+	}
+});
+
 const workerLine = (message: Record<string, unknown>) => JSON.stringify({ schema: VOICE_WORKER_SCHEMA, ...message });
 
 test("command, spotting and stopped lines carry exactly their fields", async () => {

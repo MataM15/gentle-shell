@@ -49,11 +49,10 @@ const listener = new VoiceListener({
 	focus: createHerdrFocus({ env }),
 	// The display levels travel with the capture: the listener decides whether
 	// they are needed and the warm worker publishes them only then.
-	dictation: warm ? ({ onStateChange, endpoint, levels, onLevel, kws }) => warm.session({ onStateChange, endpoint, levels, onLevel, kws }) : undefined,
-	// The spot-only capture keeps the microphone open while the listener is asleep,
-	// on the same warm worker and its one spotter.
+	dictation: warm ? ({ onStateChange, endpoint, levels, onLevel, kws, onKeywordRejected }) => warm.session({ onStateChange, endpoint, levels, onLevel, kws, onKeywordRejected }) : undefined,
+	// Spotting shares the warm worker while asleep, between turns and during readings.
 	keyword: keywordOption,
-	spot: warm && keywordOption ? () => warm.spot({ kws: keywordOption }) : undefined,
+	spot: warm && keywordOption ? (onKeywordRejected) => warm.spot({ kws: keywordOption, onKeywordRejected }) : undefined,
 	// Without a window the listener publishes the levels to the sessions that ask
 	// for them and to nobody else.
 	overlay,

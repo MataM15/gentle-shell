@@ -900,6 +900,71 @@ const feed = (stream: FakeStream, windows: number, level: number) => {
 	for (let i = 0; i < windows; i++) stream.options.onData(chunk(100, level));
 };
 
+test("diagnostic hits explain rejected lead and speech-after without ending the spot capture", async (t) => {
+	for (const [reason, at, loud] of [["lead", 4.5, 40], ["speech-after", 1.5, 30]] as const) {
+		await t.test(reason, async (st) => {
+			const worker = harness(st, { ...mono8k, fires: [{ at: fedAfter(at), keyword: "voice-off" }] });
+			worker.send(kwsStart(worker, { spot: true, keepAlive: true, keywordDiagnostics: true }));
+			await worker.waitFor(() => worker.types().includes("spotting"));
+			const stream = worker.streams[0]!;
+			feed(stream, 3, 0);
+			feed(stream, loud, 0.3);
+			feed(stream, 8, 0);
+			assert.deepEqual(worker.messages, [
+				{ schema: SCHEMA, type: "spotting" },
+				{ schema: SCHEMA, type: "keyword-rejected", command: "voice-off", reason },
+			]);
+			assert.equal(stream.closes, 0);
+			assert.equal(worker.recognizers.length, 0);
+			worker.send({ schema: SCHEMA, type: "stop" });
+			await worker.waitFor(() => worker.types().includes("stopped"));
+			assert.deepEqual(worker.types(), ["spotting", "keyword-rejected", "stopped"]);
+			worker.send({ schema: SCHEMA, type: "close" });
+			await worker.done;
+			assert.equal(worker.exitCode(), 0);
+		});
+	}
+});
+
+test("a pending spotter hit is diagnosed when stop or cancel ends it before confirmation", async (t) => {
+	for (const [ending, reason] of [["stop", "stopped"], ["cancel", "ended"]] as const) {
+		await t.test(ending, async (st) => {
+			const worker = harness(st, { ...mono8k, fires: [{ at: fedAfter(1.5), keyword: "voice-off" }] });
+			worker.send(kwsStart(worker, { spot: true, keywordDiagnostics: true }));
+			await worker.waitFor(() => worker.types().includes("spotting"));
+			feed(worker.streams[0]!, 3, 0);
+			feed(worker.streams[0]!, 12, 0.3);
+			worker.send({ schema: SCHEMA, type: ending });
+			await worker.done;
+			assert.deepEqual(worker.messages, [
+				{ schema: SCHEMA, type: "spotting" },
+				{ schema: SCHEMA, type: "keyword-rejected", command: "voice-off", reason },
+				...(ending === "stop" ? [{ schema: SCHEMA, type: "stopped" }] : []),
+			]);
+			assert.equal(worker.streams[0]!.closes, 1);
+			assert.equal(worker.recognizers.length, 0);
+			assert.equal(worker.exitCode(), 0);
+		});
+	}
+});
+
+test("a diagnostic rejection found on final decoding does not change the dictated transcript", async (t) => {
+	const worker = harness(t, { ...mono8k, fires: [{ at: fedAfter(4.3) + 1, keyword: "voice-off" }] });
+	worker.send(kwsStart(worker, { keywordDiagnostics: true }));
+	await worker.waitFor(() => worker.types().includes("recording"));
+	feed(worker.streams[0]!, 3, 0);
+	feed(worker.streams[0]!, 40, 0.3);
+	worker.send({ schema: SCHEMA, type: "stop" });
+	await worker.done;
+	assert.deepEqual(worker.messages, [
+		{ schema: SCHEMA, type: "recording" },
+		{ schema: SCHEMA, type: "keyword-rejected", command: "voice-off", reason: "lead" },
+		{ schema: SCHEMA, type: "transcribing" },
+		{ schema: SCHEMA, type: "result", text: "hello world", truncated: false },
+	]);
+	assert.equal(worker.exitCode(), 0);
+});
+
 test("a phrase that is the whole utterance is reported as its command and never transcribed", async (t) => {
 	const worker = harness(t, { ...mono8k, fires: [{ at: fedAfter(1.7), keyword: "voice-off" }] });
 	worker.send(kwsStart(worker));
@@ -1189,6 +1254,9 @@ test("spot must be exactly true, needs the keyword option and takes no endpoint 
 		["spot as a string", (worker) => kwsStart(worker, { spot: "true" })],
 		["spot with an endpoint", (worker) => kwsStart(worker, { spot: true, endpoint: ENDPOINT })],
 		["spot with levels", (worker) => kwsStart(worker, { spot: true, levels: true })],
+		["diagnostics without kws", (worker) => startRequest(worker.paths, { keywordDiagnostics: true })],
+		["diagnostics false", (worker) => kwsStart(worker, { keywordDiagnostics: false })],
+		["diagnostics string", (worker) => kwsStart(worker, { keywordDiagnostics: "true" })],
 	];
 	for (const [label, build] of bad) {
 		const worker = harness(t, mono8k);

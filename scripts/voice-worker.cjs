@@ -116,13 +116,16 @@ function parseStart(message) {
 	const withLevels = isRecord(message) && Object.hasOwn(message, "levels");
 	const withKws = isRecord(message) && Object.hasOwn(message, "kws");
 	const withSpot = isRecord(message) && Object.hasOwn(message, "spot");
-	const keys = [...START_KEYS, ...(withEndpoint ? ["endpoint"] : []), ...(withKeepAlive ? ["keepAlive"] : []), ...(withLevels ? ["levels"] : []), ...(withKws ? ["kws"] : []), ...(withSpot ? ["spot"] : [])];
+	const withKeywordDiagnostics = isRecord(message) && Object.hasOwn(message, "keywordDiagnostics");
+	const keys = [...START_KEYS, ...(withEndpoint ? ["endpoint"] : []), ...(withKeepAlive ? ["keepAlive"] : []), ...(withLevels ? ["levels"] : []), ...(withKws ? ["kws"] : []), ...(withSpot ? ["spot"] : []), ...(withKeywordDiagnostics ? ["keywordDiagnostics"] : [])];
 	if (!hasExactKeys(message, keys)) fail("invalid-request");
 	// A spot-only capture listens for keywords and nothing else: it has no
 	// transcript to end, so no endpoint, and no meter to feed.
 	if (withSpot && (message.spot !== true || !withKws || withEndpoint || withLevels)) fail("invalid-request");
 	// Opt-in as well: without it no spotter is loaded and nothing changes.
 	if (withKws) parseKws(message.kws);
+	// Only the warm listener opts in: older single-use clients do not parse diagnostics.
+	if (withKeywordDiagnostics && (!withKws || message.keywordDiagnostics !== true)) fail("invalid-request");
 	// A warm worker stays alive after each result for the next recording.
 	if (withKeepAlive && message.keepAlive !== true) fail("invalid-request");
 	// Opt-in: without it the worker publishes exactly the messages it always did.
@@ -433,6 +436,7 @@ class WorkerSession {
 	// Ends the session once: closes capture, reports at most one final message.
 	async end(final) {
 		if (this.state === "ended") return;
+		this.rejectPendingKws("ended");
 		this.state = "ended";
 		this.verification.abort();
 		await this.closeStream();
@@ -460,7 +464,10 @@ class WorkerSession {
 		if (message.type === "cancel") return this.end(undefined);
 		if (message.type === "stop") {
 			if (this.state === "recording") return this.transcribe();
-			if (this.state === "spotting") return this.finishCapture({ type: "stopped" });
+			if (this.state === "spotting") {
+				this.rejectPendingKws("stopped");
+				return this.finishCapture({ type: "stopped" });
+			}
 			if (this.state === "loading") fail("invalid-request");
 			return undefined;
 		}
@@ -616,12 +623,24 @@ class WorkerSession {
 		return "";
 	}
 
-	// True when a hit at the current audio time can be the whole utterance:
-	// a named command, with no more speech before it than the phrase itself.
-	isWholeUtterance(keyword) {
+	// Explain each hit without retaining or reporting audio, levels or words.
+	// An invalid label from the native model is never passed into the log.
+	rejectKws(keyword, reason) {
+		if (this.request?.keywordDiagnostics && KWS_COMMAND.test(keyword)) this.send({ type: "keyword-rejected", command: keyword, reason });
+	}
+
+	rejectPendingKws(reason) {
+		if (!this.kws?.pending) return;
+		this.rejectKws(this.kws.pending.command, reason);
+		this.kws.pending = undefined;
+	}
+
+	// Why a hit cannot be the whole utterance, or undefined when it can.
+	keywordRejection(keyword) {
 		const kws = this.kws;
-		if (!kws.commands.has(keyword) || kws.utteranceStart === undefined) return false;
-		return kws.time - kws.utteranceStart <= KWS_MAX_LEAD_SECONDS;
+		if (!kws.commands.has(keyword)) return "unknown-command";
+		if (kws.utteranceStart === undefined) return "no-utterance";
+		return kws.time - kws.utteranceStart <= KWS_MAX_LEAD_SECONDS ? undefined : "lead";
 	}
 
 	// Called for every device chunk of a capture that asked for keywords.
@@ -646,11 +665,20 @@ class WorkerSession {
 		}
 		kws.time += windows * WINDOW_SECONDS;
 		const keyword = this.decodeKws();
-		if (keyword) kws.pending = this.isWholeUtterance(keyword) ? { command: keyword, deadline: kws.time + KWS_CONFIRM_SECONDS } : undefined;
+		if (keyword) {
+			this.rejectPendingKws("superseded");
+			const reason = this.keywordRejection(keyword);
+			if (reason) this.rejectKws(keyword, reason);
+			else kws.pending = { command: keyword, deadline: kws.time + KWS_CONFIRM_SECONDS };
+		}
 		if (!kws.pending) return undefined;
-		if (kws.quietRun >= KWS_QUIET_WINDOWS) return kws.pending.command;
+		if (kws.quietRun >= KWS_QUIET_WINDOWS) {
+			const command = kws.pending.command;
+			kws.pending = undefined;
+			return command;
+		}
 		// Speech went on after the phrase: it was part of a sentence.
-		if (kws.time >= kws.pending.deadline) kws.pending = undefined;
+		if (kws.time >= kws.pending.deadline) this.rejectPendingKws("speech-after");
 		return undefined;
 	}
 
@@ -659,10 +687,20 @@ class WorkerSession {
 	// before the end, which the spotter only reports after a little more audio.
 	finalKwsCommand() {
 		const kws = this.kws;
-		if (kws.pending) return kws.pending.command;
+		if (kws.pending) {
+			const command = kws.pending.command;
+			kws.pending = undefined;
+			return command;
+		}
 		kws.time += kws.frames / kws.sampleRate;
 		const keyword = this.decodeKws(KWS_TAIL_SECONDS);
-		return keyword && this.isWholeUtterance(keyword) ? keyword : undefined;
+		if (!keyword) return undefined;
+		const reason = this.keywordRejection(keyword);
+		if (reason) {
+			this.rejectKws(keyword, reason);
+			return undefined;
+		}
+		return keyword;
 	}
 
 	// Loads sherpa-onnx and the recognizer; only called once the model verified.

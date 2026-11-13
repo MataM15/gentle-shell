@@ -30,6 +30,7 @@ import { KWS_MODEL_MANIFEST, KWS_SPOTTER_FILES, parseVoiceKeywords, VOICE_KEYWOR
 import { resolveVoiceKeywordSpotterPaths, type VoiceKeywordSpotterPaths } from "./voice-install.ts";
 import { createLevelMeter, type LevelMeter, type VoiceOverlay, type VoiceOverlaySnapshot } from "./voice-overlay.ts";
 import { VoiceSessionError, type VoiceKeywordOption, type VoiceSessionState, type VoiceTranscript } from "./voice-session.ts";
+import type { KeywordRejection } from "./voice-warm.ts";
 
 // One voice listener for every Pi session (S6, odd/notes/voice-listener-design.md).
 // It owns the process, the microphone and the shared turn: a single instance per
@@ -41,10 +42,10 @@ import { VoiceSessionError, type VoiceKeywordOption, type VoiceSessionState, typ
 // session that asked only receives its transcript. The levels a display draws
 // are published here too: one `level` frame per 50 ms of audio, from the same
 // worker RMS the detector judges, smoothed for the meter and never for the
-// detector. The keyword spotter reads the microphone while the listener is
-// asleep (S7): every capture it starts hears the spoken commands, and a spoken
-// "Gentle Voice off" reaches the same path a session's voice off does. The
-// window itself lives outside this file, behind the overlay port.
+// detector. The keyword spotter reads the microphone while asleep (S7) and
+// between captures while awake (S14): a spoken "Gentle Voice off" reaches the
+// same path a session's voice off does. Spot-only audio is never transcribed.
+// The window itself lives outside this file, behind the overlay port.
 
 export const LISTENER_LOCK_FILE = "listener.lock";
 export const LISTENER_SOCKET_FILE = "listener.sock";
@@ -296,7 +297,7 @@ export interface VoiceListenerOptions {
 	// not installed or the keyword file does not parse, and then the listener
 	// behaves exactly as it did before the spotter existed.
 	keyword?: VoiceKeywordOption;
-	// The spot-only capture the listener keeps open while it is asleep (S7), on
+	// Spot-only capture, asleep and while awake between captures (S7, S14), on
 	// the same warm worker in production and a fake in the tests.
 	spot?: ListenerSpotFactory;
 	// The microphone cues are played here, where the microphone is.
@@ -337,6 +338,7 @@ export interface ListenerDictationRequest {
 	// What the capture hears for its keyword spotter (S7): the worker reports a
 	// spoken command instead of words, so no transcript ever carries one.
 	kws?: VoiceKeywordOption;
+	onKeywordRejected(hit: KeywordRejection): void;
 }
 
 export type ListenerDictationFactory = (request: ListenerDictationRequest) => ListenerDictation;
@@ -351,7 +353,7 @@ export interface ListenerSpotting {
 	cancel(): Promise<void>;
 }
 
-export type ListenerSpotFactory = () => ListenerSpotting;
+export type ListenerSpotFactory = (onKeywordRejected: (hit: KeywordRejection) => void) => ListenerSpotting;
 
 // The tuning measured in odd/notes/voice-kws.md §5: one global score and
 // threshold for every line, and the decoding window the spotter uses.
@@ -409,6 +411,13 @@ export async function buildVoiceKeywordOption(options: {
 
 // The capture in progress: who asked, how it records, and what it already told
 // its requester. A capture the listener no longer holds reports nothing.
+interface PendingCapture {
+	readonly client: Client;
+	readonly sessionId: string;
+	readonly mode: CaptureMode;
+	cancelled: boolean;
+}
+
 interface ActiveCapture {
 	readonly client: Client;
 	readonly sessionId: string;
@@ -464,8 +473,12 @@ export class VoiceListener {
 	private levelAt: number | undefined;
 	private reading: ActiveReading | undefined;
 	private capture: ActiveCapture | undefined;
-	// The spot-only capture while the listener is asleep (S7), and the release of
-	// the one just stopped: the microphone is handed over only once it is free.
+	// Reserve the microphone while a requested capture waits for an earlier one.
+	private capturePending: PendingCapture | undefined;
+	private captureClosing: Promise<void> | undefined;
+	private waking = false;
+	// The spot-only capture, and the release of the one just stopped: the
+	// microphone is handed over only once it is free.
 	private spotting: ListenerSpotting | undefined;
 	// A spotter that failed once is never asked again: voice carries on without it.
 	private spotDisabled = false;
@@ -777,6 +790,8 @@ export class VoiceListener {
 		client.role = role;
 		this.say(client, withId({ type: "welcome", listenerPid: this.pid, proto: 1, state: this.currentState }, hello.id));
 		this.log("listener.hello", { sessionId: hello.sessionId, role, voiceOn: hello.voiceOn, clients: this.clients.size });
+		if (hello.voiceOn && this.currentState === "asleep") this.setState("listening");
+		else this.refreshSpotting();
 		this.armIdle();
 	}
 
@@ -786,8 +801,11 @@ export class VoiceListener {
 				client.voiceOn = request.voiceOn;
 				this.log("listener.voice", { sessionId: client.sessionId, voiceOn: request.voiceOn });
 				this.say(client, withId({ type: "ok", request: "set-voice" }, request.id));
-				if (request.voiceOn) this.turnVoiceOn(client);
-				else {
+				if (request.voiceOn) {
+					this.turnVoiceOn(client);
+					if (this.currentState === "asleep") this.setState("listening");
+					else this.refreshSpotting();
+				} else {
 					// L10: voice off from any session turns voice off everywhere, and the
 					// listener is asleep from here.
 					this.voiceOffEverywhere();
@@ -888,8 +906,8 @@ export class VoiceListener {
 	private async beginCapture(client: Client, request: { id?: string; mode: CaptureMode; endpoint?: ListenerEndpoint }): Promise<void> {
 		const sessionId = client.sessionId;
 		if (!sessionId) return;
-		if (this.capture) {
-			this.say(client, withId({ type: "busy", reason: "capture", holder: this.capture.sessionId }, request.id));
+		if (this.capture || this.capturePending) {
+			this.say(client, withId({ type: "busy", reason: "capture", holder: this.capture?.sessionId ?? this.capturePending?.sessionId }, request.id));
 			return;
 		}
 		// A reading shuts the microphone: it must not record what it is saying.
@@ -903,16 +921,17 @@ export class VoiceListener {
 			this.say(client, withId({ type: "error", code: "unknown-request" }, request.id));
 			return;
 		}
-		// One microphone (S7): while the listener is asleep the spotter holds it, so
-		// the recording waits until that capture closed before it opens its own.
-		if (this.spotting || this.spottingStop) {
-			await this.stopSpotting();
-			// The wait is a turn of its own: another capture may hold the microphone now.
-			if (this.capture) {
-				this.say(client, withId({ type: "busy", reason: "capture", holder: this.capture.sessionId }, request.id));
-				return;
-			}
-			if (!this.clients.has(client.socket)) return;
+		// Reserve the microphone across asynchronous stops: no other request or
+		// spotter can open it before the old stream has actually settled.
+		const pending: PendingCapture = { client, sessionId, mode: request.mode, cancelled: false };
+		this.capturePending = pending;
+		if (this.spotting || this.spottingStop) await this.stopSpotting();
+		if (this.captureClosing) await this.captureClosing;
+		if (pending.cancelled || !this.clients.has(client.socket) || this.closing) {
+			this.capturePending = undefined;
+			if (pending.cancelled && this.clients.has(client.socket) && !this.closing) this.answer(client, "dictate", request.id);
+			this.refreshSpotting();
+			return;
 		}
 		this.options.cues?.warm();
 		// Levels are asked for only when something draws them: the worker then
@@ -925,9 +944,11 @@ export class VoiceListener {
 			onStateChange: (state) => this.captureState(client, state),
 			onLevel: (rms) => this.publishLevel(rms),
 			kws: this.options.keyword,
+			onKeywordRejected: (hit) => this.logKeywordRejection(hit),
 		});
 		const capture: ActiveCapture = { client, sessionId, mode: request.mode, dictation, collecting: false, afterCollect: [], cue: "none" };
 		this.capture = capture;
+		this.capturePending = undefined;
 		// The meter of a new capture starts empty.
 		this.levelMeter.reset();
 		this.levelAt = undefined;
@@ -1039,9 +1060,13 @@ export class VoiceListener {
 	// session asks for it. "Gentle Voice off" is the only one that does anything
 	// (L10); anything else leaves voice as it was, as if nothing had been said.
 	private captureCommand(capture: ActiveCapture, command: string): void {
-		if (this.capture !== capture) return;
+		if (this.capture !== capture) {
+			this.log("kws.hit", { command, reason: "ignored:stale" });
+			return;
+		}
 		// The event name and the command id only: the audio is never kept.
 		this.log("capture.command", { sessionId: capture.sessionId, mode: capture.mode, command });
+		this.log("kws.hit", { command, reason: command === "voice-off" ? "whole-utterance" : command === "voice-on" ? "ignored:awake-voice-on" : "ignored:unsupported" });
 		if (command === "voice-off") this.voiceOffEverywhere();
 		// The same outcome as a recording that heard nothing: the close cue, the
 		// failed frame with `no-speech`, and the microphone handed back.
@@ -1073,13 +1098,22 @@ export class VoiceListener {
 
 	// A cancelled capture keeps nothing: no stop, no transcript, no delivery.
 	private discardCapture(client: Client, id?: string): void {
+		const pending = this.capturePending;
+		if (pending?.client === client) {
+			if (!pending.cancelled) {
+				pending.cancelled = true;
+				this.say(client, { type: "capture", phase: "cancelled" });
+				this.log("capture.cancelled", { sessionId: pending.sessionId, mode: pending.mode });
+			}
+			this.answer(client, "cancel", id);
+			return;
+		}
 		const capture = this.refuseUnlessOwner(client, id, this.capture);
 		if (!capture) return;
-		this.releaseCapture(capture);
+		this.releaseCapture(capture, true);
 		this.say(client, { type: "capture", phase: "cancelled" });
 		this.log("capture.cancelled", { sessionId: capture.sessionId, mode: capture.mode });
 		this.answer(client, "cancel", id);
-		void capture.dictation.cancel().catch(() => {});
 	}
 
 	// Only the session that asked may end its capture; every other session learns
@@ -1090,9 +1124,18 @@ export class VoiceListener {
 		return undefined;
 	}
 
-	private releaseCapture(capture: ActiveCapture): void {
+	private releaseCapture(capture: ActiveCapture, cancel = false): void {
 		if (this.capture !== capture) return;
 		this.capture = undefined;
+		if (cancel) {
+			let closing: Promise<void>;
+			try { closing = Promise.resolve(capture.dictation.cancel()).catch(() => {}); } catch { closing = Promise.resolve(); }
+			this.captureClosing = closing;
+			void closing.then(() => {
+				if (this.captureClosing === closing) this.captureClosing = undefined;
+				this.refreshSpotting();
+			});
+		}
 		// Whatever ended the capture (a stop, a cancel, a failure, a worker or a
 		// session that left), the microphone is closed from this moment.
 		this.setRecording(false);
@@ -1111,12 +1154,26 @@ export class VoiceListener {
 
 	// --- the keyword spotter (S7) --------------------------------------------------
 
-	// Asleep is the only state that listens for the keyword: the microphone stays
-	// open for the spotter alone, with no transcript and no cue of its own.
+	// Asleep keeps the S7 wake listener; when awake it listens only while at least
+	// one session wants voice and no real capture is open. It publishes no state.
+	private shouldSpot(): boolean {
+		return !this.capture && !this.capturePending && !this.captureClosing && !this.waking &&
+			(this.currentState === "asleep" || ((this.currentState === "listening" || this.currentState === "reading") && this.voiceSessions.length > 0));
+	}
+
+	private refreshSpotting(): void {
+		if (this.shouldSpot()) this.startSpotting();
+		else void this.stopSpotting();
+	}
+
+	private logKeywordRejection(hit: KeywordRejection): void {
+		this.log("kws.hit", { command: hit.command, reason: hit.reason === "cancelled" ? "ignored:cancelled" : `rejected:${hit.reason}` });
+	}
+
 	private startSpotting(): void {
 		const factory = this.options.spot;
 		if (!this.options.keyword || !factory || this.spotDisabled || this.closing) return;
-		if (this.spotting || this.currentState !== "asleep") return;
+		if (this.spotting || !this.shouldSpot()) return;
 		// A capture that is still closing holds the microphone: the next one waits.
 		const stopping = this.spottingStop;
 		if (stopping) {
@@ -1125,7 +1182,7 @@ export class VoiceListener {
 		}
 		let capture: ListenerSpotting;
 		try {
-			capture = factory();
+			capture = factory((hit) => this.logKeywordRejection(hit));
 		} catch {
 			this.failSpotting();
 			return;
@@ -1154,18 +1211,32 @@ export class VoiceListener {
 	}
 
 	private spottingHeard(capture: ListenerSpotting, command: string | undefined): void {
-		if (this.spotting !== capture) return;
-		this.spotting = undefined;
-		if (command === undefined) return;
-		// The event name and the command id only: never audio, never a level.
-		this.log("kws.hit", { command });
-		// Only a wake does anything with what it heard: every other keyword leaves the
-		// listener asleep and listening again, as if nothing had been said.
-		if (command !== "voice-on") {
-			this.startSpotting();
+		if (this.spotting !== capture) {
+			if (command !== undefined) this.log("kws.hit", { command, reason: "ignored:stale" });
 			return;
 		}
-		void this.wakeByVoice();
+		this.spotting = undefined;
+		if (command === undefined) return;
+		// Reading text is not carried by the protocol. Fail closed for the whole
+		// reading and its audible tail, rather than reacting to its own speech.
+		if (this.reading) {
+			this.log("kws.hit", { command, reason: "ignored:reading" });
+			this.refreshSpotting();
+			return;
+		}
+		if (this.currentState === "asleep") {
+			this.log("kws.hit", { command, reason: command === "voice-on" ? "whole-utterance" : "ignored:asleep" });
+			if (command !== "voice-on") return this.refreshSpotting();
+			this.waking = true;
+			void this.wakeByVoice().finally(() => { this.waking = false; this.refreshSpotting(); });
+			return;
+		}
+		const reason = command === "voice-off" && this.voiceSessions.length > 0 ? "whole-utterance" : command === "voice-on" ? "ignored:awake-voice-on" : "ignored:unsupported";
+		this.log("kws.hit", { command, reason });
+		if (reason === "whole-utterance") {
+			this.voiceOffEverywhere();
+			this.setState("asleep");
+		} else this.refreshSpotting();
 	}
 
 	// A keyword heard while asleep wakes the session the owner is looking at, and
@@ -1323,8 +1394,8 @@ export class VoiceListener {
 		}
 		// A capture holds the microphone: the reading waits instead of recording
 		// what it says, and the requester is told who has it.
-		if (this.capture) {
-			this.say(client, withId({ type: "busy", reason: "capture", holder: this.capture.sessionId }, request.id));
+		if (this.capture || this.capturePending) {
+			this.say(client, withId({ type: "busy", reason: "capture", holder: this.capture?.sessionId ?? this.capturePending?.sessionId }, request.id));
 			return;
 		}
 		if (this.currentState === "asleep" && this.voiceSessions.length === 0) {
@@ -1423,8 +1494,14 @@ export class VoiceListener {
 			...(READING_OUTCOMES.includes(reason as ReadingOutcome) ? { outcome: reason } : {}),
 		});
 		const tail = setTimeout(() => {
-			if (this.reading === reading) this.reading = undefined;
+			if (this.reading !== reading) return;
+			// A whole-utterance hit can be reported after the audible tail. Retire
+			// this spot capture before accepting commands again, so a delayed echo
+			// from the reading cannot become a command in the next turn.
+			this.reading = undefined;
+			void this.stopSpotting();
 			if (this.currentState === "reading") this.setState(reading.returnsTo);
+			else this.refreshSpotting();
 		}, this.readTailMs);
 		tail.unref?.();
 		reading.tail = tail;
@@ -1432,6 +1509,7 @@ export class VoiceListener {
 
 	private setState(next: ListenerState): void {
 		if (next === this.currentState) {
+			this.refreshSpotting();
 			this.armIdle();
 			return;
 		}
@@ -1442,10 +1520,7 @@ export class VoiceListener {
 		const owner = this.stateOwner();
 		this.broadcast({ type: "state", state: next, language: this.language, ...owner, at: this.now() });
 		this.drawSnapshot();
-		// The spotter lives in asleep and nowhere else (S7): every other state needs
-		// the microphone itself, and a capture that ends may hand it back.
-		if (next === "asleep") this.startSpotting();
-		else this.stopSpotting();
+		this.refreshSpotting();
 		this.armIdle();
 	}
 
@@ -1493,6 +1568,7 @@ export class VoiceListener {
 		if (!this.clients.delete(client.socket)) return;
 		client.socket.end(encodeListenerFrame({ type: "error", code }));
 		this.log("listener.rejected", { code, sessionId: client.sessionId });
+		this.refreshSpotting();
 		this.armIdle();
 	}
 
@@ -1502,12 +1578,13 @@ export class VoiceListener {
 		// The session that was recording is gone: the microphone goes with it.
 		const capture = this.capture;
 		if (capture && capture.client === client) {
-			this.releaseCapture(capture);
+			this.releaseCapture(capture, true);
 			this.log("capture.closed", { sessionId: capture.sessionId, mode: capture.mode });
-			void capture.dictation.cancel().catch(() => {});
 		}
+		if (this.capturePending?.client === client) this.capturePending.cancelled = true;
 		close(client.socket);
 		this.log("listener.client-closed", { sessionId: client.sessionId, clients: this.clients.size });
+		this.refreshSpotting();
 		this.armIdle();
 	}
 

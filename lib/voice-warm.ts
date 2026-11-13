@@ -40,6 +40,9 @@ export const WARM_WORKER_DEFAULTS = {
 
 const RECORDING_MARGIN_MS = 10_000;
 
+export type KeywordRejectionReason = "lead" | "speech-after" | "no-utterance" | "unknown-command" | "superseded" | "stopped" | "ended" | "cancelled";
+export interface KeywordRejection { readonly command: string; readonly reason: KeywordRejectionReason }
+
 export interface WarmDictation {
 	readonly state: VoiceSessionState;
 	start(): Promise<void>;
@@ -76,9 +79,9 @@ export interface WarmVoiceWorker {
 	// exactly the request it always did.
 	// `kws`: the worker also listens for spoken commands while it records, and a
 	// capture that ends on one resolves with `command` set and an empty text.
-	session(options: { onStateChange(state: VoiceSessionState): void; endpoint?: VoiceEndpoint; levels?: boolean; onLevel?: (rms: number) => void; kws?: VoiceKeywordOption }): WarmDictation;
+	session(options: { onStateChange(state: VoiceSessionState): void; endpoint?: VoiceEndpoint; levels?: boolean; onLevel?: (rms: number) => void; kws?: VoiceKeywordOption; onKeywordRejected?: (hit: KeywordRejection) => void }): WarmDictation;
 	// Listens for spoken commands only, on the same worker and its one spotter.
-	spot(options: { kws: VoiceKeywordOption; onStateChange?(state: VoiceSessionState): void }): WarmSpotting;
+	spot(options: { kws: VoiceKeywordOption; onStateChange?(state: VoiceSessionState): void; onKeywordRejected?: (hit: KeywordRejection) => void }): WarmSpotting;
 	// Closes the worker, killing it if it has not exited within graceMs.
 	close(graceMs?: number): Promise<void>;
 }
@@ -89,6 +92,8 @@ interface Live {
 	child: VoiceWorkerChild;
 	closed: Promise<void>;
 	exited: boolean;
+	// A cancelled worker can report its last pending hit before it exits.
+	cancelling?: Capture;
 }
 
 interface Capture {
@@ -96,6 +101,7 @@ interface Capture {
 	onStateChange(state: VoiceSessionState): void;
 	levels: boolean;
 	onLevel?: (rms: number) => void;
+	onKeywordRejected?: (hit: KeywordRejection) => void;
 	// Asked for keyword spotting; and, when `spot`, for nothing else.
 	kws: boolean;
 	spot: boolean;
@@ -104,6 +110,22 @@ interface Capture {
 	settled: boolean;
 	timer?: ReturnType<typeof setTimeout>;
 }
+
+// The shared single-use parser intentionally stays unchanged: only warm clients
+// that opted in receive this exact, audio-free diagnostic message.
+const parseKeywordRejection = (line: string): KeywordRejection | undefined => {
+	let value: unknown;
+	try { value = JSON.parse(line); } catch { return undefined; }
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+	const record = value as Record<string, unknown>;
+	const keys = ["schema", "type", "command", "reason"];
+	if (Object.keys(record).length !== keys.length || !keys.every((key) => Object.hasOwn(record, key))) return undefined;
+	if (record.schema !== VOICE_WORKER_SCHEMA || record.type !== "keyword-rejected") return undefined;
+	if (typeof record.command !== "string" || !/^[a-z][a-z0-9-]{0,31}$/.test(record.command)) return undefined;
+	const reasons: readonly unknown[] = ["lead", "speech-after", "no-utterance", "unknown-command", "superseded", "stopped", "ended"];
+	if (!reasons.includes(record.reason)) return undefined;
+	return { command: record.command, reason: record.reason as KeywordRejectionReason };
+};
 
 const unref = (handle: ReturnType<typeof setTimeout>) => {
 	(handle as { unref?: () => void }).unref?.();
@@ -250,8 +272,14 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 				const line = buffered.slice(0, newline);
 				buffered = buffered.slice(newline + 1);
 				const message = line.length <= MAX_LINE ? parseWorkerLine(line) : undefined;
-				if (message) onMessage(message);
-				else protocolError();
+				const rejected = line.length <= MAX_LINE && !message ? parseKeywordRejection(line) : undefined;
+				const diagnosticCapture = entry.cancelling ?? (live === entry ? current : undefined);
+				if (message?.type === "command" && entry.cancelling?.kws) {
+					try { entry.cancelling.onKeywordRejected?.({ command: message.command, reason: "cancelled" }); } catch { /* diagnostics are advisory */ }
+				} else if (message && live === entry) onMessage(message);
+				else if (rejected && diagnosticCapture?.kws && diagnosticCapture.onKeywordRejected && (entry.cancelling === diagnosticCapture || diagnosticCapture.state === "recording" || diagnosticCapture.state === "transcribing")) {
+					try { diagnosticCapture.onKeywordRejected(rejected); } catch { /* diagnostics are advisory */ }
+				} else if (live === entry) protocolError();
 			}
 			if (buffered.length > MAX_LINE) protocolError();
 		});
@@ -299,14 +327,14 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 
 	// One capture on the worker: a dictation, or with `spot` a capture for the
 	// keyword spotter alone. `result` is the outcome without asking it to stop.
-	const open = ({ onStateChange, endpoint, levels, onLevel, kws, spot }: { onStateChange(state: VoiceSessionState): void; endpoint?: VoiceEndpoint; levels?: boolean; onLevel?: (rms: number) => void; kws?: VoiceKeywordOption; spot?: boolean }): WarmDictation & { result(): Promise<VoiceTranscript> } => {
+	const open = ({ onStateChange, endpoint, levels, onLevel, kws, spot, onKeywordRejected }: { onStateChange(state: VoiceSessionState): void; endpoint?: VoiceEndpoint; levels?: boolean; onLevel?: (rms: number) => void; kws?: VoiceKeywordOption; spot?: boolean; onKeywordRejected?: (hit: KeywordRejection) => void }): WarmDictation & { result(): Promise<VoiceTranscript> } => {
 			let recording!: Capture["recording"];
 			let result!: Capture["result"];
 			const recordingPromise = new Promise<void>((resolve, reject) => { recording = { resolve, reject }; });
 			const resultPromise = new Promise<VoiceTranscript>((resolve, reject) => { result = { resolve, reject }; });
 			recordingPromise.catch(() => {});
 			resultPromise.catch(() => {});
-			const capture: Capture = { state: "idle", onStateChange, levels: levels === true, onLevel, kws: kws !== undefined, spot: spot === true, recording, result, settled: false };
+			const capture: Capture = { state: "idle", onStateChange, levels: levels === true, onLevel, onKeywordRejected, kws: kws !== undefined, spot: spot === true, recording, result, settled: false };
 			return {
 				get state() {
 					return capture.state;
@@ -333,6 +361,7 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 						...(endpoint ? { endpoint: { endOfSpeechMs: endpoint.endOfSpeechMs, noSpeechMs: endpoint.noSpeechMs } } : {}),
 						...(levels === true ? { levels: true } : {}),
 						...(kws ? { kws } : {}),
+						...(kws && onKeywordRejected ? { keywordDiagnostics: true } : {}),
 						...(spot === true ? { spot: true } : {}),
 						keepAlive: true,
 					});
@@ -356,6 +385,7 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 						return;
 					}
 					const entry = live;
+					if (entry) entry.cancelling = capture;
 					settle(capture, { error: fail("cancelled") });
 					if (!entry) return;
 					try {
@@ -380,8 +410,8 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 	return {
 		close,
 		session: (sessionOptions) => open(sessionOptions),
-		spot({ kws, onStateChange }) {
-			const capture = open({ onStateChange: onStateChange ?? (() => {}), kws, spot: true });
+		spot({ kws, onStateChange, onKeywordRejected }) {
+			const capture = open({ onStateChange: onStateChange ?? (() => {}), kws, spot: true, onKeywordRejected });
 			return {
 				get state() {
 					return capture.state;
