@@ -148,6 +148,127 @@ test("a worker error fails that recording, and a crash between recordings is rep
 	assert.equal(h.workers.length, 3);
 });
 
+nodeTest("a long endpoint-ended recording reuses the worker for spotting", { timeout: 5_000 }, async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const h = harness();
+	const dictation = h.warm.session({ onStateChange: () => {}, kws: KWS });
+	const recording = dictation.start();
+	await Promise.resolve();
+	assert.equal(h.workers.length, 1);
+	const child = h.workers[0]!;
+	child.say({ type: "recording" });
+	await recording;
+	// The incident's endpoint arrived after almost a minute, without a stop.
+	t.mock.timers.tick(58_000);
+	child.say({ type: "transcribing" });
+	const result = dictation.stop();
+	child.say({ type: "result", text: "seguí con eso", truncated: false });
+	assert.deepEqual(await result, { text: "seguí con eso", truncated: false });
+	const spot = h.warm.spot({ kws: KWS });
+	const spotting = spot.start();
+	await Promise.resolve();
+	assert.equal(child.received.filter((message) => message.type === "start").length, 2);
+	child.say({ type: "spotting" });
+	await spotting;
+	const heard = spot.heard();
+	child.say({ type: "command", command: "voice-off" });
+	assert.equal(await heard, "voice-off");
+	await h.warm.close();
+});
+
+nodeTest("a start timeout still fails the capture and kills its child", { timeout: 5_000 }, async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const h = harness();
+	const started = h.warm.session({ onStateChange: () => {} }).start();
+	const failed = assert.rejects(started, (error: unknown) => error instanceof VoiceSessionError && error.code === "timeout");
+	await Promise.resolve();
+	assert.equal(h.workers.length, 1);
+	t.mock.timers.tick(120_000);
+	await failed;
+	assert.deepEqual(h.workers[0]!.signals, ["SIGKILL"]);
+	await h.warm.close();
+});
+
+test("an error leaves the next capture waiting until the old child has exited", async () => {
+	const h = harness();
+	const first = h.warm.session({ onStateChange: () => {} });
+	const started = first.start();
+	await h.until(() => h.workers.length === 1 && h.workers[0]!.received.length === 1);
+	const old = h.workers[0]!;
+	old.say({ type: "recording" });
+	await started;
+	const stopped = first.stop();
+	old.say({ type: "error", code: "decode" });
+	await assert.rejects(stopped, (error: unknown) => error instanceof VoiceSessionError && error.code === "decode");
+	const next = h.warm.spot({ kws: KWS });
+	const nextStarted = next.start();
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.equal(h.workers.length, 1);
+	assert.equal(old.received.filter((message) => message.type === "start").length, 1, "nothing is sent to the exiting worker");
+	old.exit();
+	await h.until(() => h.workers.length === 2 && h.workers[1]!.received.some((message) => message.type === "start"));
+	h.workers[1]!.say({ type: "spotting" });
+	await nextStarted;
+	const heard = next.heard();
+	h.workers[1]!.say({ type: "command", command: "voice-off" });
+	assert.equal(await heard, "voice-off", "the old close did not fail the new capture");
+	await h.warm.close();
+});
+
+test("a refused spot start can wait for the owning warm capture to finish cancellation", async () => {
+	const h = harness();
+	const first = h.warm.session({ onStateChange: () => {} });
+	const started = first.start();
+	await h.until(() => h.workers.length === 1 && h.workers[0]!.received.length === 1);
+	const old = h.workers[0]!;
+	old.say({ type: "recording" });
+	await started;
+	const refused = h.warm.spot({ kws: KWS });
+	await assert.rejects(refused.start(), (error: unknown) => error instanceof VoiceSessionError && error.code === "invalid-state");
+	let settled = false;
+	const ready = refused.waitUntilSettled().then(() => { settled = true; });
+	old.stubborn = true;
+	const cancelling = first.cancel();
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.equal(settled, false, "the microphone is still held by the cancelling child");
+	old.exit();
+	await cancelling;
+	await ready;
+	const next = h.warm.spot({ kws: KWS });
+	const nextStarted = next.start();
+	await h.until(() => h.workers.length === 2 && h.workers[1]!.received.length === 1);
+	h.workers[1]!.say({ type: "spotting" });
+	await nextStarted;
+	const heard = next.heard();
+	h.workers[1]!.say({ type: "command", command: "voice-off" });
+	assert.equal(await heard, "voice-off");
+	await h.warm.close();
+});
+
+test("a start cancelled while an old worker retires does not open a replacement", async () => {
+	const h = harness();
+	const first = h.warm.session({ onStateChange: () => {} });
+	const started = first.start();
+	await h.until(() => h.workers.length === 1 && h.workers[0]!.received.length === 1);
+	const old = h.workers[0]!;
+	old.say({ type: "recording" });
+	await started;
+	const stopped = first.stop();
+	old.say({ type: "error", code: "decode" });
+	await assert.rejects(stopped, (error: unknown) => error instanceof VoiceSessionError && error.code === "decode");
+	const next = h.warm.spot({ kws: KWS });
+	const nextStarted = next.start();
+	const rejected = assert.rejects(nextStarted, (error: unknown) => error instanceof VoiceSessionError && error.code === "cancelled");
+	const cancelling = next.cancel();
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.equal(h.workers.length, 1);
+	old.exit();
+	await cancelling;
+	await rejected;
+	assert.equal(h.workers.length, 1, "the cancelled start never launches a new child");
+	await h.warm.close();
+});
+
 test("one recording at a time", async () => {
 	const h = harness();
 	const first = h.warm.session({ onStateChange: () => {} });

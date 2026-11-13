@@ -58,6 +58,8 @@ export interface WarmSpotting {
 	start(): Promise<void>;
 	// The command that was heard, or undefined when the capture was stopped.
 	heard(): Promise<string | undefined>;
+	// After a busy start, wait for the capture that refused it to release its worker.
+	waitUntilSettled(): Promise<void>;
 	// Closes the microphone and keeps the worker.
 	stop(): Promise<void>;
 	cancel(): Promise<void>;
@@ -107,6 +109,10 @@ interface Capture {
 	spot: boolean;
 	recording: { resolve(): void; reject(error: unknown): void };
 	result: { resolve(transcript: VoiceTranscript): void; reject(error: unknown): void };
+	// A failed or cancelled capture may have an outcome before its child exits.
+	released: Promise<void>;
+	release(): void;
+	entry?: Live;
 	settled: boolean;
 	timer?: ReturnType<typeof setTimeout>;
 }
@@ -139,7 +145,18 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 	const idleMs = options.idleMs ?? WARM_WORKER_DEFAULTS.idleMs;
 	let live: Live | undefined;
 	let current: Capture | undefined;
+	let retiring: Promise<void> | undefined;
 	let idleTimer: ReturnType<typeof setTimeout> | undefined;
+
+	// A terminal worker message is written before the process exits. Do not send
+	// another start to it, or let a replacement own the microphone before it exits.
+	const retire = (entry: Live) => {
+		if (live === entry) live = undefined;
+		const previous = retiring;
+		const waiting = previous ? Promise.all([previous, entry.closed]).then(() => {}) : entry.closed;
+		retiring = waiting;
+		void waiting.then(() => { if (retiring === waiting) retiring = undefined; });
+	};
 
 	const setState = (capture: Capture, state: VoiceSessionState) => {
 		if (capture.state === state) return;
@@ -150,7 +167,7 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 			/* the observer is advisory */
 		}
 	};
-	const settle = (capture: Capture, outcome: { transcript: VoiceTranscript } | { error: VoiceSessionError }) => {
+	const settle = (capture: Capture, outcome: { transcript: VoiceTranscript } | { error: VoiceSessionError }, releaseAfter?: Promise<void>) => {
 		if (capture.settled) return;
 		capture.settled = true;
 		if (capture.timer) clearTimeout(capture.timer);
@@ -162,22 +179,26 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 			capture.recording.reject(outcome.error);
 			capture.result.reject(outcome.error);
 		}
-		if (live && !live.exited) armIdle();
+		if (releaseAfter) void releaseAfter.then(capture.release);
+		else capture.release();
+		if (!current && live && !live.exited) armIdle();
 	};
 	const arm = (capture: Capture, ms: number) => {
 		if (capture.timer) clearTimeout(capture.timer);
 		capture.timer = unref(setTimeout(() => {
-			settle(capture, { error: fail("timeout") });
-			kill();
+			const entry = capture.entry;
+			if (entry) retire(entry);
+			settle(capture, { error: fail("timeout") }, entry?.closed);
+			if (entry) kill(entry);
 		}, ms));
 	};
 	const armIdle = () => {
 		if (idleTimer) clearTimeout(idleTimer);
 		idleTimer = unref(setTimeout(() => void close(), idleMs));
 	};
-	const kill = () => {
+	const kill = (entry: Live | undefined = live) => {
 		try {
-			live?.child.kill("SIGKILL");
+			entry?.child.kill("SIGKILL");
 		} catch {
 			/* close still follows */
 		}
@@ -242,14 +263,24 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 				settle(capture, text ? { transcript: { text, truncated: message.truncated } } : { error: fail("no-speech") });
 				return;
 			}
-			case "error":
-				// The worker ends itself after an error.
-				settle(capture, { error: fail(message.code) });
+			case "error": {
+				// The error is the child's last message, not its exit. Bound a child
+				// that never exits and keep the microphone reserved until it does.
+				const entry = live;
+				if (entry) {
+					retire(entry);
+					const timer = setTimeout(() => kill(entry), VOICE_SESSION_DEFAULTS.exitGraceMs);
+					void entry.closed.then(() => clearTimeout(timer));
+				}
+				settle(capture, { error: fail(message.code) }, entry?.closed);
+			}
 		}
 	};
 	const protocolError = () => {
-		if (current) settle(current, { error: fail("protocol") });
-		kill();
+		const entry = live;
+		if (entry) retire(entry);
+		if (current) settle(current, { error: fail("protocol") }, entry?.closed);
+		if (entry) kill(entry);
 	};
 
 	const launch = (root: string): Live => {
@@ -295,7 +326,8 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 				live = undefined;
 				if (idleTimer) clearTimeout(idleTimer);
 			}
-			if (current) settle(current, { error: fail("worker-exited") });
+			// A retired child cannot fail a capture reserved for its replacement.
+			if (current?.entry === entry) settle(current, { error: fail("worker-exited") });
 			resolveClosed();
 		});
 		return entry;
@@ -304,9 +336,13 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 	const close = async (graceMs: number = WARM_WORKER_DEFAULTS.closeGraceMs): Promise<void> => {
 		if (idleTimer) clearTimeout(idleTimer);
 		const entry = live;
-		if (!entry) return;
-		live = undefined;
-		if (current) settle(current, { error: fail("cancelled") });
+		if (!entry) {
+			if (current) settle(current, { error: fail("cancelled") }, retiring);
+			await retiring;
+			return;
+		}
+		retire(entry);
+		if (current) settle(current, { error: fail("cancelled") }, entry.closed);
 		try {
 			entry.child.stdin?.write(`${JSON.stringify({ schema: VOICE_WORKER_SCHEMA, type: "close" })}\n`);
 			entry.child.stdin?.end();
@@ -327,21 +363,29 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 
 	// One capture on the worker: a dictation, or with `spot` a capture for the
 	// keyword spotter alone. `result` is the outcome without asking it to stop.
-	const open = ({ onStateChange, endpoint, levels, onLevel, kws, spot, onKeywordRejected }: { onStateChange(state: VoiceSessionState): void; endpoint?: VoiceEndpoint; levels?: boolean; onLevel?: (rms: number) => void; kws?: VoiceKeywordOption; spot?: boolean; onKeywordRejected?: (hit: KeywordRejection) => void }): WarmDictation & { result(): Promise<VoiceTranscript> } => {
+	const open = ({ onStateChange, endpoint, levels, onLevel, kws, spot, onKeywordRejected }: { onStateChange(state: VoiceSessionState): void; endpoint?: VoiceEndpoint; levels?: boolean; onLevel?: (rms: number) => void; kws?: VoiceKeywordOption; spot?: boolean; onKeywordRejected?: (hit: KeywordRejection) => void }): WarmDictation & { result(): Promise<VoiceTranscript>; waitUntilSettled(): Promise<void> } => {
 			let recording!: Capture["recording"];
 			let result!: Capture["result"];
+			let release!: () => void;
+			let blockedBy: Promise<void> | undefined;
+			const released = new Promise<void>((resolve) => { release = resolve; });
 			const recordingPromise = new Promise<void>((resolve, reject) => { recording = { resolve, reject }; });
 			const resultPromise = new Promise<VoiceTranscript>((resolve, reject) => { result = { resolve, reject }; });
 			recordingPromise.catch(() => {});
 			resultPromise.catch(() => {});
-			const capture: Capture = { state: "idle", onStateChange, levels: levels === true, onLevel, onKeywordRejected, kws: kws !== undefined, spot: spot === true, recording, result, settled: false };
+			const capture: Capture = { state: "idle", onStateChange, levels: levels === true, onLevel, onKeywordRejected, kws: kws !== undefined, spot: spot === true, recording, result, released, release, settled: false };
 			return {
 				get state() {
 					return capture.state;
 				},
 				result: () => resultPromise,
+				waitUntilSettled: () => blockedBy ?? Promise.resolve(),
 				async start() {
-					if (capture.state !== "idle" || current) throw fail("invalid-state");
+					if (capture.state !== "idle") throw fail("invalid-state");
+					if (current) {
+						blockedBy = current.released;
+						throw fail("invalid-state");
+					}
 					current = capture;
 					setState(capture, "starting");
 					if (idleTimer) clearTimeout(idleTimer);
@@ -352,8 +396,10 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 						settle(capture, { error: error instanceof VoiceSessionError ? error : fail("not-installed") });
 						throw error instanceof VoiceSessionError ? error : fail("not-installed");
 					}
+					while (retiring && !capture.settled) await retiring;
 					if (capture.settled) return recordingPromise;
 					live ??= launch(prepared.root);
+					capture.entry = live;
 					arm(capture, VOICE_SESSION_DEFAULTS.startTimeoutMs);
 					send({
 						...prepared.request,
@@ -384,16 +430,18 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 						settle(capture, { error: fail("cancelled") });
 						return;
 					}
-					const entry = live;
-					if (entry) entry.cancelling = capture;
-					settle(capture, { error: fail("cancelled") });
-					if (!entry) return;
+					const entry = capture.entry;
+					if (entry) {
+						entry.cancelling = capture;
+						retire(entry);
+					}
+					settle(capture, { error: fail("cancelled") }, entry?.closed ?? retiring);
+					if (!entry) { await retiring; return; }
 					try {
 						entry.child.stdin?.write(`${JSON.stringify({ schema: VOICE_WORKER_SCHEMA, type: "cancel" })}\n`);
 					} catch {
 						/* already gone */
 					}
-					if (live === entry) live = undefined;
 					const timer = setTimeout(() => {
 						try {
 							entry.child.kill("SIGKILL");
@@ -418,6 +466,7 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 				},
 				start: () => capture.start(),
 				heard: () => capture.result().then((outcome) => outcome.command),
+				waitUntilSettled: () => capture.waitUntilSettled(),
 				// Before the microphone opened there is nothing to stop: it is cancelled.
 				async stop() {
 					if (capture.state === "idle" || capture.state === "starting") return capture.cancel();

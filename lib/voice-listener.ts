@@ -352,6 +352,8 @@ export interface ListenerSpotting {
 	start(): Promise<void>;
 	// The command that was heard, or undefined when the capture was stopped.
 	heard(): Promise<string | undefined>;
+	// A refused start can wait for the capture that still owns the warm worker.
+	waitUntilSettled?(): Promise<void>;
 	stop(): Promise<void>;
 	cancel(): Promise<void>;
 }
@@ -486,7 +488,7 @@ export class VoiceListener {
 	// The spot-only capture, and the release of the one just stopped: the
 	// microphone is handed over only once it is free.
 	private spotting: ListenerSpotting | undefined;
-	// A spotter that failed once is never asked again: voice carries on without it.
+	// A real spotter failure disables it: a transient busy start gets one retry.
 	private spotDisabled = false;
 	private spottingStop: Promise<void> | undefined;
 	// True only while the capture really records, from the worker's own report to
@@ -1211,7 +1213,7 @@ export class VoiceListener {
 		this.log("kws.hit", { command: hit.command, reason: hit.reason === "cancelled" ? "ignored:cancelled" : `rejected:${hit.reason}` });
 	}
 
-	private startSpotting(): void {
+	private startSpotting(retried = false): void {
 		const factory = this.options.spot;
 		if (!this.options.keyword || !factory || this.spotDisabled || this.closing) return;
 		if (this.spotting || !this.shouldSpot()) return;
@@ -1224,29 +1226,52 @@ export class VoiceListener {
 		let capture: ListenerSpotting;
 		try {
 			capture = factory((hit) => this.logKeywordRejection(hit));
-		} catch {
-			this.failSpotting();
+		} catch (error) {
+			this.failSpotting(error);
 			return;
 		}
 		this.spotting = capture;
-		void capture.start().then(
-			() => this.awaitSpotting(capture),
-			() => {
+		try {
+			void capture.start().then(
+				() => this.awaitSpotting(capture),
+				(error: unknown) => this.spottingStartFailed(capture, error, retried),
+			);
+		} catch (error) {
+			this.spottingStartFailed(capture, error, retried);
+		}
+	}
+
+	private spottingStartFailed(capture: ListenerSpotting, error: unknown, retried: boolean): void {
+		if (this.spotting !== capture) return;
+		if (!retried && error instanceof VoiceSessionError && error.code === "invalid-state") {
+			// Keep the failed attempt reserved while waiting, so state refreshes
+			// cannot launch extra retries. A stop or new capture retires it.
+			let settled: Promise<void>;
+			try { settled = capture.waitUntilSettled?.() ?? Promise.resolve(); }
+			catch (failure) { this.spotting = undefined; this.failSpotting(failure); return; }
+			void settled.then(() => {
 				if (this.spotting !== capture) return;
 				this.spotting = undefined;
-				this.failSpotting();
-			},
-		);
+				if (this.shouldSpot()) this.startSpotting(true);
+			}, (failure: unknown) => {
+				if (this.spotting !== capture) return;
+				this.spotting = undefined;
+				this.failSpotting(failure);
+			});
+			return;
+		}
+		this.spotting = undefined;
+		this.failSpotting(error);
 	}
 
 	// The command the open spotter heard, or nothing when it was stopped here.
 	private awaitSpotting(capture: ListenerSpotting): void {
 		void capture.heard().then(
 			(command) => this.spottingHeard(capture, command),
-			() => {
+			(error: unknown) => {
 				if (this.spotting !== capture) return;
 				this.spotting = undefined;
-				this.failSpotting();
+				this.failSpotting(error);
 			},
 		);
 	}
@@ -1307,10 +1332,11 @@ export class VoiceListener {
 
 	// A spotter that cannot open the microphone is dropped for the rest of the
 	// listener's life: voice keeps working, asleep and without spotting.
-	private failSpotting(): void {
+	private failSpotting(error: unknown): void {
 		if (this.spotDisabled) return;
 		this.spotDisabled = true;
-		this.log("kws.failed");
+		// Fixed codes only: native errors can contain paths, device names or audio.
+		this.log("kws.failed", { reason: captureErrorCode(error) });
 	}
 
 	// Releasing the microphone is asynchronous: a capture that must start waits on
