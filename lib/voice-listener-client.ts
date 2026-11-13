@@ -532,7 +532,8 @@ export async function listenerReadingTurn(options: ListenerReadingOptions): Prom
 			session,
 			start: options.start,
 			waitMs: options.waitMs,
-			createClient: () => new VoiceListenerClient({ dir: options.dir, session, role: "reading" }),
+			// Keep the live session source, including its voice getter, on reconnect.
+			createClient: () => new VoiceListenerClient({ dir: options.dir, session: () => session, role: "reading" }),
 		});
 		client = joined.client;
 	} catch {
@@ -561,7 +562,7 @@ export async function listenerReadingTurn(options: ListenerReadingOptions): Prom
 // not running means nothing is reading through it: no process is started here.
 export async function cutListenerReading(options: { dir: string; session: ListenerSession }): Promise<boolean> {
 	if (!(await probeListenerSocket(listenerPaths(options.dir).socket))) return false;
-	const client = new VoiceListenerClient({ dir: options.dir, session: options.session, role: "reading" });
+	const client = new VoiceListenerClient({ dir: options.dir, session: () => options.session, role: "reading" });
 	try {
 		await client.connect();
 		const frame = await client.request({ type: "read-cut" });

@@ -533,9 +533,8 @@ export class VoiceListener {
 	// The sessions whose voice is on, as the registry knows them: L10 reads this
 	// when voice off has to reach everyone, and when a keyword wakes one session.
 	get voiceSessions(): readonly string[] {
-		// One session holds two connections at once (S6), and it keeps the listener
-		// awake once: every connection joins with the flag, and the session counts
-		// while any of them has voice on.
+		// One session can hold two connections (S6). Their flags follow the
+		// session-role connection while it exists, and count that session once.
 		const awake = new Set<string>();
 		for (const client of this.clients.values()) if (client.sessionId && client.voiceOn) awake.add(client.sessionId);
 		return [...awake];
@@ -778,11 +777,15 @@ export class VoiceListener {
 		const role = hello.role ?? "session";
 		// Publish the replacement before retiring its old socket, so an unchanged
 		// voice-on reload never briefly looks like the last session went away.
+		const owner = role === "reading" ? [...this.clients.values()].find((other) => other.sessionId === hello.sessionId && other.role === "session") : undefined;
 		client.sessionId = hello.sessionId;
 		client.paneId = hello.paneId;
-		client.voiceOn = hello.voiceOn;
+		// A reader may have queued its hello before the session turned voice off.
+		// With no session link, its own current flag retains the reader-only path.
+		client.voiceOn = owner?.voiceOn ?? hello.voiceOn;
 		client.label = hello.label;
 		client.role = role;
+		if (role === "session") this.setSessionVoice(hello.sessionId, hello.voiceOn);
 		for (const other of [...this.clients.values()]) {
 			// One session, one live socket per role: a reloaded session replaces its
 			// stale one, while the connection its reading is held on survives, and a
@@ -799,17 +802,23 @@ export class VoiceListener {
 		this.say(client, withId({ type: "welcome", listenerPid: this.pid, proto: 1, state: this.currentState }, hello.id));
 		client.welcomed = true;
 		this.log("listener.hello", { sessionId: hello.sessionId, role, voiceOn: hello.voiceOn, clients: this.clients.size });
-		if (hello.voiceOn && this.currentState === "asleep") this.setState("listening");
+		if (client.voiceOn && this.currentState === "asleep") this.setState("listening");
+		else if (role === "session" && !client.voiceOn && this.voiceSessions.length === 0) this.sleepWithoutVoice();
 		else this.refreshSpotting();
 		this.armIdle();
+	}
+
+	private setSessionVoice(sessionId: string | undefined, voiceOn: boolean): void {
+		for (const other of this.clients.values()) if (other.sessionId === sessionId) other.voiceOn = voiceOn;
 	}
 
 	private apply(client: Client, request: Exclude<ListenerRequest, { type: "hello" }>): void {
 		switch (request.type) {
 			case "session-voice": {
-				// One session may have a separate reading connection: its flag must not
-				// keep that same session awake after the session turns voice off.
-				for (const other of this.clients.values()) if (other.sessionId === client.sessionId) other.voiceOn = request.voiceOn;
+				// A reader's post-welcome update can be stale too. While the session's
+				// own link exists, only that link can update the per-session flag.
+				if (client.role === "reading" && [...this.clients.values()].some((other) => other.sessionId === client.sessionId && other.role === "session")) return;
+				this.setSessionVoice(client.sessionId, request.voiceOn);
 				this.log("listener.voice", { sessionId: client.sessionId, voiceOn: request.voiceOn });
 				if (request.voiceOn && this.currentState === "asleep") this.setState("listening");
 				else if (!request.voiceOn && this.voiceSessions.length === 0) this.sleepWithoutVoice();
@@ -1099,7 +1108,7 @@ export class VoiceListener {
 	// already receives when voice turns on. A wake says so on the frame of the
 	// session it woke, and on no other: the others only learn that voice is on.
 	private turnVoiceOn(client: Client, wake = false): void {
-		client.voiceOn = true;
+		this.setSessionVoice(client.sessionId, true);
 		if (!wake) {
 			this.broadcast({ type: "command", command: "voice-on" });
 			return;

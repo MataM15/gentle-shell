@@ -406,6 +406,8 @@ export type ReadingEnd = "done" | "skipped" | "cancelled";
 
 export interface ReadingTurnHooks {
 	sessionId?: string;
+	// Read at hello time: a queued reading must not replay an old voice choice.
+	voiceOn?: () => boolean;
 	chars?: number;
 	// The listener took the turn back (a cut, a lost lease): the reading stops.
 	onCut?: (reason: ReadingReleaseReason) => void;
@@ -441,7 +443,7 @@ export function createReadingTurn(options: CreateReadingTurnOptions): ReadingTur
 		if (hooks.sessionId) {
 			let answer: ListenerReading | undefined;
 			try {
-				answer = await turn({ dir: options.dir, session: { sessionId: hooks.sessionId, voiceOn: true }, chars: hooks.chars, signal, onCut: hooks.onCut });
+				answer = await turn({ dir: options.dir, session: { sessionId: hooks.sessionId, get voiceOn() { return hooks.voiceOn?.() ?? false; } }, chars: hooks.chars, signal, onCut: hooks.onCut });
 			} catch {
 				answer = { kind: "unavailable" };
 			}
@@ -642,7 +644,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	const paneFocus = deps.paneFocus ?? (() => herdrPaneFocus({ env }));
 	const readingTurn = deps.readingTurn ?? createReadingTurn({ dir: resolveVoiceHome(env), start: () => startVoiceListenerProcess(env) });
 	const readCut = deps.readCut ?? ((sessionId: string) => {
-		void cutListenerReading({ dir: resolveVoiceHome(env), session: { sessionId, voiceOn: false } }).catch(() => {});
+		void cutListenerReading({ dir: resolveVoiceHome(env), session: { sessionId, get voiceOn() { return sessionIdOf(sessionCtx) === sessionId && voiceOn(sessionCtx); } } }).catch(() => {});
 	});
 	const sessionIdOf = (ctx: ExtensionContext | undefined): string | undefined => {
 		try {
@@ -900,8 +902,10 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			// One reading at a time across every Pi process: wait for the turn. The
 			// listener hands it to one session, and tells that session when it takes
 			// it back, so a cut or a lost lease stops the speech here.
+			const sessionId = sessionIdOf(ctx);
 			release = await readingTurn(current.controller.signal, {
-				sessionId: sessionIdOf(ctx),
+				sessionId,
+				voiceOn: () => current.generation === generation && sessionIdOf(sessionCtx) === sessionId && sessionIdOf(ctx) === sessionId && voiceOn(ctx),
 				chars: markdown.length,
 				onCut: () => cutReadings(),
 			});

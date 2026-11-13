@@ -211,7 +211,114 @@ test("the real entry point owns the socket and the lock and cleans both up on sh
 	client.close();
 });
 
+test("a delayed reading hello cannot revive the session after its voice-off update", async () => {
+	const dir = scratch();
+	const server = new VoiceListener({ dir });
+	await server.listen();
+	const main = new VoiceListenerClient({ dir, session: session("s-1", true) });
+	// This reader was queued with the old value before the session turned off.
+	const reader = new VoiceListenerClient({ dir, session: session("s-1", true), role: "reading" });
+	try {
+		await main.connect();
+		assert.deepEqual(server.voiceSessions, ["s-1"]);
+		assert.equal(main.updateVoice(false), true);
+		await main.request({ type: "status" }); // barrier after session-voice
+		assert.equal(server.state, "asleep");
+		assert.deepEqual(server.voiceSessions, []);
+		await reader.connect();
+		await reader.request({ type: "status" });
+		assert.equal(server.state, "asleep", "the old reading hello cannot wake voice");
+		assert.deepEqual(server.voiceSessions, []);
+		assert.equal(reader.updateVoice(true), true);
+		await reader.request({ type: "status" });
+		assert.equal(server.state, "asleep", "the reading role cannot override the live session");
+		assert.deepEqual(server.voiceSessions, []);
+	} finally {
+		reader.close();
+		main.close();
+		await server.close();
+	}
+});
+
+test("both roles read a session getter when the hello is actually sent", async () => {
+	for (const role of ["session", "reading"] as const) {
+		const written: Array<Record<string, unknown>> = [];
+		class FakeSocket extends EventEmitter {
+			destroyed = false;
+			setEncoding() {}
+			write(chunk: string) {
+				const frame = JSON.parse(chunk) as Record<string, unknown>;
+				written.push(frame);
+				queueMicrotask(() => this.emit("data", encodeListenerFrame({ type: "welcome", id: String(frame.id), listenerPid: 1, proto: 1, state: "asleep" })));
+				return true;
+			}
+			destroy() { this.destroyed = true; return this; }
+		}
+		const socket = new FakeSocket();
+		let voiceOn = true;
+		const live = { sessionId: "s-1", get voiceOn() { return voiceOn; } };
+		const client = new VoiceListenerClient({ dir: scratch(), session: live, role, dial: () => socket as unknown as Socket });
+		const connecting = client.connect();
+		try {
+			voiceOn = false;
+			socket.emit("connect");
+			await connecting;
+			assert.equal(written.length, 1, role);
+			assert.equal(written[0]!.type, "hello", role);
+			assert.equal(written[0]!.voiceOn, false, role);
+		} finally {
+			client.close();
+		}
+	}
+});
+
 // --- the reading turn through the listener (slice B) -------------------------
+
+test("a reading reconnect uses the live voice after an in-flight welcome update", async () => {
+	const dir = scratch();
+	let voiceOn = true;
+	let firstReadingHello = true;
+	const hellos: Array<{ role: unknown; voiceOn: unknown }> = [];
+	const log = (event: string, fields?: Record<string, unknown>) => {
+		if (event !== "listener.hello") return;
+		hellos.push({ role: fields?.role, voiceOn: fields?.voiceOn });
+		if (fields?.role === "reading" && firstReadingHello) {
+			firstReadingHello = false;
+			voiceOn = false; // after hello, before the client receives welcome
+		}
+	};
+	let server = new VoiceListener({ dir, log });
+	await server.listen();
+	const keeper = new VoiceListenerClient({ dir, session: session("keeper") });
+	await keeper.connect();
+	const clients: VoiceListenerClient[] = [];
+	const connect = VoiceListenerClient.prototype.connect;
+	VoiceListenerClient.prototype.connect = function () { clients.push(this); return connect.call(this); };
+	let reading: Awaited<ReturnType<typeof listenerReadingTurn>>;
+	try {
+		const live = { sessionId: "s-1", get voiceOn() { return voiceOn; } };
+		reading = await listenerReadingTurn({ dir, session: live, signal: new AbortController().signal });
+		assert.ok(reading && reading.kind === "granted");
+		assert.equal(voiceOn, false);
+		await waitFor(() => !server.voiceSessions.includes("s-1"));
+		voiceOn = true;
+		keeper.close();
+		await server.close();
+		server = new VoiceListener({ dir, log });
+		await server.listen();
+		await waitFor(() => hellos.filter((hello) => hello.role === "reading").length === 2);
+		assert.deepEqual(hellos.filter((hello) => hello.role === "reading"), [
+			{ role: "reading", voiceOn: true },
+			{ role: "reading", voiceOn: true },
+		], "the previous post-welcome update must not freeze later hellos");
+		assert.deepEqual(server.voiceSessions, ["s-1"]);
+	} finally {
+		VoiceListenerClient.prototype.connect = connect;
+		for (const client of clients) client.close();
+		keeper.close();
+		await server.close();
+	}
+});
 
 test("a session reads through the listener, another waits for the turn, and a cut reaches the reader", async () => {
 	const dir = scratch();

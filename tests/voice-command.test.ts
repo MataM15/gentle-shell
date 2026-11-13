@@ -906,10 +906,11 @@ test("a toggle dictation records through the listener and this session only past
 
 // A protocol peer for session registration, independent of the concurrently
 // edited listener. It speaks only hello, session-voice and command frames.
-function registrationPeer(dir: string) {
+function registrationPeer(dir: string, holdFirstWelcome = false) {
 	const frames: Array<Record<string, unknown>> = [];
 	const connections = new Map<Socket, { sessionId: string; voiceOn: boolean }>();
 	const sockets = new Set<Socket>();
+	const heldWelcomes: Array<() => void> = [];
 	const server = createServer((socket) => {
 		sockets.add(socket);
 		socket.on("error", () => {});
@@ -925,7 +926,11 @@ function registrationPeer(dir: string) {
 				frames.push(frame);
 				if (frame.type === "hello") {
 					connections.set(socket, { sessionId: String(frame.sessionId), voiceOn: frame.voiceOn === true });
-					socket.write(encodeListenerFrame({ type: "welcome", id: String(frame.id), listenerPid: process.pid, proto: 1, state: "asleep" }));
+					const welcome = () => {
+						if (!socket.destroyed) socket.write(encodeListenerFrame({ type: "welcome", id: String(frame.id), listenerPid: process.pid, proto: 1, state: "asleep" }));
+					};
+					if (holdFirstWelcome && frames.filter((entry) => entry.type === "hello").length === 1) heldWelcomes.push(welcome);
+					else welcome();
 				} else if (frame.type === "session-voice") {
 					const session = connections.get(socket);
 					if (session) session.voiceOn = frame.voiceOn === true;
@@ -935,6 +940,7 @@ function registrationPeer(dir: string) {
 	});
 	return {
 		frames,
+		releaseWelcomes: () => { for (const welcome of heldWelcomes.splice(0)) welcome(); },
 		voiceSessions: () => [...connections.values()].filter((session) => session.voiceOn).map((session) => session.sessionId),
 		broadcastOff: () => {
 			for (const [socket, session] of connections) {
@@ -953,22 +959,40 @@ function registrationPeer(dir: string) {
 	};
 }
 
-for (const initiallyOn of [false, true]) test(`menu voice ${initiallyOn ? "off" : "on"} updates the live registration and its reconnect hello`, async () => {
+for (const { initiallyOn, beforeWelcome } of [
+	{ initiallyOn: false, beforeWelcome: false },
+	{ initiallyOn: false, beforeWelcome: true },
+	{ initiallyOn: true, beforeWelcome: false },
+]) test(`menu voice ${initiallyOn ? "off" : "on"} ${beforeWelcome ? "before welcome" : "after joining"} updates its reconnect hello`, async () => {
 	const home = mkdtempSync(join(tmpdir(), "voice-command-registration-"));
 	const dir = join(home, "voice");
-	let peer = registrationPeer(dir);
+	let peer = registrationPeer(dir, beforeWelcome);
 	await peer.listen();
 	const { engine } = fakeEngine();
 	const h = harness({ installed: true, voice: initiallyOn, engine, env: { HERDR_PANE_ID: "w1:p1", GENTLE_PI_CONFIG_HOME: home } });
 	delete (h.deps as { createSession?: unknown }).createSession;
 	const pi = register(h);
 	const ui = fakeContext({ select: pick(initiallyOn ? /^Voice in this session \(on\): turn off$/ : /^Voice in this session \(off\): turn on$/) });
+	// Inspect the actual client-side join, not just the peer's receipt of hello.
+	const clients: VoiceListenerClient[] = [];
+	const connect = VoiceListenerClient.prototype.connect;
+	VoiceListenerClient.prototype.connect = function () { clients.push(this); return connect.call(this); };
 	try {
 		await pi.fire("session_start", ui.ctx);
-		await until(() => peer.frames.some((frame) => frame.type === "hello"));
+		await until(() => peer.frames.some((frame) => frame.type === "hello") && clients.length > 0);
+		if (beforeWelcome) assert.equal(clients[0]!.connected, false);
+		else await until(() => clients[0]!.connected);
 		await run(pi, ui);
-		await until(() => peer.frames.some((frame) => frame.type === "session-voice"));
-		assert.deepEqual(peer.frames.filter((frame) => frame.type === "session-voice"), [{ schema: "gentle.voice-listener/v1", type: "session-voice", voiceOn: !initiallyOn }]);
+		if (beforeWelcome) {
+			await until(() => peer.frames.filter((frame) => frame.type === "hello").length === 2 && clients.some((client) => client.connected));
+			await until(() => peer.voiceSessions().length === 1);
+			assert.deepEqual(peer.frames.filter((frame) => frame.type === "hello").map((frame) => frame.voiceOn), [false, true], "an unjoined passive client is replaced by a fresh on hello");
+			assert.deepEqual(peer.frames.filter((frame) => frame.type === "session-voice"), []);
+			peer.releaseWelcomes();
+		} else {
+			await until(() => peer.frames.some((frame) => frame.type === "session-voice"));
+			assert.deepEqual(peer.frames.filter((frame) => frame.type === "session-voice"), [{ schema: "gentle.voice-listener/v1", type: "session-voice", voiceOn: !initiallyOn }]);
+		}
 		assert.deepEqual(peer.voiceSessions(), initiallyOn ? [] : ["session-alpha"]);
 		assert.deepEqual(h.voice.sessions, initiallyOn ? [] : ["session-alpha"]);
 		assert.deepEqual(h.voice.writes, [initiallyOn ? [] : ["session-alpha"]]);
@@ -983,6 +1007,43 @@ for (const initiallyOn of [false, true]) test(`menu voice ${initiallyOn ? "off" 
 		assert.equal(ui.editor(), "draft: ");
 	} finally {
 		await pi.fire("session_shutdown", ui.ctx);
+		VoiceListenerClient.prototype.connect = connect;
+		await peer.close();
+		rmSync(home, { recursive: true, force: true });
+	}
+});
+
+test("a queued cut hello uses the current voice after the session turns back on", async () => {
+	const home = mkdtempSync(join(tmpdir(), "voice-command-cut-"));
+	const peer = registrationPeer(join(home, "voice"));
+	await peer.listen();
+	const gate = deferred<void>();
+	let dialing = false;
+	const connect = VoiceListenerClient.prototype.connect;
+	VoiceListenerClient.prototype.connect = function () { dialing = true; return gate.promise.then(() => connect.call(this)); };
+	const { engine } = fakeEngine();
+	const h = harness({ installed: true, voice: true, engine, env: { GENTLE_PI_CONFIG_HOME: home } });
+	delete h.deps.readCut;
+	const pi = register(h);
+	const ui = fakeContext();
+	try {
+		await pi.fire("session_start", ui.ctx);
+		await run(pi, fakeContext({ select: pick(/^Voice in this session \(on\): turn off$/) }));
+		await until(() => dialing);
+		assert.deepEqual(h.voice.sessions, []);
+		await run(pi, fakeContext({ select: pick(/^Voice in this session \(off\): turn on$/) }));
+		assert.deepEqual(h.voice.sessions, ["session-alpha"]);
+		gate.resolve();
+		await until(() => peer.frames.some((frame) => frame.type === "hello"));
+		const hello = peer.frames.find((frame) => frame.type === "hello")!;
+		assert.equal(hello.role, "reading");
+		assert.equal(hello.voiceOn, true, "the cut did not replay the old off value");
+		assert.equal(pi.counts.sends, 0);
+		assert.equal(ui.editor(), "draft: ");
+	} finally {
+		gate.resolve();
+		await pi.fire("session_shutdown", ui.ctx);
+		VoiceListenerClient.prototype.connect = connect;
 		await peer.close();
 		rmSync(home, { recursive: true, force: true });
 	}
@@ -3076,6 +3137,72 @@ test("stopping a hands-free recording with the shortcut before speaking pauses w
 	await pressed;
 	assert.deepEqual(ui.notices.at(-1), { message: "Conversation paused. Press alt+m to talk.", type: "info" });
 	assert.equal(pi.counts.sends, 0);
+});
+
+test("a queued reading hello uses the current voice value, not the value when it was queued", async () => {
+	const written: Array<Record<string, unknown>> = [];
+	class FakeSocket extends EventEmitter {
+		destroyed = false;
+		setEncoding() {}
+		write(chunk: string) {
+			const frame = JSON.parse(chunk) as Record<string, unknown>;
+			written.push(frame);
+			queueMicrotask(() => this.emit("data", encodeListenerFrame({ type: "welcome", id: String(frame.id), listenerPid: 1, proto: 1, state: "asleep" })));
+			return true;
+		}
+		destroy() { this.destroyed = true; return this; }
+	}
+	const socket = new FakeSocket();
+	let client: VoiceListenerClient | undefined;
+	let voiceOn = true;
+	const turn = createReadingTurn({
+		dir: VOICE_HOME,
+		turn: async ({ dir, session }) => {
+			client = new VoiceListenerClient({ dir, session, role: "reading", dial: () => socket as unknown as Socket });
+			await client.connect();
+			return undefined;
+		},
+	});
+	const waiting = turn(new AbortController().signal, { sessionId: "session-alpha", voiceOn: () => voiceOn });
+	try {
+		await until(() => client !== undefined);
+		voiceOn = false;
+		socket.emit("connect");
+		assert.equal(await waiting, undefined);
+		assert.equal(written.length, 1);
+		assert.equal(written[0]!.type, "hello");
+		assert.equal(written[0]!.role, "reading");
+		assert.equal(written[0]!.voiceOn, false);
+	} finally {
+		client?.close();
+	}
+});
+
+test("the session passes its live voice source to a waiting reading", async () => {
+	const { engine, readings } = fakeEngine();
+	const h = harness({ voice: true, engine });
+	const gate = deferred<void>();
+	let source: (() => boolean) | undefined;
+	h.deps.readingTurn = async (_signal, hooks) => { source = hooks?.voiceOn; await gate.promise; return undefined; };
+	const pi = register(h);
+	const ui = fakeContext();
+	try {
+		await pi.fire("session_start", ui.ctx);
+		// Pi can supply a different context object for the same session event.
+		const eventCtx = { ...ui.ctx };
+		await settleReply(pi, eventCtx, "Una respuesta pendiente.");
+		await until(() => source !== undefined);
+		assert.equal(source!(), true);
+		ui.type(ESC);
+		assert.equal(source!(), true, "cancelling a reading does not turn session voice off");
+		h.voice.sessions = [];
+		assert.equal(source!(), false, "a voice change in another process is read fresh");
+		assert.deepEqual(readings, []);
+		assert.equal(pi.counts.sends, 0);
+	} finally {
+		gate.resolve();
+		await pi.fire("session_shutdown", ui.ctx);
+	}
 });
 
 test("the default reading turn asks the voice listener in the voice home instead of a turn file", async () => {

@@ -2191,6 +2191,21 @@ test("awake spotting is replaced by asleep spotting when the last session leaves
 	assert.equal(started.listener.voiceSessions.length, 0, "rejecting the last client releases awake spotting too");
 });
 
+test("a reading-only hello with voice off registers without waking", async (t) => {
+	const started = await startListener(scratch());
+	t.after(() => started.listener.close());
+	const reader = await started.client();
+	reader.hello("s-1", "w1:p1", false, "reading");
+	await awaitFrame(reader, (frame) => frame.type === "welcome");
+	reader.send({ type: "status", id: "barrier" });
+	assert.deepEqual(await awaitFrame(reader, (frame) => "id" in frame && frame.id === "barrier"), {
+		type: "snapshot", id: "barrier", state: "asleep", listenerPid: process.pid, clients: 1, sessions: ["s-1"],
+	});
+	assert.deepEqual(started.listener.voiceSessions, []);
+	reader.send({ type: "read-begin", id: "read", readingId: "read-1", chars: 5 });
+	assert.deepEqual(await awaitFrame(reader, (frame) => "id" in frame && frame.id === "read"), { type: "busy", id: "read", reason: "asleep" });
+});
+
 let sessionVoiceBarrier = 0;
 async function sendSessionVoice(client: Client, voiceOn: boolean): Promise<void> {
 	const id = `session-voice-barrier-${sessionVoiceBarrier++}`;
@@ -2199,6 +2214,43 @@ async function sendSessionVoice(client: Client, voiceOn: boolean): Promise<void>
 	const answer = await awaitFrame(client, (frame) => frame.type === "error" || ("id" in frame && frame.id === id));
 	assert.equal(answer.type, "snapshot", `session-voice must not close the link: ${JSON.stringify(answer)}`);
 }
+
+test("a session joining after a reader owns its voice and the reader cannot override it", async (t) => {
+	const started = await startListener(scratch());
+	t.after(() => started.listener.close());
+	const reader = await started.client();
+	reader.hello("s-1", "w1:p1", true, "reading");
+	await awaitFrame(reader, (frame) => frame.type === "welcome");
+	assert.equal(started.listener.state, "listening");
+	assert.deepEqual(started.listener.voiceSessions, ["s-1"]);
+
+	const session = await started.client();
+	session.hello("s-1", "w1:p1", false, "session");
+	await awaitFrame(session, (frame) => frame.type === "welcome");
+	session.send({ type: "status", id: "joined" });
+	await awaitFrame(session, (frame) => "id" in frame && frame.id === "joined");
+	assert.equal(started.listener.state, "asleep");
+	assert.deepEqual(started.listener.voiceSessions, []);
+	await sendSessionVoice(reader, true);
+	assert.equal(started.listener.state, "asleep", "a reader update is not session authority");
+	assert.deepEqual(started.listener.voiceSessions, []);
+	await sendSessionVoice(session, true);
+	assert.equal(started.listener.state, "listening");
+	assert.deepEqual(started.listener.voiceSessions, ["s-1"]);
+	const replacement = await started.client();
+	replacement.hello("s-1", "w1:p1", false, "reading");
+	await awaitFrame(replacement, (frame) => frame.type === "welcome");
+	await reader.closed;
+	assert.equal(started.listener.state, "listening", "a stale off hello cannot change an on session");
+	assert.deepEqual(started.listener.voiceSessions, ["s-1"]);
+	await sendSessionVoice(replacement, false);
+	assert.equal(started.listener.state, "listening", "a reader cannot turn an on session off either");
+	assert.deepEqual(started.listener.voiceSessions, ["s-1"]);
+	await sendSessionVoice(session, false);
+	assert.equal(started.listener.state, "asleep");
+	assert.deepEqual(started.listener.voiceSessions, []);
+	assert.deepEqual([...framesOf(reader, "command"), ...framesOf(replacement, "command"), ...framesOf(session, "command")], []);
+});
 
 test("session-voice updates only its session across both connection roles, without a broadcast", async (t) => {
 	const spot = fakeSpotting();
