@@ -4,7 +4,7 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, wr
 import { join } from "node:path";
 import test, { after } from "node:test";
 import { fileURLToPath } from "node:url";
-import { createSessionListenerLink, cutListenerReading, ensureListener, ListenerDeliveryError, listenerReadingTurn, VoiceListenerClient, type SessionDictation } from "../lib/voice-listener-client.ts";
+import { createSessionListenerLink, cutListenerReading, ensureListener, LISTENER_DICTATE_TIMEOUT_MS, ListenerDeliveryError, listenerReadingTurn, VoiceListenerClient, type SessionDictation } from "../lib/voice-listener-client.ts";
 import { VoiceSessionError, type VoiceSessionErrorCode, type VoiceSessionState } from "../lib/voice-session.ts";
 import { listenerPaths, readListenerLock, takeListenerLock, VoiceListener, type ListenerDictation, type ListenerDictationRequest } from "../lib/voice-listener.ts";
 import type { ListenerFrame } from "../lib/voice-listener-protocol.ts";
@@ -263,13 +263,14 @@ test("a cut on a listener that is not running does nothing and starts nothing", 
 // --- capture through the listener (slice C) ----------------------------------
 
 // The same fake worker the listener tests use: recording, transcribing, finished.
-function fakeCapture(options: { text?: string; error?: VoiceSessionErrorCode } = {}) {
+function fakeCapture(options: { text?: string; error?: VoiceSessionErrorCode; delayMs?: number } = {}) {
 	const calls: string[] = [];
 	const factory = (request: ListenerDictationRequest): ListenerDictation => {
 		const notify = request.onStateChange;
 		return {
 			start: async () => {
 				calls.push("start");
+				if (options.delayMs) await new Promise((resolve) => setTimeout(resolve, options.delayMs));
 				notify("recording");
 			},
 			stop: async () => {
@@ -367,5 +368,57 @@ test("a capture refused because another one is running fails the start instead o
 	await recording.stop();
 	first.close();
 	second.close();
+	await server.close();
+});
+
+test("a session whose dictate was refused still receives the transcript the focus sends it", async () => {
+	const dir = scratch();
+	const server = new VoiceListener({ dir, dictation: fakeCapture({ text: "para el enfocado" }).factory, focus: focusedOn("w1:p2") });
+	await server.listen();
+	const asker = createSessionListenerLink({ dir, session: () => session("s-1", true, "w1:p1") });
+	assert.equal(await asker.ensure(), true);
+	const received: string[] = [];
+	const focused = createSessionListenerLink({ dir, session: () => session("s-2", true, "w1:p2"), onTranscript: (text) => received.push(text) });
+	assert.equal(await focused.ensure(), true);
+	const recording = asker.dictate({ mode: "conversation", onStateChange: () => {}, fallback: () => assert.fail("the listener is reachable") });
+	await recording.start();
+	const refused = focused.dictate({ mode: "conversation", onStateChange: () => {}, fallback: () => assert.fail("no second microphone") });
+	await assert.rejects(refused.start(), (error: unknown) => error instanceof VoiceSessionError && error.code === "invalid-state");
+	recording.stop();
+	await assert.rejects(recording.stop(), (error: unknown) => error instanceof ListenerDeliveryError && error.kind === "elsewhere");
+	await waitFor(() => received.length === 1);
+	assert.deepEqual(received, ["para el enfocado"], "a refused start left no handler swallowing the focused transcript");
+	asker.close();
+	focused.close();
+	await server.close();
+});
+
+test("a slow capture start never opens a second microphone in the session", async () => {
+	assert.ok(LISTENER_DICTATE_TIMEOUT_MS >= 30_000, "a cold worker start fits inside the production dictate wait");
+	const dir = scratch();
+	const capture = fakeCapture({ text: "tarde", delayMs: 120 });
+	const server = new VoiceListener({ dir, dictation: capture.factory, focus: focusedOn("w1:p1") });
+	await server.listen();
+	const link = createSessionListenerLink({ dir, session: () => session("s-1"), dictateTimeoutMs: 20 });
+	const own = localCapture();
+	const dictation = link.dictate({ mode: "dictation", onStateChange: () => {}, fallback: () => own.dictation });
+	await assert.rejects(dictation.start(), (error: unknown) => error instanceof VoiceSessionError && error.code === "timeout");
+	assert.deepEqual(own.calls, [], "a listener that may still own the capture is never duplicated");
+	await waitFor(() => capture.calls.includes("cancel"));
+	assert.deepEqual(capture.calls, ["start", "cancel"], "the listener is asked to let the capture go");
+	link.close();
+	await server.close();
+});
+
+test("a listener with no worker leaves the capture to the session", async () => {
+	const dir = scratch();
+	const server = new VoiceListener({ dir });
+	await server.listen();
+	const link = createSessionListenerLink({ dir, session: () => session("s-1") });
+	const own = localCapture();
+	const dictation = link.dictate({ mode: "dictation", onStateChange: () => {}, fallback: () => own.dictation });
+	await dictation.start();
+	assert.deepEqual([dictation.owner, ...own.calls], ["session", "start"], "an unsupported platform records in the session as before");
+	link.close();
 	await server.close();
 });

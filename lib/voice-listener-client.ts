@@ -34,6 +34,9 @@ import { VoiceSessionError, type VoiceEndpoint, type VoiceSessionState, type Voi
 
 export const LISTENER_START_TIMEOUT_MS = 10_000;
 export const LISTENER_REQUEST_TIMEOUT_MS = 5_000;
+// A capture start waits for the warm worker to load its model, and a cold start
+// takes about 6.3 s: dictate gets a wait of its own, well past that.
+export const LISTENER_DICTATE_TIMEOUT_MS = 30_000;
 // 250 ms → 2 s, capped: a killed listener costs one retry, never a stuck voice.
 export const LISTENER_BACKOFF_MS = [250, 500, 1_000, 2_000] as const;
 const PROBE_INTERVAL_MS = 50;
@@ -57,6 +60,14 @@ interface Pending {
 	resolve(frame: ListenerFrame): void;
 	reject(error: Error): void;
 	timer: ReturnType<typeof setTimeout>;
+}
+
+// The listener did not answer in time, and may still be working on the request.
+class ListenerTimeoutError extends Error {
+	constructor() {
+		super("the voice listener did not answer");
+		this.name = "ListenerTimeoutError";
+	}
 }
 
 export class VoiceListenerClient {
@@ -117,15 +128,15 @@ export class VoiceListenerClient {
 		return frame.state;
 	}
 
-	request(frame: ListenerRequest): Promise<ListenerFrame> {
+	request(frame: ListenerRequest, timeoutMs = LISTENER_REQUEST_TIMEOUT_MS): Promise<ListenerFrame> {
 		const socket = this.socket;
 		if (!socket || socket.destroyed) return Promise.reject(new Error("voice listener is not connected"));
 		const id = String(this.nextId++);
 		const answered = new Promise<ListenerFrame>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				this.pending.delete(id);
-				reject(new Error("the voice listener did not answer"));
-			}, LISTENER_REQUEST_TIMEOUT_MS);
+				reject(new ListenerTimeoutError());
+			}, timeoutMs);
 			timer.unref?.();
 			this.pending.set(id, { resolve, reject, timer });
 		});
@@ -458,6 +469,8 @@ export interface SessionListenerLinkOptions {
 	session(): ListenerSession | undefined;
 	start?: () => void | Promise<void>;
 	waitMs?: number;
+	// How long the listener gets to accept a dictate, before the start fails.
+	dictateTimeoutMs?: number;
 	backoffMs?: readonly number[];
 	// A transcript the listener handed to this session: another session recorded
 	// it and this pane had the focus. It is handed over once, never buffered.
@@ -577,20 +590,31 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 			start: async () => {
 				setState("starting");
 				handler = handle;
-				if (!(await ensure())) return local();
-				const active = client;
-				if (!active) return local();
-				let answer: ListenerFrame;
 				try {
-					answer = await active.request({ type: "dictate", mode: request.mode, endpoint: request.endpoint });
-				} catch {
-					// The listener went away before it answered: record here instead.
-					return local();
+					if (!(await ensure())) return local();
+					const active = client;
+					if (!active) return local();
+					let answer: ListenerFrame;
+					try {
+						answer = await active.request({ type: "dictate", mode: request.mode, endpoint: request.endpoint }, options.dictateTimeoutMs ?? LISTENER_DICTATE_TIMEOUT_MS);
+					} catch (error) {
+						// Only confirmed unavailability records here instead: a listener that is
+						// gone, or one that answered and refused. A timeout may still be owned by
+						// the listener, so it is asked to let go and the start fails instead.
+						if (!active.connected || !(error instanceof ListenerTimeoutError)) return local();
+						void active.request({ type: "cancel" }).catch(() => {});
+						throw new VoiceSessionError("timeout");
+					}
+					// A refusal is obeyed, never routed around: another capture holds the mic.
+					if (answer.type === "busy") throw new VoiceSessionError("invalid-state");
+					if (answer.type !== "ok") throw new VoiceSessionError("protocol");
+					if (failure) throw failure.error;
+				} catch (error) {
+					// A start that failed holds no capture, so its handler goes with it: a
+					// transcript the focus sends this session still reaches onTranscript.
+					settle({ error });
+					throw error;
 				}
-				// A refusal is obeyed, never routed around: another capture holds the mic.
-				if (answer.type === "busy") throw new VoiceSessionError("invalid-state");
-				if (answer.type !== "ok") throw new VoiceSessionError("protocol");
-				if (failure) throw failure.error;
 			},
 			stop: () => {
 				if (fallback) return fallback.stop();

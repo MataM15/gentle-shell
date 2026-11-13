@@ -766,6 +766,36 @@ test("a cancelled capture ends without a transcript and without a stop", async (
 	await started.listener.close();
 });
 
+test("a cancel that arrives while the focus is read delivers nothing", async () => {
+	const dir = scratch();
+	let openFocus!: () => void;
+	const gate = new Promise<void>((resolve) => (openFocus = resolve));
+	const capture = fakeCapture({ text: "no debería" });
+	const started = await startListener(dir, {
+		dictation: capture.factory,
+		focus: { focusedPaneId: async () => { await gate; return { focused: "w1:p2" }; } },
+	});
+	const asker = await started.client();
+	asker.hello("s-1", "w1:p1");
+	const focused = await started.client();
+	focused.hello("s-2", "w1:p2");
+	await waitFor(() => framesOf(asker, "welcome").length === 1 && framesOf(focused, "welcome").length === 1);
+	asker.send({ type: "dictate", mode: "conversation" });
+	await awaitFrame(asker, (frame) => frame.type === "capture" && frame.phase === "recording");
+	// The stop is waiting on the focus lookup: the cancel arrives inside that window.
+	asker.send({ type: "stop", id: "s1" });
+	await awaitFrame(asker, (frame) => frame.type === "capture" && frame.phase === "transcribing");
+	asker.send({ type: "cancel", id: "c1" });
+	assert.equal((await awaitFrame(asker, (frame) => "id" in frame && frame.id === "c1")).type, "ok");
+	assert.deepEqual(framesOf(asker, "capture").at(-1), { type: "capture", phase: "cancelled" });
+	openFocus();
+	await awaitFrame(asker, (frame) => "id" in frame && frame.id === "s1");
+	assert.deepEqual([...framesOf(asker, "transcript"), ...framesOf(focused, "transcript")], [], "a cancelled capture reaches nobody");
+	asker.socket.destroy();
+	focused.socket.destroy();
+	await started.listener.close();
+});
+
 test("a capture that fails reports the worker's code and closes the microphone", async () => {
 	const dir = scratch();
 	const started = await startListener(dir, { dictation: fakeCapture({ error: "no-speech" }).factory, cues: cuePlayer(), focus: { focusedPaneId: async () => ({ focused: "w1:p1" }) } });

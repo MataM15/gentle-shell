@@ -461,8 +461,9 @@ export class VoiceListener {
 
 	// A transcript belongs to the session whose pane is focused when the
 	// recording ends. It is never broadcast, buffered or retried, and the session
-	// that asked always learns the outcome through its own request.
-	async deliverTranscript(text: string, truncated = false): Promise<string | undefined> {
+	// that asked always learns the outcome through its own request. `cancelled` is
+	// the capture's token, re-checked after the focus was read.
+	async deliverTranscript(text: string, truncated = false, cancelled?: () => boolean): Promise<string | undefined> {
 		const clients = [...this.clients.values()].filter((client) => client.sessionId);
 		if (clients.length === 0) {
 			this.log("transcript.undelivered", { clients: 0 });
@@ -470,6 +471,11 @@ export class VoiceListener {
 		}
 		const withPane = clients.filter((client) => client.paneId);
 		const lookup = await (this.options.focus ?? noFocus).focusedPaneId();
+		if (cancelled?.()) {
+			// Cancelled while the focus was read: the cancel already reported it.
+			this.log("transcript.undelivered", { clients: clients.length, capture: "cancelled" });
+			return undefined;
+		}
 		if ("failed" in lookup) {
 			// A failed lookup is not an unfocused one: the fallback would be a guess.
 			this.log("transcript.undelivered", { clients: clients.length, focus: "unknown" });
@@ -749,13 +755,16 @@ export class VoiceListener {
 				this.answer(client, "stop", id);
 				return;
 			}
-			const target = await this.deliverTranscript(transcript.text, transcript.truncated === true);
-			const phase = target === undefined ? "dropped" : target === capture.sessionId ? "delivered" : "elsewhere";
-			this.log("capture.end", { sessionId: capture.sessionId, mode: capture.mode, phase, target });
-			// The requester always learns the outcome, then the request is answered: a
-			// client waiting on stop already has its transcript when it returns.
-			this.say(capture.client, phase === "elsewhere" && target ? { type: "capture", phase, target } : { type: "capture", phase });
-			this.releaseCapture(capture);
+			const target = await this.deliverTranscript(transcript.text, transcript.truncated === true, () => this.capture !== capture);
+			// A cancel inside that lookup released the capture and already answered.
+			if (this.capture === capture) {
+				const phase = target === undefined ? "dropped" : target === capture.sessionId ? "delivered" : "elsewhere";
+				this.log("capture.end", { sessionId: capture.sessionId, mode: capture.mode, phase, target });
+				// The requester always learns the outcome, then the request is answered: a
+				// client waiting on stop already has its transcript when it returns.
+				this.say(capture.client, phase === "elsewhere" && target ? { type: "capture", phase, target } : { type: "capture", phase });
+				this.releaseCapture(capture);
+			}
 			this.answer(client, "stop", id);
 		})();
 	}
