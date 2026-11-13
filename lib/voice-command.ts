@@ -8,7 +8,7 @@ import { SpaceHoldDetector, type PushToTalkOptions } from "./voice-push-to-talk.
 import { createVoiceSession, VoiceSessionError, type VoiceEndpoint, type VoiceSessionErrorCode, type VoiceSessionState, type VoiceTranscript } from "./voice-session.ts";
 import { installKokoro, installMiro, KOKORO_MANIFESTS, KOKORO_NOTICES, kokoroBytes, MIRO_MANIFEST, MIRO_NOTICE, miroBytes, readKokoroStatus, readMiroStatus, type KokoroStatus } from "./voice-kokoro.ts";
 import { createReplyReader, defaultSpeechEngineResolver, lastAssistantText, replyLanguage } from "./voice-reply-speech.ts";
-import { createVoiceSpeechPublisher, type VoiceSpeechReading } from "./voice-speech-events.ts";
+import { createVoiceSpeechPublisher, type VoiceSpeechChunk, type VoiceSpeechReading } from "./voice-speech-events.ts";
 import { acquireLocalReadingTurn, paneFocus as herdrPaneFocus, paneFocused as herdrPaneFocused, type PaneFocus } from "./voice-presence.ts";
 import { cutListenerReading, createSessionListenerLink, listenerReadingTurn, sessionDisplayLabel, startVoiceListenerProcess, type ListenerReading, type ListenerSession, type SessionDictation, type SessionListenerLink } from "./voice-listener-client.ts";
 import type { ReadingReleaseReason } from "./voice-listener-protocol.ts";
@@ -410,7 +410,15 @@ export interface ReadingTurnHooks {
 	onCut?: (reason: ReadingReleaseReason) => void;
 }
 
-export type ReadingTurn = (signal: AbortSignal, hooks?: ReadingTurnHooks) => Promise<((outcome?: ReadingEnd) => void) | undefined>;
+// Giving the turn back. A turn held through the listener also takes the loudness
+// of each chunk the player began, so the listener draws the reading's wave (T13);
+// a turn with no listener has no `levels`, and the reading behaves as it did.
+export interface ReadingRelease {
+	(outcome?: ReadingEnd): void;
+	levels?(chunk: VoiceSpeechChunk): void;
+}
+
+export type ReadingTurn = (signal: AbortSignal, hooks?: ReadingTurnHooks) => Promise<ReadingRelease | undefined>;
 
 export interface CreateReadingTurnOptions {
 	// The voice home, shared by every Pi process of this user.
@@ -439,11 +447,17 @@ export function createReadingTurn(options: CreateReadingTurnOptions): ReadingTur
 			if (answer?.kind === "granted") {
 				const granted = answer;
 				let released = false;
-				return (outcome?: ReadingEnd) => {
+				const release: ReadingRelease = (outcome?: ReadingEnd) => {
 					if (released) return;
 					released = true;
 					granted.release(outcome ?? "done");
 				};
+				// The listener draws what the reading plays; once the turn is given back
+				// there is nothing left to draw on it.
+				release.levels = (chunk) => {
+					if (!released) granted.levels(chunk);
+				};
+				return release;
 			}
 			// A refusal or a cancelled wait is the listener's answer: nothing reads.
 			if (!answer || answer.kind !== "unavailable") return undefined;
@@ -844,7 +858,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			}
 		});
 		setVoiceFooter(ctx, live, "Waiting to read · esc skip");
-		let release: ((outcome?: ReadingEnd) => void) | undefined;
+		let release: ReadingRelease | undefined;
 		let ended: ReadingOutcome | undefined;
 		let started: VoiceSpeechReading | undefined;
 		// The voice that speaks this reading, as the log and the event report it.
@@ -870,7 +884,12 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			started = engine ? speechEvents.begin(voice ?? engine.id) : undefined;
 			voiceLog("reading.start", { session: sessionIdOf(ctx), chars: markdown.length, language, voice });
 			const read = await replyReader.read(markdown, current.controller.signal, {
-				chunk: (chunk) => started?.chunk(chunk),
+				// The event bus first, unchanged, so outside consumers see exactly what
+				// they saw before; then the same chunk to the listener's overlay wave.
+				chunk: (chunk) => {
+					started?.chunk(chunk);
+					release?.levels?.(chunk);
+				},
 				// Why the reply was read again by the same voice (S4).
 				retry: ({ attempt, failure }) => voiceLog("reading.retry", { session: sessionIdOf(ctx), voice, attempt, failure }),
 			});

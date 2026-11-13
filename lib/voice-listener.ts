@@ -262,6 +262,10 @@ interface ActiveReading {
 	lease?: ReturnType<typeof setTimeout>;
 	tail?: ReturnType<typeof setTimeout>;
 	ended: boolean;
+	// The loudness of the chunk the player began (T13), queued here and drawn one
+	// value per frame of audio. A new chunk replaces it; the end clears it.
+	levels?: { readonly values: readonly number[]; at: number };
+	levelTimer?: ReturnType<typeof setTimeout>;
 }
 
 export interface VoiceListenerOptions {
@@ -721,6 +725,9 @@ export class VoiceListener {
 				this.say(client, withId({ type: "ok", request: "read-cut", state: this.currentState }, request.id));
 				return;
 			}
+			case "read-levels":
+				this.readingLevels(client, request.id, request);
+				return;
 			case "levels":
 				client.levels = request.on;
 				this.say(client, withId({ type: "ok", request: "levels", state: this.currentState }, request.id));
@@ -1006,6 +1013,58 @@ export class VoiceListener {
 		this.log("reading.begin", { readingId: reading.readingId, sessionId: session, chars: reading.chars });
 	}
 
+	// The reading's own loudness (T13, S5): the session that holds the turn sends
+	// the output level of each chunk its player began, and the overlay draws it.
+	// Only the holder with that reading id is accepted, so no other session can
+	// paint a wave over a reading it does not speak, and a refused frame changes
+	// nothing. The values are raw output loudness, paced here in audio time: the
+	// window normalizes and smooths them, as it does for the microphone.
+	private readingLevels(client: Client, id: string | undefined, request: { readingId: string; frameMs: number; levels: readonly number[] }): void {
+		const reading = this.reading;
+		if (!reading || reading.ended || reading.session !== client.sessionId || reading.readingId !== request.readingId) {
+			this.say(client, withId({ type: "busy", reason: "reading", ...(reading && !reading.ended ? { holder: reading.session } : {}) }, id));
+			return;
+		}
+		this.scheduleLevels(reading, request.frameMs, request.levels);
+		this.say(client, withId({ type: "ok", request: "read-levels", state: this.currentState }, id));
+	}
+
+	// One value per frame of audio, never faster than the published-level ceiling,
+	// so a chunk that arrives late or early still draws at the speed it is heard.
+	// With no overlay there is nothing to draw, so no timer is armed at all.
+	private scheduleLevels(reading: ActiveReading, frameMs: number, levels: readonly number[]): void {
+		this.stopLevels(reading);
+		if (!this.overlay || levels.length === 0) return;
+		reading.levels = { values: [...levels], at: 0 };
+		const step = Math.max(frameMs, LEVEL_MIN_INTERVAL_MS);
+		const tick = () => {
+			reading.levelTimer = undefined;
+			const scheduled = reading.levels;
+			// The reading ended, or another one holds the listener now: nothing more
+			// is drawn, in either case.
+			if (!scheduled || this.reading !== reading || reading.ended || this.currentState !== "reading") return;
+			const value = scheduled.values[scheduled.at];
+			scheduled.at += 1;
+			if (value !== undefined) this.drawOverlay((overlay) => overlay.level(value));
+			if (scheduled.at >= scheduled.values.length) {
+				this.stopLevels(reading);
+				return;
+			}
+			const timer = setTimeout(tick, step);
+			timer.unref?.();
+			reading.levelTimer = timer;
+		};
+		const timer = setTimeout(tick, step);
+		timer.unref?.();
+		reading.levelTimer = timer;
+	}
+
+	private stopLevels(reading: ActiveReading): void {
+		if (reading.levelTimer) clearTimeout(reading.levelTimer);
+		reading.levelTimer = undefined;
+		reading.levels = undefined;
+	}
+
 	private armReadLease(reading: ActiveReading): void {
 		if (reading.lease) clearTimeout(reading.lease);
 		const lease = setTimeout(() => {
@@ -1025,6 +1084,8 @@ export class VoiceListener {
 		reading.ended = true;
 		if (reading.lease) clearTimeout(reading.lease);
 		reading.lease = undefined;
+		// The wave goes with the reading: no value is drawn after it ends.
+		this.stopLevels(reading);
 		this.broadcast({ type: "reading", change: "released", readingId: reading.readingId, session: reading.session, reason });
 		this.log("reading.release", {
 			readingId: reading.readingId,

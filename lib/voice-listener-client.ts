@@ -14,6 +14,8 @@ import {
 import {
 	encodeListenerFrame,
 	parseListenerFrameLine,
+	LISTENER_MAX_FRAME_MS,
+	LISTENER_MAX_LEVELS,
 	LISTENER_MAX_LINE,
 	type CaptureMode,
 	type ListenerFrame,
@@ -22,6 +24,7 @@ import {
 	type ReadingOutcome,
 	type ReadingReleaseReason,
 } from "./voice-listener-protocol.ts";
+import { VOICE_SPEECH_FRAME_MS, type VoiceSpeechChunk } from "./voice-speech-events.ts";
 import { VoiceSessionError, type VoiceEndpoint, type VoiceSessionState, type VoiceTranscript } from "./voice-session.ts";
 
 // The session side of the one voice listener (S6): join the running listener,
@@ -343,7 +346,16 @@ export interface ListenerReadingOptions {
 // "unavailable" means the listener could not be reached at all: the session may
 // fall back to its own reading turn, exactly as it did before the listener
 // existed. A refusal or a cancelled wait is undefined: nothing reads then.
-export type ListenerReading = { kind: "granted"; release: (outcome?: ReadingOutcome) => void } | { kind: "unavailable" };
+export type ListenerReading =
+	| {
+			kind: "granted";
+			release: (outcome?: ReadingOutcome) => void;
+			// The loudness of one chunk the player just began, for the overlay wave
+			// (T13). Advisory: a frame that cannot be sent or is refused never stops
+			// the reading.
+			levels: (chunk: VoiceSpeechChunk) => void;
+	  }
+	| { kind: "unavailable" };
 
 type Answer = "granted" | "reading" | "asleep" | "closed";
 
@@ -375,6 +387,16 @@ function holdReading(client: VoiceListenerClient, readingId: string, options: Li
 		done = true;
 		return true;
 	};
+	// The reading's loudness: the same measurement the speech events publish, sent
+	// on this turn so the listener can draw it. The wire refuses any number
+	// outside 0..1 by closing the connection, so a value the meter cannot draw is
+	// silence here instead of a malformed frame that would mute the session.
+	const levels = (chunk: VoiceSpeechChunk): void => {
+		if (done) return;
+		const values = chunk.levels.slice(0, LISTENER_MAX_LEVELS).map((level) => (!Number.isFinite(level) || level <= 0 ? 0 : level >= 1 ? 1 : level));
+		const frameMs = Number.isSafeInteger(chunk.frameMs) && chunk.frameMs > 0 && chunk.frameMs <= LISTENER_MAX_FRAME_MS ? chunk.frameMs : VOICE_SPEECH_FRAME_MS;
+		client.request({ type: "read-levels", readingId, frameMs, levels: values }).catch(() => {});
+	};
 	const heartbeat = setInterval(() => {
 		const lose = () => {
 			if (!claim()) return;
@@ -396,6 +418,7 @@ function holdReading(client: VoiceListenerClient, readingId: string, options: Li
 	});
 	return {
 		kind: "granted",
+		levels,
 		release: (outcome: ReadingOutcome = "done") => {
 			claim();
 			off();

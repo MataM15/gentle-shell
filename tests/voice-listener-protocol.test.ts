@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
 	encodeListenerFrame,
+	LISTENER_MAX_LEVELS,
 	LISTENER_MAX_LINE,
 	parseListenerFrameLine,
 	parseListenerRequestLine,
@@ -188,6 +189,40 @@ test("a reading request or answer outside the fixed lists is refused", () => {
 		{ type: "granted", state: "reading" },
 	]) {
 		assert.equal(parseListenerFrameLine(line(bad)), undefined, JSON.stringify(bad));
+	}
+});
+
+// --- the reading's loudness (T13, S5) ------------------------------------------------
+
+test("the reading's loudness parses as one bounded frame of levels", () => {
+	const frame = { type: "read-levels", id: "v1", readingId: "read-1", frameMs: 50, levels: [0, 0.25, 1] };
+	assert.deepEqual(parseListenerRequestLine(line(frame)), frame);
+	assert.deepEqual(parseListenerRequestLine(line({ type: "read-levels", readingId: "read-1", frameMs: 50, levels: [] })), {
+		type: "read-levels",
+		readingId: "read-1",
+		frameMs: 50,
+		levels: [],
+	});
+	const full = { type: "read-levels", readingId: "read-1", frameMs: 50, levels: Array.from({ length: LISTENER_MAX_LEVELS }, () => 0.5) };
+	assert.deepEqual(parseListenerRequestLine(line(full)), full, "the widest frame the wire accepts still parses");
+	// Every number is validated, and the list stays inside its bound.
+	for (const bad of [
+		{ type: "read-levels", readingId: "read-1", frameMs: 50 },
+		{ type: "read-levels", frameMs: 50, levels: [0.1] },
+		{ type: "read-levels", readingId: "read-1", levels: [0.1] },
+		{ type: "read-levels", readingId: 7, frameMs: 50, levels: [0.1] },
+		{ type: "read-levels", readingId: "read-1", frameMs: 0, levels: [0.1] },
+		{ type: "read-levels", readingId: "read-1", frameMs: -50, levels: [0.1] },
+		{ type: "read-levels", readingId: "read-1", frameMs: 50.5, levels: [0.1] },
+		{ type: "read-levels", readingId: "read-1", frameMs: 50, levels: [-0.01] },
+		{ type: "read-levels", readingId: "read-1", frameMs: 50, levels: [1.01] },
+		{ type: "read-levels", readingId: "read-1", frameMs: 50, levels: [null] },
+		{ type: "read-levels", readingId: "read-1", frameMs: 50, levels: ["0.1"] },
+		{ type: "read-levels", readingId: "read-1", frameMs: 50, levels: 0.1 },
+		{ type: "read-levels", readingId: "read-1", frameMs: 50, levels: [], durationMs: 100 },
+		{ type: "read-levels", readingId: "read-1", frameMs: 50, levels: Array.from({ length: LISTENER_MAX_LEVELS + 1 }, () => 0.1) },
+	]) {
+		assert.equal(parseListenerRequestLine(line(bad)), undefined, JSON.stringify(bad).slice(0, 120));
 	}
 });
 

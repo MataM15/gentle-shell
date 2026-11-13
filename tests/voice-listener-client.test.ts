@@ -8,6 +8,7 @@ import test, { after } from "node:test";
 import { fileURLToPath } from "node:url";
 import { createSessionListenerLink, cutListenerReading, ensureListener, LISTENER_DICTATE_TIMEOUT_MS, ListenerDeliveryError, listenerReadingTurn, sessionDisplayLabel, SESSION_LABEL_MAX, VoiceListenerClient, type ListenerSession, type SessionDictation } from "../lib/voice-listener-client.ts";
 import { VoiceSessionError, type VoiceSessionErrorCode, type VoiceSessionState } from "../lib/voice-session.ts";
+import type { VoiceOverlay } from "../lib/voice-overlay.ts";
 import { listenerPaths, readListenerLock, takeListenerLock, VoiceListener, type ListenerDictation, type ListenerDictationRequest } from "../lib/voice-listener.ts";
 import { encodeListenerFrame, type ListenerFrame } from "../lib/voice-listener-protocol.ts";
 
@@ -239,6 +240,44 @@ test("a session reads through the listener, another waits for the turn, and a cu
 	assert.ok(granted && granted.kind === "granted");
 	granted.release("skipped");
 	reading.release("done");
+	await server.close();
+});
+
+test("the reading turn sends the played loudness to the listener and survives a chunk the wire would refuse", async () => {
+	const dir = scratch();
+	const levels: number[] = [];
+	const states: string[] = [];
+	const overlay: VoiceOverlay = {
+		show: (snapshot) => {
+			states.push(snapshot.state);
+		},
+		level: (value) => {
+			levels.push(value);
+		},
+		dispose: () => {},
+	};
+	const server = new VoiceListener({ dir, overlay, readTailMs: 5 });
+	await server.listen();
+	const reading = await listenerReadingTurn({ dir, session: session("s-1"), chars: 20, signal: new AbortController().signal });
+	assert.ok(reading && reading.kind === "granted", "the free turn is granted");
+	assert.deepEqual(states, ["reading"], "the overlay is already drawing the reading");
+
+	reading.levels({ frameMs: 50, durationMs: 200, levels: [0.25, 0.5, 0.75] });
+	await waitFor(() => levels.length === 3, 2_000);
+	assert.deepEqual(levels, [0.25, 0.5, 0.75], "the loudness reaches the overlay as it is");
+
+	// The wire refuses a malformed frame by closing the connection, so the client
+	// sanitizes instead: the reading never dies over a value it cannot draw.
+	reading.levels({ frameMs: 0, durationMs: 0, levels: [Number.NaN, -1, 4] });
+	await waitFor(() => levels.length === 6, 2_000);
+	assert.deepEqual(levels.slice(3), [0, 0, 1], "a value the meter cannot draw is silence");
+	assert.equal(server.readingSession, "s-1", "the turn is still held after the malformed chunk");
+
+	reading.release("done");
+	await waitFor(() => server.readingSession === undefined, 2_000);
+	reading.levels({ frameMs: 50, durationMs: 50, levels: [1] });
+	await new Promise((resolve) => setTimeout(resolve, 120));
+	assert.equal(levels.length, 6, "a released reading sends nothing");
 	await server.close();
 });
 

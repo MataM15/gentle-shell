@@ -13,6 +13,7 @@ import { createSessionListenerLink } from "../lib/voice-listener-client.ts";
 import type { PaneFocus } from "../lib/voice-presence.ts";
 import type { CuePlayer } from "../lib/voice-cues.ts";
 import type { PushToTalkTimers } from "../lib/voice-push-to-talk.ts";
+import type { VoiceSpeechChunk } from "../lib/voice-speech-events.ts";
 import { createRetrySpeechEngine, createWindowsSpeechEngine, SpeechEngineError, type SpeechEngine, type SpeechOptions, type SpeechOutcome } from "../lib/voice-speech.ts";
 
 // /gentle:voice through its registered command, with fake UI, acquisition and
@@ -207,7 +208,7 @@ interface Harness {
 	settings: { enabled: boolean; reads: number; writes: boolean[] };
 	voice: { sessions: string[]; writes: string[][] };
 	focus: { state: PaneFocus; asks: number };
-	turn: { held: boolean; waiting: Array<() => void>; acquired: number; released: number; cut?: () => void };
+	turn: { held: boolean; waiting: Array<() => void>; acquired: number; released: number; cut?: () => void; levels: VoiceSpeechChunk[] };
 	// The readings this session cut elsewhere when its voice was turned off.
 	readCuts: string[];
 	warmReleases: number;
@@ -229,7 +230,7 @@ function harness(overrides: { platform?: string; arch?: string; installed?: bool
 	// Spoken replies are faked too: no test reaches PowerShell or the config home.
 	const voice: Harness["voice"] = { sessions: overrides.voice ? ["session-alpha"] : [], writes: [] };
 	const focus: Harness["focus"] = { state: overrides.focus ?? "focused", asks: 0 };
-	const turn: Harness["turn"] = { held: overrides.turnHeld ?? false, waiting: [], acquired: 0, released: 0 };
+	const turn: Harness["turn"] = { held: overrides.turnHeld ?? false, waiting: [], acquired: 0, released: 0, levels: [] };
 	const harnessRef = { warmReleases: 0, cues: [] as string[], readCuts: [] as string[], events: [] as Array<{ event: string } & Record<string, unknown>> };
 	const kokoro: Harness["kokoro"] = { state: overrides.kokoro ?? "missing", installs: [] };
 	const miro: Harness["miro"] = { state: overrides.miro ?? "missing", installs: [] };
@@ -289,7 +290,12 @@ function harness(overrides: { platform?: string; arch?: string; installed?: bool
 		// The shared reading turn, faked: free unless a test holds it. The listener
 		// hands its cut back through the hooks, so a test can cut like it does.
 		readingTurn: (signal, hooks) => new Promise((resolve) => {
-			const take = () => { turn.acquired++; turn.cut = () => hooks?.onCut?.("cut"); resolve(() => { turn.released++; }); };
+			const take = () => {
+				turn.acquired++;
+				turn.cut = () => hooks?.onCut?.("cut");
+				// The granted turn also carries the loudness sink the listener draws.
+				resolve(Object.assign(() => { turn.released++; }, { levels: (chunk: VoiceSpeechChunk) => turn.levels.push(chunk) }));
+			};
 			if (!turn.held) return take();
 			const wait = () => { turn.held = false; take(); };
 			turn.waiting.push(wait);
@@ -2415,7 +2421,7 @@ test("a session that cannot reach the listener still reads through the local tur
 	const route = (answer: "granted" | "refused" | "unavailable") => async (options: { dir: string; session: { sessionId: string }; chars?: number }) => {
 		asked += 1;
 		assert.equal(options.session.sessionId, "session-alpha", "the listener is told which session reads");
-		if (answer === "granted") return { kind: "granted" as const, release: () => { released += 1; } };
+		if (answer === "granted") return { kind: "granted" as const, release: () => { released += 1; }, levels: () => {} };
 		return answer === "refused" ? undefined : { kind: "unavailable" as const };
 	};
 	const localTurn = async () => { local += 1; return () => { released += 1; }; };
@@ -2858,6 +2864,47 @@ test("a reading publishes start before it speaks, its played chunks, and one end
 	assert.deepEqual(speechEvents(pi).at(-1), { schema: VOICE_SPEECH_SCHEMA, phase: "end", engine: "fake", outcome: "done" });
 	await tick();
 	assert.equal(speechEvents(pi).length, 3, "exactly one end per start");
+});
+
+test("a played chunk goes to the event bus unchanged and to the listener's wave, in that order", async () => {
+	const { engine, readings } = fakeEngine();
+	const h = harness({ voice: true, engine });
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	await settleReply(pi, ui.ctx, "Respuesta.");
+	await until(() => readings.length === 1);
+	readings[0]!.options.onChunk!({ frameMs: 50, durationMs: 300, levels: [1, 0.4] });
+	assert.deepEqual(
+		speechEvents(pi),
+		[
+			{ schema: VOICE_SPEECH_SCHEMA, phase: "start", engine: "fake" },
+			{ schema: VOICE_SPEECH_SCHEMA, phase: "chunk", engine: "fake", frameMs: 50, durationMs: 300, levels: [1, 0.4] },
+		],
+		"the published payload is exactly the one it was before the listener saw it",
+	);
+	assert.deepEqual(h.turn.levels, [{ frameMs: 50, durationMs: 300, levels: [1, 0.4] }], "the same loudness, tapped for the overlay");
+	readings[0]!.finish("done");
+	await until(() => speechEvents(pi).length === 3);
+	assert.deepEqual(speechEvents(pi).at(-1), { schema: VOICE_SPEECH_SCHEMA, phase: "end", engine: "fake", outcome: "done" });
+});
+
+test("a reading whose turn carries no listener still publishes its chunks and sends nothing", async () => {
+	const { engine, readings } = fakeEngine();
+	const h = harness({ voice: true, engine });
+	// The turn a session gets when the listener is unreachable: a plain release.
+	h.deps.readingTurn = async () => () => { h.turn.released += 1; };
+	const pi = register(h);
+	const ui = fakeContext();
+	await pi.fire("session_start", ui.ctx);
+	await settleReply(pi, ui.ctx, "Respuesta.");
+	await until(() => readings.length === 1);
+	assert.doesNotThrow(() => readings[0]!.options.onChunk!({ frameMs: 50, durationMs: 100, levels: [0.2] }));
+	assert.deepEqual(speechEvents(pi).at(-1), { schema: VOICE_SPEECH_SCHEMA, phase: "chunk", engine: "fake", frameMs: 50, durationMs: 100, levels: [0.2] });
+	assert.deepEqual(h.turn.levels, [], "there is no listener route to send it to");
+	readings[0]!.finish("done");
+	await until(() => speechEvents(pi).some((event) => event.phase === "end"));
+	assert.equal(h.turn.released, 1);
 });
 
 test("Esc and Stop reading each end the reading once, with the outcome the log records", async () => {

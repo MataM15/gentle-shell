@@ -12,6 +12,12 @@ export const LISTENER_MAX_LINE = 64 * 1024;
 export const LISTENER_MAX_TEXT = 16 * 1024;
 export const LISTENER_MAX_CLIENTS = 64;
 export const LISTENER_MAX_FRAMES_PER_SECOND = 200;
+// One loudness frame carries at most a minute of audio (50 ms a value, twenty a
+// second): the same frame the speech events publish, and never a long list that
+// pushes a line past its bound.
+export const LISTENER_MAX_LEVELS = 1200;
+// The widest frame width a loudness frame may name. The speech events use 50 ms.
+export const LISTENER_MAX_FRAME_MS = 1000;
 
 export const LISTENER_STATES = ["asleep", "listening", "transcribing", "reading"] as const;
 export type ListenerState = (typeof LISTENER_STATES)[number];
@@ -96,6 +102,10 @@ export type ListenerRequest =
 	| { type: "read-heartbeat"; id?: string; readingId: string }
 	| { type: "read-end"; id?: string; readingId: string; outcome: ReadingOutcome }
 	| { type: "read-cut"; id?: string; readingId?: string }
+	// The reading's own loudness (T13): the session that holds the turn sends the
+	// output level of every chunk its player began, so the overlay draws the wave
+	// from the audio that is really playing.
+	| { type: "read-levels"; id?: string; readingId: string; frameMs: number; levels: number[] }
 	// The microphone (slice C): ask for one capture, end it, or throw it away.
 	| { type: "dictate"; id?: string; mode: CaptureMode; endpoint?: ListenerEndpoint }
 	| { type: "stop"; id?: string }
@@ -152,6 +162,8 @@ type Kind =
 	| "change"
 	| "language"
 	| "rms"
+	| "frame-ms"
+	| "level-list"
 	| "busy"
 	| "mode"
 	| "phase"
@@ -180,6 +192,12 @@ const KINDS: Record<Kind, (value: unknown) => boolean> = {
 	language: (value) => LISTENER_LANGUAGES.includes(value as ListenerLanguage),
 	// Not a weight: a level the overlay could not draw is a malformed frame.
 	rms: (value) => typeof value === "number" && Number.isFinite(value) && (value as number) >= 0 && (value as number) <= 1,
+	// A frame width is a positive whole number of milliseconds, not a weight.
+	"frame-ms": (value) => Number.isSafeInteger(value) && (value as number) > 0 && (value as number) <= LISTENER_MAX_FRAME_MS,
+	// A bounded list of output levels: every one validated, as a single rms is. A
+	// chunk with no level at all is a chunk that could not be measured.
+	"level-list": (value) =>
+		Array.isArray(value) && value.length <= LISTENER_MAX_LEVELS && value.every((level) => typeof level === "number" && Number.isFinite(level) && level >= 0 && level <= 1),
 	busy: (value) => LISTENER_BUSY_REASONS.includes(value as ListenerBusyReason),
 	mode: (value) => CAPTURE_MODES.includes(value as CaptureMode),
 	phase: (value) => CAPTURE_PHASES.includes(value as CapturePhase),
@@ -212,6 +230,7 @@ const REQUEST_SPECS: Record<string, Spec> = {
 	"read-heartbeat": { required: { readingId: "string" }, optional: { ...ID } },
 	"read-end": { required: { readingId: "string", outcome: "outcome" }, optional: { ...ID } },
 	"read-cut": { required: {}, optional: { readingId: "string", ...ID } },
+	"read-levels": { required: { readingId: "string", frameMs: "frame-ms", levels: "level-list" }, optional: { ...ID } },
 	dictate: { required: { mode: "mode" }, optional: { endpoint: "endpoint", ...ID } },
 	stop: { required: {}, optional: { ...ID } },
 	cancel: { required: {}, optional: { ...ID } },

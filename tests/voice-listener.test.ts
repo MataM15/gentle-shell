@@ -1082,3 +1082,202 @@ test("an overlay whose promises reject is dropped the same way", async () => {
 	assert.equal(failures[0]!.fields, undefined);
 	assert.equal(calls, 1, "a rejecting overlay is never called again");
 });
+
+// --- the reading's own loudness (T13, S5) --------------------------------------
+// While a reply is read aloud the overlay draws the output, not the microphone:
+// the session that holds the reading sends the loudness of each chunk its player
+// began, and the listener hands it to the overlay one frame at a time.
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// One session that asked, was granted the turn, and is the only one accepted.
+async function grantedReading(started: Started, sessionId = "s-1", readingId = "read-1"): Promise<Client> {
+	const reader = await started.client();
+	reader.hello(sessionId);
+	await waitFor(() => framesOf(reader, "welcome").length === 1);
+	reader.send({ type: "read-begin", id: "b1", readingId, chars: 40 });
+	assert.equal((await awaitFrame(reader, (frame) => "id" in frame && frame.id === "b1")).type, "granted");
+	return reader;
+}
+
+test("the reading's loudness reaches the overlay as it is, one value per frame of audio, and stops when the reading ends", async () => {
+	const overlay = fakeOverlay();
+	const started = await startListener(scratch(), { overlay: overlay.overlay });
+	const reader = await grantedReading(started);
+	reader.send({ type: "read-levels", id: "v1", readingId: "read-1", frameMs: 50, levels: [0.3, 0.6, 0.1] });
+	assert.deepEqual(await awaitFrame(reader, (frame) => "id" in frame && frame.id === "v1"), { type: "ok", id: "v1", request: "read-levels", state: "reading" });
+	assert.deepEqual(overlay.levels, [], "a level is drawn in audio time, never at the moment it arrives");
+	const first = Date.now();
+	await waitFor(() => overlay.levels.length === 3);
+	assert.deepEqual(overlay.levels, [0.3, 0.6, 0.1], "raw output loudness: the window normalizes and smooths it");
+	assert.ok(Date.now() - first >= 80, "three values of 50 ms each take at least 100 ms, not one burst");
+	await sleep(120);
+	assert.equal(overlay.levels.length, 3, "nothing is drawn past the last value of the chunk");
+
+	// A narrower frame than the ceiling is still paced at the ceiling: twenty a
+	// second, never faster.
+	reader.send({ type: "read-levels", id: "v2", readingId: "read-1", frameMs: 10, levels: [0.2, 0.2, 0.2, 0.2, 0.2] });
+	await awaitFrame(reader, (frame) => "id" in frame && frame.id === "v2");
+	const paced = Date.now();
+	await waitFor(() => overlay.levels.length === 8);
+	assert.ok(Date.now() - paced >= 200, "five ten-millisecond frames take the same quarter second twenty a second allows");
+
+	// Ending the reading stops whatever is still scheduled.
+	reader.send({ type: "read-levels", id: "v3", readingId: "read-1", frameMs: 50, levels: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9] });
+	await awaitFrame(reader, (frame) => "id" in frame && frame.id === "v3");
+	await waitFor(() => overlay.levels.length >= 9);
+	reader.send({ type: "read-end", id: "e1", readingId: "read-1", outcome: "done" });
+	await awaitFrame(reader, (frame) => "id" in frame && frame.id === "e1");
+	const atEnd = overlay.levels.length;
+	await sleep(200);
+	assert.equal(overlay.levels.length, atEnd, "no level is delivered after the reading ended");
+	reader.socket.destroy();
+	await started.listener.close();
+});
+
+test("only the session holding this reading is accepted, and a new chunk replaces the one still scheduled", async () => {
+	const overlay = fakeOverlay();
+	const started = await startListener(scratch(), { overlay: overlay.overlay });
+	const reader = await grantedReading(started);
+	const other = await started.client();
+	other.hello("s-2");
+	await waitFor(() => framesOf(other, "welcome").length === 1);
+
+	// A session that does not hold the turn changes nothing, and neither does the
+	// holder naming another reading.
+	other.send({ type: "read-levels", id: "x1", readingId: "read-1", frameMs: 50, levels: [0.9] });
+	assert.deepEqual(await awaitFrame(other, (frame) => "id" in frame && frame.id === "x1"), { type: "busy", id: "x1", reason: "reading", holder: "s-1" });
+	reader.send({ type: "read-levels", id: "x2", readingId: "read-9", frameMs: 50, levels: [0.9] });
+	assert.deepEqual(await awaitFrame(reader, (frame) => "id" in frame && frame.id === "x2"), { type: "busy", id: "x2", reason: "reading", holder: "s-1" });
+	await sleep(120);
+	assert.deepEqual(overlay.levels, [], "a refused frame draws nothing");
+
+	reader.send({ type: "read-levels", id: "v1", readingId: "read-1", frameMs: 50, levels: Array.from({ length: 8 }, () => 0.1) });
+	await awaitFrame(reader, (frame) => "id" in frame && frame.id === "v1");
+	await waitFor(() => overlay.levels.length >= 1);
+	reader.send({ type: "read-levels", id: "v2", readingId: "read-1", frameMs: 50, levels: [0.5, 0.5] });
+	await awaitFrame(reader, (frame) => "id" in frame && frame.id === "v2");
+	await waitFor(() => overlay.levels.includes(0.5));
+	await sleep(220);
+	assert.deepEqual(overlay.levels.slice(overlay.levels.indexOf(0.5)), [0.5, 0.5], "the new chunk replaced the rest of the old one");
+	assert.ok(overlay.levels.length <= 4, "the replaced values are never drawn");
+	other.socket.destroy();
+	reader.socket.destroy();
+	await started.listener.close();
+});
+
+test("a cut and an expired lease stop the scheduled levels at once", async () => {
+	// A cut: another session takes the turn back while the wave is drawing.
+	const cutOverlay = fakeOverlay();
+	const cut = await startListener(scratch(), { overlay: cutOverlay.overlay });
+	const reader = await grantedReading(cut);
+	const cutter = await cut.client();
+	cutter.hello("s-2");
+	await waitFor(() => framesOf(cutter, "welcome").length === 1);
+	reader.send({ type: "read-levels", readingId: "read-1", frameMs: 50, levels: Array.from({ length: 20 }, () => 0.4) });
+	await waitFor(() => cutOverlay.levels.length >= 1);
+	cutter.send({ type: "read-cut", id: "c1", readingId: "read-1" });
+	await awaitFrame(cutter, (frame) => "id" in frame && frame.id === "c1");
+	const afterCut = cutOverlay.levels.length;
+	await sleep(200);
+	assert.equal(cutOverlay.levels.length, afterCut, "a cut stops the levels at once");
+	reader.socket.destroy();
+	cutter.socket.destroy();
+	await cut.listener.close();
+
+	// A lease that is not renewed: the turn goes back and the wave with it.
+	const leaseOverlay = fakeOverlay();
+	const lease = await startListener(scratch(), { overlay: leaseOverlay.overlay, readLeaseMs: 150 });
+	const silent = await grantedReading(lease);
+	silent.send({ type: "read-levels", readingId: "read-1", frameMs: 50, levels: Array.from({ length: 20 }, () => 0.4) });
+	await waitFor(() => leaseOverlay.levels.length >= 1);
+	await waitFor(() => lease.events.some((entry) => entry.event === "reading.lease-expired"));
+	const afterLease = leaseOverlay.levels.length;
+	await sleep(200);
+	assert.equal(leaseOverlay.levels.length, afterLease, "an expired lease stops the levels at once");
+	silent.socket.destroy();
+	await lease.listener.close();
+});
+
+test("a holder that disconnects and a listener that closes stop the scheduled levels", async () => {
+	const goneOverlay = fakeOverlay();
+	const gone = await startListener(scratch(), { overlay: goneOverlay.overlay });
+	const reader = await grantedReading(gone);
+	reader.send({ type: "read-levels", readingId: "read-1", frameMs: 50, levels: Array.from({ length: 20 }, () => 0.4) });
+	await waitFor(() => goneOverlay.levels.length >= 1);
+	reader.socket.destroy();
+	await waitFor(() => gone.listener.readingSession === undefined);
+	const afterGone = goneOverlay.levels.length;
+	await sleep(200);
+	assert.equal(goneOverlay.levels.length, afterGone, "the holder leaving stops the levels");
+	await gone.listener.close();
+
+	const closedOverlay = fakeOverlay();
+	const closing = await startListener(scratch(), { overlay: closedOverlay.overlay });
+	const last = await grantedReading(closing);
+	last.send({ type: "read-levels", readingId: "read-1", frameMs: 50, levels: Array.from({ length: 20 }, () => 0.4) });
+	await waitFor(() => closedOverlay.levels.length >= 1);
+	await closing.listener.close();
+	const afterClose = closedOverlay.levels.length;
+	await sleep(200);
+	assert.equal(closedOverlay.levels.length, afterClose, "a closing listener stops the levels");
+	last.socket.destroy();
+});
+
+test("with no overlay attached the reading accepts its levels and schedules nothing", async () => {
+	const started = await startListener(scratch());
+	const reader = await grantedReading(started);
+	reader.send({ type: "read-levels", id: "v1", readingId: "read-1", frameMs: 50, levels: [0.2, 0.2] });
+	assert.deepEqual(await awaitFrame(reader, (frame) => "id" in frame && frame.id === "v1"), { type: "ok", id: "v1", request: "read-levels", state: "reading" });
+	reader.send({ type: "read-end", id: "e1", readingId: "read-1", outcome: "done" });
+	assert.deepEqual(await awaitFrame(reader, (frame) => "id" in frame && frame.id === "e1"), { type: "ok", id: "e1", request: "read-end", state: "reading" });
+	reader.socket.destroy();
+	await started.listener.close();
+});
+
+test("an overlay that fails on a reading level is dropped once and the reading carries on", async () => {
+	let calls = 0;
+	const overlay: VoiceOverlay = {
+		show: () => {},
+		level: () => {
+			calls += 1;
+			throw new Error("the window is gone");
+		},
+		dispose: () => {},
+	};
+	const started = await startListener(scratch(), { overlay });
+	const reader = await grantedReading(started);
+	reader.send({ type: "read-levels", id: "v1", readingId: "read-1", frameMs: 50, levels: [0.2, 0.4, 0.6] });
+	await waitFor(() => calls === 1);
+	await sleep(150);
+	assert.equal(calls, 1, "a dead overlay is never called again");
+	const failures = started.events.filter((entry) => entry.event === "overlay.failed");
+	assert.equal(failures.length, 1);
+	assert.equal(failures[0]!.fields, undefined, "the event name only: never a level value");
+	reader.send({ type: "read-end", id: "e1", readingId: "read-1", outcome: "done" });
+	assert.deepEqual(await awaitFrame(reader, (frame) => "id" in frame && frame.id === "e1"), { type: "ok", id: "e1", request: "read-end", state: "reading" });
+	reader.socket.destroy();
+	await started.listener.close();
+});
+
+test("the microphone meter is untouched: a reading level is raw and a capture's is still smoothed", async () => {
+	const dir = scratch();
+	const overlay = fakeOverlay();
+	const capture = fakeCapture({ text: "hola" });
+	const started = await startListener(dir, { dictation: capture.factory, overlay: overlay.overlay, readTailMs: 20, focus: { focusedPaneId: async () => ({ focused: "w1:p1" }) } });
+	const reader = await grantedReading(started);
+	reader.send({ type: "read-levels", id: "v1", readingId: "read-1", frameMs: 50, levels: [0.5] });
+	await waitFor(() => overlay.levels.length === 1);
+	assert.deepEqual(overlay.levels, [0.5], "no normalization or smoothing on the listener side");
+	reader.send({ type: "read-end", id: "e1", readingId: "read-1", outcome: "done" });
+	await awaitFrame(reader, (frame) => "id" in frame && frame.id === "e1");
+	await waitFor(() => started.listener.readingSession === undefined, 2_000);
+
+	reader.send({ type: "dictate", id: "d1", mode: "conversation" });
+	await awaitFrame(reader, (frame) => "id" in frame && frame.id === "d1");
+	await awaitFrame(reader, (frame) => frame.type === "capture" && frame.phase === "recording");
+	capture.requests.at(-1)!.onLevel(0.016);
+	assert.deepEqual(overlay.levels, [0.5, 0.6], "the microphone level is still normalized and smoothed as before");
+	reader.socket.destroy();
+	await started.listener.close();
+});
