@@ -306,15 +306,34 @@ that is not the same as a real room, and the phrase "gentle voice" alone can fir
 
 ## 9. Real-microphone results
 
-_To be filled by the parent after the session with the owner: detections per attempt (5×
-each phrase), latency, false accepts per hour over one minute of Spanish, on/off
-confusions, decode cost, memory. Empty on purpose — this section is not extrapolated from
-synthetic audio._
+Run by the owner on 2026-11-13 with his own voice and microphone, recommended
+configuration (boost 2.0, threshold 0.25, `maxActivePaths` 16, one thread, int8). The
+probe's `--real` mode originally left `maxActivePaths` at 4; the parent fixed that in the
+scratch probe before the run. Numbers only; the audio stayed in memory.
+
+| phrase | attempt 1 | 2 | 3 | 4 | 5 | detected | latency median |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Gentle Voice on | hit 170 ms | hit 190 ms | hit 140 ms | **no hit** | hit 190 ms | 4/5 | 180 ms |
+| Gentle Voice off | hit 430 ms | hit 610 ms | hit 410 ms | **no hit** | hit 260 ms | 4/5 | 420 ms |
+
+- On/off confusions: 0 in 8 detections.
+- Free Spanish speech: 0 hits in 1.00 min (one minute bounds nothing useful about the
+  hourly rate; it only shows no immediate false accepts).
+- Model load 878 ms; RSS 103 MB after load, 119 MB at the end; capture 44100 Hz mono f32.
+
+Reading: the model hears the owner's pronunciation (8 of 10, never the wrong phrase),
+faster than on the synthetic voices, but not every time: one miss per phrase in five.
+Five attempts cannot tell 80 % from 95 %. It is enough to build T6 on this model, with
+three consequences for the implementation: the configuration stays tunable without a
+code change; a miss must be cheap (saying the phrase again works, and `alt+m` and the
+menu always remain, S10); and the keyword file should be able to carry more than one
+spelling per command, so pronunciation variants can be added and re-measured with the
+same probe before changing thresholds.
 
 Command, one line, ready to paste (no `--repo`, no build, no install; writes nothing):
 
 ```bash
-node /tmp/gpLPqO91/voice-kws-probe/scripts/probe.mjs --model /tmp/gpLPqO91/voice-kws-probe/model/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01 --real --keywords /tmp/gpLPqO91/voice-kws-probe/keywords/spaced.txt --boost 2 --threshold 0.25
+node /tmp/gpLPqO91/voice-kws-probe/scripts/probe.mjs --model /tmp/gpLPqO91/voice-kws-probe/model/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01 --real --keywords /tmp/gpLPqO91/voice-kws-probe/keywords/spaced.txt --boost 2 --threshold 0.25 --max-active-paths 16
 ```
 
 `--dry-run` on the same command prints the plan and returns before any capture module is
