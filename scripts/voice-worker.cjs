@@ -115,8 +115,12 @@ function parseStart(message) {
 	const withKeepAlive = isRecord(message) && Object.hasOwn(message, "keepAlive");
 	const withLevels = isRecord(message) && Object.hasOwn(message, "levels");
 	const withKws = isRecord(message) && Object.hasOwn(message, "kws");
-	const keys = [...START_KEYS, ...(withEndpoint ? ["endpoint"] : []), ...(withKeepAlive ? ["keepAlive"] : []), ...(withLevels ? ["levels"] : []), ...(withKws ? ["kws"] : [])];
+	const withSpot = isRecord(message) && Object.hasOwn(message, "spot");
+	const keys = [...START_KEYS, ...(withEndpoint ? ["endpoint"] : []), ...(withKeepAlive ? ["keepAlive"] : []), ...(withLevels ? ["levels"] : []), ...(withKws ? ["kws"] : []), ...(withSpot ? ["spot"] : [])];
 	if (!hasExactKeys(message, keys)) fail("invalid-request");
+	// A spot-only capture listens for keywords and nothing else: it has no
+	// transcript to end, so no endpoint, and no meter to feed.
+	if (withSpot && (message.spot !== true || !withKws || withEndpoint || withLevels)) fail("invalid-request");
 	// Opt-in as well: without it no spotter is loaded and nothing changes.
 	if (withKws) parseKws(message.kws);
 	// A warm worker stays alive after each result for the next recording.
@@ -452,6 +456,7 @@ class WorkerSession {
 		if (message.type === "cancel") return this.end(undefined);
 		if (message.type === "stop") {
 			if (this.state === "recording") return this.transcribe();
+			if (this.state === "spotting") return this.finishCapture({ type: "stopped" });
 			if (this.state === "loading") fail("invalid-request");
 			return undefined;
 		}
@@ -697,7 +702,9 @@ class WorkerSession {
 		} catch (error) {
 			throw error instanceof WorkerFailure ? error : new WorkerFailure("unsupported-input");
 		}
-		this.recorder = new MonoRecorder(config, Math.ceil((config.sampleRate * maxRecordingMs) / 1000));
+		// A spot-only capture keeps no audio, so it has no recording limit either.
+		const spot = this.request?.spot === true;
+		this.recorder = new MonoRecorder(config, spot ? Infinity : Math.ceil((config.sampleRate * maxRecordingMs) / 1000));
 		this.endpointer = this.request?.endpoint ? new Endpointer(config.sampleRate, this.request.endpoint) : undefined;
 		this.levels = this.request?.levels === true;
 		this.levelWindowFrames = Math.max(1, Math.round(config.sampleRate * LEVEL_WINDOW_SECONDS));
@@ -723,6 +730,12 @@ class WorkerSession {
 			fail("capture");
 		}
 		if (this.state !== "loading") return this.closeStream();
+		if (spot) {
+			// The dictation model is neither verified nor loaded: nothing is transcribed.
+			this.state = "spotting";
+			this.send({ type: "spotting" });
+			return;
+		}
 		this.state = "recording";
 		this.send({ type: "recording" });
 		this.verifyModel();
@@ -741,8 +754,25 @@ class WorkerSession {
 		this.send({ type: "level", rms });
 	}
 
+	// A spot-only capture: every chunk goes to the spotter and is then dropped.
+	onSpotData(data) {
+		this.recorder.append(data);
+		let command;
+		try {
+			command = this.pushKws();
+		} catch (error) {
+			void this.fail(error);
+			return;
+		}
+		this.recorder.chunks = [];
+		this.recorder.length = 0;
+		if (command) void this.finishCommand(command).catch((error) => this.fail(error));
+	}
+
 	onData(data) {
-		if (this.state !== "recording" || !ArrayBuffer.isView(data)) return;
+		if (!ArrayBuffer.isView(data)) return;
+		if (this.state === "spotting") return this.onSpotData(data);
+		if (this.state !== "recording") return;
 		const room = this.recorder.append(data);
 		this.publishLevel();
 		if (this.kws) {
@@ -808,10 +838,15 @@ class WorkerSession {
 	}
 
 	// A spoken command ends the capture in place of a transcript (S4: the
-	// command is never sent to the model): the client sees `recording`, then
-	// `command`, and nothing else for this capture.
-	async finishCommand(command) {
-		const message = { type: "command", command };
+	// command is never sent to the model): the client sees `recording` (or
+	// `spotting`), then `command`, and nothing else for this capture.
+	finishCommand(command) {
+		return this.finishCapture({ type: "command", command });
+	}
+
+	// Ends a capture that has no transcript with one last message: a command,
+	// or `stopped` for a spot-only capture that was asked to stop.
+	async finishCapture(message) {
 		if (!this.request.keepAlive) return this.end(message);
 		this.state = "closing";
 		await this.closeStream();

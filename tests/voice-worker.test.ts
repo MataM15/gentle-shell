@@ -1068,3 +1068,112 @@ test("a warm worker reports a command, takes the next recording and keeps its on
 	assert.deepEqual(worker.messages.at(-1), { schema: SCHEMA, type: "error", code: "invalid-request" });
 	assert.equal(worker.spotters.length, 1);
 });
+
+// The spot-only capture (S7, L8): the microphone open for the keyword spotter
+// alone, with no dictation model, no end of its own and no transcript. It is
+// what listens while voice is asleep and while a reply is read aloud (S13).
+const spotStart = (worker: ReturnType<typeof harness>, overrides: Record<string, unknown> = {}) => kwsStart(worker, { spot: true, ...overrides });
+
+test("a spot-only capture hears a command without the dictation model, a time limit or a transcript", async (t) => {
+	const worker = harness(t, { ...mono8k, fires: [{ at: fedAfter(21.7), keyword: "voice-on" }] });
+	// A dictation model that would fail verification: a spot-only capture never reads it.
+	writeFileSync(join(worker.paths.modelRoot, "encoder.int8.onnx"), "tampered");
+	worker.send(spotStart(worker, { keepAlive: true, maxRecordingMs: 1000 }));
+	await worker.waitFor(() => worker.types().includes("spotting"));
+	const [stream] = worker.streams;
+	// Twenty seconds of room noise, far past the recording limit of the request.
+	feed(stream!, 200, 0.001);
+	await settle();
+	assert.deepEqual(worker.types(), ["spotting"], "no limit, no endpoint, nothing reported while nothing is said");
+	feed(stream!, 3, 0);
+	feed(stream!, 12, 0.3);
+	feed(stream!, 4, 0);
+	await worker.waitFor(() => worker.types().includes("command"));
+	assert.deepEqual(worker.messages, [
+		{ schema: SCHEMA, type: "spotting" },
+		{ schema: SCHEMA, type: "command", command: "voice-on" },
+	]);
+	assert.equal(stream!.closes, 1, "the microphone is released with the command");
+	assert.equal(worker.recognizers.length, 0);
+	assert.ok(!worker.loaded.includes(join(worker.paths.runtimeRoot, ...SHERPA_ENTRY.split("/"))), "the dictation module is never loaded");
+	assert.equal(worker.exitCode(), undefined, "a warm worker stays for the next capture");
+	// The same worker spots again with its one spotter.
+	worker.send(spotStart(worker, { keepAlive: true }));
+	await worker.waitFor(() => worker.types().filter((type) => type === "spotting").length === 2);
+	assert.equal(worker.spotters.length, 1);
+	worker.send({ schema: SCHEMA, type: "cancel" });
+	await worker.done;
+});
+
+test("a phrase inside a sentence does not end a spot-only capture", async (t) => {
+	const worker = harness(t, { ...mono8k, fires: [{ at: fedAfter(4.5), keyword: "voice-off" }] });
+	worker.send(spotStart(worker));
+	await worker.waitFor(() => worker.types().includes("spotting"));
+	const [stream] = worker.streams;
+	feed(stream!, 3, 0);
+	feed(stream!, 40, 0.3);
+	feed(stream!, 20, 0);
+	await settle();
+	assert.deepEqual(worker.types(), ["spotting"]);
+	assert.equal(worker.spotters[0]!.resets, 1);
+	assert.equal(stream!.closes, 0, "it keeps listening");
+	worker.send({ schema: SCHEMA, type: "cancel" });
+	await worker.done;
+	assert.equal(stream!.closes, 1);
+	assert.equal(worker.exitCode(), 0);
+	assert.deepEqual(worker.types(), ["spotting"], "a cancel leaves without a message");
+});
+
+test("stop ends a spot-only capture at once, closing the microphone, and a warm worker dictates afterwards", async (t) => {
+	const worker = harness(t, mono8k);
+	worker.send(spotStart(worker, { keepAlive: true }));
+	await worker.waitFor(() => worker.types().includes("spotting"));
+	feed(worker.streams[0]!, 12, 0.3);
+	worker.send({ schema: SCHEMA, type: "stop" });
+	await worker.waitFor(() => worker.types().includes("stopped"));
+	assert.deepEqual(worker.messages, [
+		{ schema: SCHEMA, type: "spotting" },
+		{ schema: SCHEMA, type: "stopped" },
+	]);
+	assert.equal(worker.streams[0]!.closes, 1);
+	// Audio that arrives after the stop is not handed to the spotter.
+	const fedBefore = worker.spotters[0]!.fed;
+	feed(worker.streams[0]!, 5, 0.3);
+	assert.equal(worker.spotters[0]!.fed, fedBefore);
+	worker.send(startRequest(worker.paths, { keepAlive: true }));
+	await worker.waitFor(() => worker.types().includes("recording"));
+	feed(worker.streams[1]!, 5, 0.3);
+	worker.send({ schema: SCHEMA, type: "stop" });
+	await worker.waitFor(() => worker.types().includes("result"));
+	assert.deepEqual(worker.types(), ["spotting", "stopped", "recording", "transcribing", "result"]);
+	worker.send({ schema: SCHEMA, type: "close" });
+	await worker.done;
+});
+
+test("without keepAlive a stopped spot-only capture ends the worker", async (t) => {
+	const worker = harness(t, mono8k);
+	worker.send(spotStart(worker));
+	await worker.waitFor(() => worker.types().includes("spotting"));
+	worker.send({ schema: SCHEMA, type: "stop" });
+	await worker.done;
+	assert.deepEqual(worker.types(), ["spotting", "stopped"]);
+	assert.equal(worker.exitCode(), 0);
+	assert.equal(worker.streams[0]!.closes, 1);
+});
+
+test("spot must be exactly true, needs the keyword option and takes no endpoint or levels", async (t) => {
+	const bad: Array<[string, (worker: ReturnType<typeof harness>) => unknown]> = [
+		["spot without kws", (worker) => startRequest(worker.paths, { spot: true })],
+		["spot false", (worker) => kwsStart(worker, { spot: false })],
+		["spot as a string", (worker) => kwsStart(worker, { spot: "true" })],
+		["spot with an endpoint", (worker) => kwsStart(worker, { spot: true, endpoint: ENDPOINT })],
+		["spot with levels", (worker) => kwsStart(worker, { spot: true, levels: true })],
+	];
+	for (const [label, build] of bad) {
+		const worker = harness(t, mono8k);
+		worker.send(build(worker));
+		await worker.done;
+		assert.deepEqual(worker.messages, [{ schema: SCHEMA, type: "error", code: "invalid-request" }], label);
+		assert.deepEqual(worker.loaded, [], label);
+	}
+});

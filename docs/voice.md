@@ -461,7 +461,12 @@ a session that asks for a capture only receives the transcript.
   `command` message naming it (`voice-on`, `voice-off`, `cancel`) in place of a
   transcript, so the phrase never reaches the dictation model; a phrase inside a
   sentence changes nothing and is dictated like any other words. Without the
-  option the worker loads no spotter and its output is unchanged.
+  option the worker loads no spotter and its output is unchanged. With
+  `spot: true` as well, the capture is for the spotter alone: it answers
+  `spotting`, keeps no audio, has no time limit, never verifies or loads the
+  dictation model, and ends with a `command`, or with `stopped` when it is told
+  to stop. It is what will listen while voice is asleep and while a reply is
+  read aloud.
 - **The overlay port.** `lib/voice-overlay.ts` is the seam the window plugs into:
   the listener hands it a snapshot of the display (state, language, owning session) on every change and the smoothed level while recording. The
   meter lives there, never in the detector: the same worker RMS is normalized
