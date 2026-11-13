@@ -84,18 +84,32 @@ async function connectClient(dir: string): Promise<Client> {
 
 const framesOf = (client: Client, type: ListenerFrame["type"]) => client.frames.filter((frame) => frame.type === type);
 
+// The one frame matching a predicate, waited for: every reading request carries
+// its own id, so a predicate never picks up the answer to an older request.
+async function awaitFrame(client: Client, match: (frame: ListenerFrame) => boolean, ms = 2_000): Promise<ListenerFrame> {
+	const deadline = Date.now() + ms;
+	for (;;) {
+		const found = client.frames.find(match);
+		if (found) return found;
+		if (Date.now() > deadline) throw new Error("timed out waiting for a listener frame");
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+}
+
 interface Started {
 	listener: VoiceListener;
 	events: Array<{ event: string; fields?: Record<string, unknown> }>;
 	client(): Promise<Client>;
 }
 
-async function startListener(dir: string, options: { idleMs?: number; asleepIdleMs?: number; focus?: ListenerFocus } = {}): Promise<Started> {
+async function startListener(dir: string, options: { idleMs?: number; asleepIdleMs?: number; focus?: ListenerFocus; readLeaseMs?: number; readTailMs?: number } = {}): Promise<Started> {
 	const events: Array<{ event: string; fields?: Record<string, unknown> }> = [];
 	const listener = new VoiceListener({
 		dir,
 		idleMs: options.idleMs ?? 60_000,
 		asleepIdleMs: options.asleepIdleMs ?? 600_000,
+		readLeaseMs: options.readLeaseMs,
+		readTailMs: options.readTailMs,
 		log: (event, fields) => events.push({ event, fields }),
 		focus: options.focus ?? { focusedPaneId: async () => ({ focused: undefined }) },
 	});
@@ -408,4 +422,143 @@ test("a regular file where the socket belongs is refused, never unlinked", async
 	const listener = new VoiceListener({ dir });
 	await assert.rejects(listener.listen(), /unsafe_path/);
 	assert.equal(readFileSync(listenerPaths(dir).socket, "utf8"), "not a socket");
+});
+
+// --- the reading turn (slice B) ----------------------------------------------
+// The listener owns the one reading turn: a session asks, renews, ends, and any
+// session can cut. A session that goes away loses its turn without waiting.
+
+test("one reading turn at a time: the second session waits and is granted when the first ends", async () => {
+	const dir = scratch();
+	const started = await startListener(dir, { readTailMs: 5 });
+	const first = await started.client();
+	first.hello("s-1", "w1:p1");
+	const second = await started.client();
+	second.hello("s-2", "w1:p2");
+	await waitFor(() => framesOf(first, "welcome").length === 1 && framesOf(second, "welcome").length === 1);
+
+	first.send({ type: "read-begin", id: "a1", readingId: "read-1", chars: 900 });
+	assert.deepEqual(await awaitFrame(first, (frame) => "id" in frame && frame.id === "a1"), { type: "granted", id: "a1", readingId: "read-1", state: "reading" });
+	assert.equal(started.listener.state, "reading", "a reading is a state every session sees");
+	assert.deepEqual(await awaitFrame(second, (frame) => frame.type === "reading" && frame.change === "granted"), { type: "reading", change: "granted", readingId: "read-1", session: "s-1" });
+
+	second.send({ type: "read-begin", id: "b1", readingId: "read-2", chars: 10 });
+	assert.deepEqual(await awaitFrame(second, (frame) => "id" in frame && frame.id === "b1"), { type: "busy", id: "b1", reason: "reading", holder: "s-1" });
+	assert.equal(started.listener.state, "reading", "the second session never talks over the first");
+
+	first.send({ type: "read-end", id: "a2", readingId: "read-1", outcome: "done" });
+	assert.deepEqual(await awaitFrame(first, (frame) => "id" in frame && frame.id === "a2"), { type: "ok", id: "a2", request: "read-end", state: "reading" });
+	await waitFor(() => started.listener.state === "asleep");
+	assert.ok(started.events.some((event: { event: string }) => event.event === "reading.release"));
+	second.send({ type: "read-begin", id: "b2", readingId: "read-2", chars: 10 });
+	assert.deepEqual(await awaitFrame(second, (frame) => "id" in frame && frame.id === "b2"), { type: "granted", id: "b2", readingId: "read-2", state: "reading" });
+	first.socket.destroy();
+	second.socket.destroy();
+	await started.listener.close();
+});
+
+test("a reading whose session stopped renewing loses the turn when its lease expires", async () => {
+	const dir = scratch();
+	const started = await startListener(dir, { readLeaseMs: 60, readTailMs: 5 });
+	const first = await started.client();
+	first.hello("s-1", "w1:p1");
+	const second = await started.client();
+	second.hello("s-2", "w1:p2");
+	await waitFor(() => framesOf(first, "welcome").length === 1 && framesOf(second, "welcome").length === 1);
+
+	first.send({ type: "read-begin", id: "a1", readingId: "read-1", chars: 100 });
+	await awaitFrame(first, (frame) => "id" in frame && frame.id === "a1");
+	// No heartbeat: a session that crashed must not mute voice forever.
+	assert.deepEqual(await awaitFrame(first, (frame) => frame.type === "reading" && frame.change === "released"), { type: "reading", change: "released", readingId: "read-1", session: "s-1", reason: "lease" });
+	assert.ok(started.events.some((event: { event: string }) => event.event === "reading.lease-expired"));
+	await waitFor(() => started.listener.state === "asleep");
+	second.send({ type: "read-begin", id: "b1", readingId: "read-2", chars: 10 });
+	assert.equal((await awaitFrame(second, (frame) => "id" in frame && frame.id === "b1")).type, "granted", "the turn is free again");
+	first.socket.destroy();
+	second.socket.destroy();
+	await started.listener.close();
+});
+
+test("a heartbeat keeps the reading turn, and ending it releases the cued state", async () => {
+	const dir = scratch();
+	const started = await startListener(dir, { readLeaseMs: 300, readTailMs: 5 });
+	const first = await started.client();
+	first.hello("s-1", "w1:p1");
+	await waitFor(() => framesOf(first, "welcome").length === 1);
+	first.send({ type: "read-begin", id: "a1", readingId: "read-1", chars: 100 });
+	await awaitFrame(first, (frame) => "id" in frame && frame.id === "a1");
+	// Half a lease later one heartbeat buys another full lease.
+	await new Promise((resolve) => setTimeout(resolve, 150));
+	first.send({ type: "read-heartbeat", id: "h1", readingId: "read-1" });
+	assert.equal((await awaitFrame(first, (frame) => "id" in frame && frame.id === "h1")).type, "ok");
+	await new Promise((resolve) => setTimeout(resolve, 200));
+	assert.equal(started.listener.state, "reading", "a renewed reading is never cut by its lease");
+	// A heartbeat for a reading this listener did not grant is refused.
+	first.send({ type: "read-heartbeat", id: "h2", readingId: "read-9" });
+	assert.deepEqual(await awaitFrame(first, (frame) => "id" in frame && frame.id === "h2"), { type: "busy", id: "h2", reason: "reading", holder: "s-1" });
+	first.send({ type: "read-end", readingId: "read-1", outcome: "skipped" });
+	await waitFor(() => started.listener.state === "asleep");
+	assert.ok(started.events.some((event: { event: string; fields?: Record<string, unknown> }) => event.event === "reading.release" && event.fields?.outcome === "skipped"));
+	first.socket.destroy();
+	await started.listener.close();
+});
+
+test("a cut ends the reading wherever it speaks and frees the turn", async () => {
+	const dir = scratch();
+	const started = await startListener(dir, { readTailMs: 5 });
+	const first = await started.client();
+	first.hello("s-1", "w1:p1");
+	const second = await started.client();
+	second.hello("s-2", "w1:p2");
+	await waitFor(() => framesOf(first, "welcome").length === 1 && framesOf(second, "welcome").length === 1);
+	first.send({ type: "read-begin", id: "a1", readingId: "read-1", chars: 100 });
+	await awaitFrame(first, (frame) => "id" in frame && frame.id === "a1");
+	second.send({ type: "read-cut", id: "c1" });
+	assert.equal((await awaitFrame(second, (frame) => "id" in frame && frame.id === "c1")).type, "ok");
+	assert.deepEqual(await awaitFrame(first, (frame) => frame.type === "reading" && frame.change === "released"), { type: "reading", change: "released", readingId: "read-1", session: "s-1", reason: "cut" });
+	await waitFor(() => started.listener.state === "asleep");
+	second.send({ type: "read-begin", id: "b1", readingId: "read-2", chars: 10 });
+	assert.equal((await awaitFrame(second, (frame) => "id" in frame && frame.id === "b1")).type, "granted");
+	first.socket.destroy();
+	second.socket.destroy();
+	await started.listener.close();
+});
+
+test("a reader whose session went away releases the turn at once", async () => {
+	const dir = scratch();
+	const started = await startListener(dir, { readTailMs: 5 });
+	const first = await started.client();
+	first.hello("s-1", "w1:p1");
+	const second = await started.client();
+	second.hello("s-2", "w1:p2");
+	await waitFor(() => framesOf(first, "welcome").length === 1 && framesOf(second, "welcome").length === 1);
+	first.send({ type: "read-begin", id: "a1", readingId: "read-1", chars: 100 });
+	await awaitFrame(first, (frame) => "id" in frame && frame.id === "a1");
+	first.socket.destroy();
+	await waitFor(() => started.listener.state === "asleep");
+	second.send({ type: "read-begin", id: "b1", readingId: "read-2", chars: 10 });
+	assert.equal((await awaitFrame(second, (frame) => "id" in frame && frame.id === "b1")).type, "granted", "a dead reader never holds the turn");
+	second.socket.destroy();
+	await started.listener.close();
+});
+
+test("a session with voice off cannot read while the listener is asleep, and a fresh listener still lets one read", async () => {
+	const dir = scratch();
+	const started = await startListener(dir, { readTailMs: 5 });
+	const quiet = await started.client();
+	quiet.hello("s-1", "w1:p1", false);
+	await waitFor(() => framesOf(quiet, "welcome").length === 1);
+	quiet.send({ type: "read-begin", id: "a1", readingId: "read-1", chars: 10 });
+	assert.deepEqual(await awaitFrame(quiet, (frame) => "id" in frame && frame.id === "a1"), { type: "busy", id: "a1", reason: "asleep" });
+	assert.equal(started.listener.state, "asleep", "a refused reading changes no state");
+	// A fresh listener is asleep too, and a session with voice on reads as it
+	// always did: "asleep" is not a reading ban for a session that has voice.
+	const voiced = await started.client();
+	voiced.hello("s-2", "w1:p2", true);
+	await waitFor(() => framesOf(voiced, "welcome").length === 1);
+	voiced.send({ type: "read-begin", id: "b1", readingId: "read-2", chars: 10 });
+	assert.equal((await awaitFrame(voiced, (frame) => "id" in frame && frame.id === "b1")).type, "granted");
+	quiet.socket.destroy();
+	voiced.socket.destroy();
+	await started.listener.close();
 });

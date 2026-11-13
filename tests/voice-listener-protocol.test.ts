@@ -103,3 +103,45 @@ test("unknown states, commands, reasons and oversized transcript text are refuse
 	assert.equal(parseListenerFrameLine(line({ type: "snapshot", state: "asleep", listenerPid: 1, clients: 1, sessions: ["../x"] })), undefined);
 	assert.equal(parseListenerFrameLine(line({ type: "welcome", listenerPid: 0, proto: 1, state: "asleep" })), undefined);
 });
+
+test("the reading turn parses as requests and as answers", () => {
+	const requests = [
+		{ type: "read-begin", id: "r1", readingId: "read-1", chars: 1_200 },
+		{ type: "read-heartbeat", readingId: "read-1" },
+		{ type: "read-end", readingId: "read-1", outcome: "skipped" },
+		{ type: "read-cut" },
+		{ type: "read-cut", readingId: "read-1" },
+	];
+	for (const request of requests) assert.deepEqual(parseListenerRequestLine(line(request)), request, JSON.stringify(request));
+	const frames = [
+		{ type: "granted", id: "r1", readingId: "read-1", state: "reading" },
+		{ type: "busy", id: "r2", reason: "reading", holder: "s-1" },
+		{ type: "busy", reason: "asleep" },
+		{ type: "reading", change: "granted", readingId: "read-1", session: "s-1" },
+		{ type: "reading", change: "released", readingId: "read-1", session: "s-1", reason: "lease" },
+	];
+	for (const frame of frames) assert.deepEqual(parseListenerFrameLine(line(frame)), frame, JSON.stringify(frame));
+});
+
+test("a reading request or answer outside the fixed lists is refused", () => {
+	for (const bad of [
+		{ type: "read-begin", readingId: "read-1" },
+		{ type: "read-begin", readingId: "read-1", chars: -1 },
+		{ type: "read-begin", readingId: 7, chars: 10 },
+		{ type: "read-heartbeat" },
+		{ type: "read-end", readingId: "read-1", outcome: "partial" },
+		{ type: "read-end", readingId: "read-1" },
+		{ type: "read-cut", readingId: 7 },
+	]) {
+		assert.equal(parseListenerRequestLine(line(bad)), undefined, JSON.stringify(bad));
+	}
+	for (const bad of [
+		{ type: "busy", reason: "tired" },
+		{ type: "reading", change: "held" },
+		{ type: "reading", change: "released", reason: "stop" },
+		{ type: "granted", readingId: "read-1", state: "off" },
+		{ type: "granted", state: "reading" },
+	]) {
+		assert.equal(parseListenerFrameLine(line(bad)), undefined, JSON.stringify(bad));
+	}
+});

@@ -13,15 +13,19 @@ import {
 	type ListenerFrame,
 	type ListenerRequest,
 	type ListenerState,
+	type ReadingOutcome,
+	type ReadingReleaseReason,
+	READING_OUTCOMES,
 } from "./voice-listener-protocol.ts";
 
 // One voice listener for every Pi session (S6, odd/notes/voice-listener-design.md).
-// Slice A owns the process, not the microphone: a single instance per voice home
-// (an exclusive lock file plus the unix socket it binds), the JSON-lines registry
-// every session joins, the state edges, focus resolution through herdr, and the
-// rule that a transcript reaches the focused session only. Capture, the keyword
-// spotter, cues and the overlay arrive in the later slices, so nothing here opens
-// an audio device.
+// It owns the process and the shared turn, not the microphone: a single instance
+// per voice home (an exclusive lock file plus the unix socket it binds), the
+// JSON-lines registry every session joins, the state edges, focus resolution
+// through herdr, the rule that a transcript reaches the focused session only,
+// and the one reading turn every session asks for. Capture, the keyword spotter,
+// cues and the overlay arrive in the later slices, so nothing here opens an audio
+// device and the session still speaks.
 
 export const LISTENER_LOCK_FILE = "listener.lock";
 export const LISTENER_SOCKET_FILE = "listener.sock";
@@ -34,6 +38,12 @@ export const LISTENER_STALE_MS = 6_000;
 export const LISTENER_IDLE_MS = 60_000;
 // Asleep with no session that has voice on: L10 asks for ten minutes, then off.
 export const LISTENER_ASLEEP_IDLE_MS = 600_000;
+// A reading is renewed while it speaks; a session that stopped renewing (killed,
+// or stuck) loses the turn instead of muting voice everywhere.
+export const READING_LEASE_MS = 15_000;
+// A released reading keeps the state for the tail still audible in the speaker
+// (design §2.4), so the next reading never starts over the last word.
+export const READING_TAIL_MS = 250;
 
 export interface ListenerPaths {
 	readonly dir: string;
@@ -89,8 +99,9 @@ export function readListenerLock(paths: ListenerPaths): ListenerLock | undefined
 	}
 }
 
-// The exclusive create is the primitive the reading turn already uses
-// (lib/voice-presence.ts): whoever creates the file owns the listener.
+// The exclusive create is the primitive: whoever creates the lock owns the
+// listener. It is rewritten only through a rename, so a client never reads half
+// a body.
 export function takeListenerLock(paths: ListenerPaths, options: { pid?: number; now?: number; socket?: string } = {}): ListenerLock | undefined {
 	const now = options.now ?? Date.now();
 	const lock: ListenerLock = {
@@ -223,6 +234,20 @@ interface Client {
 	windowStart: number;
 }
 
+// The one reading turn (slice B): the listener arbitrates it, the session that
+// holds it speaks. `ended` stays true through the tail, while the turn is still
+// not available to anyone else.
+interface ActiveReading {
+	readonly readingId: string;
+	readonly session: string;
+	readonly socket: Socket;
+	readonly chars: number;
+	readonly returnsTo: ListenerState;
+	lease?: ReturnType<typeof setTimeout>;
+	tail?: ReturnType<typeof setTimeout>;
+	ended: boolean;
+}
+
 export interface VoiceListenerOptions {
 	// The voice home shared by every Pi process of this user.
 	dir: string;
@@ -235,6 +260,8 @@ export interface VoiceListenerOptions {
 	idleMs?: number;
 	asleepIdleMs?: number;
 	heartbeatMs?: number;
+	readLeaseMs?: number;
+	readTailMs?: number;
 }
 
 const noFocus: ListenerFocus = { focusedPaneId: async () => ({ focused: undefined }) };
@@ -250,6 +277,9 @@ export class VoiceListener {
 	private readonly idleMs: number;
 	private readonly asleepIdleMs: number;
 	private readonly heartbeatMs: number;
+	private readonly readLeaseMs: number;
+	private readonly readTailMs: number;
+	private reading: ActiveReading | undefined;
 	private server: Server | undefined;
 	private readonly clients = new Map<Socket, Client>();
 	private currentState: ListenerState = "asleep";
@@ -269,6 +299,8 @@ export class VoiceListener {
 		this.idleMs = options.idleMs ?? LISTENER_IDLE_MS;
 		this.asleepIdleMs = options.asleepIdleMs ?? LISTENER_ASLEEP_IDLE_MS;
 		this.heartbeatMs = options.heartbeatMs ?? LISTENER_HEARTBEAT_MS;
+		this.readLeaseMs = options.readLeaseMs ?? READING_LEASE_MS;
+		this.readTailMs = options.readTailMs ?? READING_TAIL_MS;
 	}
 
 	get state(): ListenerState {
@@ -277,6 +309,11 @@ export class VoiceListener {
 
 	get clientCount(): number {
 		return this.clients.size;
+	}
+
+	// The session speaking right now, if any: one reading at a time, everywhere.
+	get readingSession(): string | undefined {
+		return this.reading && !this.reading.ended ? this.reading.session : undefined;
 	}
 
 	// Binds the socket. Exactly one process can do this per voice home: the lock
@@ -325,6 +362,9 @@ export class VoiceListener {
 		this.idleTimer = undefined;
 		if (this.heartbeat) clearInterval(this.heartbeat);
 		this.heartbeat = undefined;
+		this.endReading("shutdown");
+		if (this.reading?.tail) clearTimeout(this.reading.tail);
+		this.reading = undefined;
 		for (const client of [...this.clients.values()]) {
 			// end() flushes the bye before the FIN; a client that never closes is
 			// dropped shortly after so shutdown cannot hang on it.
@@ -497,6 +537,9 @@ export class VoiceListener {
 				// registered flag is cleared with it, or armIdle never arms the exit.
 				if (!request.voiceOn) for (const other of this.clients.values()) other.voiceOn = false;
 				this.broadcast({ type: "command", command: request.voiceOn ? "voice-on" : "voice-off" });
+				// Voice off everywhere cuts a reading that is speaking: nothing is on
+				// to hear it. The reading session is told, so it stops its own speech.
+				if (!request.voiceOn) this.endReading("cut");
 				if (!request.voiceOn) this.setState("asleep");
 				this.armIdle();
 				return;
@@ -524,7 +567,97 @@ export class VoiceListener {
 					),
 				);
 				return;
+			case "read-begin":
+				this.beginReading(client, request);
+				return;
+			case "read-heartbeat": {
+				const reading = this.reading;
+				if (!reading || reading.ended || reading.session !== client.sessionId || reading.readingId !== request.readingId) {
+					this.say(client, withId({ type: "busy", reason: "reading", ...(reading && !reading.ended ? { holder: reading.session } : {}) }, request.id));
+					return;
+				}
+				this.armReadLease(reading);
+				this.say(client, withId({ type: "ok", request: "read-heartbeat", state: this.currentState }, request.id));
+				return;
+			}
+			case "read-end": {
+				const reading = this.reading;
+				if (!reading || reading.ended || reading.session !== client.sessionId || reading.readingId !== request.readingId) {
+					this.say(client, withId({ type: "busy", reason: "reading", ...(reading && !reading.ended ? { holder: reading.session } : {}) }, request.id));
+					return;
+				}
+				this.say(client, withId({ type: "ok", request: "read-end", state: this.currentState }, request.id));
+				this.endReading(request.outcome);
+				return;
+			}
+			case "read-cut": {
+				const reading = this.reading;
+				if (!reading || reading.ended) {
+					// Nothing to cut: the caller learns nobody was speaking.
+					this.say(client, withId({ type: "busy", reason: "reading" }, request.id));
+					return;
+				}
+				this.endReading("cut");
+				this.say(client, withId({ type: "ok", request: "read-cut", state: this.currentState }, request.id));
+				return;
+			}
 		}
+	}
+
+	// A reading is granted to one session at a time, and only where voice is on:
+	// asleep with no session that has voice means there is nothing to read over.
+	private beginReading(client: Client, request: { id?: string; readingId: string; chars: number }): void {
+		if (this.reading) {
+			this.say(client, withId({ type: "busy", reason: "reading", holder: this.reading.session }, request.id));
+			return;
+		}
+		if (this.currentState === "asleep" && ![...this.clients.values()].some((entry) => entry.sessionId && entry.voiceOn)) {
+			this.say(client, withId({ type: "busy", reason: "asleep" }, request.id));
+			return;
+		}
+		const session = client.sessionId;
+		if (!session) return;
+		const reading: ActiveReading = { readingId: request.readingId, session, socket: client.socket, chars: request.chars, returnsTo: this.currentState, ended: false };
+		this.reading = reading;
+		this.armReadLease(reading);
+		this.setState("reading");
+		this.broadcast({ type: "reading", change: "granted", readingId: reading.readingId, session });
+		this.say(client, withId({ type: "granted", readingId: reading.readingId, state: "reading" }, request.id));
+		this.log("reading.begin", { readingId: reading.readingId, sessionId: session, chars: reading.chars });
+	}
+
+	private armReadLease(reading: ActiveReading): void {
+		if (reading.lease) clearTimeout(reading.lease);
+		const lease = setTimeout(() => {
+			if (this.reading !== reading || reading.ended) return;
+			this.log("reading.lease-expired", { readingId: reading.readingId, sessionId: reading.session });
+			this.endReading("lease");
+		}, this.readLeaseMs);
+		lease.unref?.();
+		reading.lease = lease;
+	}
+
+	// Ending a reading is idempotent and keeps the turn for the tail: the speaker
+	// is still finishing the sentence, so nothing new may start before it does.
+	private endReading(reason: ReadingReleaseReason): void {
+		const reading = this.reading;
+		if (!reading || reading.ended) return;
+		reading.ended = true;
+		if (reading.lease) clearTimeout(reading.lease);
+		reading.lease = undefined;
+		this.broadcast({ type: "reading", change: "released", readingId: reading.readingId, session: reading.session, reason });
+		this.log("reading.release", {
+			readingId: reading.readingId,
+			sessionId: reading.session,
+			reason,
+			...(READING_OUTCOMES.includes(reason as ReadingOutcome) ? { outcome: reason } : {}),
+		});
+		const tail = setTimeout(() => {
+			if (this.reading === reading) this.reading = undefined;
+			if (this.currentState === "reading") this.setState(reading.returnsTo);
+		}, this.readTailMs);
+		tail.unref?.();
+		reading.tail = tail;
 	}
 
 	private setState(next: ListenerState): void {
@@ -560,6 +693,7 @@ export class VoiceListener {
 
 	private forget(client: Client): void {
 		if (!this.clients.delete(client.socket)) return;
+		if (this.reading && !this.reading.ended && this.reading.socket === client.socket) this.endReading("closed");
 		client.socket.destroy();
 		this.log("listener.client-closed", { sessionId: client.sessionId, clients: this.clients.size });
 		this.armIdle();

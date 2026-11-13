@@ -1,6 +1,7 @@
 // The wire protocol between Pi sessions and the one voice listener (S6,
-// odd/notes/voice-listener-design.md §2): `gentle.voice-listener/v1`, one JSON
-// object per line, bounded, and strict about unknown fields. Frames carry the
+// odd/notes/voice-listener-design.md §2, §2.4 for the reading turn):
+// `gentle.voice-listener/v1`, one JSON object per line, bounded, and strict
+// about unknown fields. Frames carry the
 // schema and a `type`; requests may carry an `id` the answer echoes. Nothing
 // here opens a socket, a process or an audio device.
 
@@ -21,6 +22,17 @@ export const LISTENER_ERRORS = ["bad-frame", "bad-hello", "too-many-clients", "r
 export type ListenerErrorCode = (typeof LISTENER_ERRORS)[number];
 export const LISTENER_BYE_REASONS = ["idle", "shutdown", "error"] as const;
 export type ListenerByeReason = (typeof LISTENER_BYE_REASONS)[number];
+// How a reading ended. The first three are the session's own report; the rest
+// are the listener taking the turn back (a stale lease, a cut, a gone session,
+// a closing listener).
+export const READING_OUTCOMES = ["done", "skipped", "cancelled"] as const;
+export type ReadingOutcome = (typeof READING_OUTCOMES)[number];
+export const READING_RELEASE_REASONS = [...READING_OUTCOMES, "lease", "cut", "closed", "shutdown"] as const;
+export type ReadingReleaseReason = (typeof READING_RELEASE_REASONS)[number];
+// Why a read-begin was refused: another session is reading, or voice is off and
+// there is nothing to read over.
+export const READING_BUSY_REASONS = ["reading", "asleep"] as const;
+export type ReadingBusyReason = (typeof READING_BUSY_REASONS)[number];
 
 export interface HelloRequest {
 	type: "hello";
@@ -37,7 +49,12 @@ export type ListenerRequest =
 	| { type: "set-voice"; id?: string; voiceOn: boolean }
 	| { type: "wake"; id?: string }
 	| { type: "sleep"; id?: string }
-	| { type: "status"; id?: string };
+	| { type: "status"; id?: string }
+	// The reading turn (slice B): one reply is spoken at a time, by a session.
+	| { type: "read-begin"; id?: string; readingId: string; chars: number }
+	| { type: "read-heartbeat"; id?: string; readingId: string }
+	| { type: "read-end"; id?: string; readingId: string; outcome: ReadingOutcome }
+	| { type: "read-cut"; id?: string; readingId?: string };
 
 export interface WelcomeFrame {
 	type: "welcome";
@@ -55,9 +72,29 @@ export type ListenerFrame =
 	| { type: "command"; command: ListenerCommand }
 	| { type: "transcript"; text: string }
 	| { type: "error"; code: ListenerErrorCode; id?: string }
-	| { type: "bye"; reason: ListenerByeReason };
+	| { type: "bye"; reason: ListenerByeReason }
+	| { type: "granted"; id?: string; readingId: string; state: ListenerState }
+	| { type: "busy"; id?: string; reason: ReadingBusyReason; holder?: string }
+	| { type: "reading"; change: "granted" | "released"; readingId: string; session: string; reason?: ReadingReleaseReason };
 
-type Kind = "text" | "string" | "boolean" | "number" | "proto" | "pid" | "counter" | "session" | "sessions" | "state" | "command" | "error" | "reason";
+type Kind =
+	| "text"
+	| "string"
+	| "boolean"
+	| "number"
+	| "proto"
+	| "pid"
+	| "counter"
+	| "session"
+	| "sessions"
+	| "state"
+	| "command"
+	| "error"
+	| "reason"
+	| "outcome"
+	| "release"
+	| "change"
+	| "busy";
 
 const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const MAX_FIELD = 256;
@@ -75,6 +112,10 @@ const KINDS: Record<Kind, (value: unknown) => boolean> = {
 	command: (value) => LISTENER_COMMANDS.includes(value as ListenerCommand),
 	error: (value) => LISTENER_ERRORS.includes(value as ListenerErrorCode),
 	reason: (value) => LISTENER_BYE_REASONS.includes(value as ListenerByeReason),
+	outcome: (value) => READING_OUTCOMES.includes(value as ReadingOutcome),
+	release: (value) => READING_RELEASE_REASONS.includes(value as ReadingReleaseReason),
+	change: (value) => value === "granted" || value === "released",
+	busy: (value) => READING_BUSY_REASONS.includes(value as ReadingBusyReason),
 };
 
 interface Spec {
@@ -90,6 +131,10 @@ const REQUEST_SPECS: Record<string, Spec> = {
 	wake: { required: {}, optional: { ...ID } },
 	sleep: { required: {}, optional: { ...ID } },
 	status: { required: {}, optional: { ...ID } },
+	"read-begin": { required: { readingId: "string", chars: "counter" }, optional: { ...ID } },
+	"read-heartbeat": { required: { readingId: "string" }, optional: { ...ID } },
+	"read-end": { required: { readingId: "string", outcome: "outcome" }, optional: { ...ID } },
+	"read-cut": { required: {}, optional: { readingId: "string", ...ID } },
 };
 
 const FRAME_SPECS: Record<string, Spec> = {
@@ -101,6 +146,9 @@ const FRAME_SPECS: Record<string, Spec> = {
 	transcript: { required: { text: "text" } },
 	error: { required: { code: "error" }, optional: { ...ID } },
 	bye: { required: { reason: "reason" } },
+	granted: { required: { readingId: "string", state: "state" }, optional: { ...ID } },
+	busy: { required: { reason: "busy" }, optional: { holder: "session", ...ID } },
+	reading: { required: { change: "change", readingId: "string", session: "session" }, optional: { reason: "release" } },
 };
 
 // Exact keys: every field present must be declared and typed, and every

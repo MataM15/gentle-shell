@@ -4,7 +4,7 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, wr
 import { join } from "node:path";
 import test, { after } from "node:test";
 import { fileURLToPath } from "node:url";
-import { ensureListener, VoiceListenerClient } from "../lib/voice-listener-client.ts";
+import { cutListenerReading, ensureListener, listenerReadingTurn, VoiceListenerClient } from "../lib/voice-listener-client.ts";
 import { listenerPaths, readListenerLock, takeListenerLock, VoiceListener } from "../lib/voice-listener.ts";
 import type { ListenerFrame } from "../lib/voice-listener-protocol.ts";
 
@@ -206,4 +206,55 @@ test("the real entry point owns the socket and the lock and cleans both up on sh
 	await waitFor(() => !existsSync(listenerPaths(dir).socket), 3_000);
 	assert.equal(existsSync(listenerPaths(dir).lock), false);
 	client.close();
+});
+
+// --- the reading turn through the listener (slice B) -------------------------
+
+test("a session reads through the listener, another waits for the turn, and a cut reaches the reader", async () => {
+	const dir = scratch();
+	const server = new VoiceListener({ dir, readTailMs: 5 });
+	await server.listen();
+	const cuts: string[] = [];
+	const reading = await listenerReadingTurn({
+		dir,
+		session: session("s-1"),
+		chars: 40,
+		signal: new AbortController().signal,
+		onCut: (reason) => cuts.push(reason),
+	});
+	assert.ok(reading && reading.kind === "granted", "the free turn is granted");
+	assert.equal(server.readingSession, "s-1");
+
+	// The second session waits for the turn instead of failing: it is granted
+	// once the first one ends.
+	const waiting = listenerReadingTurn({ dir, session: session("s-2"), chars: 5, signal: new AbortController().signal, pollMs: 5, maxWaitMs: 2_000 });
+	await new Promise((resolve) => setTimeout(resolve, 40));
+	assert.equal(await cutListenerReading({ dir, session: session("s-3") }), true, "any session can cut what is speaking");
+	assert.deepEqual(cuts, ["cut"], "the reader is told to stop");
+	await waitFor(() => server.readingSession !== "s-1", 1_000);
+	const granted = await waiting;
+	assert.ok(granted && granted.kind === "granted");
+	granted.release("skipped");
+	reading.release("done");
+	await server.close();
+});
+
+test("a listener that cannot be reached reports itself unavailable instead of failing", async () => {
+	const dir = scratch();
+	const turn = await listenerReadingTurn({
+		dir,
+		session: session("s-1"),
+		signal: new AbortController().signal,
+		start: () => {
+			throw new Error("the listener could not start");
+		},
+		waitMs: 60,
+	});
+	assert.deepEqual(turn, { kind: "unavailable" }, "the session falls back to its own turn");
+});
+
+test("a cut on a listener that is not running does nothing and starts nothing", async () => {
+	const dir = scratch();
+	assert.equal(await cutListenerReading({ dir, session: session("s-1") }), false);
+	assert.equal(existsSync(listenerPaths(dir).lock), false, "a cut never spawns a listener");
 });

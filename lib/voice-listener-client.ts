@@ -1,4 +1,7 @@
+import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { createConnection, type Socket } from "node:net";
+import { fileURLToPath } from "node:url";
 import {
 	clearStaleListenerLock,
 	clearStaleListenerSocket,
@@ -15,12 +18,15 @@ import {
 	type ListenerFrame,
 	type ListenerRequest,
 	type ListenerState,
+	type ReadingOutcome,
+	type ReadingReleaseReason,
 } from "./voice-listener-protocol.ts";
 
-// The session side of the one voice listener (S6, slice A): join the running
-// listener, start it once when it is absent, and keep the same session id across
-// a listener restart. Nothing here records audio; the listener owns the
-// microphone from slice C on, and this module only speaks its protocol.
+// The session side of the one voice listener (S6): join the running listener,
+// start it once when it is absent, keep the same session id across a listener
+// restart, and ask it for the one reading turn (slice B). Nothing here records
+// audio or speaks: the listener owns the microphone from slice C on, and the
+// session keeps its own PowerShell voice.
 
 export const LISTENER_START_TIMEOUT_MS = 10_000;
 export const LISTENER_REQUEST_TIMEOUT_MS = 5_000;
@@ -192,6 +198,25 @@ export class VoiceListenerClient {
 	}
 }
 
+export const VOICE_LISTENER_SCRIPT_URL = new URL("../scripts/voice-listener.mjs", import.meta.url);
+
+// Starts the listener as its own process: detached, no stdio, and never waited
+// on, because the socket and the lock are what prove it came up. The listener
+// owns no session state, so it outliving the session that started it is fine.
+export function startVoiceListenerProcess(env: NodeJS.ProcessEnv = process.env): void {
+	const child = spawn(process.execPath, ["--experimental-strip-types", fileURLToPath(VOICE_LISTENER_SCRIPT_URL)], {
+		env,
+		stdio: "ignore",
+		detached: true,
+		windowsHide: true,
+		shell: false,
+	});
+	child.once("error", () => {
+		/* the join that asked for it reports the missing listener */
+	});
+	child.unref();
+}
+
 export interface EnsureListenerOptions {
 	dir: string;
 	session: ListenerSession;
@@ -246,4 +271,138 @@ export async function ensureListener(options: EnsureListenerOptions): Promise<{ 
 	await options.start?.();
 	if (await waitForListener(paths.socket, waitMs)) return join(true);
 	throw new Error("voice_listener_missing");
+}
+
+// How often a reading renews its turn: well inside the listener's lease, and
+// short enough that a dead listener stops a reading before the sentence ends.
+export const READING_HEARTBEAT_MS = 5_000;
+// Waiting for another session's reading to end: a reply that waited this long
+// is stale, so its turn is abandoned instead of read into an old conversation.
+export const READING_WAIT_MS = 120_000;
+export const READING_POLL_MS = 200;
+
+export interface ListenerReadingOptions {
+	dir: string;
+	session: ListenerSession;
+	chars?: number;
+	signal: AbortSignal;
+	// The turn is gone: the session stops speaking. The reason is the listener's
+	// own ("cut", "lease", "closed", "shutdown") or "lease" for a failed renewal.
+	onCut?: (reason: ReadingReleaseReason) => void;
+	start?: () => void | Promise<void>;
+	waitMs?: number;
+	pollMs?: number;
+	maxWaitMs?: number;
+}
+
+// "unavailable" means the listener could not be reached at all: the session may
+// fall back to its own reading turn, exactly as it did before the listener
+// existed. A refusal or a cancelled wait is undefined: nothing reads then.
+export type ListenerReading = { kind: "granted"; release: (outcome?: ReadingOutcome) => void } | { kind: "unavailable" };
+
+type Answer = "granted" | "reading" | "asleep" | "closed";
+
+const askToRead = (client: VoiceListenerClient, readingId: string, chars: number): Promise<Answer> =>
+	new Promise((resolve) => {
+		let answered = false;
+		const done = (answer: Answer) => {
+			if (answered) return;
+			answered = true;
+			off();
+			resolve(answer);
+		};
+		const off = client.onFrame((frame) => {
+			if (frame.type === "granted") done("granted");
+			else if (frame.type === "busy") done(frame.reason);
+			else if (frame.type === "bye" || frame.type === "error") done("closed");
+		});
+		client.request({ type: "read-begin", readingId, chars }).catch(() => done("closed"));
+	});
+
+// The granted turn: renew it while the session speaks, hear the listener when
+// it takes it back, and give it back when the reading ends.
+function holdReading(client: VoiceListenerClient, readingId: string, options: ListenerReadingOptions): ListenerReading {
+	let done = false;
+	const claim = () => {
+		if (done) return false;
+		done = true;
+		return true;
+	};
+	const heartbeat = setInterval(() => {
+		const lose = () => {
+			if (!claim()) return;
+			clearInterval(heartbeat);
+			client.close();
+			options.onCut?.("lease");
+		};
+		client.request({ type: "read-heartbeat", readingId }).then((frame) => {
+			if (frame.type !== "ok") lose();
+		}, lose);
+	}, READING_HEARTBEAT_MS);
+	heartbeat.unref?.();
+	const off = client.onFrame((frame) => {
+		if (frame.type !== "reading" || frame.change !== "released" || frame.readingId !== readingId) return;
+		if (!claim()) return;
+		off();
+		clearInterval(heartbeat);
+		options.onCut?.(frame.reason ?? "closed");
+	});
+	return {
+		kind: "granted",
+		release: (outcome: ReadingOutcome = "done") => {
+			claim();
+			off();
+			clearInterval(heartbeat);
+			client.request({ type: "read-end", readingId, outcome }).then(
+				() => client.close(),
+				() => client.close(),
+			);
+		},
+	};
+}
+
+// The one reading turn through the listener (slice B): ask, wait behind another
+// session's reading, and hold it until the reply ends. Never starts a listener
+// for a session that cannot join one, because speaking stays in the session.
+export async function listenerReadingTurn(options: ListenerReadingOptions): Promise<ListenerReading | undefined> {
+	let client: VoiceListenerClient;
+	try {
+		const joined = await ensureListener({ dir: options.dir, session: options.session, start: options.start, waitMs: options.waitMs });
+		client = joined.client;
+	} catch {
+		return { kind: "unavailable" };
+	}
+	const readingId = randomUUID();
+	const chars = options.chars ?? 0;
+	const deadline = Date.now() + (options.maxWaitMs ?? READING_WAIT_MS);
+	for (;;) {
+		if (options.signal.aborted) {
+			client.close();
+			return undefined;
+		}
+		const answer = await askToRead(client, readingId, chars);
+		if (answer === "granted") return holdReading(client, readingId, options);
+		// Another session is speaking, and only it can end that: wait in line.
+		if (answer !== "reading" || Date.now() >= deadline) {
+			client.close();
+			return undefined;
+		}
+		await wait(options.pollMs ?? READING_POLL_MS);
+	}
+}
+
+// Cuts whatever the listener is reading, from any session. A listener that is
+// not running means nothing is reading through it: no process is started here.
+export async function cutListenerReading(options: { dir: string; session: ListenerSession }): Promise<boolean> {
+	if (!(await probeListenerSocket(listenerPaths(options.dir).socket))) return false;
+	const client = new VoiceListenerClient({ dir: options.dir, session: options.session });
+	try {
+		await client.connect();
+		const frame = await client.request({ type: "read-cut" });
+		return frame.type === "ok";
+	} catch {
+		return false;
+	} finally {
+		client.close();
+	}
 }
