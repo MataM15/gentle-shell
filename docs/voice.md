@@ -343,6 +343,11 @@ Each outcome means:
 | `failed` | The player was asked and did not confirm the tone. |
 | `unavailable` | No player is reachable, so nothing was played. |
 
+Whoever holds the microphone plays the cues: the listener, once a capture runs
+through it, and the session itself only when it records on its own because no
+listener could be reached. Whichever plays them, one capture plays one open cue
+and at most one close cue, and the log says which process played it.
+
 A cue that comes back `failed` is played once more after about 150 ms: the
 Pulse worker retires after a minute idle, so the first cue after a long reading
 can reach a worker that is already on its way out. A cue that played is never
@@ -355,8 +360,10 @@ the tone reaching the RDP sink.
 A dictation worker started for one recording verifies the 670 MB model digests
 and loads the recognizer every time: on the owner's machine about 3 seconds
 for the digests and 3.3 seconds for the load, before a 0.4-second decode of 3
-seconds of audio. Hands-free recordings therefore share one worker that stays
-alive between recordings (`keepAlive: true` in its start request):
+seconds of audio. The listener therefore starts one worker and keeps it alive
+between recordings (`keepAlive: true` in its start request), so both kinds of
+recording reuse it, and a session that records on its own because no listener
+answers reuses its own worker the same way:
 
 | Topic | Behavior |
 |-------|----------|
@@ -364,15 +371,16 @@ alive between recordings (`keepAlive: true` in its start request):
 | Next recordings | Reuse the verified model and the loaded recognizer, with 4 decoding threads: 0.3 to 0.6 seconds, measured. The install is still checked before each one. |
 | Microphone | Opened only while recording and released after each one; the worker keeps only the model. |
 | Memory | The loaded model, about 1 GB, stays in that one worker process, on the CPU only. |
-| Release | The worker closes after 10 idle minutes, when voice is turned off in the session and when the Pi session ends. A cancel or any error ends it, and the next recording starts a fresh one. Dictation that pastes keeps its single-use worker. |
+| Release | The worker closes after 10 idle minutes, when voice is turned off in every session and when the listener exits. On its own, a session follows the same rules and ends with the Pi session. A cancel or any error ends it, and the next recording starts a fresh one. |
 | Noise | With no speech heard by the end-of-speech detector, the recognizer is not asked at all and the transcript is blank, because Parakeet can turn noise into a word such as "Yeah." that would otherwise be sent. |
 
 ## Voice listener (in progress)
 
-One listener per user will own the microphone for every session, so a session
-that is not focused still hears nothing and two panes never record at once.
-This is the skeleton only: it owns the process, the lock and the socket, and it
-opens no microphone yet.
+One listener per user owns the microphone for every session, so a session that
+is not focused still hears nothing and two panes never record at once. It owns
+the process, the lock and the socket, and the microphone itself: the warm
+dictation worker, its transcription and the microphone cues all live in it, and
+a session that asks for a capture only receives the transcript.
 
 - **Single instance.** The listener binds `listener.sock` in the voice directory
   and holds `listener.lock` (an exclusive create of the same kind the reading
@@ -405,10 +413,27 @@ opens no microphone yet.
   session starts the listener when none is running, and reads through its own
   local turn only when no listener can be reached at all.
 
-A session reads through the listener: the lock, the socket and the turn are
-live. Capture, the keyword spotter, cues and the overlay are still to come, so
-the microphone is opened per session exactly as described above, and a reply is
-read only in the pane herdr reports focused (S12).
+- **Capture.** `dictate` asks for the microphone with a mode (`dictation` or
+  `conversation`, the latter carrying the conversation endpoint), `stop` ends
+  the recording and `cancel` throws it away. The listener answers every step
+  with a `capture` frame naming its phase: `recording`, `transcribing`,
+  `delivered`, `elsewhere` (another pane had the focus, and it got the
+  transcript), `dropped` (nobody could take it), `cancelled` or `failed` with a
+  code. The warm worker is started once and reused, so the model is loaded
+  before the first recording, and the cues play next to it: the open cue when
+  the recording starts and the close cue when it ends.
+- **One capture at a time.** A second `dictate` is refused with `busy` naming
+  the session that holds the microphone, and so is a reading begun while a
+  capture is live; `stop` and `cancel` from any other session are refused too.
+  A session that leaves frees the microphone at once.
+
+A session dictates through the listener: the lock, the socket, the turn and the
+microphone are live, and a reply is read only in the pane herdr reports focused
+(S12). A session that cannot reach a listener records itself, exactly as
+described above, and a session that is not focused receives neither a transcript
+nor a reading. The keyword spotter, the overlay and the echo cancellation the
+design defers (§5) are still to come; the capture path is shaped so a reference
+stream can be tapped into it when they arrive.
 
 ## Natural voice with Kokoro
 

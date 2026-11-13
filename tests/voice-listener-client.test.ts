@@ -4,8 +4,9 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, wr
 import { join } from "node:path";
 import test, { after } from "node:test";
 import { fileURLToPath } from "node:url";
-import { cutListenerReading, ensureListener, listenerReadingTurn, VoiceListenerClient } from "../lib/voice-listener-client.ts";
-import { listenerPaths, readListenerLock, takeListenerLock, VoiceListener } from "../lib/voice-listener.ts";
+import { createSessionListenerLink, cutListenerReading, ensureListener, ListenerDeliveryError, listenerReadingTurn, VoiceListenerClient, type SessionDictation } from "../lib/voice-listener-client.ts";
+import { VoiceSessionError, type VoiceSessionErrorCode, type VoiceSessionState } from "../lib/voice-session.ts";
+import { listenerPaths, readListenerLock, takeListenerLock, VoiceListener, type ListenerDictation, type ListenerDictationRequest } from "../lib/voice-listener.ts";
 import type { ListenerFrame } from "../lib/voice-listener-protocol.ts";
 
 // The session side of the one voice listener (S6, slice A): join the running
@@ -54,7 +55,7 @@ async function leaveStaleSocket(path: string): Promise<void> {
 	assert.equal(lstatSync(path).isSocket(), true, "the killed listener left its socket");
 }
 
-const session = (sessionId: string, voiceOn = true) => ({ sessionId, paneId: "w1:p1", voiceOn });
+const session = (sessionId: string, voiceOn = true, paneId = "w1:p1") => ({ sessionId, paneId, voiceOn });
 
 test("two sessions starting at once get one listener and both join it", async () => {
 	const dir = scratch();
@@ -257,4 +258,114 @@ test("a cut on a listener that is not running does nothing and starts nothing", 
 	const dir = scratch();
 	assert.equal(await cutListenerReading({ dir, session: session("s-1") }), false);
 	assert.equal(existsSync(listenerPaths(dir).lock), false, "a cut never spawns a listener");
+});
+
+// --- capture through the listener (slice C) ----------------------------------
+
+// The same fake worker the listener tests use: recording, transcribing, finished.
+function fakeCapture(options: { text?: string; error?: VoiceSessionErrorCode } = {}) {
+	const calls: string[] = [];
+	const factory = (request: ListenerDictationRequest): ListenerDictation => {
+		const notify = request.onStateChange;
+		return {
+			start: async () => {
+				calls.push("start");
+				notify("recording");
+			},
+			stop: async () => {
+				calls.push("stop");
+				notify("transcribing");
+				notify("finished");
+				if (options.error) throw new VoiceSessionError(options.error);
+				return { text: options.text ?? "hola", truncated: false };
+			},
+			cancel: async () => {
+				calls.push("cancel");
+				notify("finished");
+			},
+		};
+	};
+	return { calls, factory };
+}
+
+const focusedOn = (paneId: string) => ({ focusedPaneId: async () => ({ focused: paneId }) });
+// The session's own capture, used when the listener cannot be reached.
+const localCapture = () => {
+	const calls: string[] = [];
+	const dictation: SessionDictation = {
+		state: "idle",
+		owner: "session",
+		start: async () => { calls.push("start"); },
+		stop: async () => ({ text: "local", truncated: false }),
+		cancel: async () => { calls.push("cancel"); },
+	};
+	return { calls, dictation };
+};
+
+test("a session dictates through the listener and reads its own transcript back", async () => {
+	const dir = scratch();
+	const capture = fakeCapture({ text: "hola mundo" });
+	const server = new VoiceListener({ dir, dictation: capture.factory, focus: focusedOn("w1:p1") });
+	await server.listen();
+	const link = createSessionListenerLink({ dir, session: () => session("s-1") });
+	const states: VoiceSessionState[] = [];
+	const dictation = link.dictate({ mode: "conversation", onStateChange: (state) => states.push(state), fallback: () => assert.fail("the listener is reachable") });
+	await dictation.start();
+	assert.equal(dictation.owner, "listener", "the listener owns the microphone, so it owns the cues");
+	dictation.stop();
+	assert.deepEqual(await dictation.stop(), { text: "hola mundo", truncated: false });
+	assert.deepEqual(states, ["starting", "recording", "transcribing", "finished"]);
+	assert.deepEqual(capture.calls, ["start", "stop"]);
+	link.close();
+	await server.close();
+});
+
+test("a session with no listener keeps its own capture instead of losing voice", async () => {
+	const dir = scratch();
+	const link = createSessionListenerLink({ dir, session: () => session("s-1"), start: () => { throw new Error("the listener could not start"); }, waitMs: 50 });
+	const own = localCapture();
+	const dictation = link.dictate({ mode: "dictation", onStateChange: () => {}, fallback: () => own.dictation });
+	await dictation.start();
+	assert.equal(dictation.owner, "session", "the session plays its own cues again");
+	assert.deepEqual(own.calls, ["start"], "the fallback records in the session as it did before");
+	assert.equal(await link.ensure(), false);
+	link.close();
+});
+
+test("a transcript that went to the focused session is reported instead of waited on", async () => {
+	const dir = scratch();
+	const server = new VoiceListener({ dir, dictation: fakeCapture({ text: "para el otro" }).factory, focus: focusedOn("w1:p2") });
+	await server.listen();
+	const received: Array<[string, boolean]> = [];
+	const asker = createSessionListenerLink({ dir, session: () => session("s-1") });
+	await asker.ensure();
+	const focused = createSessionListenerLink({ dir, session: () => session("s-2", true, "w1:p2"), onTranscript: (text, truncated) => received.push([text, truncated]) });
+	assert.equal(await focused.ensure(), true);
+	const dictation = asker.dictate({ mode: "conversation", onStateChange: () => {}, fallback: () => assert.fail("the listener is reachable") });
+	await dictation.start();
+	dictation.stop();
+	await assert.rejects(dictation.stop(), (error: unknown) => error instanceof ListenerDeliveryError && error.kind === "elsewhere");
+	await waitFor(() => received.length === 1);
+	assert.deepEqual(received, [["para el otro", false]], "the focused session receives what the other one recorded");
+	asker.close();
+	focused.close();
+	await server.close();
+});
+
+test("a capture refused because another one is running fails the start instead of opening a second microphone", async () => {
+	const dir = scratch();
+	const server = new VoiceListener({ dir, dictation: fakeCapture({ text: "uno" }).factory, focus: focusedOn("w1:p1") });
+	await server.listen();
+	const first = createSessionListenerLink({ dir, session: () => session("s-1") });
+	await first.ensure();
+	const second = createSessionListenerLink({ dir, session: () => session("s-2", true, "w1:p2") });
+	const recording = first.dictate({ mode: "conversation", onStateChange: () => {}, fallback: () => assert.fail("no fallback") });
+	await recording.start();
+	const refused = second.dictate({ mode: "conversation", onStateChange: () => {}, fallback: () => assert.fail("no second microphone") });
+	await assert.rejects(refused.start(), (error: unknown) => error instanceof VoiceSessionError && error.code === "invalid-state");
+	recording.stop();
+	await recording.stop();
+	first.close();
+	second.close();
+	await server.close();
 });

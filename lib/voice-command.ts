@@ -10,7 +10,7 @@ import { installKokoro, installMiro, KOKORO_MANIFESTS, KOKORO_NOTICES, kokoroByt
 import { createReplyReader, defaultSpeechEngineResolver, lastAssistantText, replyLanguage } from "./voice-reply-speech.ts";
 import { createVoiceSpeechPublisher, type VoiceSpeechReading } from "./voice-speech-events.ts";
 import { acquireLocalReadingTurn, paneFocus as herdrPaneFocus, paneFocused as herdrPaneFocused, type PaneFocus } from "./voice-presence.ts";
-import { cutListenerReading, listenerReadingTurn, startVoiceListenerProcess, type ListenerReading, type ListenerSession } from "./voice-listener-client.ts";
+import { cutListenerReading, createSessionListenerLink, listenerReadingTurn, startVoiceListenerProcess, type ListenerReading, type ListenerSession, type SessionDictation, type SessionListenerLink } from "./voice-listener-client.ts";
 import type { ReadingReleaseReason } from "./voice-listener-protocol.ts";
 import { createCuePlayer, type CueName, type CuePlayer, type CueResult } from "./voice-cues.ts";
 import { createVoiceLog, type VoiceLog } from "./voice-diagnostics.ts";
@@ -62,6 +62,9 @@ export function voiceToggleKey(env: NodeJS.ProcessEnv = process.env): string | u
 // The part of VoiceSession the command drives.
 export interface VoiceDictation {
 	readonly state: VoiceSessionState;
+	// Who holds the microphone: the listener from slice C on, or this session when
+	// the listener cannot be reached. The owner also plays the microphone cues.
+	readonly owner?: "listener" | "session";
 	start(): Promise<void>;
 	stop(): Promise<VoiceTranscript>;
 	cancel(): Promise<void>;
@@ -104,6 +107,10 @@ export interface VoiceCommandDeps {
 	// The one reading turn: the voice listener arbitrates it across sessions, and a
 	// session that cannot reach the listener reads through its own local turn.
 	readingTurn?: ReadingTurn;
+	// The session's side of the listener (slice C): the microphone lives there, and
+	// a session that cannot reach it records itself. Tests inject a link built on a
+	// socket they own; production builds one from the voice home.
+	listener?: SessionListenerLink;
 	// Cuts whatever the listener is reading, wherever it is spoken.
 	readCut?: (sessionId: string) => void;
 	// Releases the dictation worker kept alive for hands-free recordings.
@@ -466,7 +473,38 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		}
 		return warm.worker;
 	};
-	const createSession = deps.createSession ?? (({ target, onStateChange, endpoint, warm }) => (warm ? warmFor(target).session({ onStateChange, endpoint }) : createVoiceSession({ env, target, onStateChange, endpoint })));
+	// The session's own microphone, kept for the case where no listener answers: the
+	// same warm worker for a hands-free recording, the same single-use worker for a
+	// dictation. This is what recorded before slice C, unchanged.
+	const localDictation = (options: Parameters<NonNullable<VoiceCommandDeps["createSession"]>>[0]): SessionDictation => {
+		const session: VoiceDictation = options.warm
+			? warmFor(options.target).session({ onStateChange: options.onStateChange, endpoint: options.endpoint })
+			: createVoiceSession({ env, target: options.target, onStateChange: options.onStateChange, endpoint: options.endpoint });
+		// The session holds the microphone here, so the session plays the cues.
+		return { get state() { return session.state; }, owner: "session", start: () => session.start(), stop: () => session.stop(), cancel: () => session.cancel() };
+	};
+	// The session's side of the listener, built once: it joins the listener, starts
+	// one when there is none, and reports this session's pane so the focus can hand
+	// a transcript to it.
+	let sessionLink: SessionListenerLink | undefined = deps.listener;
+	const listener = (): SessionListenerLink =>
+		(sessionLink ??= createSessionListenerLink({
+			dir: resolveVoiceHome(env),
+			start: () => startVoiceListenerProcess(env),
+			session: () => {
+				const id = sessionIdOf(sessionCtx);
+				return id ? { sessionId: id, paneId: paneIdOf(), voiceOn: voiceOn(sessionCtx) } : undefined;
+			},
+			onTranscript: receiveTranscript,
+		}));
+	const createSession: NonNullable<VoiceCommandDeps["createSession"]> = deps.createSession ?? ((options) => listener().dictate({
+		// A recording with an endpoint is the hands-free conversation; the listener
+		// uses the mode for its cues and its log.
+		mode: options.endpoint ? "conversation" : "dictation",
+		endpoint: options.endpoint,
+		onStateChange: options.onStateChange,
+		fallback: () => localDictation(options),
+	}));
 	const voiceLog: VoiceLog = deps.log ?? createVoiceLog({ dir: resolveVoiceHome(env) });
 	let cuePlayer = deps.cues;
 	let cuesUsed = false;
@@ -566,6 +604,29 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		} catch {
 			return undefined;
 		}
+	};
+	// The pane herdr names for this process, which is what the focus lookup matches
+	// a transcript against. Outside herdr nothing is set and the single session
+	// still counts as focused, exactly as lib/voice-presence.ts reads it.
+	const paneIdOf = (): string | undefined => env.HERDR_PANE_ID?.trim() || undefined;
+	// A transcript another session recorded, handed here because this pane had the
+	// focus when the recording ended (S6). It is pasted into this session's draft
+	// and never sent; a session with voice off, or no live session, drops it.
+	const receiveTranscript = (text: string, truncated: boolean): void => {
+		const ctx = sessionCtx;
+		if (!ctx || !supportedSession(ctx) || !voiceOn(ctx) || !text.trim()) {
+			voiceLog("transcript.received", { session: sessionIdOf(ctx), pasted: false });
+			return;
+		}
+		try {
+			ctx.ui.pasteToEditor(text);
+		} catch {
+			voiceLog("transcript.received", { session: sessionIdOf(ctx), pasted: false });
+			return;
+		}
+		// It is a dictated draft like any other: sending it later is a spoken turn.
+		recordDictation(text);
+		voiceLog("transcript.received", { session: sessionIdOf(ctx), pasted: true, chars: text.length, truncated });
 	};
 	// Plays one microphone cue and records what became of it: a cue the Pulse
 	// player never confirmed used to disappear without a trace. The cue stays
@@ -1318,15 +1379,19 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	// still the live one and still the session's only toggle.
 	const toggleDisplay = (current: ToggleRun) => {
 		const live = () => current.run.generation === generation && toggling === current;
+		// The microphone cues belong to whoever holds the microphone: the listener
+		// plays them from slice C on, and this session only plays them when it
+		// recorded itself (no listener was reachable).
+		const local = () => current.dictation?.session.owner !== "listener";
 		return (state: VoiceSessionState) => {
 			if (!live()) return;
 			// Rising when the microphone really records, falling when it stops.
 			if (state === "recording" && current.cue === "none") {
 				current.cue = "open";
-				cue(current.ctx, "open", current.send ? "conversation" : "dictation");
+				if (local()) cue(current.ctx, "open", current.send ? "conversation" : "dictation");
 			} else if (state !== "recording" && current.cue === "open") {
 				current.cue = "closed";
-				cue(current.ctx, "close", current.send ? "conversation" : "dictation");
+				if (local()) cue(current.ctx, "close", current.send ? "conversation" : "dictation");
 			}
 			setVoiceFooter(current.ctx, live, current.send ? voiceConversationStatus(state, toggleKey) : voiceToggleStatus(state, toggleKey));
 			publishVoiceState(current.ctx, voiceDisplayState(state), live);
@@ -1338,7 +1403,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		// A capture cancelled while recording reports no more states.
 		if (current.cue === "open") {
 			current.cue = "closed";
-			cue(current.ctx, "close", current.send ? "conversation" : "dictation");
+			if (current.dictation?.session.owner !== "listener") cue(current.ctx, "close", current.send ? "conversation" : "dictation");
 		}
 		toggling = undefined;
 		if (active === current.run) active = undefined;

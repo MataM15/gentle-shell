@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import nodeTest from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import gentleVoice from "../extensions/gentle-voice.ts";
 import { VoiceInstallError, type VoiceInstallProgress, type VoiceInstallResult } from "../lib/voice-install.ts";
 import { VoiceSessionError, type VoiceSessionState, type VoiceTranscript } from "../lib/voice-session.ts";
 import { createReadingTurn, HELD_REPLY_POLL_MS, HELD_REPLY_STALE_MS, VOICE_COMMAND_NAME, type VoiceCommandDeps, type VoiceDictation } from "../lib/voice-command.ts";
-import { VoiceListener } from "../lib/voice-listener.ts";
+import { VoiceListener, type ListenerDictation, type ListenerDictationRequest } from "../lib/voice-listener.ts";
+import { createSessionListenerLink } from "../lib/voice-listener-client.ts";
 import type { PaneFocus } from "../lib/voice-presence.ts";
 import type { CuePlayer } from "../lib/voice-cues.ts";
 import type { PushToTalkTimers } from "../lib/voice-push-to-talk.ts";
@@ -856,6 +859,42 @@ test("the toggle shortcut starts a dictation and the same shortcut stops it, pas
 	assert.deepEqual(session.calls, ["start", "stop"]);
 	assert.equal(pi.counts.sends, 0, "the transcript is pasted, never submitted");
 	assert.equal(ui.statuses.at(-1), undefined, "the footer status is cleared");
+});
+
+test("a toggle dictation records through the listener and this session only pastes the transcript", async () => {
+	const scratchRoot = join(import.meta.dirname, "..", "tmp");
+	mkdirSync(scratchRoot, { recursive: true });
+	const dir = mkdtempSync(join(scratchRoot, "voice-command-listener-"));
+	const calls: string[] = [];
+	const dictation = (request: ListenerDictationRequest): ListenerDictation => ({
+		start: async () => { calls.push("start"); request.onStateChange("recording"); },
+		stop: async () => { calls.push("stop"); request.onStateChange("transcribing"); request.onStateChange("finished"); return { text: "hola desde el listener", truncated: false }; },
+		cancel: async () => { calls.push("cancel"); request.onStateChange("finished"); },
+	});
+	const server = new VoiceListener({ dir, dictation, focus: { focusedPaneId: async () => ({ focused: "w1:p1" }) } });
+	await server.listen();
+	try {
+		const h = harness({ installed: true, env: { HERDR_PANE_ID: "w1:p1" } });
+		// No session worker: the microphone lives in the listener from slice C on.
+		delete (h.deps as { createSession?: unknown }).createSession;
+		h.deps.listener = createSessionListenerLink({ dir, session: () => ({ sessionId: "session-alpha", paneId: "w1:p1", voiceOn: true }) });
+		const pi = register(h);
+		const ui = fakeContext();
+		const done = press(pi, ui);
+		await until(() => /recording/i.test(ui.statuses.at(-1) ?? ""), 400);
+		await press(pi, ui);
+		await done;
+		assert.equal(ui.editor(), "draft: hola desde el listener", "the transcript reaches the focused session's draft");
+		assert.deepEqual(calls, ["start", "stop"]);
+		assert.equal(h.sessions.length, 0, "the session starts no worker of its own");
+		assert.ok(!h.calls.some((call) => call.startsWith("session:")), "no local capture is created");
+		assert.deepEqual(h.cues.filter((name) => name === "open" || name === "close"), [], "the listener plays the cues, not the session");
+		assert.equal(pi.counts.sends, 0, "the transcript is pasted, never submitted");
+		h.deps.listener.close();
+	} finally {
+		await server.close();
+		rmSync(dir, { recursive: true, force: true });
+	}
 });
 
 test("a second press while preparing stops as soon as recording begins", async () => {

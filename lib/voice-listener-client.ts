@@ -15,18 +15,22 @@ import {
 	encodeListenerFrame,
 	parseListenerFrameLine,
 	LISTENER_MAX_LINE,
+	type CaptureMode,
 	type ListenerFrame,
 	type ListenerRequest,
 	type ListenerState,
 	type ReadingOutcome,
 	type ReadingReleaseReason,
 } from "./voice-listener-protocol.ts";
+import { VoiceSessionError, type VoiceEndpoint, type VoiceSessionState, type VoiceTranscript } from "./voice-session.ts";
 
 // The session side of the one voice listener (S6): join the running listener,
 // start it once when it is absent, keep the same session id across a listener
-// restart, and ask it for the one reading turn (slice B). Nothing here records
-// audio or speaks: the listener owns the microphone from slice C on, and the
-// session keeps its own PowerShell voice.
+// restart, ask it for the one reading turn (slice B), and, from slice C, ask it
+// for the microphone: the listener records and transcribes, and this side hands
+// the transcript back to the session that pastes it. Nothing here records audio
+// or speaks. A session that cannot reach the listener keeps its own capture, so
+// dictation works exactly as it did before the listener existed.
 
 export const LISTENER_START_TIMEOUT_MS = 10_000;
 export const LISTENER_REQUEST_TIMEOUT_MS = 5_000;
@@ -313,7 +317,9 @@ const askToRead = (client: VoiceListenerClient, readingId: string, chars: number
 		};
 		const off = client.onFrame((frame) => {
 			if (frame.type === "granted") done("granted");
-			else if (frame.type === "busy") done(frame.reason);
+			// The microphone is busy: the reading waits in the same line it waits in
+			// behind another reader, and the listener says who holds it.
+			else if (frame.type === "busy") done(frame.reason === "capture" ? "reading" : frame.reason);
 			else if (frame.type === "bye" || frame.type === "error") done("closed");
 		});
 		client.request({ type: "read-begin", readingId, chars }).catch(() => done("closed"));
@@ -405,4 +411,220 @@ export async function cutListenerReading(options: { dir: string; session: Listen
 	} finally {
 		client.close();
 	}
+}
+
+// --- capture through the listener (slice C) ----------------------------------
+
+// One capture as the session drives it. The owner says who holds the worker and
+// plays the microphone cues: the listener from this slice on, or the session
+// itself when the listener cannot be reached at all.
+export interface SessionDictation {
+	readonly state: VoiceSessionState;
+	readonly owner: "listener" | "session";
+	start(): Promise<void>;
+	stop(): Promise<VoiceTranscript>;
+	cancel(): Promise<void>;
+}
+
+// The utterance was transcribed and then delivered somewhere else: the focused
+// pane decides, and a session that is not it never receives a copy (S6).
+export class ListenerDeliveryError extends Error {
+	readonly kind: "elsewhere" | "dropped";
+	constructor(kind: "elsewhere" | "dropped") {
+		super(kind === "elsewhere" ? "The transcript went to the session that had the focus." : "No session had the focus, so the transcript was dropped.");
+		this.name = "ListenerDeliveryError";
+		this.kind = kind;
+	}
+}
+
+export interface ListenerDictationOptions {
+	mode: CaptureMode;
+	endpoint?: VoiceEndpoint;
+	onStateChange(state: VoiceSessionState): void;
+	// What records when the listener cannot be reached: the session's own capture,
+	// exactly as it worked before the listener existed.
+	fallback(): SessionDictation;
+}
+
+export interface SessionListenerLink {
+	// True when this session is joined to a running listener; starts one once.
+	ensure(): Promise<boolean>;
+	dictate(options: ListenerDictationOptions): SessionDictation;
+	close(): void;
+}
+
+export interface SessionListenerLinkOptions {
+	dir: string;
+	session(): ListenerSession | undefined;
+	start?: () => void | Promise<void>;
+	waitMs?: number;
+	backoffMs?: readonly number[];
+	// A transcript the listener handed to this session: another session recorded
+	// it and this pane had the focus. It is handed over once, never buffered.
+	onTranscript?(text: string, truncated: boolean): void;
+}
+
+// One connection per session carries both roles: it registers the pane that the
+// focus sends a transcript to, and it asks for the microphone. A capture that
+// cannot get the listener records here instead of failing the dictation.
+export function createSessionListenerLink(options: SessionListenerLinkOptions): SessionListenerLink {
+	let client: VoiceListenerClient | undefined;
+	let handler: ((frame: ListenerFrame) => boolean) | undefined;
+	const route = (frame: ListenerFrame): void => {
+		if (handler?.(frame)) return;
+		// No capture of this session asked for it: the focus sent it here (S6).
+		if (frame.type === "transcript") options.onTranscript?.(frame.text, frame.truncated === true);
+	};
+
+	const ensure = async (): Promise<boolean> => {
+		if (client?.connected) return true;
+		const session = options.session();
+		if (!session) return false;
+		if (client) {
+			try {
+				await client.connect();
+				return true;
+			} catch {
+				/* the lock or the socket is gone: start a listener below */
+			}
+		}
+		try {
+			const joined = await ensureListener({
+				dir: options.dir,
+				session,
+				start: options.start,
+				waitMs: options.waitMs,
+				createClient: () => (client = new VoiceListenerClient({ dir: options.dir, session, backoffMs: options.backoffMs, onFrame: route })),
+			});
+			client = joined.client;
+			return true;
+		} catch {
+			return false;
+		}
+	};
+
+	const dictate = (request: ListenerDictationOptions): SessionDictation => {
+		let state: VoiceSessionState = "idle";
+		let fallback: SessionDictation | undefined;
+		let stopSent = false;
+		let settled = false;
+		let failure: { error: unknown } | undefined;
+		let resolveTranscript!: (transcript: VoiceTranscript) => void;
+		let rejectTranscript!: (error: unknown) => void;
+		const transcript = new Promise<VoiceTranscript>((resolve, reject) => {
+			resolveTranscript = resolve;
+			rejectTranscript = reject;
+		});
+		transcript.catch(() => {});
+		const setState = (next: VoiceSessionState): void => {
+			if (state === next) return;
+			state = next;
+			request.onStateChange(next);
+		};
+		const settle = (outcome: { transcript: VoiceTranscript } | { error: unknown }): void => {
+			if (settled) return;
+			settled = true;
+			if (handler === handle) handler = undefined;
+			setState("finished");
+			if ("transcript" in outcome) {
+				resolveTranscript(outcome.transcript);
+				return;
+			}
+			failure = { error: outcome.error };
+			rejectTranscript(outcome.error);
+		};
+		// The listener reports the capture it holds here; the transcript itself only
+		// arrives when this pane has the focus.
+		const handle = (frame: ListenerFrame): boolean => {
+			if (frame.type === "transcript") {
+				settle({ transcript: { text: frame.text, truncated: frame.truncated === true } });
+				return true;
+			}
+			if (frame.type !== "capture") return false;
+			switch (frame.phase) {
+				case "recording":
+					setState("recording");
+					return true;
+				case "transcribing":
+					setState("transcribing");
+					return true;
+				case "elsewhere":
+				case "dropped":
+					settle({ error: new ListenerDeliveryError(frame.phase) });
+					return true;
+				case "failed":
+					settle({ error: new VoiceSessionError(frame.code ?? "internal") });
+					return true;
+				case "cancelled":
+					settle({ error: new VoiceSessionError("cancelled") });
+					return true;
+				default:
+					// Delivered: the transcript frame above already settled this capture.
+					return true;
+			}
+		};
+		const local = (): Promise<void> => {
+			if (handler === handle) handler = undefined;
+			return (fallback ??= request.fallback()).start();
+		};
+		return {
+			get state() {
+				return fallback ? fallback.state : state;
+			},
+			get owner() {
+				return fallback ? "session" : "listener";
+			},
+			start: async () => {
+				setState("starting");
+				handler = handle;
+				if (!(await ensure())) return local();
+				const active = client;
+				if (!active) return local();
+				let answer: ListenerFrame;
+				try {
+					answer = await active.request({ type: "dictate", mode: request.mode, endpoint: request.endpoint });
+				} catch {
+					// The listener went away before it answered: record here instead.
+					return local();
+				}
+				// A refusal is obeyed, never routed around: another capture holds the mic.
+				if (answer.type === "busy") throw new VoiceSessionError("invalid-state");
+				if (answer.type !== "ok") throw new VoiceSessionError("protocol");
+				if (failure) throw failure.error;
+			},
+			stop: () => {
+				if (fallback) return fallback.stop();
+				if (settled || stopSent) return transcript;
+				stopSent = true;
+				// The answer only proves the request was handled; the outcome arrives as
+				// frames, and a listener that dies mid-capture settles it as a failure.
+				void client?.request({ type: "stop" }).then(
+					(frame) => {
+						if (frame.type === "busy") settle({ error: new VoiceSessionError("invalid-state") });
+					},
+					() => settle({ error: new VoiceSessionError("worker-exited") }),
+				);
+				return transcript;
+			},
+			cancel: async () => {
+				if (fallback) return fallback.cancel();
+				if (settled) return;
+				try {
+					await client?.request({ type: "cancel" });
+				} catch {
+					/* the listener is gone: nothing is recording there any more */
+				}
+			},
+		};
+	};
+
+	return {
+		ensure,
+		dictate,
+		close: () => {
+			handler = undefined;
+			client?.close();
+			client = undefined;
+		},
+	};
 }
