@@ -423,4 +423,49 @@ owner's own voice peaks around -14 dBFS, so on headphones a level gate plus the 
 detector separates the two by tens of dB and no echo canceller is needed. The speaker
 setup still needs its own run: speakers on, owner silent.
 
+Real run 2, 2026-11-13, speakers on, headphones off, owner silent (confirmed by the
+owner before the run), from the live checkout at `4ae3e897f`; recording discarded, 0
+audio files left:
+
+```text
+capture: device_rate=44100 Hz chunk_frames=441 (min=p50=max) chunks=2786 duration_s=27.86 xruns=0 overflows=0
+reference: chunks=4 total_s=19.39 start_gaps_ms: p50=105.1 max=113.3 overlap_chunks=0
+timeline: pre_roll_ms=6013 reading_ms=19712 total_ms=27860
+noise_floor (before reading): p50=-48.7 dBFS p95=-42.8 dBFS
+echo_at_mic (during reading): p50=-36.7 dBFS p95=-24.5 dBFS
+delay_estimate: median=112.0 ms p10=112.0 p90=180.0 spread=68.0 ms stdev=43.3 at_median=65.9% changes=4 at_limit=0 series_ms=[8, 180, 112, 112, 112, 112, 112, 132]
+erle_reported: median=8.0 dB p10=0.2 p90=11.3 series_db=[0.2, 0.2, 0.2, 2.9, 9.1, 12.2, 9.9, 0.2]
+erle_measured: 1.5 dB
+residual: p50=-57.3 dBFS p95=-27.1 dBFS p99=-13.8 dBFS max=-10.3 dBFS
+aec_stats: referenceDropped=0 referenceShort=0 nonFinite=0 errors=0 convergence_ms=11820
+gmm_vad_on_residual: fired=37.7% of 1972 reading frames
+verdict: delay_stable=no (spread 68.0 ms > 40) | cancellation_usable=no (ERLE 1.5 dB < 15, residual_p99 -13.8 dBFS > -45)
+```
+
+This run is valid (quiet room: floor p50 -48.7 dBFS) and the pass criteria did **not**
+hold. What it shows:
+
+1. On speakers the echo is real and strong: a median 12 dB above the room floor, with
+   peaks near -24 dBFS and residual bursts up to -10 dBFS. That is the same range as the
+   owner's own voice in run 1 (peaks around -14 dBFS), so on speakers a plain level gate
+   cannot tell the reading from the owner.
+2. AEC3, fed the way the probe feeds it, is too slow and too weak here: it needed 11.8 s
+   of a 19.4 s reading to converge, reached 9 to 12 dB of ERLE at best (15 required), and
+   lost it again at the end. Most replies end before it would have converged.
+3. The delay did lock, at 112 ms for 66 % of the reading, but it moved (8, 180, 112,
+   132 ms). The probe places each sentence by the wall-clock time of its `play` marker,
+   and the player's start gap varies by several milliseconds per sentence, so part of
+   that spread is the reference timeline, not the room.
+4. Capture and reference are sound again: steady 441-frame chunks, no xruns, 4 markers
+   for 4 lines, nothing dropped or short.
+
+Consequence for section 5: option (a) as written (AEC3 over our reference, adopted as
+the first step) is **not supported by the real path** and no dependency is adopted on
+this evidence. Candidates still open, none measured yet: keeping one AEC3 instance
+alive across readings so it converges once (the delay must then stay put); aligning
+each sentence by cross-correlation instead of marker time; option (b), capturing on the
+Windows side with the system's own echo canceller; or a gate that follows the reading's
+own loudness (the listener now receives it, task T13) and asks the microphone to exceed
+the expected echo by a margin, which is the headphone gate when no echo is present.
+
 Known probe defect: `achieved_rate` printed 0.0 Hz; frames / duration gives 44100 Hz.
