@@ -123,6 +123,51 @@ test("the reading turn parses as requests and as answers", () => {
 	for (const frame of frames) assert.deepEqual(parseListenerFrameLine(line(frame)), frame, JSON.stringify(frame));
 });
 
+test("a dictation asks, stops and cancels with its mode and its endpoint", () => {
+	const requests = [
+		{ type: "dictate", mode: "conversation" },
+		{ type: "dictate", id: "d1", mode: "dictation", endpoint: { endOfSpeechMs: 2_500, noSpeechMs: 8_000 } },
+		{ type: "stop" },
+		{ type: "stop", id: "d2" },
+		{ type: "cancel" },
+	];
+	for (const request of requests) assert.deepEqual(parseListenerRequestLine(line(request)), request, JSON.stringify(request));
+	for (const bad of [
+		{ type: "dictate" },
+		{ type: "dictate", mode: "shouting" },
+		{ type: "dictate", mode: "dictation", endpoint: { endOfSpeechMs: 2_500 } },
+		{ type: "dictate", mode: "dictation", endpoint: { endOfSpeechMs: 2_500, noSpeechMs: 8_000, pad: 1 } },
+		{ type: "dictate", mode: "dictation", endpoint: { endOfSpeechMs: 0, noSpeechMs: 8_000 } },
+		{ type: "dictate", mode: "dictation", endpoint: "2500" },
+	]) {
+		assert.equal(parseListenerRequestLine(line(bad)), undefined, JSON.stringify(bad));
+	}
+});
+
+test("a capture reports every phase, its code and who got the transcript", () => {
+	const frames = [
+		{ type: "capture", phase: "recording" },
+		{ type: "capture", phase: "transcribing" },
+		{ type: "capture", phase: "delivered" },
+		{ type: "capture", phase: "elsewhere", target: "s-2" },
+		{ type: "capture", phase: "dropped" },
+		{ type: "capture", phase: "cancelled" },
+		{ type: "capture", phase: "failed", code: "no-speech" },
+		{ type: "transcript", text: "hola", truncated: true },
+	];
+	for (const frame of frames) assert.deepEqual(parseListenerFrameLine(line(frame)), frame, JSON.stringify(frame));
+	for (const bad of [
+		{ type: "capture" },
+		{ type: "capture", phase: "paused" },
+		{ type: "capture", phase: "failed" },
+		{ type: "capture", phase: "failed", code: "oops" },
+		{ type: "capture", phase: "elsewhere", target: "../x" },
+		{ type: "transcript", text: "hola", truncated: "yes" },
+	]) {
+		assert.equal(parseListenerFrameLine(line(bad)), undefined, JSON.stringify(bad));
+	}
+});
+
 test("a reading request or answer outside the fixed lists is refused", () => {
 	for (const bad of [
 		{ type: "read-begin", readingId: "read-1" },

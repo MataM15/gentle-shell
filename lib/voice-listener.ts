@@ -5,10 +5,14 @@ import { createConnection, createServer, type Server, type Socket } from "node:n
 import { join } from "node:path";
 import {
 	encodeListenerFrame,
+	CAPTURE_ERRORS,
 	LISTENER_MAX_CLIENTS,
 	LISTENER_MAX_FRAMES_PER_SECOND,
 	LISTENER_MAX_LINE,
 	parseListenerRequestLine,
+	type CaptureErrorCode,
+	type CaptureMode,
+	type ListenerEndpoint,
 	type ListenerErrorCode,
 	type ListenerFrame,
 	type ListenerRequest,
@@ -17,15 +21,18 @@ import {
 	type ReadingReleaseReason,
 	READING_OUTCOMES,
 } from "./voice-listener-protocol.ts";
+import type { CueName, CuePlayer, CueResult } from "./voice-cues.ts";
+import { VoiceSessionError, type VoiceSessionState, type VoiceTranscript } from "./voice-session.ts";
 
 // One voice listener for every Pi session (S6, odd/notes/voice-listener-design.md).
-// It owns the process and the shared turn, not the microphone: a single instance
-// per voice home (an exclusive lock file plus the unix socket it binds), the
+// It owns the process, the microphone and the shared turn: a single instance per
+// voice home (an exclusive lock file plus the unix socket it binds), the
 // JSON-lines registry every session joins, the state edges, focus resolution
 // through herdr, the rule that a transcript reaches the focused session only,
-// and the one reading turn every session asks for. Capture, the keyword spotter,
-// cues and the overlay arrive in the later slices, so nothing here opens an audio
-// device and the session still speaks.
+// the one reading turn every session asks for, and, from slice C, the capture
+// itself: the warm dictation worker records and transcribes here, and the
+// session that asked only receives its transcript. The keyword spotter and the
+// overlay arrive in the later slices.
 
 export const LISTENER_LOCK_FILE = "listener.lock";
 export const LISTENER_SOCKET_FILE = "listener.sock";
@@ -257,6 +264,12 @@ export interface VoiceListenerOptions {
 	// Focus comes from herdr; a failed or malformed lookup is not "nobody
 	// focused", so the transcript is dropped instead of guessed.
 	focus?: ListenerFocus;
+	// The capture the listener owns (slice C): the warm dictation worker in
+	// production, a fake in the tests. Without one, dictate is refused and the
+	// session records itself, exactly as before.
+	dictation?: ListenerDictationFactory;
+	// The microphone cues are played here, where the microphone is.
+	cues?: CuePlayer;
 	idleMs?: number;
 	asleepIdleMs?: number;
 	heartbeatMs?: number;
@@ -264,7 +277,40 @@ export interface VoiceListenerOptions {
 	readTailMs?: number;
 }
 
+// One capture, as the listener drives it: the worker's own edges in, the
+// transcript out. The listener never reads a state back, it only reports the
+// edges the worker gives it, so this is the session's VoiceDictation without it.
+export interface ListenerDictation {
+	start(): Promise<void>;
+	stop(): Promise<VoiceTranscript>;
+	cancel(): Promise<void>;
+}
+
+export interface ListenerDictationRequest {
+	mode: CaptureMode;
+	endpoint?: ListenerEndpoint;
+	onStateChange(state: VoiceSessionState): void;
+}
+
+export type ListenerDictationFactory = (request: ListenerDictationRequest) => ListenerDictation;
+
+// The capture in progress: who asked, how it records, and what it already told
+// its requester. A capture the listener no longer holds reports nothing.
+interface ActiveCapture {
+	readonly client: Client;
+	readonly sessionId: string;
+	readonly mode: CaptureMode;
+	readonly dictation: ListenerDictation;
+	collecting: boolean;
+	cue: "none" | "open" | "closed";
+}
+
 const noFocus: ListenerFocus = { focusedPaneId: async () => ({ focused: undefined }) };
+
+// A capture that failed reports the worker's own code, or a fixed one: no
+// native error text ever reaches a session.
+const captureErrorCode = (error: unknown): CaptureErrorCode =>
+	error instanceof VoiceSessionError && (CAPTURE_ERRORS as readonly string[]).includes(error.code) ? (error.code as CaptureErrorCode) : "internal";
 
 const withId = <T extends object>(frame: T, id?: string): T => (id === undefined ? frame : ({ ...frame, id } as T));
 
@@ -280,6 +326,7 @@ export class VoiceListener {
 	private readonly readLeaseMs: number;
 	private readonly readTailMs: number;
 	private reading: ActiveReading | undefined;
+	private capture: ActiveCapture | undefined;
 	private server: Server | undefined;
 	private readonly clients = new Map<Socket, Client>();
 	private currentState: ListenerState = "asleep";
@@ -365,6 +412,10 @@ export class VoiceListener {
 		this.endReading("shutdown");
 		if (this.reading?.tail) clearTimeout(this.reading.tail);
 		this.reading = undefined;
+		// A capture ends with the listener: its worker is a child of this process.
+		const capture = this.capture;
+		this.capture = undefined;
+		if (capture) void capture.dictation.cancel().catch(() => {});
 		for (const client of [...this.clients.values()]) {
 			// end() flushes the bye before the FIN; a client that never closes is
 			// dropped shortly after so shutdown cannot hang on it.
@@ -411,7 +462,7 @@ export class VoiceListener {
 	// A transcript belongs to the session whose pane is focused when the
 	// recording ends. It is never broadcast, buffered or retried, and the session
 	// that asked always learns the outcome through its own request.
-	async deliverTranscript(text: string): Promise<string | undefined> {
+	async deliverTranscript(text: string, truncated = false): Promise<string | undefined> {
 		const clients = [...this.clients.values()].filter((client) => client.sessionId);
 		if (clients.length === 0) {
 			this.log("transcript.undelivered", { clients: 0 });
@@ -434,7 +485,7 @@ export class VoiceListener {
 			this.log("transcript.undelivered", { clients: clients.length });
 			return undefined;
 		}
-		this.say(target, { type: "transcript", text });
+		this.say(target, truncated ? { type: "transcript", text, truncated: true } : { type: "transcript", text });
 		this.log("transcript.delivered", { sessionId: target.sessionId });
 		return target.sessionId;
 	}
@@ -607,7 +658,170 @@ export class VoiceListener {
 				this.say(client, withId({ type: "ok", request: "read-cut", state: this.currentState }, request.id));
 				return;
 			}
+			case "dictate":
+				this.beginCapture(client, request);
+				return;
+			case "stop":
+				this.endCapture(client, request.id);
+				return;
+			case "cancel":
+				this.discardCapture(client, request.id);
+				return;
 		}
+	}
+
+	// --- the microphone (slice C) --------------------------------------------------
+
+	// One capture at a time, owned by the session that asked. The listener records
+	// and transcribes; the requester only learns where its transcript went. A
+	// worker that cannot record answers the same request with a failed capture
+	// carrying the worker's own code, so the session reports it as it always did.
+	private beginCapture(client: Client, request: { id?: string; mode: CaptureMode; endpoint?: ListenerEndpoint }): void {
+		const sessionId = client.sessionId;
+		if (!sessionId) return;
+		if (this.capture) {
+			this.say(client, withId({ type: "busy", reason: "capture", holder: this.capture.sessionId }, request.id));
+			return;
+		}
+		// A reading shuts the microphone: it must not record what it is saying.
+		if (this.reading && !this.reading.ended) {
+			this.say(client, withId({ type: "busy", reason: "reading", holder: this.reading.session }, request.id));
+			return;
+		}
+		const factory = this.options.dictation;
+		if (!factory) {
+			// No worker here: the session records itself instead of waiting forever.
+			this.say(client, withId({ type: "error", code: "unknown-request" }, request.id));
+			return;
+		}
+		this.options.cues?.warm();
+		const dictation = factory({ mode: request.mode, endpoint: request.endpoint, onStateChange: (state) => this.captureState(client, state) });
+		const capture: ActiveCapture = { client, sessionId, mode: request.mode, dictation, collecting: false, cue: "none" };
+		this.capture = capture;
+		this.setState("listening");
+		this.log("capture.begin", { sessionId, mode: request.mode, clients: this.clients.size });
+		void dictation.start().then(
+			() => this.answer(client, "dictate", request.id),
+			(error: unknown) => {
+				this.failCapture(capture, error);
+				this.answer(client, "dictate", request.id);
+			},
+		);
+	}
+
+	// The worker's own edges, in the order it reports them: the open cue and the
+	// recording frame when it really records, the close cue and the transcribing
+	// frame when it stops. A capture the listener no longer holds reports nothing.
+	private captureState(client: Client, state: VoiceSessionState): void {
+		const capture = this.capture;
+		if (!capture || capture.client !== client) return;
+		if (state === "recording") {
+			if (capture.cue !== "none") return;
+			capture.cue = "open";
+			this.playCue("open", capture);
+			this.setState("listening");
+			this.say(client, { type: "capture", phase: "recording" });
+			return;
+		}
+		if (capture.cue !== "open") return;
+		capture.cue = "closed";
+		if (state === "transcribing") {
+			this.setState("transcribing");
+			this.say(client, { type: "capture", phase: "transcribing" });
+		}
+		this.playCue("close", capture);
+	}
+
+	// The recording ends. The transcript is handed to whoever has the focus at
+	// this moment, never to whoever had it when the recording started.
+	private endCapture(client: Client, id?: string): void {
+		const capture = this.refuseUnlessOwner(client, id, this.capture);
+		if (!capture) return;
+		if (capture.collecting) return;
+		capture.collecting = true;
+		this.captureState(client, "transcribing");
+		void (async () => {
+			let transcript: VoiceTranscript;
+			try {
+				transcript = await capture.dictation.stop();
+			} catch (error) {
+				this.failCapture(capture, error);
+				this.answer(client, "stop", id);
+				return;
+			}
+			const target = await this.deliverTranscript(transcript.text, transcript.truncated === true);
+			const phase = target === undefined ? "dropped" : target === capture.sessionId ? "delivered" : "elsewhere";
+			this.log("capture.end", { sessionId: capture.sessionId, mode: capture.mode, phase, target });
+			// The requester always learns the outcome, then the request is answered: a
+			// client waiting on stop already has its transcript when it returns.
+			this.say(capture.client, phase === "elsewhere" && target ? { type: "capture", phase, target } : { type: "capture", phase });
+			this.releaseCapture(capture);
+			this.answer(client, "stop", id);
+		})();
+	}
+
+	private failCapture(capture: ActiveCapture, error: unknown): void {
+		if (this.capture !== capture) return;
+		this.captureState(capture.client, "finished");
+		const code = captureErrorCode(error);
+		this.log("capture.failed", { sessionId: capture.sessionId, mode: capture.mode, code });
+		this.say(capture.client, { type: "capture", phase: "failed", code });
+		this.releaseCapture(capture);
+	}
+
+	// A cancelled capture keeps nothing: no stop, no transcript, no delivery.
+	private discardCapture(client: Client, id?: string): void {
+		const capture = this.refuseUnlessOwner(client, id, this.capture);
+		if (!capture) return;
+		this.releaseCapture(capture);
+		this.say(client, { type: "capture", phase: "cancelled" });
+		this.log("capture.cancelled", { sessionId: capture.sessionId, mode: capture.mode });
+		this.answer(client, "cancel", id);
+		void capture.dictation.cancel().catch(() => {});
+	}
+
+	// Only the session that asked may end its capture; every other session learns
+	// that the microphone is taken instead of moving it.
+	private refuseUnlessOwner(client: Client, id: string | undefined, capture: ActiveCapture | undefined): ActiveCapture | undefined {
+		if (capture && capture.client === client) return capture;
+		this.say(client, withId(capture ? { type: "busy", reason: "capture", holder: capture.sessionId } : { type: "busy", reason: "capture" }, id));
+		return undefined;
+	}
+
+	private releaseCapture(capture: ActiveCapture): void {
+		if (this.capture !== capture) return;
+		this.capture = undefined;
+		// The microphone closed without a stop: the close cue still marks it.
+		if (capture.cue === "open") {
+			capture.cue = "closed";
+			this.playCue("close", capture);
+		}
+		// The microphone is free again, and the listener is awake as long as a
+		// session that has voice is still here.
+		this.setState([...this.clients.values()].some((entry) => entry.sessionId && entry.voiceOn) ? "listening" : "asleep");
+	}
+
+	private answer(client: Client, request: string, id?: string): void {
+		this.say(client, withId({ type: "ok", request, state: this.currentState }, id));
+	}
+
+	// The cues belong to the microphone, so they are played here, and a player
+	// that throws or answers with nothing never breaks the capture.
+	private playCue(name: CueName, capture: ActiveCapture): void {
+		const cues = this.options.cues;
+		if (!cues) return;
+		let playing: Promise<CueResult | undefined>;
+		try {
+			playing = Promise.resolve(cues.play(name));
+		} catch {
+			return;
+		}
+		void playing
+			.then((result) => {
+				if (!result) return;
+				this.log("cue", { sessionId: capture.sessionId, name: result.name, outcome: result.outcome, ms: result.ms, mode: capture.mode });
+			})
+			.catch(() => {});
 	}
 
 	// A reading is granted to one session at a time, and only where voice is on:
@@ -615,6 +829,12 @@ export class VoiceListener {
 	private beginReading(client: Client, request: { id?: string; readingId: string; chars: number }): void {
 		if (this.reading) {
 			this.say(client, withId({ type: "busy", reason: "reading", holder: this.reading.session }, request.id));
+			return;
+		}
+		// A capture holds the microphone: the reading waits instead of recording
+		// what it says, and the requester is told who has it.
+		if (this.capture) {
+			this.say(client, withId({ type: "busy", reason: "capture", holder: this.capture.sessionId }, request.id));
 			return;
 		}
 		if (this.currentState === "asleep" && ![...this.clients.values()].some((entry) => entry.sessionId && entry.voiceOn)) {
@@ -700,6 +920,13 @@ export class VoiceListener {
 	private forget(client: Client): void {
 		if (!this.clients.delete(client.socket)) return;
 		if (this.reading && !this.reading.ended && this.reading.socket === client.socket) this.endReading("closed");
+		// The session that was recording is gone: the microphone goes with it.
+		const capture = this.capture;
+		if (capture && capture.client === client) {
+			this.releaseCapture(capture);
+			this.log("capture.closed", { sessionId: capture.sessionId, mode: capture.mode });
+			void capture.dictation.cancel().catch(() => {});
+		}
 		client.socket.destroy();
 		this.log("listener.client-closed", { sessionId: client.sessionId, clients: this.clients.size });
 		this.armIdle();

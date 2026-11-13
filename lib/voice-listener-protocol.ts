@@ -29,10 +29,47 @@ export const READING_OUTCOMES = ["done", "skipped", "cancelled"] as const;
 export type ReadingOutcome = (typeof READING_OUTCOMES)[number];
 export const READING_RELEASE_REASONS = [...READING_OUTCOMES, "lease", "cut", "closed", "shutdown"] as const;
 export type ReadingReleaseReason = (typeof READING_RELEASE_REASONS)[number];
-// Why a read-begin was refused: another session is reading, or voice is off and
-// there is nothing to read over.
-export const READING_BUSY_REASONS = ["reading", "asleep"] as const;
-export type ReadingBusyReason = (typeof READING_BUSY_REASONS)[number];
+// Why a request was refused: another session is reading, another session has
+// the microphone, or voice is off and nothing is awake.
+export const LISTENER_BUSY_REASONS = ["reading", "asleep", "capture"] as const;
+export type ListenerBusyReason = (typeof LISTENER_BUSY_REASONS)[number];
+// Slice C: the listener records and transcribes, so a session only asks. A
+// hands-free recording ends on its own; a dictation ends on the stop.
+export const CAPTURE_MODES = ["conversation", "dictation"] as const;
+export type CaptureMode = (typeof CAPTURE_MODES)[number];
+export const CAPTURE_PHASES = ["recording", "transcribing", "delivered", "elsewhere", "dropped", "cancelled", "failed"] as const;
+export type CapturePhase = (typeof CAPTURE_PHASES)[number];
+// The codes a failed capture can carry: the worker's own (lib/voice-session.ts)
+// plus the ones the listener answers with. Fixed text only, as there.
+export const CAPTURE_ERRORS = [
+	"invalid-request",
+	"node-version",
+	"runtime-invalid",
+	"model-invalid",
+	"runtime-load",
+	"model-load",
+	"no-input-device",
+	"unsupported-input",
+	"capture",
+	"empty-audio",
+	"decode",
+	"internal",
+	"invalid-state",
+	"unsupported",
+	"not-installed",
+	"no-speech",
+	"timeout",
+	"protocol",
+	"worker-exited",
+	"cancelled",
+] as const;
+export type CaptureErrorCode = (typeof CAPTURE_ERRORS)[number];
+
+// The endpoint a hands-free or a dictation recording ends on.
+export interface ListenerEndpoint {
+	endOfSpeechMs: number;
+	noSpeechMs: number;
+}
 
 export interface HelloRequest {
 	type: "hello";
@@ -54,7 +91,11 @@ export type ListenerRequest =
 	| { type: "read-begin"; id?: string; readingId: string; chars: number }
 	| { type: "read-heartbeat"; id?: string; readingId: string }
 	| { type: "read-end"; id?: string; readingId: string; outcome: ReadingOutcome }
-	| { type: "read-cut"; id?: string; readingId?: string };
+	| { type: "read-cut"; id?: string; readingId?: string }
+	// The microphone (slice C): ask for one capture, end it, or throw it away.
+	| { type: "dictate"; id?: string; mode: CaptureMode; endpoint?: ListenerEndpoint }
+	| { type: "stop"; id?: string }
+	| { type: "cancel"; id?: string };
 
 export interface WelcomeFrame {
 	type: "welcome";
@@ -70,11 +111,14 @@ export type ListenerFrame =
 	| { type: "snapshot"; id?: string; state: ListenerState; listenerPid: number; clients: number; sessions: string[] }
 	| { type: "state"; state: ListenerState; at: number }
 	| { type: "command"; command: ListenerCommand }
-	| { type: "transcript"; text: string }
+	| { type: "transcript"; text: string; truncated?: boolean }
+	// What became of the capture: its phase, why it failed, and where the
+	// transcript went when another session had the focus.
+	| { type: "capture"; phase: CapturePhase; code?: CaptureErrorCode; target?: string }
 	| { type: "error"; code: ListenerErrorCode; id?: string }
 	| { type: "bye"; reason: ListenerByeReason }
 	| { type: "granted"; id?: string; readingId: string; state: ListenerState }
-	| { type: "busy"; id?: string; reason: ReadingBusyReason; holder?: string }
+	| { type: "busy"; id?: string; reason: ListenerBusyReason; holder?: string }
 	| { type: "reading"; change: "granted" | "released"; readingId: string; session: string; reason?: ReadingReleaseReason };
 
 type Kind =
@@ -94,7 +138,11 @@ type Kind =
 	| "outcome"
 	| "release"
 	| "change"
-	| "busy";
+	| "busy"
+	| "mode"
+	| "phase"
+	| "capture-error"
+	| "endpoint";
 
 const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const MAX_FIELD = 256;
@@ -115,12 +163,24 @@ const KINDS: Record<Kind, (value: unknown) => boolean> = {
 	outcome: (value) => READING_OUTCOMES.includes(value as ReadingOutcome),
 	release: (value) => READING_RELEASE_REASONS.includes(value as ReadingReleaseReason),
 	change: (value) => value === "granted" || value === "released",
-	busy: (value) => READING_BUSY_REASONS.includes(value as ReadingBusyReason),
+	busy: (value) => LISTENER_BUSY_REASONS.includes(value as ListenerBusyReason),
+	mode: (value) => CAPTURE_MODES.includes(value as CaptureMode),
+	phase: (value) => CAPTURE_PHASES.includes(value as CapturePhase),
+	"capture-error": (value) => CAPTURE_ERRORS.includes(value as CaptureErrorCode),
+	endpoint: (value) => {
+		if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+		const record = value as Record<string, unknown>;
+		// Both bounds, never one: a partial endpoint would end a recording at once.
+		if (Object.keys(record).length !== 2 || !Object.hasOwn(record, "endOfSpeechMs") || !Object.hasOwn(record, "noSpeechMs")) return false;
+		return KINDS.number(record.endOfSpeechMs) && KINDS.number(record.noSpeechMs) && (record.endOfSpeechMs as number) > 0 && (record.noSpeechMs as number) > 0;
+	},
 };
 
 interface Spec {
 	required: Record<string, Kind>;
 	optional?: Record<string, Kind>;
+	// A rule the field types cannot express, run once they all pass.
+	check?: (record: Record<string, unknown>) => boolean;
 }
 
 const ID: Record<string, Kind> = { id: "string" };
@@ -135,6 +195,9 @@ const REQUEST_SPECS: Record<string, Spec> = {
 	"read-heartbeat": { required: { readingId: "string" }, optional: { ...ID } },
 	"read-end": { required: { readingId: "string", outcome: "outcome" }, optional: { ...ID } },
 	"read-cut": { required: {}, optional: { readingId: "string", ...ID } },
+	dictate: { required: { mode: "mode" }, optional: { endpoint: "endpoint", ...ID } },
+	stop: { required: {}, optional: { ...ID } },
+	cancel: { required: {}, optional: { ...ID } },
 };
 
 const FRAME_SPECS: Record<string, Spec> = {
@@ -143,7 +206,9 @@ const FRAME_SPECS: Record<string, Spec> = {
 	snapshot: { required: { state: "state", listenerPid: "pid", clients: "counter", sessions: "sessions" }, optional: { ...ID } },
 	state: { required: { state: "state", at: "number" } },
 	command: { required: { command: "command" } },
-	transcript: { required: { text: "text" } },
+	transcript: { required: { text: "text" }, optional: { truncated: "boolean" } },
+	// A failure always names its code, and only a failure carries one.
+	capture: { required: { phase: "phase" }, optional: { code: "capture-error", target: "session" }, check: (record) => (record.phase === "failed") === (record.code !== undefined) },
 	error: { required: { code: "error" }, optional: { ...ID } },
 	bye: { required: { reason: "reason" } },
 	granted: { required: { readingId: "string", state: "state" }, optional: { ...ID } },
@@ -176,6 +241,7 @@ function decode(line: string, specs: Record<string, Spec>): Record<string, unkno
 		if (!kind || !KINDS[kind](record[key])) return undefined;
 	}
 	for (const key of Object.keys(spec.required)) if (!Object.hasOwn(record, key)) return undefined;
+	if (spec.check && !spec.check(record)) return undefined;
 	delete record.schema;
 	return record;
 }
