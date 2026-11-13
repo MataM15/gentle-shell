@@ -355,3 +355,313 @@ Kept outside the repository, in `/tmp/gpLPqO91/voice-kws-probe/`:
   the tables.
 
 The synthesized WAVs were deleted after the run; `synth.mjs` regenerates them in seconds.
+
+## 11. The command that cuts a reading (S13)
+
+S13 says a reading is interrupted by a spoken command and by nothing else, `L19` forbids
+speech, noise and another person from cutting it, and `L20` says the microphone opens
+right after the cut. T11 asks which words the command should be. Everything below is
+offline: no microphone, no playback, nothing installed, one process per candidate, and
+the configuration of §5 (boost 2.0, threshold 0.25, `maxActivePaths` 16, two trailing
+blanks, one thread, int8) unless a row says otherwise. Command clips are synthesized
+(Raul es-ES, David en-US) and peak-normalized to the owner's real peak, -14 dBFS
+(`voice-echo-bargein.md` §7); readings are the same synthesizer, robotized, and scaled to
+the three levels that matter below.
+
+`cancel` is already a `VoiceKeywordCommand` in `lib/voice-artifacts.ts`, and
+`assets/voice/kws-keywords.txt` records that it "is a known command with no line yet".
+So this section decides one line, `cancel: <pieces>`, not a new vocabulary. The two
+existing lines (`voice-on`, `voice-off`) were carried alongside in the cost run of §11.6.
+
+### 11.1 The words and their pieces
+
+| spoken | pieces | count |
+| --- | --- | --- |
+| Cancel. | `▁CAN CE L` | 3 |
+| Gentle cancel. | `▁G ENT LE ▁CAN CE L` | 6 |
+| **Gentle Voice cancel.** | `▁G ENT LE ▁ VO IC E ▁CAN CE L` | 10 |
+| Gentle stop. | `▁G ENT LE ▁ST O P` | 6 |
+| Gentle Voice stop. | `▁G ENT LE ▁ VO IC E ▁ST O P` | 10 |
+| Gentle Voice off. (reference) | `▁G ENT LE ▁ VO IC E ▁OF F` | 9 |
+| Gentle Voice cancel now. (extra) | `▁G ENT LE ▁ VO IC E ▁CAN CE L ▁NOW` | 11 |
+
+`Gentle Voice off` is not a candidate for S13 (it is the S7 command that puts the listener
+to sleep); it is measured here as the reference the other lines have to match. The encoder
+reproduced the two shipped lines exactly (9/9 self-check), so the piece sequences above are
+the ones this model really uses.
+
+### 11.2 Quiet recall and latency
+
+Five clips per voice, clean silence around the words, no reading:
+
+| candidate | EN detected | median | max | ES detected | median | max |
+| --- | --- | --- | --- | --- | --- | --- |
+| Cancel. | 5/5 | 640 ms | 710 ms | **0/5** | — | — |
+| Gentle cancel. | 5/5 | 530 ms | 630 ms | 4/5 | 530 ms | 680 ms |
+| Gentle Voice cancel. | 5/5 | 490 ms | 690 ms | 5/5 | 610 ms | 710 ms |
+| Gentle stop. | 5/5 | 580 ms | 710 ms | 4/5 | 580 ms | 730 ms |
+| Gentle Voice stop. | 5/5 | 570 ms | 670 ms | 5/5 | 490 ms | 650 ms |
+| Gentle Voice off. | 5/5 | 520 ms | 620 ms | 5/5 | 540 ms | 640 ms |
+| Gentle Voice cancel now. | 5/5 | 320 ms | 510 ms | 5/5 | 440 ms | 470 ms |
+
+Latency is measured from the moment speech stops, as in §4.3, so it is the spotter's own
+delay before any listener dispatch.
+
+The bare word is the only candidate a Spanish voice cannot say: zero out of five, and it
+is not a threshold problem, because the same settings hear `Gentle cancel.` 4/5 and
+`Gentle Voice cancel.` 5/5 with the same speaker. `gentle` in front gives the decoder a
+running start; the isolated English `cancel` with Spanish vowels does not. For a
+Spanish-speaking owner this alone rules out `Cancel.` as the whole command.
+
+### 11.3 False accepts: ordinary speech and near-sounds
+
+False accepts on the T6 negative sets, identical for all seven candidates:
+
+| language | audio | hits | rate |
+| --- | --- | --- | --- |
+| Spanish | 18.05 min | 0 | 0/h (95 % bound ≈ 8/h) |
+| English | 3.92 min | 0 | 0/h |
+
+Each candidate also got near-sound sentences built for it: the misspoken command inside a
+longer sentence ("embedded", where the surrounding words exist to be rejected) and short
+utterances with nothing else around the phrase ("whole", where only the words themselves
+can save it).
+
+| candidate | embedded fired | whole fired |
+| --- | --- | --- |
+| Cancel. | 3/11 (0.80 min) | 0/9 (0.37 min) |
+| Gentle cancel. | 0/7 (0.48 min) | 1/6 (0.28 min) |
+| Gentle Voice cancel. | 2/6 (0.41 min) | 2/5 (0.27 min) |
+| Gentle stop. | 3/9 (0.59 min) | 2/9 (0.40 min) |
+| Gentle Voice stop. | 2/6 (0.42 min) | 2/5 (0.25 min) |
+| Gentle Voice off. | 1/7 (0.52 min) | 2/5 (0.25 min) |
+| Gentle Voice cancel now. | 2/5 (0.37 min) | 2/4 (0.22 min) |
+
+Rates per hour from under a minute of audio mean nothing; the sentences matter:
+
+- **Cancel.** (all Spanish, all in-sentence): "Tengo que cancelar la reunión de mañana a la
+  mañana.", "La cancelación del vuelo nos costó bastante caro.", "Cancelaron el partido
+  por la lluvia y no avisaron a nadie." One word of Spanish, said anywhere near the
+  microphone, is enough. The whole-utterance gate of `S4` rejects all three (there are
+  other words in the utterance), so this is a gate-load cost, not a lost case.
+- **Gentle cancel.** — "Gentle cancer." (whole: nothing else in the utterance, the gate
+  cannot help).
+- **Gentle Voice cancel.** — whole: "Gentle voice candles.", "Gentle boys, cancel.";
+  embedded: "The gentle voice cancellation feature was announced today.", "A gentle voice
+  cancelled the meeting politely."
+- **Gentle stop.** — whole: "Gentle stop, please." (extra word, gate-rejectable),
+  "Gentle stock." (not rejectable); embedded: "The gentle stock market stopped moving
+  today.", "The gentle top of the hill was windy.", "A gentle stop at the corner is all I
+  ask."
+- **Gentle Voice stop.** — whole: "Gentle voice stock.", "Gentle boys stop."; embedded:
+  "The gentle voice stopping feature is written in the docs.", "A gentle voice stopped the
+  meeting at noon."
+- **Gentle Voice off.** — whole: "Gentle voice off, please." (gate-rejectable), "A gentle
+  voice." (not); embedded: "A gentle voice offered to read the whole thing out loud."
+- **Gentle Voice cancel now.** — whole: "Gentle voice candles now.", "Gentle boys, cancel
+  now."; embedded: "The gentle voice cancelled now and then during the call."
+
+Two things hold across the table. Every near-sound hit in the phrase candidates is the
+English voice - no Spanish near-sound fired a phrase in 4.5 minutes of them across the six
+phrase candidates, which is the opposite of what the bare word does. And every hit the
+gate can repair is one with words around the phrase ("Gentle stop, please.", "Gentle boys,
+cancel."); the ones it cannot are whole utterances that mishear a syllable ("candles",
+"stock", "cancer", "A gentle voice."). That is the weakness T6 already recorded for
+"gentle voice" alone (§4.4), and choosing a different tail does not remove it.
+
+### 11.4 While a reading is playing
+
+The command (peak -14 dBFS, the owner's level) is mixed over a reading at the two echo
+levels `voice-echo-bargein.md` §7 measured, plus a third condition: the synthesized
+readings have a 17.9 dB crest factor against the real recording's 12.2 dB, so scaling them
+by median makes the mask harsher than reality. The third condition matches the real
+**peak** (-24.5 dBFS) instead, which is the optimistic bound. Four mixes per condition and
+candidate, eight for the finalists; each mix is a 5-9 s passage with the command at a
+different fixed offset.
+
+| candidate | ES headphones | EN headphones | ES speakers | EN speakers | ES speakers-peak | EN speakers-peak |
+| --- | --- | --- | --- | --- | --- | --- |
+| reading level | -53 median | -53 median | -36.7 median | -36.7 median | -24.5 peak | -24.5 peak |
+| Cancel. | 1/4 | 3/4 | 0/4 | 0/4 | 0/4 | 2/4 |
+| Gentle cancel. | 2/4 | 4/4 | 0/4 | 2/4 | 2/4 | 4/4 |
+| Gentle Voice cancel. | 4/4 | 4/4 | 0/4 | 3/4 | 3/4 | 4/4 |
+| Gentle stop. | 2/4 | 4/4 | 0/4 | 2/4 | 2/4 | 3/4 |
+| Gentle Voice stop. | 4/4 | 4/4 | 0/4 | 1/4 | 2/4 | 4/4 |
+| Gentle Voice off. | 4/4 | 4/4 | 0/4 | 1/4 | 2/4 | 4/4 |
+| Gentle Voice cancel now. | 4/4 | 4/4 | 0/4 | 0/4 | 3/4 | 4/4 |
+
+Eight mixes per condition for the four that could still win, plus the two knobs worth
+re-checking:
+
+| candidate / knob | ES hp | EN hp | ES spk | EN spk | ES spk-peak | EN spk-peak |
+| --- | --- | --- | --- | --- | --- | --- |
+| Gentle Voice cancel, boost 2.0, paths 16 | 8/8 | 8/8 | 0/8 | 6/8 | 6/8 | 8/8 |
+| Gentle Voice cancel, boost 3.0, paths 16 | 8/8 | 8/8 | 0/8 | 6/8 | 6/8 | 8/8 |
+| Gentle Voice cancel, boost 2.0, paths 32 | 8/8 | 8/8 | 1/8 | 6/8 | 7/8 | 8/8 |
+| Gentle Voice stop, boost 2.0, paths 16 | 8/8 | 8/8 | 0/8 | 2/8 | 6/8 | 8/8 |
+| Gentle cancel, boost 2.0, paths 16 | 5/8 | 8/8 | 0/8 | 5/8 | 4/8 | 8/8 |
+| Gentle Voice cancel now, boost 2.0, paths 16 | 8/8 | 8/8 | 1/8 | 3/8 | 6/8 | 8/8 |
+
+Latency inside the mix stays in the same band as §11.2, 420-680 ms after the words stop.
+
+Reading: with headphones every phrase is heard every time, in both reading languages, and
+the bare word is the only line that already fails there. On speakers at the real median
+level the phrase barely survives a Spanish-accented command (0/8 for five of the six
+re-run candidates, 1/8 for the sixth) while the English-voice command is heard 6/8: the
+Spanish voice is the weaker acoustic match to an English model, so it needs a cleaner
+snr. At the real peak the same Spanish-voice command is heard 6/8 - 8/8. Since the real
+echo peaks (-24.5 dBFS) sit between the two scaled conditions, speakers are unresolved by
+this measurement, and no choice of wording fixes it: all seven candidates behave the same
+way there. Boost 3.0
+changes nothing at all, and `maxActivePaths` 32 buys one Spanish speaker mix while adding
+near-sound hits (whole 2/5 -> 4/5), so the recommended configuration stays as it is.
+
+### 11.5 A reading that says the command
+
+Each candidate's reading text was also fed to the spotter by itself, robotized, with the
+command words inside a normal sentence and as a whole short sentence, at both levels. No
+command was mixed in. Hits out of four feeds (two languages x two styles):
+
+| candidate | speakers | headphones | what fired |
+| --- | --- | --- | --- |
+| Cancel. | 1/4 | 0/4 | EN embedded |
+| Gentle cancel. | 2/4 | 1/4 | EN embedded, EN whole; EN whole |
+| Gentle Voice cancel. | 2/4 | 2/4 | EN embedded, EN whole (both levels) |
+| Gentle stop. | 1/4 | 1/4 | EN embedded; EN whole |
+| Gentle Voice stop. | 2/4 | 2/4 | EN embedded, EN whole (both levels) |
+| Gentle Voice off. | 2/4 | 2/4 | EN embedded, EN whole (both levels) |
+| Gentle Voice cancel now. | 2/4 | 2/4 | EN embedded, EN whole (both levels) |
+
+- Plain readings with no command words: 0 hits in 28 feeds (two controls x two levels x
+  seven candidates), so the readings do not fire by themselves.
+- Spanish-voice feeds: 0 hits in 28. Only the English reading fires, in both styles.
+
+This is the finding that decides the design, and it is not about wording:
+
+- **The whole-utterance rule does not protect a reading that says the phrase as its own
+  short sentence.** "Gentle Voice cancel." as a chunk fires at speaker level and at
+  headphone level. A reply that mentions the command in a sentence of its own therefore
+  cuts itself, no matter which of these phrases is chosen.
+- **Level cannot separate the owner from the echo.** The same feed fires at -53 dBFS
+  median, 39 dB below the owner's voice, because the spotter's features are normalised for
+  level. In the real run the speaker echo peaks (-24.5 dBFS) are only about 10 dB under
+  the owner's peaks (-14 dBFS), so the two overlap anyway. Any "ignore quiet hits" or
+  "require the owner's level" guard is refuted by both measurements.
+
+So S13 needs a second guard, and it is textual and temporal rather than acoustic: while a
+chunk whose text contains a command phrase is being read, drop hits for that chunk's
+playback window plus a ~300 ms echo margin. The session already knows each chunk's text
+and its playback window (that is what the overlay and the progress bar use), so the cost is
+one flag and one deadline per chunk, and a hand-written phrase is still cut normally in
+every other chunk. Without it, a reading that says the command cuts itself; with only the
+audio, nothing in the audio tells the two apart.
+
+### 11.6 Cost of carrying one more keyword
+
+One spotter holding more lines, over the 18.05 min Spanish set, with each line's own clips
+(EN and ES) run through the same instance to see what it reports back:
+
+| lines | real-time factor | load | RSS | false accepts | cross-confusion |
+| --- | --- | --- | --- | --- | --- |
+| voice-off | 3.09 % | 1173 ms | 187 MB | 0 | — |
+| voice-off + cancel | 3.29 % | 1102 ms | 214 MB | 0 | none |
+| voice-off + cancel + voice-on | 3.17 % | 1491 ms | 239 MB | 0 | none |
+| all seven at once | 2.99 % | 1005 ms | 264 MB | 0 | cancel now -> cancel |
+
+The cost of one or two more lines is under the run-to-run noise: 3.0-3.3 % of real time for
+one line and for seven. The RSS column is per spotter instance, not per line - the binding
+has no `free()`, as §4.6 records, so each new instance costs about 25 MB. Two real
+confusions in the seven-line file: `Gentle Voice cancel now` is reported as
+`Gentle Voice cancel` (one line being a prefix of another), so those two must never share a
+file, and bare `Cancel.` misses the Spanish voice again. A clean three-line file -
+`voice-on`, `voice-off` and the new `cancel` line - has no confusion at all, which is the
+file S7 actually ships.
+
+### 11.7 What these measurements do NOT establish
+
+- The **owner's own voice**. Raul is Castilian, not Argentine; `§9` already shows the real
+  voice behaves differently from the synthetic one (faster, 8/10).
+- The **real room and the real reading**: no reverb, no playback chain, no echo delay, no
+  double-talk comb filtering. The mix is arithmetic, not acoustics.
+- The **gate itself**. §11.3 reports spotter hits, not gate decisions: whether a given
+  near-sound is rejected is my reading of the `S4` rule, not a measurement of an
+  implementation that does not exist yet.
+- **Speakers.** The two speaker conditions bracket the real echo but neither is it. That is
+  exactly what §11.9 is for.
+- **Another person in the room**, television, music, and hours of speech. The 18 min bound
+  is the same one §6 disclaims.
+- The **gate timings** in §11.8 (the silence before, the 0.5 s after, the 300 ms echo
+  margin). They are design choices carried over from `S4`, not measurements of a built
+  gate.
+
+### 11.8 Recommendation
+
+`Gentle Voice cancel` - one command word, `cancel`, behind the frame the listener already
+has, as the line `cancel: ▁G ENT LE ▁ VO IC E ▁CAN CE L` in
+`assets/voice/kws-keywords.txt`.
+
+It is the best-recall line in the table (5/5 in both voices, 490 ms and 610 ms medians,
+8/8 under a reading on headphones in both reading languages), it adds no Spanish
+near-sound, and it is one word different from `Gentle Voice off`, so the owner has one
+frame to remember and the spotter still separates the three tails cleanly (§11.6). The
+trade-off is length: three words, ten pieces, about a second to say and one piece more than
+`voice-off`, against 6-piece alternatives that lose a Spanish-voice attempt in clean audio
+(`Gentle cancel.` 4/5, and only 5/8 on headphones) and against the single word, which a
+Spanish voice cannot say at all. `Gentle Voice cancel now` detects 150-200 ms sooner and is
+rejected anyway: it adds a common trailing word (`now`), its speaker numbers are no better,
+and it brings the prefix confusion of §11.6.
+
+Guards that come with the line, in the order they run:
+
+1. Whole-utterance gate (`S4`): silence before the phrase (a few hundred ms), speech that
+   ends right after it (within ~0.5 s), nothing else in the utterance. Rejects "el cancel
+   de la puerta", "gente", "estoy", "top", "stock", "Cancelaron ..." and "Gentle voice
+   candles, please".
+2. Reading guard: while a chunk whose text contains a command phrase plays, drop hits for
+   that window plus ~300 ms. Required by §11.5, and the reason the whole-utterance rule is
+   not enough.
+3. Stop the playback, do not mute it, and only then open the microphone (`L20`), with the
+   hit shown in the overlay (`S10`) the same way `alt+m` is. A false accept costs a paused
+   reading that can be resumed, never a lost paragraph.
+4. Keep exactly one spelling per tail in the file (§11.6): `cancel` and `cancel now` must
+   not both be lines.
+
+### 11.9 The real-microphone check, one line
+
+The recommended candidate, the owner's voice, the recommended configuration, with
+`--max-active-paths 16` from the start (the scratch probe in §9 needed that fixed before
+its run):
+
+```bash
+node /tmp/gpLPqO91/voice-kws-probe/scripts/real-command.mjs --candidate gentle-voice-cancel --keywords /tmp/gpLPqO91/voice-kws-probe/keywords/cmd/03-gentle-voice-cancel.txt --boost 2 --threshold 0.25 --max-active-paths 16
+```
+
+It asks for the phrase five times, then for seven near-sounds said on their own
+("Cancelar.", "Cáncer.", "El cancel de la puerta.", "Gente, estoy.", "El stock.", "Stop.",
+"Off."), which must not fire, then for 60 s of free Spanish speech. Worth repeating it once
+with headphones and once with speakers, and worth saying the phrase over a reading, which
+is the case §11.4 leaves open. Numbers only; the audio stays in memory and is dropped on
+every exit path.
+
+`--dry-run` on the same command prints the plan and returns before the spotter or the
+capture module is required, so it provably opens no microphone: it prints
+`native audio libraries loaded in this process: none`, read from the live process, and
+lists the two native modules it would load without loading them. `bash
+/tmp/gpLPqO91/voice-kws-probe/real-command.sh` runs the same thing and tees the numbers to
+`results/real-command.txt`.
+
+Covered here: **S13** (the command and its guards), with **S7** for the keyword family and
+the configuration, **S10** for the stop/open/overlay order, **S11** for the `cancel` name
+(`cancel` is also the word that discards a pending transcript, and the two cannot collide
+because one happens while a reading plays and the other while a transcript is pending),
+and `L19`/`L20` for "only a spoken command cuts it" and "the mic opens after the cut".
+
+Scratch, outside the repository in `/tmp/gpLPqO91/voice-kws-probe/`: `scripts/cmd-corpus.mjs`
+(the candidates, near-sound sentences and readings), `scripts/cmd-synth.mjs` (silent
+OneCore synthesis, 200 clips), `scripts/cmd-probe.mjs` (this section's measurements, with
+`--cost`), `scripts/real-command.mjs` and `real-command.sh` (§11.9),
+`keywords/cmd/` (one file per candidate and the cost files), `cmd-matrix.sh`,
+`cmd-sweep.sh` and `results/s13-cmd.jsonl`, `results/s13-sweep.jsonl`,
+`results/s13-cost.jsonl` (every row behind these tables). The `audio/` (258 T6 clips) and
+`audio-cmd/` (200 S13 clips) WAVs are still there, 70 MB together; `cmd-synth.mjs`
+regenerates them in four minutes.
