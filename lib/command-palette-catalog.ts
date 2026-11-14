@@ -31,6 +31,7 @@ export const COMMAND_PALETTE_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"gentle:banner-color": "#1664: banner settings live under Customization > Banner",
 	"gentle:toggle-rose": "#1664: banner settings live under Customization > Banner",
 	"gentle:toggle-text-logo": "#1664: banner settings live under Customization > Banner",
+	"gentle:desktop": "machine RPC entry point for Gentle Desktop, not a user action",
 };
 
 export const COMMAND_PALETTE_CATALOG: readonly CommandPaletteCatalogGroup[] = [
