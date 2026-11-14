@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "chosen": "01-sobre-el-cuadro.html",
+  "handoffs": {
+    "01-sobre-el-cuadro.html": {
+      "status": "in_progress",
+      "queued": false,
+      "sentAt": "2026-11-14T03:05:42.069Z",
+      "startedAt": "2026-11-14T03:06:16.997Z",
+      "implementedAt": null,
+      "feature": "odd/tasks/voice-control.md",
+      "note": "Elegida por el owner. Implementación en dos partes: render en Gentle Shell (visual, Sonnet 5.5) y datos de voz hacia la sesión (Terra), después se retira la ventana de Windows."
+    }
+  }
+}

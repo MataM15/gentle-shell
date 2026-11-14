@@ -146,7 +146,7 @@ import { NativePointerRegion } from "../lib/native-pointer-region.ts";
 import { acceptedJobs } from "../lib/shell-activity-state.ts";
 import { createVoiceReceiver } from "../lib/shell-voice-state.ts";
 import { renderVoiceIndicator } from "../lib/shell-voice-indicator.ts";
-import { reduceVoiceOverlay, renderVoiceOverlay, visibleVoiceOverlay, type VoiceOverlay } from "../lib/shell-voice-overlay.ts";
+import { renderVoiceBubble, type VoiceBubbleModel } from "../lib/shell-voice-bubble.ts";
 import { acceptedSessionSnapshot, createSessionRefresh, readSessionSnapshot, sessionRows, SESSION_REFRESH_EVENT, SESSION_SNAPSHOT_EVENT, SESSIONS_CARD_TITLE, type SessionSnapshot } from "../lib/shell-session-state.ts";
 import { installSessionChangeCapture } from "../lib/session-change-capture.ts";
 import { SelectionEngine } from "../lib/selection-engine.ts";
@@ -1708,6 +1708,8 @@ function renderDoubleEscCancelReport(
 const CHANGES_WIDGET_KEY = "gentle-shell-changes";
 const HEADER_WIDGET_KEY = "gentle-shell-below-input-header";
 const BAND_WIDGET_KEY = "gentle-shell-folded-band";
+const VOICE_BUBBLE_WIDGET_KEY = "gentle-shell-voice-bubble";
+const VOICE_BUBBLE_FRAME_MS = 120;
 const CHANGES_COMMAND_NAME = "gentle:changes";
 const IMAGES_COMMAND_NAME = "gentle:images";
 const CHANGES_POLL_DEFAULT_MS = 2000;
@@ -2604,14 +2606,32 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		renderHost?.requestRender();
 	};
 	const sessionId = () => currentContext?.sessionManager.getSessionId();
-		// Transient notice for voice transitions (S3): raised on the receiver's
-	// change callback, shown for its ttl, repainted through the digest only.
-	let voiceOverlay: VoiceOverlay | undefined;
-	let voiceStateSeen: "idle" | "preparing" | "listening" | "transcribing" = "idle";
-	const voiceReceiver = createVoiceReceiver(pi.events, sessionId, () => {
+	// The persistent voice bubble above the input (S18). This is the one place that
+	// turns the receiver's state into a bubble model; the reading, asleep and confirm
+	// states, the wave levels, the session label and the language extend it here.
+	const voiceBubbleModel = (): VoiceBubbleModel => {
 		const state = voiceReceiver.current() ?? "idle";
-		voiceOverlay = reduceVoiceOverlay(voiceOverlay, { state, at: deps.now() }, voiceStateSeen);
-		voiceStateSeen = state;
+		return {
+			state: state === "idle" ? "off" : state === "transcribing" ? "transcribing" : "listening",
+			levels: [],
+			language: "es",
+			englishMode: false,
+		};
+	};
+	// The spinner and the sweep move with the clock, so a frame timer runs only while transcribing.
+	let voiceBubbleTimer: ReturnType<typeof setInterval> | undefined;
+	const syncVoiceBubbleTimer = () => {
+		const animated = voiceBubbleModel().state === "transcribing";
+		if (animated && !voiceBubbleTimer) {
+			voiceBubbleTimer = setInterval(() => renderHost?.requestRender(), VOICE_BUBBLE_FRAME_MS);
+			voiceBubbleTimer.unref?.();
+		} else if (!animated && voiceBubbleTimer) {
+			clearInterval(voiceBubbleTimer);
+			voiceBubbleTimer = undefined;
+		}
+	};
+	const voiceReceiver = createVoiceReceiver(pi.events, sessionId, () => {
+		syncVoiceBubbleTimer();
 		redrawReview();
 	});
 	const sessionData = () => sessionSnapshotOwner && sessionSnapshotOwner === sessionId() ? sessionSnapshot : undefined;
@@ -3085,11 +3105,8 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 				invalidate() {},
 			});
 			const voicePart = sidebarPart(tui, "voice", { render: () => [], invalidate() {}, dispose() {} }, {
-				digest: () => `${voiceReceiver.current() ?? "idle"}|${visibleVoiceOverlay(voiceOverlay, deps.now()) ? voiceOverlay?.at : ""}`,
-				render: (width) => [
-					...renderVoiceIndicator(voiceReceiver.current(), theme, width),
-					...(voiceOverlay && visibleVoiceOverlay(voiceOverlay, deps.now()) ? renderVoiceOverlay(voiceOverlay, width, theme) : []),
-				],
+				digest: () => voiceReceiver.current() ?? "idle",
+				render: (width) => renderVoiceIndicator(voiceReceiver.current(), theme, width),
 				invalidate() {},
 			});
 			// An active dev-binary override is one `Build` line pinned in the rail on every tab but Status (S20);
@@ -3144,6 +3161,11 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 					return { handled: true, render: true };
 				},
 			}), { placement: "belowEditor" });
+			// The voice bubble sits in the column above the input and pushes the chat up; off draws no rows.
+			ctx.ui.setWidget(VOICE_BUBBLE_WIDGET_KEY, (_tui, widgetTheme) => ({
+				render: (width: number) => (disposed ? [] : renderVoiceBubble(voiceBubbleModel(), width, widgetTheme as unknown as CardTheme, deps.now())),
+				invalidate() {},
+			}));
 			// The band: Sesión (path, branch, model, context, cost, usage, statuses) beside the
 			// registered Breaks lines, below the editor. It repaints only when its digest
 			// changes; clicks are honoured against the geometry last painted.
@@ -3193,6 +3215,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 				sessionsPart.dispose?.();
 				ctx.ui.setWidget(HEADER_WIDGET_KEY, undefined);
 				ctx.ui.setWidget(BAND_WIDGET_KEY, undefined);
+				ctx.ui.setWidget(VOICE_BUBBLE_WIDGET_KEY, undefined);
 				disposeHeader();
 				disposeRailHeader();
 				disposeStatusBar();
@@ -3321,6 +3344,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		sessionSnapshot = undefined;
 		sessionSnapshotOwner = undefined;
 		voiceReceiver.dispose();
+		syncVoiceBubbleTimer();
 		runningJobs = undefined;
 		stopProfilePoll();
 		oddPhaseRegistry.clear(ctx.sessionManager.getSessionId());
