@@ -88,7 +88,7 @@ export interface VoiceCommandDeps {
 	readStatus?: (target: VoiceTarget) => Promise<VoiceStatusSnapshot>;
 	installRuntime?: (options: VoiceInstallRequest & { target: VoiceTarget }) => Promise<VoiceInstallResult>;
 	installModel?: (options: VoiceInstallRequest) => Promise<VoiceInstallResult>;
-	createSession?: (options: { target: VoiceTarget; onStateChange(state: VoiceSessionState): void; endpoint?: VoiceEndpoint; warm?: boolean; mode?: CaptureMode }) => VoiceDictation;
+	createSession?: (options: { target: VoiceTarget; onStateChange(state: VoiceSessionState): void; endpoint?: VoiceEndpoint; warm?: boolean; mode?: CaptureMode; wake?: boolean; wakeValid?(): boolean }) => VoiceDictation;
 	// The persisted push-to-talk toggle.
 	settings?: { read(): boolean; write(enabled: boolean): void };
 	pushToTalk?: PushToTalkOptions;
@@ -260,7 +260,7 @@ function deliver(ctx: ExtensionContext, result: Outcome, platform: string, start
 // The microphone is claimed at start(), not at creation: creation is inert, and
 // start() first waits for the capture that is still closing, so two workers can
 // never be alive at once, however long the platform takes to release the device.
-function runDictation(createSession: NonNullable<VoiceCommandDeps["createSession"]>, target: VoiceTarget, onState: (state: VoiceSessionState) => void, admission?: () => Promise<void> | undefined, options: { endpoint?: VoiceEndpoint; warm?: boolean; mode?: CaptureMode } = {}) {
+function runDictation(createSession: NonNullable<VoiceCommandDeps["createSession"]>, target: VoiceTarget, onState: (state: VoiceSessionState) => void, admission?: () => Promise<void> | undefined, options: { endpoint?: VoiceEndpoint; warm?: boolean; mode?: CaptureMode; wake?: boolean; canStart?(): boolean } = {}) {
 	let settled = false;
 	let stopping = false;
 	let cancelled = false;
@@ -302,10 +302,11 @@ function runDictation(createSession: NonNullable<VoiceCommandDeps["createSession
 			/* the observer is advisory */
 		}
 	};
-	const session = createSession({ target, onStateChange, endpoint: options.endpoint, warm: options.warm, mode: options.mode });
+	const session = createSession({ target, onStateChange, endpoint: options.endpoint, warm: options.warm, mode: options.mode, wake: options.wake, wakeValid: options.canStart });
 	const begin = () => {
 		// A run cancelled, stopped or settled while it waited never starts.
 		if (cancelled || settled) return;
+		if (options.canStart && !options.canStart()) { void cancel(); return; }
 		session.start().catch((error) => settle({ kind: "error", error }));
 	};
 	return {
@@ -514,14 +515,15 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		passiveClient = undefined;
 		client?.close();
 	};
-	const receiveVoice = (command: "voice-on" | "voice-off", wake: boolean) => {
+	const receiveVoice = (command: "voice-on" | "voice-off", wake: boolean, awake: boolean) => {
 		const ctx = sessionCtx;
 		if (!ctx) return;
 		if (command === "voice-off") {
 			if (voiceOn(ctx)) setVoice(ctx, false, (message, type) => ctx.ui.notify(message, type));
+			if (toggling?.wakeReserved && toggling.cue === "none") cancelToggle(toggling);
 			return;
 		}
-		if (wake) wakeConversation(ctx);
+		if (wake) wakeConversation(ctx, awake);
 	};
 	const listener = (): SessionListenerLink => {
 		if (sessionLink) return sessionLink;
@@ -535,9 +537,9 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			onTranscript: (text, truncated) => {
 				if (sessionLink === link) receiveTranscript(text, truncated);
 			},
-			onVoice: (command, wake) => {
+			onVoice: (command, wake, awake) => {
 				// An in-flight old hello can receive a frame after its session ended.
-				if (sessionLink === link) receiveVoice(command, wake);
+				if (sessionLink === link) receiveVoice(command, wake, awake);
 			},
 		});
 		sessionLink = link;
@@ -552,6 +554,8 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			// uses the mode for its own request to the worker and for its log.
 			mode: options.mode ?? (options.endpoint ? "conversation" : "dictation"),
 			endpoint: options.endpoint,
+			wake: options.wake,
+			wakeValid: options.wakeValid,
 			onStateChange: options.onStateChange,
 			fallback: () => localDictation(options),
 		});
@@ -1475,6 +1479,8 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		stopRequested: boolean;
 		// Conversation mode: hands-free recording, and the transcript is sent.
 		send: boolean;
+		// Only an awake spoken wake reserves the listener before preparation.
+		wakeReserved: boolean;
 		// The microphone cue already played for this capture.
 		cue: "none" | "open" | "closed";
 		cancelled: boolean;
@@ -1531,19 +1537,27 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		current.dictation?.stop();
 	};
 
+	const releaseToggleWake = (current: ToggleRun): void => {
+		if (!current.wakeReserved) return;
+		current.wakeReserved = false;
+		sessionLink?.cancelWake?.();
+	};
+
 	const cancelToggle = (current: ToggleRun) => {
 		if (current.cancelled || toggling !== current) return;
 		current.cancelled = true;
 		if (!current.dictation) {
-			// Still checking the install: nothing was recorded, so end it silently.
+			// Still checking the install: release the wake immediately, not when
+			// the asynchronous check eventually returns.
+			releaseToggleWake(current);
 			closeToggle(current);
 			return;
 		}
 		current.dictation.cancel();
 	};
 
-	const openToggle = (ctx: ExtensionContext, send: boolean): ToggleRun => {
-		const current: ToggleRun = { ctx, run: { generation, abort: () => {} }, stopRequested: false, send, cue: "none", cancelled: false, unsubscribe: () => {} };
+	const openToggle = (ctx: ExtensionContext, send: boolean, wakeReserved = false): ToggleRun => {
+		const current: ToggleRun = { ctx, run: { generation, abort: () => {} }, stopRequested: false, send, wakeReserved, cue: "none", cancelled: false, unsubscribe: () => {} };
 		toggling = current;
 		active = current.run;
 		// Esc has to cancel without reaching the editor's own interrupt.
@@ -1565,6 +1579,12 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	const runToggle = async (current: ToggleRun): Promise<void> => {
 		const { ctx } = current;
 		const live = () => current.run.generation === generation && toggling === current;
+		const wakeLive = (): boolean => {
+			if (!live()) return false;
+			if (voiceOn(ctx)) return true;
+			voiceLog("wake.dropped", { session: sessionIdOf(ctx), reason: "ignored:voice-off" });
+			return false;
+		};
 		const say: Say = (message, type) => {
 			if (live()) ctx.ui.notify(message, type);
 		};
@@ -1576,7 +1596,22 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 				say("Voice dictation is not installed. Run /gentle:voice to download it.", "warning");
 				return;
 			}
-			const dictation = runDictation(createSession, found.target, (state) => display(state), captureSlot, { endpoint: current.send ? CONVERSATION_ENDPOINT : DICTATION_ENDPOINT, warm: current.send, mode: current.send ? "conversation" : "dictation" });
+			if (current.wakeReserved) {
+				if (!wakeLive()) return;
+				const focus = await paneFocus().catch(() => "unknown" as const);
+				if (!wakeLive()) return;
+				if (focus !== "focused") {
+					voiceLog("wake.dropped", { session: sessionIdOf(ctx), reason: "ignored:focus-changed" });
+					return;
+				}
+			}
+			const dictation = runDictation(createSession, found.target, (state) => display(state), captureSlot, {
+				endpoint: current.send ? CONVERSATION_ENDPOINT : DICTATION_ENDPOINT,
+				warm: current.send,
+				mode: current.send ? "conversation" : "dictation",
+				wake: current.wakeReserved,
+				...(current.wakeReserved ? { canStart: wakeLive } : {}),
+			});
 			current.dictation = dictation;
 			current.run.abort = dictation.cancel;
 			display("starting");
@@ -1584,9 +1619,11 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			if (current.stopRequested) dictation.stop();
 			const result = await dictation.outcome;
 			if (!live()) return;
+			if (current.wakeReserved && result.kind === "error" && result.error instanceof VoiceSessionError && result.error.code === "cancelled") return;
 			if (current.send) sendToAgent(ctx, result, found.platform, say, current.stopRequested);
 			else deliver(ctx, result, found.platform, "toggle", say, { command: (text) => runSpokenCommand(ctx, text, say), dictated: recordDictation });
 		} finally {
+			if (!current.dictation) releaseToggleWake(current);
 			current.run.abort = () => {};
 			closeToggle(current);
 		}
@@ -1673,15 +1710,15 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	// capture plays the one open cue and the transcript is sent. A session that
 	// cannot record right now only turns voice on: nothing beeps and nothing is
 	// claimed for a microphone it never opened.
-	const wakeConversation = (ctx: ExtensionContext): void => {
-		if (!supportedSession(ctx)) return;
-		// The session may have voice off and still be the one that was woken: the
-		// listener turned its flag on, and the session follows with its own setting.
-		if (!voiceOn(ctx)) setVoice(ctx, true, (message, type) => ctx.ui.notify(message, type));
+	const wakeConversation = (ctx: ExtensionContext, awake: boolean): void => {
+		if (!supportedSession(ctx)) { if (awake) sessionLink?.cancelWake?.(); return; }
+		// Only an asleep wake turns voice on. An awake wake must never revive a
+		// session whose voice was turned off before the frame was delivered.
+		if (!awake && !voiceOn(ctx)) setVoice(ctx, true, (message, type) => ctx.ui.notify(message, type));
 		const busy = !voiceOn(ctx) ? "voice-refused" : toggling ? "dictation-running" : active ? "voice-busy" : reading ? "reading" : undefined;
 		voiceLog("wake.conversation", { session: sessionIdOf(ctx), result: busy ? "skipped" : "opened", reason: busy });
-		if (busy) return;
-		void runToggle(openToggle(ctx, true));
+		if (busy) { if (awake) sessionLink?.cancelWake?.(); return; }
+		void runToggle(openToggle(ctx, true, awake));
 	};
 
 	// Join the same link dictation uses, with the session's current voice flag.
@@ -1700,7 +1737,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 						: undefined,
 					onFrame: (frame) => {
 						if (passiveClient !== client) return;
-						if (frame.type === "command") receiveVoice(frame.command, frame.wake === true);
+						if (frame.type === "command") receiveVoice(frame.command, frame.wake === true, client.listenerState !== "asleep");
 						else if (frame.type === "transcript") receiveTranscript(frame.text, frame.truncated === true);
 					},
 				});

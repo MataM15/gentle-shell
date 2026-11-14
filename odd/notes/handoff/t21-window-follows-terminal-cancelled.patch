@@ -1,0 +1,451 @@
+diff --git a/scripts/voice-overlay-window.ps1 b/scripts/voice-overlay-window.ps1
+index f55031b37..ad74484b8 100644
+--- a/scripts/voice-overlay-window.ps1
++++ b/scripts/voice-overlay-window.ps1
+@@ -13,7 +13,8 @@
+ # The design is design/voice-overlay/03-bordes-y-pildora.html ("Bordes y pildora",
+ # the owner's choice); every size, opacity, colour and string below comes from it.
+ # All geometry is in the artboard's design units (one unit = one pixel at 100%)
+-# and scaled by the DPI of the monitor the window opens on.
++# and scaled by the DPI of the terminal's monitor. The pill follows the most
++# recently active visible terminal; without one, it uses the foreground monitor.
+ #
+ # Honesty (S10): the screen-edge glow and the live wave are drawn only while
+ # `rec 1` holds. A listener that is awake but not recording shows nothing at
+@@ -27,7 +28,10 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
+ Add-Type -ReferencedAssemblies WindowsBase -TypeDefinition @"
+ using System;
+ using System.Collections.Concurrent;
++using System.Collections.Generic;
++using System.Diagnostics;
+ using System.Runtime.InteropServices;
++using System.Text;
+ using System.Threading;
+ using System.Windows.Threading;
+ 
+@@ -35,7 +39,16 @@ public static class VoiceOverlayNative {
+   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+   [StructLayout(LayoutKind.Sequential)] public struct MONITORINFO { public int Size; public RECT Monitor; public RECT Work; public int Flags; }
+   [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr value);
++  delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr arg);
++  [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindowsProc callback, IntPtr arg);
+   [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
++  [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hwnd);
++  [DllImport("user32.dll")] static extern bool IsIconic(IntPtr hwnd);
++  [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
++  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
++  [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr hwnd, StringBuilder text, int maxCount);
++  [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr hwnd, StringBuilder text, int maxCount);
++  [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr hwnd, int attribute, out int value, int size);
+   [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
+   [DllImport("user32.dll")] static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
+   [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr hwnd, int index);
+@@ -57,14 +70,101 @@ public static class VoiceOverlayNative {
+     SetWindowPos(hwnd, new IntPtr(-1), x, y, w, h, 0x0010 | 0x0040);
+   }
+ 
+-  // The monitor that holds the foreground window: left, top, width, height, dpi.
+-  public static int[] Monitor() {
+-    IntPtr monitor = MonitorFromWindow(GetForegroundWindow(), 2);
++  // These decisions and calculations are pure: they can be checked without a
++  // desktop, even for a monitor to the left of the primary or a tiny work area.
++  public static bool IsTerminal(string processName, string title) {
++    string name = (processName ?? "").ToLowerInvariant();
++    switch (name) {
++      case "windowsterminal": case "windowsterminalpreview": case "conemu": case "conemu64":
++      case "mintty": case "wezterm-gui": case "alacritty": case "kitty": case "hyper":
++      case "tabby": case "cmd": case "powershell": case "pwsh": case "wsl": case "ubuntu":
++        return true;
++      // A browser showing a page about herdr is not an agent terminal.
++      case "chrome": case "msedge": case "firefox": case "brave": case "opera": case "vivaldi":
++        return false;
++    }
++    return (title ?? "").StartsWith("herdr", StringComparison.OrdinalIgnoreCase);
++  }
++
++  public static int PickTerminal(int foregroundIndex, bool[] candidates) {
++    if (foregroundIndex >= 0 && foregroundIndex < candidates.Length && candidates[foregroundIndex]) return foregroundIndex;
++    for (int i = 0; i < candidates.Length; i++) if (candidates[i]) return i;
++    return -1;
++  }
++
++  // Rectangles are x, y, width, height, in physical screen pixels.
++  public static int[] SelectAnchor(int[] terminal, int[] monitor) { return terminal ?? monitor; }
++  public static int[] SurfaceBounds(int[] anchor, int[] work) {
++    int left = Math.Max(anchor[0], work[0]), top = Math.Max(anchor[1], work[1]);
++    int right = Math.Min(anchor[0] + anchor[2], work[0] + work[2]);
++    int bottom = Math.Min(anchor[1] + anchor[3], work[1] + work[3]);
++    return new int[] { left, top, Math.Max(0, right - left), Math.Max(0, bottom - top) };
++  }
++  public static double[] PillGeometry(int[] anchor, int[] work, double width, double height) {
++    double factor = Math.Min(1, Math.Min(work[2] / width, work[3] / height));
++    double w = width * factor, h = height * factor;
++    double x = anchor[0] + (anchor[2] - w) / 2, y = anchor[1] + (anchor[3] - h) / 2;
++    x = Math.Max(work[0], Math.Min(x, work[0] + work[2] - w));
++    y = Math.Max(work[1], Math.Min(y, work[1] + work[3] - h));
++    return new double[] { x, y, w, h, factor };
++  }
++
++  static int[] Bounds(RECT r) { return new int[] { r.Left, r.Top, r.Right - r.Left, r.Bottom - r.Top }; }
++  static bool Eligible(IntPtr hwnd) {
++    if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return false;
++    uint pid; GetWindowThreadProcessId(hwnd, out pid);
++    // Our click-through WPF windows also belong to a PowerShell process.
++    if (pid == 0 || pid == (uint)Process.GetCurrentProcess().Id) return false;
++    int cloaked = 0;
++    try { if (DwmGetWindowAttribute(hwnd, 14, out cloaked, 4) == 0 && cloaked != 0) return false; } catch { }
++    RECT rect; if (!GetWindowRect(hwnd, out rect) || rect.Right <= rect.Left || rect.Bottom <= rect.Top) return false;
++    MONITORINFO info = new MONITORINFO(); info.Size = Marshal.SizeOf(typeof(MONITORINFO));
++    if (!GetMonitorInfo(MonitorFromWindow(hwnd, 2), ref info)) return false;
++    int[] surface = SurfaceBounds(Bounds(rect), Bounds(info.Work));
++    if (surface[2] == 0 || surface[3] == 0) return false;
++    string name = "";
++    try { using (Process process = Process.GetProcessById((int)pid)) { name = process.ProcessName; } } catch { }
++    StringBuilder title = new StringBuilder(256); GetWindowText(hwnd, title, title.Capacity);
++    if (!IsTerminal(name, title.ToString())) return false;
++    // Another PowerShell WPF overlay is not a console window either.
++    if (String.Equals(name, "powershell", StringComparison.OrdinalIgnoreCase) ||
++        String.Equals(name, "pwsh", StringComparison.OrdinalIgnoreCase) ||
++        String.Equals(name, "cmd", StringComparison.OrdinalIgnoreCase)) {
++      StringBuilder cls = new StringBuilder(128); GetClassName(hwnd, cls, cls.Capacity);
++      if (!String.Equals(cls.ToString(), "ConsoleWindowClass", StringComparison.Ordinal)) return false;
++    }
++    return true;
++  }
++
++  // EnumWindows is in top-to-bottom z-order. Prefer the foreground terminal
++  // explicitly; otherwise its first eligible entry is the last active one.
++  static IntPtr Terminal() {
++    List<IntPtr> windows = new List<IntPtr>(); List<bool> candidates = new List<bool>();
++    EnumWindows(delegate(IntPtr hwnd, IntPtr arg) {
++      windows.Add(hwnd);
++      try { candidates.Add(Eligible(hwnd)); } catch { candidates.Add(false); }
++      return true;
++    }, IntPtr.Zero);
++    int index = PickTerminal(windows.IndexOf(GetForegroundWindow()), candidates.ToArray());
++    return index < 0 ? IntPtr.Zero : windows[index];
++  }
++
++  // Surface for edges/sweep, monitor DPI, original anchor and monitor work area.
++  // The terminal's full rectangle centers the pill even when partially offscreen;
++  // the surface and pill are clamped to the chosen monitor's work area.
++  public static int[] Location() {
++    IntPtr terminal = Terminal(); RECT rect = new RECT();
++    if (terminal != IntPtr.Zero && !GetWindowRect(terminal, out rect)) terminal = IntPtr.Zero;
++    IntPtr monitor = MonitorFromWindow(terminal == IntPtr.Zero ? GetForegroundWindow() : terminal, 2);
+     MONITORINFO info = new MONITORINFO(); info.Size = Marshal.SizeOf(typeof(MONITORINFO));
+-    GetMonitorInfo(monitor, ref info);
++    if (!GetMonitorInfo(monitor, ref info)) throw new InvalidOperationException("No monitor");
++    int[] screen = Bounds(info.Monitor), work = Bounds(info.Work);
++    int[] anchor = SelectAnchor(terminal == IntPtr.Zero ? null : Bounds(rect), screen);
++    int[] surface = terminal == IntPtr.Zero ? screen : SurfaceBounds(anchor, work);
+     uint dx = 96, dy = 96;
+     try { GetDpiForMonitor(monitor, 0, out dx, out dy); } catch { }
+-    return new int[] { info.Monitor.Left, info.Monitor.Top, info.Monitor.Right - info.Monitor.Left, info.Monitor.Bottom - info.Monitor.Top, (int)dx };
++    return new int[] { surface[0], surface[1], surface[2], surface[3], (int)dx,
++      anchor[0], anchor[1], anchor[2], anchor[3], work[0], work[1], work[2], work[3] };
+   }
+ }
+ 
+@@ -236,7 +336,8 @@ function Set-Spaced($panel, [string]$text, [double]$size, [string]$weight, [stri
+ # ---- state ------------------------------------------------------------------
+ $script:state = $null; $script:lang = 'es'; $script:label = ''
+ $script:rec = $false; $script:level = 0.0; $script:history = New-Object 'double[]' $MIRROR_BARS
+-$script:mon = $null; $script:scale = 1.0
++$script:mon = $null; $script:scale = 1.0; $script:anchor = $null; $script:work = $null
++$script:location = $null; $script:layoutPasses = 0
+ $script:t0 = [Diagnostics.Stopwatch]::StartNew(); $script:last = 0.0
+ $script:env = 0.1; $script:phase = 0.0; $script:edgeOpacity = -1.0; $script:levelAt = -10.0; $script:sweepWidth = -1.0; $script:sweepMargin = -1.0; $script:edgeAt = -10.0
+ 
+@@ -251,7 +352,16 @@ function Place($o, [double]$x, [double]$y, [double]$w, [double]$h, [bool]$show)
+   }
+ }
+ function Hide-Window($o) { if ($o.Shown) { $o.Window.Hide(); $o.Shown = $false } }
+-function Hide-All { foreach ($e in $edges.Values) { Hide-Window $e }; Hide-Window $sweep; Hide-Window $pill }
++function Hide-All { $followTimer.Stop(); foreach ($e in $edges.Values) { Hide-Window $e }; Hide-Window $sweep; Hide-Window $pill }
++
++function Update-Location {
++  $location = [VoiceOverlayNative]::Location()
++  if ($script:location -and ($location -join ',') -eq ($script:location -join ',')) { return $false }
++  $script:location = $location
++  $script:mon = [int[]]$location[0..3]; $script:scale = [Math]::Max(0.5, $location[4] / 96.0)
++  $script:anchor = [int[]]$location[5..8]; $script:work = [int[]]$location[9..12]
++  return $true
++}
+ 
+ function Set-EdgeColor($o, [string]$hex) {
+   $o.Gradient.GradientStops[0].Color = Color $hex
+@@ -260,30 +370,32 @@ function Set-EdgeColor($o, [string]$hex) {
+ function Show-Edges([string[]]$which, [double]$thickness, [string]$hex, [double]$opacity) {
+   $m = $script:mon; $s = $script:scale
+   $t = [Math]::Round($thickness * $s)
++  $th = [Math]::Min($m[3], $t); $tw = [Math]::Min($m[2], $t)
+   foreach ($name in 'top', 'bottom', 'left', 'right') {
+     $o = $edges[$name]
+     if ($which -notcontains $name) { Hide-Window $o; continue }
+     Set-EdgeColor $o $hex
+     $o.Window.Opacity = $opacity
+     switch ($name) {
+-      'top'    { Place $o $m[0] $m[1] $m[2] $t $true }
+-      'bottom' { Place $o $m[0] ($m[1] + $m[3] - $t) $m[2] $t $true }
+-      'left'   { Place $o $m[0] $m[1] $t $m[3] $true }
+-      'right'  { Place $o ($m[0] + $m[2] - $t) $m[1] $t $m[3] $true }
++      'top'    { Place $o $m[0] $m[1] $m[2] $th $true }
++      'bottom' { Place $o $m[0] ($m[1] + $m[3] - $th) $m[2] $th $true }
++      'left'   { Place $o $m[0] $m[1] $tw $m[3] $true }
++      'right'  { Place $o ($m[0] + $m[2] - $tw) $m[1] $tw $m[3] $true }
+     }
+   }
+ }
+ 
+ function Place-Pill([double]$w, [double]$h, [bool]$shadow) {
+-  $m = $script:mon; $s = $script:scale
++  $s = $script:scale
+   $boxW = ($w + 56) * $s; $boxH = ($h + 56) * $s
++  $bounds = [VoiceOverlayNative]::PillGeometry($script:anchor, $script:work, $boxW, $boxH)
+   $ui.Pill.Width = $w; $ui.Pill.Height = $h
+   $ui.Box.Width = $w + 56; $ui.Box.Height = $h + 56
+   $wpf = Wpf-Dpi $pill.Window
+-  $k = $s / $wpf
++  $k = $s * $bounds[4] / $wpf
+   $ui.Box.LayoutTransform = New-Object System.Windows.Media.ScaleTransform($k, $k)
+   $ui.Shadow.Opacity = $(if ($shadow) { 0.45 } else { 0 })
+-  Place $pill ($m[0] + ($m[2] - $boxW) / 2) ($m[1] + ($m[3] - $boxH) / 2) $boxW $boxH $true
++  Place $pill $bounds[0] $bounds[1] $bounds[2] $bounds[3] $true
+ }
+ 
+ function Set-Palette([string]$c, [string]$b) {
+@@ -348,13 +460,10 @@ function Show-Resting([string]$paletteKey, [string]$tag) {
+ function Stop-Animation { $timer.Stop() }
+ function Start-Animation { $script:last = $script:t0.Elapsed.TotalSeconds; if (-not $timer.IsEnabled) { $timer.Start() } }
+ 
+-# The one place a state becomes pixels. `fresh` re-picks the monitor.
++# The one place a state becomes pixels. `fresh` re-picks the terminal/monitor.
+ function Apply([bool]$fresh) {
+   $state = $script:state
+-  if ($fresh -or -not $script:mon) {
+-    $m = [VoiceOverlayNative]::Monitor()
+-    $script:mon = $m; $script:scale = [Math]::Max(0.5, $m[4] / 96.0)
+-  }
++  if ($fresh -or -not $script:mon) { if (Update-Location) { $script:layoutPasses = 2 } }
+   Stop-Animation
+   Hide-Window $sweep
+   $script:sweepWidth = -1.0; $script:sweepMargin = -1.0
+@@ -393,7 +502,7 @@ function Apply([bool]$fresh) {
+       $ui.Mini.Visibility = 'Collapsed'
+       Place-Pill 620 104 $true
+       $sweepBorder.Background = Brush $p[0]; $sweepGlow.Color = Color $p[0]
+-      Move-Sweep ($(if ($reduced) { 528.0 } else { 0.0 }))
++      Move-Sweep (Sweep-Position $script:t0.Elapsed.TotalSeconds)
+       if (-not $reduced) { Start-Animation }
+     }
+     'reading' {
+@@ -411,6 +520,16 @@ function Apply([bool]$fresh) {
+       Start-Animation
+     }
+   }
++  if ($pill.Shown) { if (-not $followTimer.IsEnabled) { $followTimer.Start() } }
++  else { $followTimer.Stop() }
++}
++
++function Sweep-Position([double]$now) {
++  $travel = [Math]::Max(0, $script:mon[2] / $script:scale - 420)
++  if ($reduced) { return [Math]::Min(528.0, $travel) }
++  $p = ($now % 3.6) / 1.8; if ($p -gt 1) { $p = 2 - $p }
++  $e = if ($p -lt 0.5) { 2 * $p * $p } else { 1 - [Math]::Pow(-2 * $p + 2, 2) / 2 }
++  return $e * $travel
+ }
+ 
+ function Move-Sweep([double]$x) {
+@@ -418,7 +537,7 @@ function Move-Sweep([double]$x) {
+   # Window = bar plus its glow, clamped to the monitor so no glow leaks next door.
+   $left = $m[0] + ($x - 28) * $s; $right = $m[0] + ($x + 448) * $s
+   $cl = [Math]::Max($m[0], $left); $cr = [Math]::Min($m[0] + $m[2], $right)
+-  $width = $cr - $cl
++  $width = $cr - $cl; $height = [Math]::Min($m[3], 40 * $s)
+   if ($width -ne $script:sweepWidth) {
+     # Only the clamped ends change the window's size; the middle of the sweep is
+     # a plain move, which repaints nothing.
+@@ -426,14 +545,38 @@ function Move-Sweep([double]$x) {
+     $wpf = Wpf-Dpi $sweep.Window
+     $sweepRoot.LayoutTransform = New-Object System.Windows.Media.ScaleTransform(($s / $wpf), ($s / $wpf))
+     $sweepRoot.Width = $width / $s
+-    $sweep.Window.Width = [Math]::Max(1, $width / $wpf); $sweep.Window.Height = 40 * $s / $wpf
++    $sweep.Window.Width = [Math]::Max(1, $width / $wpf); $sweep.Window.Height = [Math]::Max(1, $height / $wpf)
+   }
+   $margin = ($m[0] + $x * $s - $cl) / $s
+   if ($margin -ne $script:sweepMargin) { $script:sweepMargin = $margin; $sweepBorder.Margin = New-Object System.Windows.Thickness($margin, 0, 0, 0) }
+   if (-not $sweep.Shown) { $sweep.Window.Show(); $sweep.Shown = $true }
+-  [VoiceOverlayNative]::Place($sweep.Handle, [int][Math]::Round($cl), $m[1], [int][Math]::Round($width), [int][Math]::Round(40 * $s))
++  [VoiceOverlayNative]::Place($sweep.Handle, [int][Math]::Round($cl), $m[1], [int][Math]::Round($width), [int][Math]::Round($height))
+ }
+ 
++# Reposition visible surfaces without resetting the wave, recording flag or
++# animation. A second pass lets WPF settle after crossing a monitor DPI boundary.
++function Reposition-Visible {
++  if ($pill.Shown) { if ($script:state -eq 'asleep') { Place-Pill 400 56 $false } else { Place-Pill 620 104 $true } }
++  if ($script:state -eq 'listening' -and $script:rec) {
++    Show-Edges @('top', 'bottom', 'left', 'right') 72 $PALETTE.listening[0] (0.2 + 0.55 * $script:level)
++  } elseif ($script:state -eq 'reading') {
++    Show-Edges @('bottom') 96 $PALETTE.reading[0] 0.85
++  }
++  if ($sweep.Shown) {
++    $script:sweepWidth = -1.0; $script:sweepMargin = -1.0
++    Move-Sweep (Sweep-Position $script:t0.Elapsed.TotalSeconds)
++  }
++}
++
++$followTimer = New-Object System.Windows.Threading.DispatcherTimer
++$followTimer.Interval = [TimeSpan]::FromMilliseconds(333)
++$followTimer.Add_Tick({
++  try {
++    if (Update-Location) { $script:layoutPasses = 2 }
++    if ($script:layoutPasses -gt 0) { Reposition-Visible; $script:layoutPasses-- }
++  } catch { }
++})
++
+ # ---- animation ---------------------------------------------------------------
+ $timer = New-Object System.Windows.Threading.DispatcherTimer
+ $timer.Interval = [TimeSpan]::FromMilliseconds(50)
+@@ -455,11 +598,8 @@ $timer.Add_Tick({
+       }
+       'transcribing' {
+         $ui.Spin.Angle = ($now / 1.1 % 1.0) * 360
+-        # 1.8 s ease-in-out, alternating, across the monitor.
+-        $p = ($now % 3.6) / 1.8; if ($p -gt 1) { $p = 2 - $p }
+-        $e = if ($p -lt 0.5) { 2 * $p * $p } else { 1 - [Math]::Pow(-2 * $p + 2, 2) / 2 }
+-        $travel = $script:mon[2] / $script:scale - 420
+-        Move-Sweep ($e * $travel)
++        # 1.8 s ease-in-out, alternating, across the terminal surface.
++        Move-Sweep (Sweep-Position $now)
+       }
+       'reading' {
+         # The bars follow the level of the speech the player really started,
+diff --git a/tests/voice-overlay-windows.test.ts b/tests/voice-overlay-windows.test.ts
+index 6e65e3382..5242b778b 100644
+--- a/tests/voice-overlay-windows.test.ts
++++ b/tests/voice-overlay-windows.test.ts
+@@ -1,12 +1,18 @@
+ import assert from "node:assert/strict";
++import { spawnSync } from "node:child_process";
+ import { EventEmitter } from "node:events";
++import { readFileSync } from "node:fs";
++import { release } from "node:os";
+ import test from "node:test";
+ import { createOutputLevelMeter, levelToPercent, type VoiceOverlay } from "../lib/voice-overlay.ts";
+ import { createOverlayForEnvironment, createWindowsOverlay, type WindowsOverlayOptions } from "../lib/voice-overlay-windows.ts";
++import { resolvePowerShell, windowsSpeechAvailable } from "../lib/voice-speech.ts";
+ 
+ // The overlay window host (T12, S5, S10): one warm PowerShell process, a line
+ // protocol on stdin, state changes acknowledged and levels fire and forget. No
+-// test starts PowerShell, opens a window or touches a microphone.
++// adapter test opens a window or touches a microphone. The pure native-geometry
++// test compiles the host's C# with PowerShell when Windows or WSL is available;
++// it does not invoke Win32 or show a window.
+ 
+ interface FakeProc {
+ 	argv: readonly string[];
+@@ -93,6 +99,103 @@ test("the host starts once with an encoded bootstrap, receives the script on std
+ 	overlay.dispose();
+ });
+ 
++test("terminal placement is automatic in the script, with the existing state and recording protocol", async () => {
++	const script = readFileSync(new URL("../scripts/voice-overlay-window.ps1", import.meta.url), "utf8");
++	const { spawn, procs } = fakeSpawn();
++	const overlay = make(spawn, { readScript: () => script });
++	await overlay.show({ state: "listening", language: "es", label: "agent", recording: true });
++	assert.equal(Buffer.from(procs[0]!.written[0]!, "base64").toString("utf8"), script);
++	assert.deepEqual(procs[0]!.written.slice(1), [stateLine("listening", "es", "agent"), "rec 1"]);
++	overlay.dispose();
++});
++
++test("terminal identity, foreground/z-order, geometry and fallback are pure native functions", async (t) => {
++	const script = readFileSync(new URL("../scripts/voice-overlay-window.ps1", import.meta.url), "utf8");
++	const native = /Add-Type -ReferencedAssemblies WindowsBase -TypeDefinition @"\r?\n([\s\S]*?)\r?\n"@/.exec(script)?.[1];
++	assert.ok(native, "the host embeds its native helper");
++	for (const name of ["IsTerminal", "PickTerminal", "SelectAnchor", "SurfaceBounds", "PillGeometry"]) {
++		assert.match(native, new RegExp(`public static [^\\n]+\\b${name}\\(`), `${name} is independently checkable`);
++	}
++	const powershell = windowsSpeechAvailable({ platform: process.platform, kernelRelease: release() })
++		? resolvePowerShell(process.platform, process.env)
++		: undefined;
++	if (!powershell) return t.skip("Windows PowerShell is unavailable; structural assertions ran");
++	const command = `
++$ErrorActionPreference = 'Stop'
++$source = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadLine()))
++Add-Type -ReferencedAssemblies WindowsBase -TypeDefinition $source
++$result = [ordered]@{
++  identities = @(
++    [VoiceOverlayNative]::IsTerminal('WindowsTerminal', ''),
++    [VoiceOverlayNative]::IsTerminal('WindowsTerminalPreview', ''),
++    [VoiceOverlayNative]::IsTerminal('wezterm-gui', ''),
++    [VoiceOverlayNative]::IsTerminal('unknown', 'herdr - agent'),
++    [VoiceOverlayNative]::IsTerminal('chrome', 'herdr - Google Chrome'),
++    [VoiceOverlayNative]::IsTerminal('chrome', 'Other page')
++  )
++  picks = @(
++    [VoiceOverlayNative]::PickTerminal(2, [bool[]]@($false,$true,$true)),
++    [VoiceOverlayNative]::PickTerminal(0, [bool[]]@($false,$true,$true)),
++    [VoiceOverlayNative]::PickTerminal(-1, [bool[]]@($false,$true,$true)),
++    [VoiceOverlayNative]::PickTerminal(-1, [bool[]]@($false,$false))
++  )
++  anchor = @([VoiceOverlayNative]::SelectAnchor([int[]]@(100,200,800,600), [int[]]@(0,0,1920,1080)))
++  fallback = @([VoiceOverlayNative]::SelectAnchor($null, [int[]]@(0,0,1920,1080)))
++  surface = @([VoiceOverlayNative]::SurfaceBounds([int[]]@(-200,-100,800,600), [int[]]@(0,0,1920,1040)))
++  outside = @([VoiceOverlayNative]::SurfaceBounds([int[]]@(-900,0,800,600), [int[]]@(0,0,1920,1040)))
++  centered = @([VoiceOverlayNative]::PillGeometry([int[]]@(100,200,800,600), [int[]]@(0,0,1920,1040), 676, 160))
++  clamped = @([VoiceOverlayNative]::PillGeometry([int[]]@(-300,900,800,600), [int[]]@(0,0,1920,1040), 676, 160))
++  negativeMonitor = @([VoiceOverlayNative]::PillGeometry([int[]]@(-1800,100,800,600), [int[]]@(-1920,0,1920,1040), 676, 160))
++  oversized = @([VoiceOverlayNative]::PillGeometry([int[]]@(0,0,400,200), [int[]]@(0,0,400,200), 676, 160))
++  fallbackPill = @([VoiceOverlayNative]::PillGeometry([int[]]@(0,0,1920,1080), [int[]]@(0,0,1920,1040), 676, 160))
++}
++[Console]::Out.WriteLine(($result | ConvertTo-Json -Compress -Depth 5))
++`;
++	const result = spawnSync(powershell, ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(command, "utf16le").toString("base64")], {
++		input: `${Buffer.from(native, "utf8").toString("base64")}\n`, encoding: "utf8", windowsHide: true, timeout: 20_000,
++	});
++	assert.equal(result.status, 0, result.stderr || String(result.error));
++	const actual = JSON.parse(result.stdout.trim());
++	await t.test("recognizes terminal processes and herdr titles without treating a browser as a terminal", () => {
++		assert.deepEqual(actual.identities, [true, true, true, true, false, false]);
++	});
++	await t.test("prefers the foreground terminal, then the first eligible window in z-order", () => {
++		assert.deepEqual(actual.picks, [2, 1, 1, -1]);
++	});
++	await t.test("uses the terminal rectangle, or the foreground monitor when no terminal exists", () => {
++		assert.deepEqual(actual.anchor, [100, 200, 800, 600]);
++		assert.deepEqual(actual.fallback, [0, 0, 1920, 1080]);
++		assert.deepEqual(actual.fallbackPill, [622, 460, 676, 160, 1]);
++	});
++	await t.test("clips edges and sweep to the work area and rejects offscreen terminals", () => {
++		assert.deepEqual(actual.surface, [0, 0, 600, 500]);
++		assert.equal(actual.outside[2], 0);
++	});
++	await t.test("centers the pill over the terminal, including on a negative-coordinate monitor", () => {
++		assert.deepEqual(actual.centered, [162, 420, 676, 160, 1]);
++		assert.deepEqual(actual.negativeMonitor, [-1738, 320, 676, 160, 1]);
++	});
++	await t.test("clamps the pill and scales it down only if it is larger than the work area", () => {
++		assert.deepEqual(actual.clamped, [0, 880, 676, 160, 1]);
++		assert.ok(Math.abs(actual.oversized[0]) < 0.001 && actual.oversized[2] <= 400 && actual.oversized[3] <= 200 && actual.oversized[4] < 1);
++	});
++});
++
++test("the host follows shown windows at a modest rate without activation or polling while hidden", () => {
++	const script = readFileSync(new URL("../scripts/voice-overlay-window.ps1", import.meta.url), "utf8");
++	assert.match(script, /\$followTimer\.Interval = \[TimeSpan\]::FromMilliseconds\(333\)/);
++	assert.match(script, /if \(\$pill\.Shown\) \{[^\n]*Place-Pill/);
++	assert.match(script, /function Hide-All \{ \$followTimer\.Stop\(\)/);
++	assert.match(script, /if \(\$pill\.Shown\) \{ if \(-not \$followTimer\.IsEnabled\) \{ \$followTimer\.Start\(\)/);
++	assert.match(script, /if \(Update-Location\) \{ \$script:layoutPasses = 2 \}[\s\S]*Reposition-Visible/);
++	assert.match(script, /function Reposition-Visible[\s\S]*Show-Edges[\s\S]*Move-Sweep/);
++	assert.match(script, /!IsWindowVisible\(hwnd\) \|\| IsIconic\(hwnd\)/);
++	assert.match(script, /DwmGetWindowAttribute\(hwnd, 14/);
++	assert.match(script, /pid == \(uint\)Process\.GetCurrentProcess\(\)\.Id/);
++	assert.match(script, /WS_EX_TRANSPARENT[\s\S]*WS_EX_NOACTIVATE/);
++	assert.match(script, /SetWindowPos\(hwnd, new IntPtr\(-1\), x, y, w, h, 0x0010 \| 0x0040\)/);
++});
++
+ test("a label is sanitized and bounded before it reaches the host", async () => {
+ 	const { spawn, procs } = fakeSpawn();
+ 	const overlay = make(spawn);

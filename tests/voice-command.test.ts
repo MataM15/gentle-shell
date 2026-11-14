@@ -2797,7 +2797,7 @@ for (const reload of [false, true]) test(`a spoken wake reaches the focused sess
 
 // Use the real listener, session link and reading-turn client, but fake the
 // worker and speaker. No audio or live voice settings are touched.
-async function awakeConversationFixture(busy: boolean) {
+async function awakeConversationFixture(busy: boolean, installGate?: Promise<void>) {
 	const { engine, readings } = fakeEngine();
 	const home = mkdtempSync(join(tmpdir(), "voice-command-awake-on-"));
 	const dir = join(home, "voice");
@@ -2806,6 +2806,7 @@ async function awakeConversationFixture(busy: boolean) {
 	const cueNames: string[] = [];
 	let heard: ((command: string | undefined) => void) | undefined;
 	let spotStarts = 0;
+	const focus = { pane: "w1:p1" };
 	const server = new VoiceListener({
 		dir,
 		dictation: (request) => {
@@ -2824,17 +2825,21 @@ async function awakeConversationFixture(busy: boolean) {
 			return { start: async () => {}, heard: () => waiting, stop: async () => settle(undefined), cancel: async () => settle(undefined) };
 		},
 		keyword: { model: { root: "/fake/kws", files: {} }, keywords: [{ tokens: "ON", command: "voice-on" }], boost: 2, threshold: 0.25, maxActivePaths: 16, trailingBlanks: 2 },
-		focus: { focusedPaneId: async () => ({ focused: "w1:p1" }) },
+		focus: { focusedPaneId: async () => ({ focused: focus.pane }) },
 		cues: { play: async (name) => { cueNames.push(name); return { name, outcome: "done", ms: 1 }; }, warm: () => {}, dispose: () => {} },
 		log: (event, fields) => listenerEvents.push({ event, ...fields }),
 	});
 	const reached = async (check: () => boolean, ms = 2_000) => {
 		const deadline = Date.now() + ms;
 		while (!check() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
-		assert.ok(check(), "condition not reached");
+		assert.ok(check(), `condition not reached; listener=${JSON.stringify(listenerEvents)} session=${JSON.stringify(h.events)} notices=${JSON.stringify(ui.notices)}`);
 	};
 	await server.listen();
 	const h = harness({ installed: true, engine, voice: true, env: { HERDR_PANE_ID: "w1:p1", GENTLE_PI_CONFIG_HOME: home } });
+	if (installGate) {
+		const readStatus = h.deps.readStatus!;
+		h.deps.readStatus = async (target) => { h.calls.push("install-gate"); await installGate; return readStatus(target); };
+	}
 	delete (h.deps as { createSession?: unknown }).createSession;
 	delete (h.deps as { readingTurn?: unknown }).readingTurn;
 	const pi = register(h);
@@ -2848,11 +2853,153 @@ async function awakeConversationFixture(busy: boolean) {
 	await reached(() => server.sessionIds.includes("session-alpha") && spotStarts > 0 && heard !== undefined);
 	(ui.ctx.ui as unknown as { setEditorText(text: string): void }).setEditorText("");
 	return {
-		h, pi, ui, requests, readings, listenerEvents, cueNames, reached,
+		h, pi, ui, requests, readings, listenerEvents, cueNames, reached, focus, server, dir,
 		hearOn: () => heard!("voice-on"),
 		close: async () => { await pi.fire("session_shutdown", ui.ctx); await server.close(); rmSync(home, { recursive: true, force: true }); },
 	};
 }
+
+test("T19-R1: global voice off while an awake wake checks installation drops it without capture or cue", async () => {
+	const gate = deferred<void>();
+	const f = await awakeConversationFixture(true, gate.promise);
+	const other = new VoiceListenerClient({ dir: f.dir, session: { sessionId: "session-beta", paneId: "w1:p2", voiceOn: true } });
+	try {
+		await other.connect();
+		f.hearOn();
+		await f.reached(() => f.h.calls.includes("install-gate"));
+		assert.equal((await other.request({ type: "set-voice", voiceOn: false })).type, "ok");
+		await f.reached(() => f.h.voice.sessions.length === 0);
+		gate.resolve();
+		await f.reached(() => f.requests.length > 0 || f.listenerEvents.some((entry) => entry.event === "wake.dropped" && entry.reason === "ignored:voice-off"));
+		assert.deepEqual(f.requests, []);
+		assert.ok(f.listenerEvents.some((entry) => entry.event === "wake.dropped" && entry.reason === "ignored:voice-off"));
+		assert.deepEqual(f.cueNames, []);
+		assert.deepEqual(f.pi.sent, []);
+		assert.equal(f.server.state, "asleep");
+	} finally {
+		gate.resolve();
+		other.close();
+		await f.close();
+	}
+});
+
+test("T19-R1: a persisted voice-off observed locally during preparation is logged and dropped", async () => {
+	const gate = deferred<void>();
+	const f = await awakeConversationFixture(true, gate.promise);
+	try {
+		f.hearOn();
+		await f.reached(() => f.h.calls.includes("install-gate"));
+		f.h.voice.sessions = [];
+		gate.resolve();
+		await f.reached(() => f.ui.terminal.unsubscribes > 0);
+		assert.ok(f.h.events.some((entry) => entry.event === "wake.dropped" && entry.reason === "ignored:voice-off"));
+		assert.deepEqual(f.requests, []);
+		assert.deepEqual(f.cueNames, []);
+		assert.deepEqual(f.pi.sent, []);
+	} finally {
+		gate.resolve();
+		await f.close();
+	}
+});
+
+test("T19-R1: focus moving while an awake wake checks installation drops it without capture or cue", async () => {
+	const gate = deferred<void>();
+	const f = await awakeConversationFixture(true, gate.promise);
+	try {
+		f.hearOn();
+		await f.reached(() => f.h.calls.includes("install-gate"));
+		f.focus.pane = "w1:p2";
+		gate.resolve();
+		await f.reached(() => f.requests.length > 0 || f.listenerEvents.some((entry) => entry.event === "wake.dropped" && entry.reason === "ignored:focus-changed"));
+		assert.deepEqual(f.requests, []);
+		assert.ok(f.listenerEvents.some((entry) => entry.event === "wake.dropped" && entry.reason === "ignored:focus-changed"));
+		assert.deepEqual(f.cueNames, []);
+		assert.deepEqual(f.pi.sent, []);
+		assert.deepEqual(f.h.voice.sessions, ["session-alpha"]);
+	} finally {
+		gate.resolve();
+		await f.close();
+	}
+});
+
+test("T19-R1/R2: a locally unfocused wake releases its reservation and the reply waits for focus", async () => {
+	const gate = deferred<void>();
+	const f = await awakeConversationFixture(true, gate.promise);
+	try {
+		f.hearOn();
+		await f.reached(() => f.h.calls.includes("install-gate"));
+		await settleReply(f.pi, f.ui.ctx, "Respuesta al volver.");
+		await f.reached(() => f.ui.statuses.includes("Waiting to read · esc skip"));
+		f.h.focus.state = "unfocused";
+		gate.resolve();
+		await f.reached(() => f.h.events.some((entry) => entry.event === "wake.dropped" && entry.reason === "ignored:focus-changed"));
+		await f.reached(() => f.h.events.some((entry) => entry.event === "reading.held"));
+		assert.deepEqual(f.requests, []);
+		assert.deepEqual(f.cueNames, []);
+		assert.equal(f.readings.length, 0);
+		f.h.focus.state = "focused";
+		await f.reached(() => f.readings.length === 1);
+		assert.equal(f.readings[0]!.text, "Respuesta al volver.");
+		f.readings[0]!.finish("done");
+	} finally {
+		gate.resolve();
+		await f.close();
+	}
+});
+
+test("T19-R2: a reply ready before the first dictate request waits for the reserved wake capture", async () => {
+	const gate = deferred<void>();
+	const f = await awakeConversationFixture(true, gate.promise);
+	try {
+		f.hearOn();
+		await f.reached(() => f.h.calls.includes("install-gate"));
+		await settleReply(f.pi, f.ui.ctx, "La respuesta esperada.");
+		await f.reached(() => f.ui.statuses.includes("Waiting to read · esc skip"));
+		await new Promise((resolve) => setTimeout(resolve, 250));
+		assert.deepEqual(f.requests, [], "the installation gate is before the first dictate request");
+		assert.equal(f.readings.length, 0, "the accepted wake reserves the shared capture slot immediately");
+		assert.equal(f.listenerEvents.some((entry) => entry.event === "reading.begin"), false);
+		gate.resolve();
+		await f.reached(() => f.requests.length === 1);
+		assert.deepEqual(f.cueNames, ["open"]);
+		assert.equal(f.readings.length, 0);
+		f.requests[0]!.onStateChange("finished");
+		await f.reached(() => f.readings.length === 1);
+		assert.equal(f.readings[0]!.text, "La respuesta esperada.");
+		assert.ok(f.listenerEvents.findIndex((entry) => entry.event === "capture.end") < f.listenerEvents.findIndex((entry) => entry.event === "reading.begin"));
+		assert.deepEqual(f.pi.sent, [{ content: "seguí por favor", options: { deliverAs: "followUp" } }]);
+		assert.equal(f.ui.notices.some((notice) => notice.type === "error"), false);
+		f.readings[0]!.finish("done");
+	} finally {
+		gate.resolve();
+		await f.close();
+	}
+});
+
+test("T19-R2: failed preparation releases the wake reservation and the waiting reply is read", async () => {
+	const gate = deferred<void>();
+	const f = await awakeConversationFixture(true, gate.promise);
+	try {
+		f.hearOn();
+		await f.reached(() => f.h.calls.includes("install-gate"));
+		await settleReply(f.pi, f.ui.ctx, "La respuesta tras el fallo.");
+		await f.reached(() => f.ui.statuses.includes("Waiting to read · esc skip"));
+		await new Promise((resolve) => setTimeout(resolve, 250));
+		assert.equal(f.readings.length, 0, "the reply waits even while installation is being checked");
+		assert.deepEqual(f.requests, []);
+		gate.reject(new Error("install check failed"));
+		await f.reached(() => f.readings.length === 1);
+		assert.equal(f.readings[0]!.text, "La respuesta tras el fallo.");
+		assert.deepEqual(f.requests, []);
+		assert.deepEqual(f.cueNames, []);
+		assert.deepEqual(f.pi.sent, []);
+		assert.deepEqual(f.ui.notices.at(-1), { message: "Voice dictation is not installed. Run /gentle:voice to download it.", type: "warning" });
+		f.readings[0]!.finish("done");
+	} finally {
+		gate.resolve();
+		await f.close();
+	}
+});
 
 for (const busy of [false, true]) test(`awake voice-on opens a hands-free spoken turn ${busy ? "while the agent is answering" : "while idle"} (S15, S2)`, async () => {
 	const f = await awakeConversationFixture(busy);

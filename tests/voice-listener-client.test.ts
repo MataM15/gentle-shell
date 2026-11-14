@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import type { Socket } from "node:net";
+import { createServer, type Socket } from "node:net";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test, { after } from "node:test";
@@ -788,6 +788,87 @@ test("a session label is the session name, or the working directory's, sanitized
 	const long = sessionDisplayLabel({ name: "x".repeat(500) });
 	assert.equal(long?.length, SESSION_LABEL_MAX);
 	assert.ok(SESSION_LABEL_MAX <= 256, "well inside the protocol's field bound");
+});
+
+test("T19-R1: welcome followed by a state in the same packet keeps the newer listener state", async () => {
+	const written: Array<Record<string, unknown>> = [];
+	class FakeSocket extends EventEmitter {
+		destroyed = false;
+		setEncoding() {}
+		write(chunk: string) { written.push(JSON.parse(chunk) as Record<string, unknown>); return true; }
+		destroy() { this.destroyed = true; return this; }
+	}
+	const socket = new FakeSocket();
+	const client = new VoiceListenerClient({ dir: scratch(), session: session("s-1"), dial: () => socket as unknown as Socket });
+	const connecting = client.connect();
+	try {
+		queueMicrotask(() => socket.emit("connect"));
+		await waitFor(() => written.length === 1);
+		socket.emit("data", encodeListenerFrame({ type: "welcome", id: String(written[0]!.id), listenerPid: 1, proto: 1, state: "asleep" }) + encodeListenerFrame({ type: "state", state: "listening", at: 1 }));
+		assert.equal(await connecting, "asleep", "the connect result remains the welcome state");
+		assert.equal(client.listenerState, "listening", "a newer edge is not overwritten by the awaited welcome");
+	} finally {
+		client.close();
+	}
+});
+
+test("T19-R2: a declined wake releases its reservation even when it arrives with welcome", async () => {
+	const dir = scratch();
+	let cancelled = false;
+	const sockets = new Set<Socket>();
+	const server = createServer((socket) => {
+		sockets.add(socket);
+		socket.on("close", () => sockets.delete(socket));
+		let buffered = "";
+		socket.setEncoding("utf8");
+		socket.on("data", (chunk: string) => {
+			buffered += chunk;
+			let newline: number;
+			while ((newline = buffered.indexOf("\n")) !== -1) {
+				const frame = JSON.parse(buffered.slice(0, newline)) as { type: string; id?: string };
+				buffered = buffered.slice(newline + 1);
+				if (frame.type === "hello") socket.write(
+					encodeListenerFrame({ type: "welcome", id: frame.id, listenerPid: 1, proto: 1, state: "asleep" }) +
+					encodeListenerFrame({ type: "state", state: "listening", at: 1 }) +
+					encodeListenerFrame({ type: "command", command: "voice-on", wake: true }),
+				);
+				if (frame.type === "cancel") {
+					cancelled = true;
+					socket.write(encodeListenerFrame({ type: "ok", id: frame.id, request: "cancel" }));
+				}
+			}
+		});
+	});
+	await new Promise<void>((resolve) => server.listen(listenerPaths(dir).socket, resolve));
+	let link!: ReturnType<typeof createSessionListenerLink>;
+	link = createSessionListenerLink({ dir, session: () => session("s-1"), onVoice: (_command, wake, awake) => { if (wake && awake) link.cancelWake?.(); } });
+	try {
+		assert.equal(await link.ensure(), true);
+		await waitFor(() => cancelled, 500);
+	} finally {
+		link.close();
+		for (const socket of sockets) socket.destroy();
+		await new Promise<void>((resolve) => server.close(() => resolve()));
+	}
+});
+
+test("T19-R1: an invalid awake wake does not request capture or fall back locally", async () => {
+	const dir = scratch();
+	const capture = fakeCapture();
+	const own = localCapture();
+	const server = new VoiceListener({ dir, dictation: capture.factory, focus: focusedOn("w1:p1") });
+	await server.listen();
+	const link = createSessionListenerLink({ dir, session: () => session("s-1") });
+	try {
+		assert.equal(await link.ensure(), true);
+		const dictation = link.dictate({ mode: "conversation", wake: true, wakeValid: () => false, onStateChange: () => {}, fallback: () => own.dictation });
+		await assert.rejects(dictation.start(), (error: unknown) => error instanceof VoiceSessionError && error.code === "cancelled");
+		assert.deepEqual(capture.calls, []);
+		assert.deepEqual(own.calls, []);
+	} finally {
+		link.close();
+		await server.close();
+	}
 });
 
 test("a voice change while hello awaits welcome is sent after the join", async () => {

@@ -242,7 +242,7 @@ export type ListenerLog = (event: string, fields?: Record<string, unknown>) => v
 export type ListenerFocusResult = { readonly focused: string | undefined } | { readonly failed: true };
 
 export interface ListenerFocus {
-	focusedPaneId(): Promise<ListenerFocusResult>;
+	focusedPaneId(options?: { fresh?: boolean }): Promise<ListenerFocusResult>;
 }
 
 interface Client {
@@ -418,11 +418,18 @@ export async function buildVoiceKeywordOption(options: {
 
 // The capture in progress: who asked, how it records, and what it already told
 // its requester. A capture the listener no longer holds reports nothing.
+interface AwakeWake {
+	readonly client: Client;
+	invalid?: "ignored:voice-off" | "ignored:focus-changed" | "ignored:stale";
+}
+
 interface PendingCapture {
 	readonly client: Client;
 	readonly sessionId: string;
 	readonly mode: CaptureMode;
+	readonly wake?: AwakeWake;
 	cancelled: boolean;
+	cancelWakeCheck?(): void;
 }
 
 interface ActiveCapture {
@@ -485,6 +492,8 @@ export class VoiceListener {
 	private capture: ActiveCapture | undefined;
 	// Reserve the microphone while a requested capture waits for an earlier one.
 	private capturePending: PendingCapture | undefined;
+	// An accepted awake wake owns the slot before the session checks its install.
+	private awakeWake: AwakeWake | undefined;
 	private captureClosing: Promise<void> | undefined;
 	private waking = false;
 	// The spot-only capture, and the release of the one just stopped: the
@@ -619,6 +628,10 @@ export class VoiceListener {
 		// A capture ends with the listener: its worker is a child of this process.
 		const capture = this.capture;
 		this.capture = undefined;
+		if (this.capturePending) {
+			this.capturePending.cancelled = true;
+			this.capturePending.cancelWakeCheck?.();
+		}
 		// The spotter holds the microphone too, and it goes with the listener.
 		void this.stopSpotting();
 		// The window is being disposed below, but the flag never outlives the recording.
@@ -813,7 +826,17 @@ export class VoiceListener {
 	}
 
 	private setSessionVoice(sessionId: string | undefined, voiceOn: boolean): void {
+		const wake = this.awakeWake ?? this.capturePending?.wake;
+		if (wake && wake.client.sessionId === sessionId && wake.client.voiceOn !== voiceOn) this.invalidateAwakeWake("ignored:voice-off");
 		for (const other of this.clients.values()) if (other.sessionId === sessionId) other.voiceOn = voiceOn;
+	}
+
+	private invalidateAwakeWake(reason: NonNullable<AwakeWake["invalid"]>): void {
+		const wake = this.awakeWake ?? this.capturePending?.wake;
+		if (!wake || wake.invalid) return;
+		wake.invalid = reason;
+		this.log("wake.dropped", { command: "voice-on", reason });
+		this.capturePending?.cancelWakeCheck?.();
 	}
 
 	private apply(client: Client, request: Exclude<ListenerRequest, { type: "hello" }>): void {
@@ -939,8 +962,9 @@ export class VoiceListener {
 	private async beginCapture(client: Client, request: { id?: string; mode: CaptureMode; endpoint?: ListenerEndpoint }): Promise<void> {
 		const sessionId = client.sessionId;
 		if (!sessionId) return;
-		if (this.capture || this.capturePending) {
-			this.say(client, withId({ type: "busy", reason: "capture", holder: this.capture?.sessionId ?? this.capturePending?.sessionId }, request.id));
+		const wake = this.awakeWake;
+		if (this.capture || this.capturePending || (wake && (wake.client !== client || request.mode !== "conversation"))) {
+			this.say(client, withId({ type: "busy", reason: "capture", holder: this.capture?.sessionId ?? this.capturePending?.sessionId ?? wake?.client.sessionId }, request.id));
 			return;
 		}
 		// A reading shuts the microphone: it must not record what it is saying.
@@ -950,19 +974,36 @@ export class VoiceListener {
 		}
 		const factory = this.options.dictation;
 		if (!factory) {
-			// No worker here: the session records itself instead of waiting forever.
+			// No worker here: an ordinary session may record itself instead.
+			if (wake) { this.awakeWake = undefined; this.refreshSpotting(); }
 			this.say(client, withId({ type: "error", code: "unknown-request" }, request.id));
 			return;
 		}
-		// Reserve the microphone across asynchronous stops: no other request or
-		// spotter can open it before the old stream has actually settled.
-		const pending: PendingCapture = { client, sessionId, mode: request.mode, cancelled: false };
+		// Transfer the wake reservation without a gap, then keep it across stops.
+		const pending: PendingCapture = { client, sessionId, mode: request.mode, wake, cancelled: false };
 		this.capturePending = pending;
+		if (wake) this.awakeWake = undefined;
 		if (this.spotting || this.spottingStop) await this.stopSpotting();
 		if (this.captureClosing) await this.captureClosing;
-		if (pending.cancelled || !this.clients.has(client.socket) || this.closing) {
+		// Focus may have changed during the session's install check or microphone
+		// teardown. Bypass the herdr cache and fail closed on a failed lookup.
+		if (wake && !pending.cancelled && !wake.invalid) {
+			// A hung focus lookup must not keep a cancelled wake's reservation.
+			const cancelled = new Promise<ListenerFocusResult>((resolve) => { pending.cancelWakeCheck = () => resolve({ failed: true }); });
+			let lookup: ListenerFocusResult;
+			try { lookup = await Promise.race([(this.options.focus ?? noFocus).focusedPaneId({ fresh: true }), cancelled]); }
+			catch { lookup = { failed: true }; }
+			pending.cancelWakeCheck = undefined;
+			if (!pending.cancelled && !wake.invalid && (!("focused" in lookup) || lookup.focused !== client.paneId)) this.invalidateAwakeWake("ignored:focus-changed");
+		}
+		if (wake && !wake.invalid && !client.voiceOn) this.invalidateAwakeWake("ignored:voice-off");
+		if (wake && !wake.invalid && (this.currentState !== "listening" || this.reading)) this.invalidateAwakeWake("ignored:stale");
+		if (pending.cancelled || wake?.invalid || !this.clients.has(client.socket) || this.closing) {
 			this.capturePending = undefined;
-			if (pending.cancelled && this.clients.has(client.socket) && !this.closing) this.answer(client, "dictate", request.id);
+			if (this.clients.has(client.socket) && !this.closing) {
+				if (!pending.cancelled) this.say(client, { type: "capture", phase: "cancelled" });
+				this.answer(client, "dictate", request.id);
+			}
 			this.refreshSpotting();
 			return;
 		}
@@ -1125,6 +1166,7 @@ export class VoiceListener {
 	// speaking is cut with it, because nothing is on to hear it. The state is the
 	// caller's: a voice off from a capture leaves it to the release.
 	private voiceOffEverywhere(): void {
+		this.invalidateAwakeWake("ignored:voice-off");
 		for (const other of this.clients.values()) other.voiceOn = false;
 		this.broadcast({ type: "command", command: "voice-off" });
 		this.endReading("cut");
@@ -1132,10 +1174,17 @@ export class VoiceListener {
 
 	// A cancelled capture keeps nothing: no stop, no transcript, no delivery.
 	private discardCapture(client: Client, id?: string): void {
+		if (this.awakeWake?.client === client) {
+			this.awakeWake = undefined;
+			this.answer(client, "cancel", id);
+			this.refreshSpotting();
+			return;
+		}
 		const pending = this.capturePending;
 		if (pending?.client === client) {
 			if (!pending.cancelled) {
 				pending.cancelled = true;
+				pending.cancelWakeCheck?.();
 				this.say(client, { type: "capture", phase: "cancelled" });
 				this.log("capture.cancelled", { sessionId: pending.sessionId, mode: pending.mode });
 			}
@@ -1300,6 +1349,13 @@ export class VoiceListener {
 			this.refreshSpotting();
 			return;
 		}
+		// Preparing a wake reserves dictation, not command spotting. A repeated
+		// on cannot replace that reservation, even if voice just went off.
+		if (command === "voice-on" && this.awakeWake) {
+			this.log("kws.hit", { command, reason: "ignored:stale" });
+			this.refreshSpotting();
+			return;
+		}
 		if (this.currentState === "asleep") {
 			this.log("kws.hit", { command, reason: command === "voice-on" ? "whole-utterance" : "ignored:asleep" });
 			if (command !== "voice-on") return this.refreshSpotting();
@@ -1341,10 +1397,13 @@ export class VoiceListener {
 			this.log("kws.hit", { command: "voice-on", reason: "ignored:no-focused-voice-session" });
 			return;
 		}
-		if (this.currentState !== "listening" || this.spotting || this.capture || this.capturePending || this.captureClosing || this.closing) {
+		if (this.currentState !== "listening" || this.spotting || this.capture || this.capturePending || this.awakeWake || this.captureClosing || this.closing) {
 			this.log("kws.hit", { command: "voice-on", reason: "ignored:stale" });
 			return;
 		}
+		// Reserve before notifying the session: its install check can be slow and
+		// another session's reply must not take the turn in the meantime.
+		this.awakeWake = { client: target };
 		this.log("kws.hit", { command: "voice-on", reason: "whole-utterance" });
 		this.say(target, { type: "command", command: "voice-on", wake: true });
 	}
@@ -1505,8 +1564,8 @@ export class VoiceListener {
 		}
 		// A capture holds the microphone until cancellation has actually settled:
 		// a closing worker may still record even after the capture was released.
-		if (this.capture || this.capturePending || this.captureClosing) {
-			this.say(client, withId({ type: "busy", reason: "capture", holder: this.capture?.sessionId ?? this.capturePending?.sessionId }, request.id));
+		if (this.capture || this.capturePending || this.awakeWake || this.captureClosing) {
+			this.say(client, withId({ type: "busy", reason: "capture", holder: this.capture?.sessionId ?? this.capturePending?.sessionId ?? this.awakeWake?.client.sessionId }, request.id));
 			return;
 		}
 		if (this.currentState === "asleep" && this.voiceSessions.length === 0) {
@@ -1624,6 +1683,7 @@ export class VoiceListener {
 			this.armIdle();
 			return;
 		}
+		this.invalidateAwakeWake("ignored:stale");
 		this.currentState = next;
 		this.log("listener.state", { state: next });
 		// The frame and the snapshot name the same owning session, so a window and
@@ -1690,7 +1750,11 @@ export class VoiceListener {
 			this.releaseCapture(capture, true);
 			this.log("capture.closed", { sessionId: capture.sessionId, mode: capture.mode });
 		}
-		if (this.capturePending?.client === client) this.capturePending.cancelled = true;
+		if (this.capturePending?.client === client) {
+			this.capturePending.cancelled = true;
+			this.capturePending.cancelWakeCheck?.();
+		}
+		if (this.awakeWake?.client === client) this.awakeWake = undefined;
 		close(client.socket);
 		this.log("listener.client-closed", { sessionId: client.sessionId, clients: this.clients.size });
 		if (client.voiceOn && this.voiceSessions.length === 0) this.sleepWithoutVoice();
@@ -1765,8 +1829,8 @@ export function createHerdrFocus(options: { env?: NodeJS.ProcessEnv; run?: Focus
 	const now = options.now ?? Date.now;
 	let cached: { at: number; agents: HerdrAgent[] } | undefined;
 	// Undefined means the lookup failed; an empty list would mean nobody focused.
-	const read = async (): Promise<HerdrAgent[] | undefined> => {
-		if (cached && now() - cached.at < ttlMs) return cached.agents;
+	const read = async (fresh = false): Promise<HerdrAgent[] | undefined> => {
+		if (!fresh && cached && now() - cached.at < ttlMs) return cached.agents;
 		cached = undefined;
 		try {
 			const agents = parseHerdrAgents(await (options.run ?? runHerdr)(env.HERDR_BIN_PATH?.trim() || "herdr", ["agent", "list"]));
@@ -1779,8 +1843,8 @@ export function createHerdrFocus(options: { env?: NodeJS.ProcessEnv; run?: Focus
 	};
 	return {
 		agents: async () => (await read()) ?? [],
-		focusedPaneId: async () => {
-			const agents = await read();
+		focusedPaneId: async (options) => {
+			const agents = await read(options?.fresh);
 			return agents ? { focused: agents.find((agent) => agent.focused)?.paneId } : { failed: true };
 		},
 	};

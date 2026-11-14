@@ -196,7 +196,6 @@ export class VoiceListenerClient {
 		const { sessionId, paneId, label, voiceOn } = session;
 		const frame = await this.request({ type: "hello", proto: 1, sessionId, paneId, label, voiceOn, ...(this.options.role ? { role: this.options.role } : {}) });
 		if (frame.type !== "welcome") throw new Error("the voice listener refused hello");
-		this.currentState = frame.state;
 		this.joined = true;
 		this.attempt = 0;
 		const current = this.session();
@@ -255,7 +254,9 @@ export class VoiceListenerClient {
 				else pending.resolve(frame);
 			}
 		}
-		if (frame.type === "state") this.currentState = frame.state;
+		// Welcome and a newer state can arrive in one socket chunk. Apply them in
+		// wire order instead of overwriting the newer state after await resumes.
+		if (frame.type === "welcome" || frame.type === "state") this.currentState = frame.state;
 		if (frame.type === "bye" && frame.reason === "replaced") this.replaced = true;
 		for (const listener of [...this.listeners]) listener(frame);
 	}
@@ -601,6 +602,9 @@ export class ListenerDeliveryError extends Error {
 export interface ListenerDictationOptions {
 	mode: CaptureMode;
 	endpoint?: VoiceEndpoint;
+	// An awake spoken wake must never fall back to an unvalidated local capture.
+	wake?: boolean;
+	wakeValid?(): boolean;
 	onStateChange(state: VoiceSessionState): void;
 	// What records when the listener cannot be reached: the session's own capture,
 	// exactly as it worked before the listener existed.
@@ -612,6 +616,7 @@ export interface SessionListenerLink {
 	ensure(): Promise<boolean>;
 	// Optional for injected links; production updates the joined registration.
 	updateVoice?(voiceOn: boolean): void;
+	cancelWake?(): void;
 	dictate(options: ListenerDictationOptions): SessionDictation;
 	close(): void;
 }
@@ -631,7 +636,7 @@ export interface SessionListenerLinkOptions {
 	// The listener telling this session about its own voice: on, because it was
 	// woken by voice (the frame says so) or because another session turned it on,
 	// and off when voice off reached every session (S7, L10).
-	onVoice?(command: ListenerCommand, wake: boolean): void;
+	onVoice?(command: ListenerCommand, wake: boolean, awake: boolean): void;
 }
 
 // One connection per session carries both roles: it registers the pane that the
@@ -656,7 +661,7 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 	const route = (frame: ListenerFrame): void => {
 		if (handler?.(frame)) return;
 		if (frame.type === "command") {
-			options.onVoice?.(frame.command, frame.wake === true);
+			options.onVoice?.(frame.command, frame.wake === true, client?.listenerState !== "asleep");
 			return;
 		}
 		// No capture of this session asked for it: the focus sent it here (S6).
@@ -717,6 +722,13 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 			}
 		})();
 		return pending.promise;
+	};
+
+	// A declined wake uses the existing cancel request on the same session link.
+	const cancelWake = (): void => {
+		// A wake can share the welcome's socket chunk, before connect() marks the
+		// client joined. Its hello was already accepted, so cancel is safe now.
+		if (client) void client.request({ type: "cancel" }).catch(() => {});
 	};
 
 	const dictate = (request: ListenerDictationOptions): SessionDictation => {
@@ -802,6 +814,10 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 					const joined = await joiningPromise;
 					waitingForJoin = undefined;
 					if (cancelled) return;
+					if (request.wake && (!joined || !client || !request.wakeValid?.())) {
+						cancelWake();
+						throw new VoiceSessionError("cancelled");
+					}
 					if (!joined) return local();
 					const active = client;
 					if (!active) return local();
@@ -814,7 +830,10 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 						// gone, or one that answered and refused. A timeout may still be owned by
 						// the listener, so it is asked to let go and the start fails instead.
 						if (cancelled) return;
-						if (!active.connected || !(error instanceof ListenerTimeoutError)) return local();
+						if (!active.connected || !(error instanceof ListenerTimeoutError)) {
+							if (request.wake) throw new VoiceSessionError("cancelled");
+							return local();
+						}
 						void active.request({ type: "cancel" }).catch(() => {});
 						throw new VoiceSessionError("timeout");
 					}
@@ -849,6 +868,7 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 				cancelled = true;
 				if (fallback) return fallback.cancel();
 				if (settled || !requested) {
+					if (request.wake && !requested) cancelWake();
 					retireJoin(waitingForJoin);
 					settle({ error: new VoiceSessionError("cancelled") });
 					return;
@@ -864,6 +884,7 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 
 	return {
 		ensure,
+		cancelWake,
 		updateVoice: (voiceOn) => {
 			if (joining) {
 				joining.allowStart = voiceOn;

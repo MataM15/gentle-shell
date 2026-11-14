@@ -411,6 +411,20 @@ test("herdr agent list is read once per decision and a changed shape focuses not
 	assert.deepEqual(binary, ["/opt/herdr"]);
 });
 
+test("T19-R1: the wake recheck bypasses a still-valid herdr focus cache", async () => {
+	let focused = "w1:p1";
+	let calls = 0;
+	const focus = createHerdrFocus({
+		env: {}, now: () => 0, ttlMs: 300,
+		run: async () => { calls++; return JSON.stringify({ result: { agents: [{ pane_id: focused, focused: true }] } }); },
+	});
+	assert.deepEqual(await focus.focusedPaneId(), { focused: "w1:p1" });
+	focused = "w1:p2";
+	assert.deepEqual(await focus.focusedPaneId(), { focused: "w1:p1" }, "ordinary callers keep the cache");
+	assert.deepEqual(await focus.focusedPaneId({ fresh: true }), { focused: "w1:p2" });
+	assert.equal(calls, 2);
+});
+
 test("a listener with no client exits after the idle window and takes its files with it", async () => {
 	const dir = scratch();
 	const started = await startListener(dir, { idleMs: 40 });
@@ -2198,6 +2212,101 @@ test("awake voice-on opens a conversation only for the focused voice-on session 
 	await awaitFrame(focused, (frame) => "id" in frame && frame.id === "s");
 	assert.deepEqual(framesOf(focused, "transcript"), [{ type: "transcript", text: "seguí por favor" }]);
 	assert.deepEqual(framesOf(other, "transcript"), []);
+});
+
+test("T19-R1/R2: commands stay audible while an awake wake prepares, without replacing its reservation (S14)", async (t) => {
+	const spot = fakeSpotting();
+	const capture = fakeCapture();
+	const started = await startListener(scratch(), {
+		keyword: keywordOption(), spot: spot.factory, dictation: capture.factory, cues: cuePlayer(),
+		focus: { focusedPaneId: async () => ({ focused: "w1:p1" }) },
+	});
+	t.after(() => started.listener.close());
+	const owner = await started.client();
+	const reader = await started.client();
+	owner.hello("s-1", "w1:p1", true);
+	reader.hello("s-2", "w1:p2", true, "reading");
+	await waitFor(() => framesOf(owner, "welcome").length === 1 && framesOf(reader, "welcome").length === 1 && spot.starts === 1);
+	spot.hearing("voice-on");
+	await awaitFrame(owner, (frame) => frame.type === "command" && frame.wake === true);
+	await waitFor(() => spot.starts === 2, 500);
+	spot.hearing("voice-on");
+	await waitFor(() => started.events.some((entry) => entry.event === "kws.hit" && entry.fields?.reason === "ignored:stale"));
+	await waitFor(() => spot.starts === 3);
+	assert.equal(framesOf(owner, "command").length, 1, "a repeated hit does not replace the first wake");
+	reader.send({ type: "read-begin", id: "r", readingId: "reply", chars: 10 });
+	assert.deepEqual(await awaitFrame(reader, (frame) => "id" in frame && frame.id === "r"), { type: "busy", id: "r", reason: "capture", holder: "s-1" });
+	spot.hearing("voice-off");
+	await awaitFrame(owner, (frame) => frame.type === "command" && frame.command === "voice-off");
+	assert.ok(started.events.some((entry) => entry.event === "wake.dropped" && entry.fields?.reason === "ignored:voice-off"));
+	owner.send({ type: "cancel", id: "c" });
+	await awaitFrame(owner, (frame) => "id" in frame && frame.id === "c");
+	await waitFor(() => spot.starts === 4);
+	assert.equal(started.listener.state, "asleep");
+	assert.deepEqual(capture.calls, []);
+	assert.deepEqual(cueLog(started.events), []);
+});
+
+test("T19-R1: an off-on change during the fresh focus check cannot revive the accepted wake", async (t) => {
+	let release!: () => void;
+	let checks = 0;
+	const gate = new Promise<void>((resolve) => { release = resolve; });
+	const spot = fakeSpotting();
+	const capture = fakeCapture();
+	const started = await startListener(scratch(), {
+		keyword: keywordOption(), spot: spot.factory, dictation: capture.factory, cues: cuePlayer(),
+		focus: { focusedPaneId: async () => { if (++checks > 1) await gate; return { focused: "w1:p1" }; } },
+	});
+	t.after(() => { release(); return started.listener.close(); });
+	const client = await started.client();
+	client.hello("s-1", "w1:p1", true);
+	await waitFor(() => framesOf(client, "welcome").length === 1 && spot.starts === 1);
+	spot.hearing("voice-on");
+	await awaitFrame(client, (frame) => frame.type === "command" && frame.wake === true);
+	client.send({ type: "dictate", id: "d", mode: "conversation" });
+	await waitFor(() => checks === 2);
+	await sendSessionVoice(client, false);
+	await sendSessionVoice(client, true);
+	release();
+	assert.equal((await awaitFrame(client, (frame) => "id" in frame && frame.id === "d")).type, "ok");
+	assert.deepEqual(framesOf(client, "capture"), [{ type: "capture", phase: "cancelled" }]);
+	assert.ok(started.events.some((entry) => entry.event === "wake.dropped" && entry.fields?.reason === "ignored:voice-off"));
+	assert.deepEqual(capture.calls, []);
+	assert.deepEqual(cueLog(started.events), []);
+	assert.deepEqual(framesOf(client, "transcript"), []);
+});
+
+test("T19-R2: cancelling a wake during a pending focus check releases a different session's reading", async (t) => {
+	let release!: () => void;
+	let checks = 0;
+	const gate = new Promise<void>((resolve) => { release = resolve; });
+	const spot = fakeSpotting();
+	const capture = fakeCapture();
+	const started = await startListener(scratch(), {
+		keyword: keywordOption(), spot: spot.factory, dictation: capture.factory, cues: cuePlayer(),
+		focus: { focusedPaneId: async () => { if (++checks > 1) await gate; return { focused: "w1:p1" }; } },
+	});
+	t.after(() => { release(); return started.listener.close(); });
+	const owner = await started.client();
+	const reader = await started.client();
+	owner.hello("s-1", "w1:p1", true);
+	reader.hello("s-2", "w1:p2", true, "reading");
+	await waitFor(() => framesOf(owner, "welcome").length === 1 && framesOf(reader, "welcome").length === 1 && spot.starts === 1);
+	spot.hearing("voice-on");
+	await awaitFrame(owner, (frame) => frame.type === "command" && frame.wake === true);
+	reader.send({ type: "read-begin", id: "r1", readingId: "reply", chars: 10 });
+	assert.deepEqual(await awaitFrame(reader, (frame) => "id" in frame && frame.id === "r1"), { type: "busy", id: "r1", reason: "capture", holder: "s-1" });
+	owner.send({ type: "dictate", id: "d", mode: "conversation" });
+	await waitFor(() => checks === 2);
+	owner.send({ type: "cancel", id: "c" });
+	assert.equal((await awaitFrame(owner, (frame) => "id" in frame && frame.id === "c")).type, "ok");
+	reader.send({ type: "read-begin", id: "r2", readingId: "reply", chars: 10 });
+	assert.equal((await awaitFrame(reader, (frame) => "id" in frame && frame.id === "r2")).type, "granted", "a cancelled focus lookup cannot reserve the microphone indefinitely");
+	release();
+	assert.equal((await awaitFrame(owner, (frame) => "id" in frame && frame.id === "d")).type, "ok");
+	assert.deepEqual(capture.calls, []);
+	assert.deepEqual(cueLog(started.events), []);
+	assert.equal(started.listener.readingSession, "s-2");
 });
 
 test("awake voice-on with no focused voice-on session is ignored without changing state (S15)", async (t) => {
