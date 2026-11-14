@@ -3,13 +3,13 @@
   "chosen": "01-sobre-el-cuadro.html",
   "handoffs": {
     "01-sobre-el-cuadro.html": {
-      "status": "in_progress",
+      "status": "implemented",
       "queued": false,
       "sentAt": "2026-11-14T03:05:42.069Z",
       "startedAt": "2026-11-14T03:06:16.997Z",
-      "implementedAt": null,
+      "implementedAt": "2026-11-14T05:50:18.061Z",
       "feature": "odd/tasks/voice-control.md",
-      "note": "Elegida por el owner. Implementación en dos partes: render en Gentle Shell (visual, Sonnet 5.5) y datos de voz hacia la sesión (Terra), después se retira la ventana de Windows."
+      "note": "Implementado en Gentle Shell (0ff40e5d9 render, ca942e7d4 datos y retiro de la ventana de Windows). Es una TUI, no hay URL de preview; verificado en una Pi aislada en tmux. Límite: el chip de idioma muestra ES hasta Whisper."
     }
   }
 }

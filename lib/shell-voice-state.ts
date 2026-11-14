@@ -66,11 +66,15 @@ export function createVoiceReceiver(events: { on(name: string, listener: (value:
  const model = (): VoiceBubbleModel => {
   const view = display?.sessionId === currentSession() ? display : undefined;
   const local = current();
+  const localState = local === 'transcribing' ? 'transcribing' : local ? 'listening' : undefined;
+  // This session's capture is authoritative, even if a listener snapshot is
+  // late or describes another state. Only matching snapshots supply its wave.
+  if (localState && view?.snapshot.state !== localState) return { state: localState, levels: [], language: view?.snapshot.language ?? 'es', englishMode: false };
   if (view && view.snapshot.state !== 'off') return {
    state: view.snapshot.state, levels: [...view.levels], language: view.snapshot.language, englishMode: false,
    ...(view.snapshot.label === undefined ? {} : { session: view.snapshot.label }),
   };
-  return { state: local === 'transcribing' ? 'transcribing' : local ? 'listening' : 'off', levels: [], language: view?.snapshot.language ?? 'es', englishMode: false };
+  return { state: localState ?? 'off', levels: [], language: view?.snapshot.language ?? 'es', englishMode: false };
  };
  return {
   current, model,

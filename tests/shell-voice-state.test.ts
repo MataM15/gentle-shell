@@ -57,6 +57,26 @@ test('display snapshots and levels build a bounded, normalized session bubble wi
  session='two'; assert.equal(receiver.model().state,'off', 'replacement cannot inherit the old session');
 });
 
+test('T21-R1: this session capture takes precedence over every listener snapshot', t => {
+ const listeners=new Map<string,(value:unknown)=>void>();
+ const events={on:(name:string,fn:(value:unknown)=>void)=>{listeners.set(name,fn);return ()=>listeners.delete(name);}};
+ const receiver=createVoiceReceiver(events,()=> 'one',()=>{});
+ t.after(()=>receiver.dispose());
+ const state=(state:string)=>listeners.get('gentle-ai:voice-state')?.({schema:'gentle-pi.voice-state/v1',sessionId:'one',state});
+ const display=(state:string)=>listeners.get('gentle-ai:voice-display')?.({schema:'gentle-pi.voice-display/v1',sessionId:'one',state,language:'en',label:'repo'});
+ const level=()=>listeners.get('gentle-ai:voice-level')?.({schema:'gentle-pi.voice-level/v1',sessionId:'one',source:'listening',rms:0.016});
+ for (const remote of ['asleep','off','reading','transcribing']) {
+  display(remote); state('listening');
+  assert.deepEqual(receiver.model(),{state:'listening',levels:[],language:'en',englishMode:false}, `${remote} cannot hide this session recording`);
+  state('transcribing');
+  assert.deepEqual(receiver.model(),{state:'transcribing',levels:[],language:'en',englishMode:false,...(remote === 'transcribing' ? {session:'repo'} : {})}, `${remote} cannot override this session transcribing`);
+  state('idle');
+  assert.equal(receiver.model().state,remote, 'a live listener snapshot drives the bubble again when capture ends');
+ }
+ display('listening'); state('listening'); level();
+ assert.deepEqual(receiver.model(),{state:'listening',levels:[1],language:'en',englishMode:false,session:'repo'}, 'matching live listener data keeps its level and label');
+});
+
 test('accept only exact schema and active session, including idle clear', () => {
  const event={schema:'gentle-pi.voice-state/v1',sessionId:'here',state:'listening'};
  assert.equal(acceptedVoiceState('here',event),'listening');

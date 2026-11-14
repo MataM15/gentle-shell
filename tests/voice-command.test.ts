@@ -12,6 +12,7 @@ import { VoiceSessionError, type VoiceSessionState, type VoiceTranscript } from 
 import { createReadingTurn, CONVERSATION_ENDPOINT, HELD_REPLY_POLL_MS, HELD_REPLY_STALE_MS, VOICE_COMMAND_NAME, type VoiceCommandDeps, type VoiceDictation } from "../lib/voice-command.ts";
 import { listenerPaths, VoiceListener, type ListenerDictation, type ListenerDictationRequest, type ListenerSpotFactory } from "../lib/voice-listener.ts";
 import { createSessionListenerLink, VoiceListenerClient } from "../lib/voice-listener-client.ts";
+import { createVoiceReceiver } from "../lib/shell-voice-state.ts";
 import { encodeListenerFrame } from "../lib/voice-listener-protocol.ts";
 import type { PaneFocus } from "../lib/voice-presence.ts";
 import type { CuePlayer } from "../lib/voice-cues.ts";
@@ -1240,6 +1241,54 @@ test("a new session id on the same context replaces the old listener registratio
 		assert.equal(pi.counts.sends, 0);
 	} finally {
 		await pi.fire("session_shutdown", ui.ctx);
+		await server.close();
+		rmSync(home, { recursive: true, force: true });
+	}
+});
+
+test("T21-R1: closing a passive asleep display before offline local capture clears it and shows the microphone", async () => {
+	const home = mkdtempSync(join(tmpdir(), "voice-command-passive-fallback-"));
+	const dir = join(home, "voice");
+	const server = new VoiceListener({ dir, dictation: () => { throw new Error("unexpected listener capture"); } });
+	await server.listen();
+	const h = harness({ installed: true, env: { HERDR_PANE_ID: "w1:p1", GENTLE_PI_CONFIG_HOME: home } });
+	delete h.deps.createSession;
+	const link = createSessionListenerLink({ dir, waitMs: 0, probe: async () => false, start: () => {}, session: () => ({ sessionId: "session-alpha", paneId: "w1:p1", voiceOn: false }) });
+	let local: FakeSession | undefined;
+	h.deps.listener = {
+		ensure: () => link.ensure(), close: () => link.close(),
+		dictate: request => link.dictate({ ...request, fallback: () => (local = Object.assign(new FakeSession(request.onStateChange), { owner: "session" as const })) }),
+	};
+	const pi = register(h);
+	const ui = fakeContext();
+	const observers = new Map<string, (value: unknown) => void>();
+	const receiver = createVoiceReceiver({ on: (name, fn) => { observers.set(name, fn); return () => observers.delete(name); } }, () => "session-alpha", () => {});
+	const bus = pi.pi.events as unknown as { emit(name: string, value: unknown): void };
+	const emit = bus.emit;
+	bus.emit = (name, value) => { emit(name, value); observers.get(name)?.(value); };
+	const displays = () => pi.emitted.filter(event => event.channel === "gentle-ai:voice-display").map(event => event.data as { state: string });
+	try {
+		await pi.fire("session_start", ui.ctx);
+		await until(() => receiver.model().state === "asleep");
+		assert.equal(server.clientCount, 1, "a voice-off session passively subscribes");
+		const done = press(pi, ui);
+		await until(() => local !== undefined);
+		assert.equal(displays().at(-1)?.state, "off", "retiring the passive socket clears its snapshot before fallback");
+		local!.started.resolve();
+		await until(() => local!.state === "recording");
+		assert.equal(receiver.model().state, "listening", "the recording microphone remains visible");
+		assert.deepEqual(h.cues.filter(name => name === "open" || name === "close"), ["open"]);
+		await press(pi, ui);
+		await until(() => local!.calls.includes("stop"));
+		local!.result.resolve({ text: "hola local", truncated: false });
+		await done;
+		assert.equal(receiver.model().state, "off", "the retired asleep snapshot cannot reappear when capture ends");
+		assert.equal(ui.editor(), "draft: hola local");
+		assert.deepEqual(h.cues.filter(name => name === "open" || name === "close"), ["open", "close"]);
+		assert.deepEqual(pi.sent, []);
+	} finally {
+		await pi.fire("session_shutdown", ui.ctx);
+		receiver.dispose();
 		await server.close();
 		rmSync(home, { recursive: true, force: true });
 	}
@@ -2878,6 +2927,26 @@ test("the real listener sends this session's reading and its played levels to th
   await f.reached(()=>display().at(-1)?.state==='off');
   assert.deepEqual(f.pi.sent,[]);
  } finally { await f.close(); }
+});
+
+test("T21-R1: reloading the same session immediately clears its retired reading snapshot", async () => {
+	const f = await awakeConversationFixture(false);
+	const observers = new Map<string, (value: unknown) => void>();
+	const receiver = createVoiceReceiver({ on: (name, fn) => { observers.set(name, fn); return () => observers.delete(name); } }, () => "session-alpha", () => {});
+	const bus = f.pi.pi.events as unknown as { emit(name: string, value: unknown): void };
+	const emit = bus.emit;
+	bus.emit = (name, value) => { emit(name, value); observers.get(name)?.(value); };
+	try {
+		await settleReply(f.pi, f.ui.ctx, "Una respuesta de la sesión anterior.");
+		await f.reached(() => f.readings.length === 1 && receiver.model().state === "reading");
+		await f.pi.fire("session_start", f.ui.ctx);
+		assert.equal(f.readings[0]!.options.signal.aborted, true, "reload cancels the old reading");
+		assert.equal(receiver.model().state, "off", "the same session id cannot inherit the retired snapshot");
+		assert.deepEqual(f.pi.sent, []);
+	} finally {
+		receiver.dispose();
+		await f.close();
+	}
 });
 
 // Both wakes share the unresolved install check, but belong to different links.

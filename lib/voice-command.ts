@@ -513,8 +513,9 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	const adoptedPassives = new WeakMap<VoiceListenerClient, SessionListenerLink>();
 	const closePassive = () => {
 		const client = passiveClient;
-		passiveClient = undefined;
+		// Keep the callback owned until close publishes its display withdrawal.
 		client?.close();
+		if (passiveClient === client) passiveClient = undefined;
 	};
 	const receiveVoice = (command: "voice-on" | "voice-off", wake: boolean, awake: boolean, wakeLink?: SessionListenerLink) => {
 		const ctx = sessionCtx;
@@ -1875,6 +1876,9 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		}
 		const target = ctx ?? statePublisherCtx;
 		setVoiceFooter(target, () => true, undefined);
+		// A link's callback may already be stale during session replacement, but
+		// its last snapshot must not survive a reload with the same session id.
+		if (listenerDisplayState !== "off") statePublisher?.publishDisplay({ state: "off", language: "es" });
 		// Nothing was ever published for this session: no display to clear.
 		if (statePublisher) publishVoiceState(target, "idle");
 		statePublisher?.close();

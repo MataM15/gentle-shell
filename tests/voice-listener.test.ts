@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { createConnection, type Socket } from "node:net";
+import { createConnection, Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import test, { after } from "node:test";
@@ -1246,26 +1246,79 @@ test("a disconnected display never breaks another session's capture", async (t) 
 	assert.deepEqual(cueLog(started.events).map(cue => cue?.name), ["open", "close"]);
 });
 
-test("a paused owning display never holds up a capture or its transcript", async (t) => {
-	const capture = fakeCapture({ text: "sigue" });
-	const started = await startListener(scratch(), { dictation: capture.factory, focus: { focusedPaneId: async () => ({ focused: "w1:p1" }) } });
+test("T21-R2: a backpressured display drops levels, coalesces snapshots and never holds the capture", async (t) => {
+	const capture = manualCapture();
+	let clock = 0;
+	let saturated = false;
+	let armed = false;
+	let backpressureReturn: boolean | undefined;
+	let serverDisplay: Socket | undefined;
+	const writes: Array<{ frame: ListenerFrame; saturated: boolean }> = [];
+	// Intercept the public server connection event and control only the first
+	// accepted socket. All actual frames still cross the real Unix socket.
+	const emit = Server.prototype.emit;
+	Server.prototype.emit = function (event: string | symbol, ...args: unknown[]) {
+		if (event === "connection" && !serverDisplay) {
+			const socket = args[0] as Socket;
+			serverDisplay = socket;
+			const write = socket.write.bind(socket);
+			Object.defineProperty(socket, "writableNeedDrain", { configurable: true, get: () => saturated });
+			socket.write = ((chunk: string) => {
+				const frame = parseListenerFrameLine(chunk);
+				if (frame?.type === "display" || frame?.type === "level") writes.push({ frame, saturated });
+				const result = write(chunk);
+				if (armed && frame?.type === "display" && frame.state === "listening") {
+					armed = false;
+					saturated = true;
+					backpressureReturn = false;
+					return false;
+				}
+				return result;
+			}) as typeof socket.write;
+		}
+		return emit.call(this, event, ...args);
+	} as typeof Server.prototype.emit;
+	t.after(() => { Server.prototype.emit = emit; });
+	const started = await startListener(scratch(), { dictation: capture.factory, now: () => clock, focus: { focusedPaneId: async () => ({ focused: "w1:p1" }) } });
 	t.after(() => started.listener.close());
 	const display = await started.client(); const asker = await started.client();
+	Server.prototype.emit = emit;
 	display.hello("s-1", "w1:p1"); asker.hello("s-1", "w1:p1", true, "reading");
 	await awaitFrame(display, frame => frame.type === "welcome");
 	await awaitFrame(asker, frame => frame.type === "welcome");
 	await watchDisplay(display);
-	display.socket.pause();
+	armed = true;
 	asker.send({ type: "dictate", mode: "conversation" });
+	await waitFor(() => capture.requests.length === 1);
+	capture.state("recording");
 	await awaitFrame(asker, frame => frame.type === "capture" && frame.phase === "recording");
-	capture.requests.at(-1)!.onLevel(0.02);
+	assert.equal(backpressureReturn, false, "the server-side write really returned false");
+	assert.equal(serverDisplay!.writableNeedDrain, true, "the server-side buffer is saturated");
+	capture.requests[0]!.onLevel(0.02);
+	clock = 50;
+	capture.requests[0]!.onLevel(0.03);
 	asker.send({ type: "stop" });
+	await awaitFrame(asker, frame => frame.type === "capture" && frame.phase === "transcribing");
 	assert.deepEqual(await awaitFrame(asker, frame => frame.type === "capture" && frame.phase === "delivered"), { type: "capture", phase: "delivered" });
-	display.socket.resume();
 	await awaitFrame(display, frame => frame.type === "transcript");
-	assert.deepEqual(framesOf(display, "transcript"), [{ type: "transcript", text: "sigue" }]);
-	assert.ok(displayStates(display).includes("listening"));
-	assert.deepEqual(levelFrames(display).map(frame => frame.type === "level" ? frame.rms : undefined), [0.02]);
+	assert.deepEqual(framesOf(display, "transcript"), [{ type: "transcript", text: "hola" }], "capture and transcript finish while saturated");
+	asker.send({ type: "sleep", id: "sleep-after-capture" });
+	await awaitFrame(asker, frame => "id" in frame && frame.id === "sleep-after-capture");
+	assert.equal(started.listener.state, "asleep", "the latest snapshot differs from the first pending off snapshot");
+	assert.equal(serverDisplay!.writableNeedDrain, true);
+	assert.deepEqual(writes.filter(entry => entry.saturated), [], "neither state nor level frames are written while saturated");
+	assert.deepEqual(levelFrames(display), [], "expendable levels are dropped, not buffered");
+	await waitFor(() => displayStates(display).includes("listening"));
+	assert.deepEqual(displayStates(display), ["off", "listening"]);
+	// While blocked: off, transcribing, off, then asleep. A first-only
+	// queue would flush off; replacement must flush only the latest, asleep.
+	const beforeDrain = writes.length;
+	saturated = false;
+	serverDisplay!.emit("drain");
+	await waitFor(() => displayFrames(display).length === 3);
+	assert.deepEqual(displayStates(display), ["off", "listening", "asleep"], "at most one pending snapshot is delivered, and it is the newest");
+	assert.deepEqual(writes.slice(beforeDrain).map(entry => entry.frame), [{ type: "display", state: "asleep", language: "es" }]);
+	assert.deepEqual(levelFrames(display), []);
 	display.socket.destroy();
 });
 

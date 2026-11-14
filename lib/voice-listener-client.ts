@@ -125,6 +125,8 @@ export class VoiceListenerClient {
 	private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 	private currentState: ListenerState = "asleep";
 	private updatedVoiceOn: boolean | undefined;
+	private displayPublished = false;
+	private socketRetired = false;
 	// The listener replaced this connection with a newer one of its own role. It is
 	// closed for good: reconnecting would evict that newer one and the two would
 	// take turns for ever, which is what one session's reload used to do (S6).
@@ -139,7 +141,7 @@ export class VoiceListenerClient {
 	// Joined means the hello was answered: a socket that is still dialing is not
 	// connected, so a caller never sends a request into a half-open connection.
 	get connected(): boolean {
-		return this.joined && Boolean(this.socket && !this.socket.destroyed);
+		return this.joined && !this.socketRetired && Boolean(this.socket && !this.socket.destroyed);
 	}
 
 	get listenerState(): ListenerState {
@@ -148,7 +150,7 @@ export class VoiceListenerClient {
 
 	// Opaque identity of the current socket, including before welcome completes.
 	get connectionToken(): object | undefined {
-		return !this.closed && !this.replaced && this.socket && !this.socket.destroyed ? this.socket : undefined;
+		return !this.closed && !this.replaced && !this.socketRetired && this.socket && !this.socket.destroyed ? this.socket : undefined;
 	}
 
 	onFrame(handler: (frame: ListenerFrame) => void): () => void {
@@ -181,11 +183,22 @@ export class VoiceListenerClient {
 		// joins again with a new one instead of evicting its own replacement.
 		if (this.replaced) throw new Error("this voice listener connection was replaced");
 		if (this.closed) throw new Error("voice listener client closed");
+		// A new dial retires the old socket immediately, not when its eventual
+		// close event arrives. Its callbacks must not affect the new connection.
+		const old = this.socket;
+		this.socket = undefined;
+		this.joined = false;
+		if (old) {
+			this.failPending(new Error("the voice listener connection was replaced"));
+			this.withdrawDisplay();
+			old.destroy();
+		}
 		const socket = (this.options.dial ?? createConnection)(this.paths.socket);
 		socket.setEncoding("utf8");
 		this.buffered = "";
 		this.socket = socket;
-		socket.on("data", (chunk: string) => this.receive(chunk));
+		this.socketRetired = false;
+		socket.on("data", (chunk: string) => { if (this.socket === socket && !this.closed && !this.socketRetired) this.receive(chunk); });
 		socket.on("error", () => {});
 		socket.on("close", () => this.disconnected(socket));
 		await new Promise<void>((resolve, reject) => {
@@ -202,6 +215,9 @@ export class VoiceListenerClient {
 		if (!session) throw new Error("voice listener session ended");
 		const { sessionId, paneId, label, voiceOn } = session;
 		const frame = await this.request({ type: "hello", proto: 1, sessionId, paneId, label, voiceOn, ...(this.options.role ? { role: this.options.role } : {}) });
+		// A replacement can follow welcome in the same chunk, before this await
+		// resumes. That welcome no longer establishes a usable connection.
+		if (this.closed || this.socket !== socket || this.socketRetired) throw new Error("voice listener connection closed or replaced");
 		if (frame.type !== "welcome") throw new Error("the voice listener refused hello");
 		this.joined = true;
 		this.attempt = 0;
@@ -215,7 +231,7 @@ export class VoiceListenerClient {
 
 	request(frame: ListenerRequest, timeoutMs = LISTENER_REQUEST_TIMEOUT_MS): Promise<ListenerFrame> {
 		const socket = this.socket;
-		if (!socket || socket.destroyed) return Promise.reject(new Error("voice listener is not connected"));
+		if (!socket || socket.destroyed || this.closed || this.socketRetired) return Promise.reject(new Error("voice listener is not connected"));
 		const id = String(this.nextId++);
 		const answered = new Promise<ListenerFrame>((resolve, reject) => {
 			const timer = setTimeout(() => {
@@ -231,13 +247,16 @@ export class VoiceListenerClient {
 	}
 
 	close(): void {
+		if (this.closed) return;
 		this.closed = true;
 		this.joined = false;
+		const socket = this.socket;
+		this.socket = undefined;
 		if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
 		this.reconnectTimer = undefined;
 		this.failPending(new Error("voice listener client closed"));
-		this.socket?.destroy();
-		this.socket = undefined;
+		this.withdrawDisplay();
+		socket?.destroy();
 	}
 
 	private receive(chunk: string): void {
@@ -249,11 +268,17 @@ export class VoiceListenerClient {
 			if (line.length > LISTENER_MAX_LINE) continue;
 			const frame = parseListenerFrameLine(line);
 			if (frame) this.dispatch(frame);
+			if (this.socketRetired || this.closed) break;
 		}
 		if (this.buffered.length > LISTENER_MAX_LINE) this.buffered = "";
 	}
 
-	private dispatch(frame: ListenerFrame): void {
+	private withdrawDisplay(): void {
+		if (!this.displayPublished) return;
+		this.dispatch({ type: "display", state: "off", language: "es" }, true);
+	}
+
+	private dispatch(frame: ListenerFrame, withdrawing = false): void {
 		const id = "id" in frame ? frame.id : undefined;
 		if (id !== undefined) {
 			const pending = this.pending.get(id);
@@ -267,7 +292,12 @@ export class VoiceListenerClient {
 		// Welcome and a newer state can arrive in one socket chunk. Apply them in
 		// wire order instead of overwriting the newer state after await resumes.
 		if (frame.type === "welcome" || frame.type === "state") this.currentState = frame.state;
-		if (frame.type === "bye" && frame.reason === "replaced") this.replaced = true;
+		if (frame.type === "display") this.displayPublished = !withdrawing;
+		if (frame.type === "bye") {
+			this.socketRetired = true;
+			if (frame.reason === "replaced") this.replaced = true;
+			this.withdrawDisplay();
+		}
 		for (const listener of [...this.listeners]) {
 			try { listener(frame); } catch { /* a display or observer cannot break voice */ }
 		}
@@ -278,7 +308,7 @@ export class VoiceListenerClient {
 		this.socket = undefined;
 		this.joined = false;
 		this.failPending(new Error("the voice listener connection closed"));
-		if (this.options.display) this.dispatch({ type: "display", state: "off", language: "es" });
+		this.withdrawDisplay();
 		if (this.replaced) return;
 		this.scheduleReconnect();
 	}
@@ -952,10 +982,10 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 		close: () => {
 			retireJoin(joining);
 			wakeIdentity = undefined;
-			detachAdopted?.();
-			detachAdopted = undefined;
 			handler = undefined;
 			client?.close();
+			detachAdopted?.();
+			detachAdopted = undefined;
 			client = undefined;
 		},
 	};

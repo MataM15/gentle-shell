@@ -995,6 +995,96 @@ test("a display client subscribes after welcome without waiting on the display",
  } finally {client.close();}
 });
 
+class DisplayTestSocket extends EventEmitter {
+	destroyed = false;
+	private readonly replaceOnWelcome: boolean;
+	constructor(replaceOnWelcome = false) { super(); this.replaceOnWelcome = replaceOnWelcome; }
+	setEncoding() {}
+	write(chunk: string) {
+		const frame = JSON.parse(chunk) as { type: string; id?: string };
+		if (frame.type === "hello") queueMicrotask(() => this.emit("data", encodeListenerFrame({ type: "welcome", id: frame.id, listenerPid: 1, proto: 1, state: "asleep" }) + (this.replaceOnWelcome ? encodeListenerFrame({ type: "bye", reason: "replaced" }) : "")));
+		return true;
+	}
+	destroy() { this.destroyed = true; return this; }
+}
+
+test("T21-R1: an explicitly closed display socket immediately withdraws its snapshot", async () => {
+	const socket = new DisplayTestSocket();
+	const states: string[] = [];
+	const client = new VoiceListenerClient({ dir: scratch(), session: session("s-1", false), display: true, dial: () => socket as unknown as Socket, onFrame: frame => { if (frame.type === "display") states.push(frame.state); } });
+	try {
+		const joining = client.connect(); queueMicrotask(() => socket.emit("connect")); await joining;
+		socket.emit("data", encodeListenerFrame({ type: "display", state: "asleep", language: "en" }));
+		assert.deepEqual(states, ["asleep"]);
+		client.close();
+		assert.deepEqual(states, ["asleep", "off"], "explicit close clears before any close event");
+		socket.emit("data", encodeListenerFrame({ type: "display", state: "reading", language: "en" }));
+		socket.emit("close");
+		assert.deepEqual(states, ["asleep", "off"], "retired data and close cannot resurrect or clear again");
+	} finally { client.close(); }
+});
+
+test("T21-R1: closing an adopted passive link withdraws its display before detaching", async () => {
+	const socket = new DisplayTestSocket();
+	const client = new VoiceListenerClient({ dir: scratch(), session: session("s-1"), display: true, dial: () => socket as unknown as Socket });
+	const states: string[] = [];
+	const link = createSessionListenerLink({ dir: scratch(), session: () => session("s-1"), adoptedClient: client, onDisplay: frame => { if (frame.type === "display") states.push(frame.state); } });
+	try {
+		const joining = client.connect(); queueMicrotask(() => socket.emit("connect")); await joining;
+		socket.emit("data", encodeListenerFrame({ type: "display", state: "asleep", language: "es" }));
+		link.close();
+		assert.deepEqual(states, ["asleep", "off"]);
+	} finally { link.close(); }
+});
+
+test("T21-R1: socket replacement clears its snapshot and rejects stale socket data", async () => {
+	const sockets = [new DisplayTestSocket(), new DisplayTestSocket()];
+	let next = 0;
+	const states: string[] = [];
+	const client = new VoiceListenerClient({ dir: scratch(), session: session("s-1"), display: true, dial: () => sockets[next++] as unknown as Socket, onFrame: frame => { if (frame.type === "display") states.push(frame.state); } });
+	try {
+		const first = client.connect(); queueMicrotask(() => sockets[0]!.emit("connect")); await first;
+		sockets[0]!.emit("data", encodeListenerFrame({ type: "display", state: "asleep", language: "es" }));
+		const second = client.connect();
+		assert.deepEqual(states, ["asleep", "off"], "replacement withdraws the old snapshot immediately");
+		queueMicrotask(() => sockets[1]!.emit("connect")); await second;
+		sockets[1]!.emit("data", encodeListenerFrame({ type: "display", state: "reading", language: "es" }));
+		sockets[0]!.emit("data", encodeListenerFrame({ type: "display", state: "asleep", language: "es" }));
+		sockets[0]!.emit("close");
+		assert.deepEqual(states, ["asleep", "off", "reading"], "an old socket cannot overwrite or clear the new snapshot");
+	} finally { client.close(); }
+});
+
+test("T21-R1: a replacement notice clears the snapshot before the peer closes", async () => {
+	const socket = new DisplayTestSocket();
+	const states: string[] = [];
+	const client = new VoiceListenerClient({ dir: scratch(), session: session("s-1"), display: true, dial: () => socket as unknown as Socket, onFrame: frame => { if (frame.type === "display") states.push(frame.state); } });
+	try {
+		const joining = client.connect(); queueMicrotask(() => socket.emit("connect")); await joining;
+		socket.emit("data", encodeListenerFrame({ type: "display", state: "asleep", language: "es" }));
+		socket.emit("data", encodeListenerFrame({ type: "bye", reason: "replaced" }) + encodeListenerFrame({ type: "display", state: "reading", language: "es" }));
+		assert.equal(socket.destroyed, false);
+		assert.deepEqual(states, ["asleep", "off"], "replacement invalidates the rest of the old socket's frames");
+		assert.equal(client.connected, false, "a retired socket is not connected even before close");
+		const keepAlive = setTimeout(() => {}, 100);
+		try { await assert.rejects(client.request({ type: "status" }, 20), /not connected/, "requests cannot use a retired socket"); }
+		finally { clearTimeout(keepAlive); }
+		socket.emit("close");
+		assert.deepEqual(states, ["asleep", "off"], "close does not withdraw a second time");
+	} finally { client.close(); }
+});
+
+test("T21-R1: welcome followed by replacement in one packet cannot revive the stale connection", async () => {
+	const socket = new DisplayTestSocket(true);
+	const client = new VoiceListenerClient({ dir: scratch(), session: session("s-1"), display: true, dial: () => socket as unknown as Socket });
+	try {
+		const joining = client.connect(); queueMicrotask(() => socket.emit("connect"));
+		await assert.rejects(joining, /closed|replaced/, "a stale welcome is never accepted as a live join");
+		assert.equal(client.connected, false);
+		await assert.rejects(client.request({ type: "status" }), /not connected/);
+	} finally { client.close(); }
+});
+
 test("the production listener no longer wires a Windows overlay process", () => {
  const source=readFileSync(join(import.meta.dirname,'..','scripts','voice-listener.mjs'),'utf8');
  assert.doesNotMatch(source,/voice-overlay-windows|createOverlayForEnvironment|GENTLE_PI_VOICE_OVERLAY/);
