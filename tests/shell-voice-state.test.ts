@@ -77,6 +77,27 @@ test('T21-R1: this session capture takes precedence over every listener snapshot
  assert.deepEqual(receiver.model(),{state:'listening',levels:[1],language:'en',englishMode:false,session:'repo'}, 'matching live listener data keeps its level and label');
 });
 
+// T21-R1 follow-up (L50): a capture that is still preparing has not opened the
+// microphone, so it must neither claim listening (S10) nor hide a live
+// listener snapshot such as asleep or reading.
+test('T21-R1: a preparing capture never claims listening nor hides the live snapshot', t => {
+ const listeners=new Map<string,(value:unknown)=>void>();
+ const events={on:(name:string,fn:(value:unknown)=>void)=>{listeners.set(name,fn);return ()=>listeners.delete(name);}};
+ const receiver=createVoiceReceiver(events,()=> 'one',()=>{});
+ t.after(()=>receiver.dispose());
+ const state=(state:string)=>listeners.get('gentle-ai:voice-state')?.({schema:'gentle-pi.voice-state/v1',sessionId:'one',state});
+ const display=(state:string)=>listeners.get('gentle-ai:voice-display')?.({schema:'gentle-pi.voice-display/v1',sessionId:'one',state,language:'en',label:'repo'});
+ state('preparing');
+ assert.equal(receiver.model().state,'off', 'no snapshot: preparing draws nothing until the microphone records');
+ for (const remote of ['asleep','reading']) {
+  display(remote); state('preparing');
+  assert.equal(receiver.model().state,remote, `preparing keeps the live ${remote} snapshot`);
+  state('listening');
+  assert.equal(receiver.model().state,'listening', 'recording then takes over');
+  state('idle');
+ }
+});
+
 test('accept only exact schema and active session, including idle clear', () => {
  const event={schema:'gentle-pi.voice-state/v1',sessionId:'here',state:'listening'};
  assert.equal(acceptedVoiceState('here',event),'listening');

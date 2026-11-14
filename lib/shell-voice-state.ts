@@ -66,7 +66,9 @@ export function createVoiceReceiver(events: { on(name: string, listener: (value:
  const model = (): VoiceBubbleModel => {
   const view = display?.sessionId === currentSession() ? display : undefined;
   const local = current();
-  const localState = local === 'transcribing' ? 'transcribing' : local ? 'listening' : undefined;
+  // A capture that is still preparing has not opened the microphone (S10), so
+  // it claims nothing and a live listener snapshot keeps driving the bubble.
+  const localState = local === 'transcribing' ? 'transcribing' : local === 'listening' ? 'listening' : undefined;
   // This session's capture is authoritative, even if a listener snapshot is
   // late or describes another state. Only matching snapshots supply its wave.
   if (localState && view?.snapshot.state !== localState) return { state: localState, levels: [], language: view?.snapshot.language ?? 'es', englishMode: false };
