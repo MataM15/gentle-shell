@@ -42,8 +42,10 @@ export const LISTENER_REQUEST_TIMEOUT_MS = 5_000;
 // A capture start waits for the warm worker to load its model, and a cold start
 // takes about 6.3 s: dictate gets a wait of its own, well past that.
 export const LISTENER_DICTATE_TIMEOUT_MS = 30_000;
-// 250 ms → 2 s, capped: a killed listener costs one retry, never a stuck voice.
-export const LISTENER_BACKOFF_MS = [250, 500, 1_000, 2_000] as const;
+// Two quick retries preserve restart recovery; continued failures settle at two
+// attempts a minute. A welcome alone is not proof of a stable connection.
+export const LISTENER_BACKOFF_MS = [250, 1_000, 30_000] as const;
+export const LISTENER_STABLE_MS = 60_000;
 const PROBE_INTERVAL_MS = 50;
 
 export interface ListenerSession {
@@ -123,6 +125,7 @@ export class VoiceListenerClient {
 	private joined = false;
 	private closed = false;
 	private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+	private stableTimer: ReturnType<typeof setTimeout> | undefined;
 	private currentState: ListenerState = "asleep";
 	private updatedVoiceOn: boolean | undefined;
 	private displayPublished = false;
@@ -183,9 +186,14 @@ export class VoiceListenerClient {
 		// joins again with a new one instead of evicting its own replacement.
 		if (this.replaced) throw new Error("this voice listener connection was replaced");
 		if (this.closed) throw new Error("voice listener client closed");
+		// A user-triggered rejoin may beat a scheduled retry. The timer must not
+		// later retire the socket that rejoin just established.
+		if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+		this.reconnectTimer = undefined;
 		// A new dial retires the old socket immediately, not when its eventual
 		// close event arrives. Its callbacks must not affect the new connection.
 		const old = this.socket;
+		this.clearStableTimer();
 		this.socket = undefined;
 		this.joined = false;
 		if (old) {
@@ -220,7 +228,12 @@ export class VoiceListenerClient {
 		if (this.closed || this.socket !== socket || this.socketRetired) throw new Error("voice listener connection closed or replaced");
 		if (frame.type !== "welcome") throw new Error("the voice listener refused hello");
 		this.joined = true;
-		this.attempt = 0;
+		const stableTimer = setTimeout(() => {
+			if (this.socket === socket && this.joined && !this.socketRetired) this.attempt = 0;
+			if (this.stableTimer === stableTimer) this.stableTimer = undefined;
+		}, LISTENER_STABLE_MS);
+		stableTimer.unref?.();
+		this.stableTimer = stableTimer;
 		const current = this.session();
 		if (current && current.sessionId === sessionId && current.voiceOn !== voiceOn) this.updateVoice(current.voiceOn);
 		if (this.options.display) {
@@ -250,6 +263,7 @@ export class VoiceListenerClient {
 		if (this.closed) return;
 		this.closed = true;
 		this.joined = false;
+		this.clearStableTimer();
 		const socket = this.socket;
 		this.socket = undefined;
 		if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
@@ -303,8 +317,14 @@ export class VoiceListenerClient {
 		}
 	}
 
+	private clearStableTimer(): void {
+		if (this.stableTimer) clearTimeout(this.stableTimer);
+		this.stableTimer = undefined;
+	}
+
 	private disconnected(socket: Socket): void {
 		if (this.socket !== socket) return;
+		this.clearStableTimer();
 		this.socket = undefined;
 		this.joined = false;
 		this.failPending(new Error("the voice listener connection closed"));
@@ -328,7 +348,13 @@ export class VoiceListenerClient {
 		this.attempt += 1;
 		const timer = setTimeout(() => {
 			this.reconnectTimer = undefined;
-			void this.connect().catch(() => this.scheduleReconnect());
+			const joining = this.connect();
+			const socket = this.socket;
+			void joining.catch(() => {
+				// A manual rejoin may have superseded this dial. Its failure must not
+				// schedule a retry that would replace the newer live socket.
+				if (this.socket === socket) this.scheduleReconnect();
+			});
 		}, delay);
 		timer.unref?.();
 		this.reconnectTimer = timer;

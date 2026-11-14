@@ -181,6 +181,159 @@ test("the client reconnects with backoff and keeps its session id", async () => 
 	await server.close();
 });
 
+// Exercise the production client with a deterministic socket and clock: a peer
+// can welcome a client, then disappear before the connection becomes stable.
+class ReconnectTestSocket extends EventEmitter {
+	destroyed = false;
+	private readonly hellos: Array<{ at: number; voiceOn: boolean }>;
+	constructor(hellos: Array<{ at: number; voiceOn: boolean }>) { super(); this.hellos = hellos; }
+	setEncoding() {}
+	write(chunk: string) {
+		const frame = JSON.parse(chunk) as { type: string; id?: string; voiceOn?: boolean };
+		if (frame.type === "hello") {
+			this.hellos.push({ at: Date.now(), voiceOn: frame.voiceOn === true });
+			queueMicrotask(() => this.emit("data", encodeListenerFrame({ type: "welcome", id: frame.id, listenerPid: 1, proto: 1, state: "asleep" })));
+		}
+		return true;
+	}
+	drop(bye?: "shutdown" | "replaced") {
+		if (bye) this.emit("data", encodeListenerFrame({ type: "bye", reason: bye }));
+		this.destroy();
+	}
+	destroy() {
+		if (!this.destroyed) {
+			this.destroyed = true;
+			this.emit("close");
+		}
+		return this;
+	}
+}
+
+const flushReconnect = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); };
+
+for (const bye of [undefined, "shutdown"] as const) test(`flapping ${bye ?? "unannounced"} closes back off until a minute of stability`, async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+	const hellos: Array<{ at: number; voiceOn: boolean }> = [];
+	const sockets: ReconnectTestSocket[] = [];
+	const client = new VoiceListenerClient({
+		dir: scratch(), session: session("s-1", false), display: true,
+		dial: () => {
+			const socket = new ReconnectTestSocket(hellos);
+			sockets.push(socket);
+			queueMicrotask(() => socket.emit("connect"));
+			return socket as unknown as Socket;
+		},
+	});
+	const advance = async (ms: number) => { t.mock.timers.tick(ms); await flushReconnect(); };
+	try {
+		await client.connect();
+		for (const [before, delay] of [[0, 250], [250, 1_000], [1_250, 30_000], [31_250, 30_000]] as const) {
+			sockets.at(-1)!.drop(bye);
+			const previous = hellos.length;
+			await advance(delay - 1);
+			assert.equal(hellos.length, previous, `no early retry after ${before} ms`);
+			await advance(1);
+			assert.equal(hellos.length, previous + 1);
+			assert.equal(hellos.at(-1)!.at, before + delay);
+		}
+		assert.deepEqual(hellos.map((hello) => hello.at), [0, 250, 1_250, 31_250, 61_250]);
+		assert.ok(hellos.every((hello) => hello.voiceOn === false));
+		await advance(59_999);
+		sockets.at(-1)!.drop(bye);
+		await advance(29_999);
+		assert.equal(hellos.length, 5, "less than a stable minute retains the capped delay");
+		await advance(1);
+		assert.equal(hellos.at(-1)!.at, 151_249);
+		await advance(60_000);
+		sockets.at(-1)!.drop(bye);
+		await advance(249);
+		assert.equal(hellos.length, 6);
+		await advance(1);
+		assert.equal(hellos.at(-1)!.at, 211_499, "a stable minute resets the initial retry delay");
+	} finally {
+		client.close();
+	}
+});
+
+test("an explicit rejoin cancels its pending retry and keeps the joined socket", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+	const hellos: Array<{ at: number; voiceOn: boolean }> = [];
+	const sockets: ReconnectTestSocket[] = [];
+	const client = new VoiceListenerClient({
+		dir: scratch(), session: session("s-1", true),
+		dial: () => {
+			const socket = new ReconnectTestSocket(hellos);
+			sockets.push(socket);
+			queueMicrotask(() => socket.emit("connect"));
+			return socket as unknown as Socket;
+		},
+	});
+	try {
+		await client.connect();
+		sockets[0]!.drop();
+		await client.connect(); // Alt+M can rejoin before the scheduled retry.
+		assert.equal(client.connected, true);
+		t.mock.timers.tick(250);
+		await flushReconnect();
+		assert.equal(hellos.length, 2, "the old timer cannot dial over the new socket");
+		assert.equal(sockets[1]!.destroyed, false);
+		assert.equal(client.connected, true);
+	} finally {
+		client.close();
+	}
+});
+
+test("a superseded in-flight retry cannot schedule another dial over a manual rejoin", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+	const hellos: Array<{ at: number; voiceOn: boolean }> = [];
+	const sockets: ReconnectTestSocket[] = [];
+	const client = new VoiceListenerClient({
+		dir: scratch(), session: session("s-1", true),
+		dial: () => {
+			const socket = new ReconnectTestSocket(hellos);
+			sockets.push(socket);
+			if (sockets.length !== 2) queueMicrotask(() => socket.emit("connect"));
+			return socket as unknown as Socket;
+		},
+	});
+	try {
+		await client.connect();
+		sockets[0]!.drop();
+		t.mock.timers.tick(250);
+		await flushReconnect();
+		assert.equal(sockets.length, 2, "the retry is still dialing");
+		await client.connect();
+		await flushReconnect();
+		assert.equal(client.connected, true);
+		t.mock.timers.tick(1_000);
+		await flushReconnect();
+		assert.equal(sockets.length, 3, "the superseded dial cannot schedule over its replacement");
+		assert.equal(hellos.length, 2);
+		assert.equal(sockets[2]!.destroyed, false);
+		assert.equal(client.connected, true);
+	} finally {
+		client.close();
+	}
+});
+
+test("an unknown newer listener frame is ignored without closing the voice-off socket", async () => {
+	const hellos: Array<{ at: number; voiceOn: boolean }> = [];
+	const socket = new ReconnectTestSocket(hellos);
+	const client = new VoiceListenerClient({ dir: scratch(), session: session("s-1", false), dial: () => socket as unknown as Socket });
+	try {
+		const joining = client.connect();
+		queueMicrotask(() => socket.emit("connect"));
+		await joining;
+		socket.emit("data", JSON.stringify({ schema: "gentle.voice-listener/v1", type: "future-display", state: "asleep" }) + "\n");
+		await new Promise((resolve) => setTimeout(resolve, 350));
+		assert.equal(client.connected, true);
+		assert.equal(socket.destroyed, false);
+		assert.equal(hellos.length, 1);
+	} finally {
+		client.close();
+	}
+});
+
 test("the real entry point owns the socket and the lock and cleans both up on shutdown", async () => {
 	const home = scratch();
 	const dir = join(home, "voice");
@@ -409,9 +562,14 @@ test("the listener's voice frames reach the session, and only a wake says it was
 
 test("a connection the listener replaced never reconnects to evict its replacement (S6)", async () => {
 	const dir = scratch();
-	const server = new VoiceListener({ dir });
+	const events: Array<{ event: string; clients: unknown }> = [];
+	const server = new VoiceListener({ dir, log: (event, fields) => {
+		if (event === "listener.hello" || event === "listener.client-closed") events.push({ event, clients: fields?.clients });
+	} });
 	await server.listen();
 	const stale = new VoiceListenerClient({ dir, session: session("s-1") });
+	const frames: ListenerFrame[] = [];
+	stale.onFrame((frame) => frames.push(frame));
 	await stale.connect();
 	const fresh = new VoiceListenerClient({ dir, session: session("s-1") });
 	await fresh.connect();
@@ -420,6 +578,12 @@ test("a connection the listener replaced never reconnects to evict its replaceme
 	// back on its own every 250 ms to evict the one that replaced it, for ever.
 	await new Promise((resolve) => setTimeout(resolve, 800));
 	assert.equal(server.clientCount, 1, "the replaced connection stayed gone");
+	assert.ok(frames.some((frame) => frame.type === "bye" && frame.reason === "replaced"));
+	assert.deepEqual(events, [
+		{ event: "listener.hello", clients: 1 },
+		{ event: "listener.client-closed", clients: 1 },
+		{ event: "listener.hello", clients: 1 },
+	], "replacement itself logs close then hello at the same client count");
 	await assert.rejects(stale.request({ type: "status" }), "and it refuses to come back");
 	await assert.rejects(stale.connect());
 	assert.equal(server.clientCount, 1, "the session keeps the one connection it has");

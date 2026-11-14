@@ -960,6 +960,90 @@ function registrationPeer(dir: string, holdFirstWelcome = false) {
 	};
 }
 
+test("a voice-off startup keeps one display connection to a healthy listener", async () => {
+	const home = mkdtempSync(join(tmpdir(), "voice-command-passive-stable-"));
+	const events: Array<{ event: string } & Record<string, unknown>> = [];
+	const server = new VoiceListener({
+		dir: join(home, "voice"),
+		dictation: () => { throw new Error("unexpected capture"); },
+		log: (event, fields) => events.push({ event, ...fields }),
+	});
+	await server.listen();
+	const h = harness({ installed: true, env: { GENTLE_PI_CONFIG_HOME: home } });
+	delete h.deps.createSession;
+	const pi = register(h);
+	const ui = fakeContext();
+	try {
+		await pi.fire("session_start", ui.ctx);
+		await until(() => pi.emitted.some((event) => event.channel === "gentle-ai:voice-display"));
+		await new Promise((resolve) => setTimeout(resolve, 800));
+		assert.equal(events.filter((entry) => entry.event === "listener.hello" && entry.sessionId === "session-alpha").length, 1);
+		assert.equal(events.filter((entry) => entry.event === "listener.client-closed" && entry.sessionId === "session-alpha").length, 0);
+		assert.equal(server.clientCount, 1);
+		assert.deepEqual(h.voice.writes, []);
+		assert.deepEqual(h.cues, []);
+		assert.equal(pi.counts.sends, 0);
+		assert.equal(ui.editor(), "draft: ");
+	} finally {
+		await pi.fire("session_shutdown", ui.ctx);
+		await server.close();
+		rmSync(home, { recursive: true, force: true });
+	}
+});
+
+test("a passive session backs off when a listener repeatedly rejects its display subscription", async () => {
+	const home = mkdtempSync(join(tmpdir(), "voice-command-passive-reject-"));
+	const dir = join(home, "voice");
+	mkdirSync(dir, { recursive: true });
+	const sockets = new Set<Socket>();
+	const hellos: Array<Record<string, unknown>> = [];
+	let rejects = 0;
+	const server = createServer((socket) => {
+		sockets.add(socket);
+		socket.on("close", () => sockets.delete(socket));
+		socket.on("error", () => {});
+		socket.setEncoding("utf8");
+		let buffered = "";
+		socket.on("data", (chunk: string) => {
+			buffered += chunk;
+			let newline: number;
+			while ((newline = buffered.indexOf("\n")) !== -1) {
+				const frame = JSON.parse(buffered.slice(0, newline)) as Record<string, unknown>;
+				buffered = buffered.slice(newline + 1);
+				if (frame.type === "hello") {
+					hellos.push(frame);
+					socket.write(encodeListenerFrame({ type: "welcome", id: String(frame.id), listenerPid: process.pid, proto: 1, state: "asleep" }));
+				} else if (frame.type === "display") {
+					rejects++;
+					socket.end(encodeListenerFrame({ type: "error", code: "bad-frame" }));
+				}
+			}
+		});
+	});
+	await new Promise<void>((resolve) => server.listen(listenerPaths(dir).socket, resolve));
+	const h = harness({ installed: true, env: { GENTLE_PI_CONFIG_HOME: home } });
+	delete h.deps.createSession;
+	const pi = register(h);
+	const ui = fakeContext();
+	try {
+		await pi.fire("session_start", ui.ctx);
+		await until(() => rejects >= 2, 1_000);
+		await new Promise((resolve) => setTimeout(resolve, 850));
+		assert.equal(hellos.length, 2, `expected two hellos over roughly 1.1 seconds, got ${hellos.length}`);
+		assert.equal(rejects, 2);
+		assert.ok(hellos.every((hello) => hello.sessionId === "session-alpha" && hello.voiceOn === false));
+		assert.deepEqual(h.voice.writes, []);
+		assert.deepEqual(h.cues, []);
+		assert.equal(pi.counts.sends, 0);
+		assert.equal(ui.editor(), "draft: ");
+	} finally {
+		await pi.fire("session_shutdown", ui.ctx);
+		for (const socket of sockets) socket.destroy();
+		await new Promise<void>((resolve) => server.close(() => resolve()));
+		rmSync(home, { recursive: true, force: true });
+	}
+});
+
 for (const { initiallyOn, beforeWelcome } of [
 	{ initiallyOn: false, beforeWelcome: false },
 	{ initiallyOn: false, beforeWelcome: true },
