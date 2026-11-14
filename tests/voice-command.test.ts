@@ -2797,7 +2797,7 @@ for (const reload of [false, true]) test(`a spoken wake reaches the focused sess
 
 // Use the real listener, session link and reading-turn client, but fake the
 // worker and speaker. No audio or live voice settings are touched.
-async function awakeConversationFixture(busy: boolean, installGate?: Promise<void>) {
+async function awakeConversationFixture(busy: boolean, installGate?: Promise<void>, localFocusGate?: Promise<void>, initiallyOn = true) {
 	const { engine, readings } = fakeEngine();
 	const home = mkdtempSync(join(tmpdir(), "voice-command-awake-on-"));
 	const dir = join(home, "voice");
@@ -2835,15 +2835,16 @@ async function awakeConversationFixture(busy: boolean, installGate?: Promise<voi
 		assert.ok(check(), `condition not reached; listener=${JSON.stringify(listenerEvents)} session=${JSON.stringify(h.events)} notices=${JSON.stringify(ui.notices)}`);
 	};
 	await server.listen();
-	const h = harness({ installed: true, engine, voice: true, env: { HERDR_PANE_ID: "w1:p1", GENTLE_PI_CONFIG_HOME: home } });
+	const h = harness({ installed: true, engine, voice: initiallyOn, env: { HERDR_PANE_ID: "w1:p1", GENTLE_PI_CONFIG_HOME: home } });
 	if (installGate) {
 		const readStatus = h.deps.readStatus!;
 		h.deps.readStatus = async (target) => { h.calls.push("install-gate"); await installGate; return readStatus(target); };
 	}
+	if (localFocusGate) h.deps.paneFocus = async () => { h.focus.asks++; await localFocusGate; return h.focus.state; };
 	delete (h.deps as { createSession?: unknown }).createSession;
 	delete (h.deps as { readingTurn?: unknown }).readingTurn;
 	const pi = register(h);
-	const ui = fakeContext({}, "tui", true, "session-alpha", () => !busy);
+	const ui = fakeContext({ select: pick(/^Voice in this session \(off\): turn on$/) }, "tui", true, "session-alpha", () => !busy);
 	// Pi emits an input event for a sent voice message. Exercise that event too:
 	// it must not discard a reply that is waiting for this very capture.
 	const api = pi.pi as unknown as { sendUserMessage(content: unknown, options?: unknown): void };
@@ -2854,10 +2855,270 @@ async function awakeConversationFixture(busy: boolean, installGate?: Promise<voi
 	(ui.ctx.ui as unknown as { setEditorText(text: string): void }).setEditorText("");
 	return {
 		h, pi, ui, requests, readings, listenerEvents, cueNames, reached, focus, server, dir,
+		spotStarts: () => spotStarts,
 		hearOn: () => heard!("voice-on"),
 		close: async () => { await pi.fire("session_shutdown", ui.ctx); await server.close(); rmSync(home, { recursive: true, force: true }); },
 	};
 }
+
+// Both wakes share the unresolved install check, but belong to different links.
+async function replaceAcceptedAwakeWake(f: Awaited<ReturnType<typeof awakeConversationFixture>>) {
+	f.hearOn();
+	await f.reached(() => f.h.calls.includes("install-gate") && f.h.events.filter((entry) => entry.event === "wake.conversation" && entry.result === "opened").length === 1);
+	const spots = f.spotStarts();
+	await f.pi.fire("session_start", f.ui.ctx);
+	await f.reached(() => f.listenerEvents.filter((entry) => entry.event === "listener.hello" && entry.role === "session").length === 2 && f.spotStarts() > spots);
+	f.hearOn();
+	await f.reached(() => f.h.events.filter((entry) => entry.event === "wake.conversation" && entry.result === "opened").length === 2);
+	assert.equal(f.h.calls.filter((call) => call === "install-gate").length, 1, "both runs share the pending install check");
+}
+
+test("T19-R3: a replaced wake cannot make the new wake skip fresh focus validation", async () => {
+	const gate = deferred<void>();
+	const f = await awakeConversationFixture(true, gate.promise);
+	try {
+		await replaceAcceptedAwakeWake(f);
+		assert.equal(f.h.focus.state, "focused", "the session's local focus still says focused");
+		f.focus.pane = "w1:p2";
+		gate.resolve();
+		await f.reached(() => f.requests.length > 0 || f.listenerEvents.some((entry) => entry.event === "wake.dropped" && entry.reason === "ignored:focus-changed"));
+		assert.deepEqual(f.requests, [], "the listener must revalidate the new wake before capturing");
+		assert.ok(f.listenerEvents.some((entry) => entry.event === "wake.dropped" && entry.reason === "ignored:focus-changed"));
+		assert.deepEqual(f.cueNames, []);
+		assert.deepEqual(f.h.cues.filter((name) => name === "open" || name === "close"), []);
+		assert.deepEqual(f.pi.sent, []);
+		assert.equal(f.ui.editor(), "");
+		assert.deepEqual(f.h.voice.sessions, ["session-alpha"]);
+	} finally {
+		gate.resolve();
+		await f.close();
+	}
+});
+
+test("T19-R3: an earlier cancelled wake cannot release a later wake on the same link", async () => {
+	const gate = deferred<void>();
+	const f = await awakeConversationFixture(true, gate.promise);
+	const reader = new VoiceListenerClient({ dir: f.dir, session: { sessionId: "session-beta", paneId: "w1:p2", voiceOn: true }, role: "reading" });
+	try {
+		f.hearOn();
+		await f.reached(() => f.h.calls.includes("install-gate"));
+		f.ui.type(ESC);
+		await f.reached(() => f.ui.terminal.unsubscribes === 1);
+		await reader.connect();
+		// The reply cannot start until the first wake's cancellation reached the
+		// listener. Its end gives the next wake a fresh spotter on the same link.
+		let answer = await reader.request({ type: "read-begin", readingId: "barrier", chars: 1 });
+		for (let attempt = 0; answer.type === "busy" && attempt < 100; attempt++) {
+			answer = await reader.request({ type: "read-begin", readingId: "barrier", chars: 1 });
+		}
+		assert.equal(answer.type, "granted");
+		const spots = f.spotStarts();
+		assert.equal((await reader.request({ type: "read-end", readingId: "barrier", outcome: "done" })).type, "ok");
+		await f.reached(() => f.spotStarts() > spots);
+		f.hearOn();
+		await f.reached(() => f.h.events.filter((entry) => entry.event === "wake.conversation" && entry.result === "opened").length === 2);
+		assert.equal(f.h.calls.filter((call) => call === "install-gate").length, 1);
+		f.focus.pane = "w1:p2";
+		gate.resolve();
+		await f.reached(() => f.requests.length > 0 || f.listenerEvents.some((entry) => entry.event === "wake.dropped" && entry.reason === "ignored:focus-changed"));
+		assert.deepEqual(f.requests, []);
+		assert.ok(f.listenerEvents.some((entry) => entry.event === "wake.dropped" && entry.reason === "ignored:focus-changed"));
+		assert.deepEqual(f.cueNames, []);
+		assert.deepEqual(f.pi.sent, []);
+	} finally {
+		gate.resolve();
+		reader.close();
+		await f.close();
+	}
+});
+
+test("T19-R3: an obsolete wake release leaves the new wake reserved until its own capture", async () => {
+	const installGate = deferred<void>();
+	const focusGate = deferred<void>();
+	const f = await awakeConversationFixture(true, installGate.promise, focusGate.promise);
+	const reader = new VoiceListenerClient({ dir: f.dir, session: { sessionId: "session-beta", paneId: "w1:p2", voiceOn: true }, role: "reading" });
+	try {
+		await replaceAcceptedAwakeWake(f);
+		await reader.connect();
+		installGate.resolve();
+		await f.reached(() => f.h.focus.asks > 0);
+		const answer = await reader.request({ type: "read-begin", readingId: "other-reply", chars: 10 });
+		assert.equal(answer.type, "busy", "the new wake still reserves the listener after the old run settles");
+		if (answer.type === "busy") {
+			assert.equal(answer.reason, "capture");
+			assert.equal(answer.holder, "session-alpha");
+		}
+		assert.deepEqual(f.requests, []);
+		assert.deepEqual(f.cueNames, []);
+		assert.deepEqual(f.pi.sent, []);
+		focusGate.resolve();
+		await f.reached(() => f.requests.length === 1);
+		assert.deepEqual(f.cueNames, ["open"]);
+		assert.equal(f.requests[0]!.mode, "conversation");
+		f.requests[0]!.onStateChange("finished");
+		await f.reached(() => f.pi.sent.length === 1);
+		assert.deepEqual(f.pi.sent, [{ content: "seguí por favor", options: { deliverAs: "followUp" } }]);
+	} finally {
+		installGate.resolve();
+		focusGate.resolve();
+		reader.close();
+		await f.close();
+	}
+});
+
+async function connectedPassiveAwakeFixture(localFocusGate?: Promise<void>) {
+	const clients: VoiceListenerClient[] = [];
+	const connect = VoiceListenerClient.prototype.connect;
+	VoiceListenerClient.prototype.connect = function () { clients.push(this); return connect.call(this); };
+	try {
+		const f = await awakeConversationFixture(true, undefined, localFocusGate, false);
+		await f.reached(() => clients.some((client) => client.connected));
+		return { ...f, passive: clients.find((client) => client.connected)! };
+	} finally {
+		VoiceListenerClient.prototype.connect = connect;
+	}
+}
+
+test("T19-R3: a wake after passive voice-on keeps its reservation and rechecks focus", async () => {
+	const focusGate = deferred<void>();
+	const f = await connectedPassiveAwakeFixture(focusGate.promise);
+	try {
+		assert.deepEqual(f.h.voice.sessions, []);
+		assert.deepEqual(f.listenerEvents.filter((entry) => entry.event === "listener.hello").map((entry) => entry.voiceOn), [false]);
+		await run(f.pi, f.ui);
+		await f.reached(() => f.listenerEvents.some((entry) => entry.event === "listener.voice" && entry.sessionId === "session-alpha" && entry.voiceOn === true));
+		f.hearOn();
+		await f.reached(() => f.h.focus.asks > 0 && f.h.events.some((entry) => entry.event === "wake.conversation" && entry.result === "opened"));
+		assert.equal(f.h.focus.state, "focused");
+		f.focus.pane = "w1:p2";
+		focusGate.resolve();
+		await f.reached(() => f.requests.length > 0 || f.listenerEvents.some((entry) => entry.event === "wake.dropped" && entry.reason === "ignored:focus-changed"));
+		assert.deepEqual(f.requests, [], "the wake must not become an ordinary capture on a replacement connection");
+		assert.ok(f.listenerEvents.some((entry) => entry.event === "wake.dropped" && entry.reason === "ignored:focus-changed"));
+		assert.deepEqual(f.cueNames, []);
+		assert.deepEqual(f.pi.sent, []);
+		assert.equal(f.ui.editor(), "");
+		assert.deepEqual(f.h.voice.sessions, ["session-alpha"]);
+		assert.equal(f.listenerEvents.filter((entry) => entry.event === "listener.hello" && entry.sessionId === "session-alpha").length, 1, "voice-on upgrades the original connection in place");
+		assert.equal(f.listenerEvents.some((entry) => entry.event === "listener.client-closed" && entry.sessionId === "session-alpha"), false);
+	} finally {
+		focusGate.resolve();
+		await f.close();
+	}
+});
+
+test("T19-R3: retiring a connection with an accepted wake logs its drop and releases it", async () => {
+	const gate = deferred<void>();
+	const f = await awakeConversationFixture(true, gate.promise);
+	const reader = new VoiceListenerClient({ dir: f.dir, session: { sessionId: "session-beta", paneId: "w1:p2", voiceOn: true }, role: "reading" });
+	try {
+		f.hearOn();
+		await f.reached(() => f.h.calls.includes("install-gate"));
+		await f.pi.fire("session_start", f.ui.ctx);
+		await f.reached(() => f.listenerEvents.filter((entry) => entry.event === "listener.hello" && entry.sessionId === "session-alpha").length === 2);
+		assert.equal(f.h.events.filter((entry) => entry.event === "wake.dropped" && entry.reason === "ignored:stale").length, 1);
+		await reader.connect();
+		assert.equal((await reader.request({ type: "read-begin", readingId: "retired-wake", chars: 1 })).type, "granted");
+		gate.resolve();
+		await f.reached(() => f.h.calls.some((call) => call.startsWith("status:")));
+		assert.deepEqual(f.requests, []);
+		assert.deepEqual(f.cueNames, []);
+		assert.deepEqual(f.pi.sent, []);
+		assert.equal(f.ui.editor(), "");
+	} finally {
+		gate.resolve();
+		reader.close();
+		await f.close();
+	}
+});
+
+test("T19-R3: a wake loses its reservation when its connection is replaced during preparation", async () => {
+	const focusGate = deferred<void>();
+	const f = await connectedPassiveAwakeFixture(focusGate.promise);
+	const replacement = new VoiceListenerClient({ dir: f.dir, session: { sessionId: "session-alpha", paneId: "w1:p1", voiceOn: true } });
+	try {
+		await run(f.pi, f.ui);
+		await f.reached(() => f.listenerEvents.some((entry) => entry.event === "listener.voice" && entry.voiceOn === true));
+		f.hearOn();
+		await f.reached(() => f.h.focus.asks > 0);
+		await replacement.connect();
+		await f.reached(() => !f.passive.connected && f.listenerEvents.some((entry) => entry.event === "listener.client-closed" && entry.sessionId === "session-alpha"));
+		focusGate.resolve();
+		await f.reached(() => f.requests.length > 0 || f.h.events.some((entry) => entry.event === "wake.dropped" && entry.reason === "ignored:stale"));
+		assert.deepEqual(f.requests, [], "the retired connection's wake cannot be rerouted through a replacement");
+		assert.ok(f.h.events.some((entry) => entry.event === "wake.dropped" && entry.reason === "ignored:stale"));
+		assert.deepEqual(f.cueNames, []);
+		assert.deepEqual(f.pi.sent, []);
+		assert.equal(f.ui.editor(), "");
+		const answer = await replacement.request({ type: "read-begin", readingId: "after-disconnect", chars: 1 });
+		assert.equal(answer.type, "granted", "the disconnected wake left no reservation");
+	} finally {
+		focusGate.resolve();
+		replacement.close();
+		await f.close();
+	}
+});
+
+test("T19-R3: a wake delayed past retirement is logged and cannot reach the replacement", async () => {
+	const onFrame = VoiceListenerClient.prototype.onFrame;
+	let deliverWake: (() => void) | undefined;
+	VoiceListenerClient.prototype.onFrame = function (handler) {
+		return onFrame.call(this, (frame) => {
+			if (frame.type === "command" && frame.command === "voice-on" && frame.wake === true) {
+				deliverWake = () => handler(frame);
+				return;
+			}
+			handler(frame);
+		});
+	};
+	let f: Awaited<ReturnType<typeof connectedPassiveAwakeFixture>> | undefined;
+	let reader: VoiceListenerClient | undefined;
+	try {
+		f = await connectedPassiveAwakeFixture();
+		await run(f.pi, f.ui);
+		await f.reached(() => f!.listenerEvents.some((entry) => entry.event === "listener.voice" && entry.voiceOn === true));
+		f.hearOn();
+		await f.reached(() => deliverWake !== undefined);
+		assert.ok(f.listenerEvents.some((entry) => entry.event === "kws.hit" && entry.reason === "whole-utterance"));
+		assert.equal(f.h.events.some((entry) => entry.event === "wake.conversation"), false, "the accepted frame is held before the session handles it");
+		await f.pi.fire("session_start", f.ui.ctx);
+		await f.reached(() => f!.listenerEvents.filter((entry) => entry.event === "listener.hello" && entry.sessionId === "session-alpha").length === 2);
+		deliverWake!();
+		assert.ok(f.h.events.some((entry) => entry.event === "wake.dropped" && entry.reason === "ignored:stale"));
+		reader = new VoiceListenerClient({ dir: f.dir, session: { sessionId: "session-beta", paneId: "w1:p2", voiceOn: true }, role: "reading" });
+		await reader.connect();
+		const answer = await reader.request({ type: "read-begin", readingId: "released-wake", chars: 1 });
+		assert.equal(answer.type, "granted", "retiring the old connection releases its wake reservation");
+		assert.deepEqual(f.requests, []);
+		assert.deepEqual(f.cueNames, []);
+		assert.deepEqual(f.pi.sent, []);
+		assert.equal(f.ui.editor(), "");
+	} finally {
+		VoiceListenerClient.prototype.onFrame = onFrame;
+		reader?.close();
+		await f?.close();
+	}
+});
+
+test("T19-R3: an upgraded passive connection still opens a focused awake conversation", async () => {
+	const f = await connectedPassiveAwakeFixture();
+	try {
+		await run(f.pi, f.ui);
+		await f.reached(() => f.listenerEvents.some((entry) => entry.event === "listener.voice" && entry.sessionId === "session-alpha" && entry.voiceOn === true));
+		f.hearOn();
+		await f.reached(() => f.requests.length === 1);
+		assert.equal(f.listenerEvents.filter((entry) => entry.event === "listener.hello" && entry.sessionId === "session-alpha").length, 1, "the awake capture uses the upgraded connection");
+		assert.equal(f.listenerEvents.some((entry) => entry.event === "listener.client-closed" && entry.sessionId === "session-alpha"), false);
+		assert.equal(f.server.clientCount, 1);
+		assert.equal(f.requests[0]!.mode, "conversation");
+		assert.deepEqual(f.cueNames, ["open"]);
+		f.requests[0]!.onStateChange("finished");
+		await f.reached(() => f.pi.sent.length === 1);
+		assert.deepEqual(f.pi.sent, [{ content: "seguí por favor", options: { deliverAs: "followUp" } }]);
+	} finally {
+		await f.close();
+	}
+});
 
 test("T19-R1: global voice off while an awake wake checks installation drops it without capture or cue", async () => {
 	const gate = deferred<void>();

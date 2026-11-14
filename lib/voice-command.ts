@@ -10,7 +10,7 @@ import { installKokoro, installMiro, KOKORO_MANIFESTS, KOKORO_NOTICES, kokoroByt
 import { createReplyReader, defaultSpeechEngineResolver, lastAssistantText, replyLanguage } from "./voice-reply-speech.ts";
 import { createVoiceSpeechPublisher, type VoiceSpeechChunk, type VoiceSpeechReading } from "./voice-speech-events.ts";
 import { acquireLocalReadingTurn, paneFocus as herdrPaneFocus, paneFocused as herdrPaneFocused, type PaneFocus } from "./voice-presence.ts";
-import { cutListenerReading, createSessionListenerLink, listenerReadingTurn, sessionDisplayLabel, startVoiceListenerProcess, VoiceListenerClient, type ListenerReading, type ListenerSession, type SessionDictation, type SessionListenerLink } from "./voice-listener-client.ts";
+import { cutListenerReading, createSessionListenerLink, listenerReadingTurn, sessionDisplayLabel, startVoiceListenerProcess, VoiceListenerClient, type ListenerReading, type ListenerSession, type ListenerWakeReservation, type SessionDictation, type SessionListenerLink } from "./voice-listener-client.ts";
 import type { ReadingReleaseReason, CaptureMode } from "./voice-listener-protocol.ts";
 import { createCuePlayer, type CueName, type CuePlayer, type CueResult } from "./voice-cues.ts";
 import { createVoiceLog, type VoiceLog } from "./voice-diagnostics.ts";
@@ -88,7 +88,7 @@ export interface VoiceCommandDeps {
 	readStatus?: (target: VoiceTarget) => Promise<VoiceStatusSnapshot>;
 	installRuntime?: (options: VoiceInstallRequest & { target: VoiceTarget }) => Promise<VoiceInstallResult>;
 	installModel?: (options: VoiceInstallRequest) => Promise<VoiceInstallResult>;
-	createSession?: (options: { target: VoiceTarget; onStateChange(state: VoiceSessionState): void; endpoint?: VoiceEndpoint; warm?: boolean; mode?: CaptureMode; wake?: boolean; wakeValid?(): boolean }) => VoiceDictation;
+	createSession?: (options: { target: VoiceTarget; onStateChange(state: VoiceSessionState): void; endpoint?: VoiceEndpoint; warm?: boolean; mode?: CaptureMode; wake?: boolean; wakeValid?(): boolean; wakeReservation?: ListenerWakeReservation }) => VoiceDictation;
 	// The persisted push-to-talk toggle.
 	settings?: { read(): boolean; write(enabled: boolean): void };
 	pushToTalk?: PushToTalkOptions;
@@ -260,7 +260,7 @@ function deliver(ctx: ExtensionContext, result: Outcome, platform: string, start
 // The microphone is claimed at start(), not at creation: creation is inert, and
 // start() first waits for the capture that is still closing, so two workers can
 // never be alive at once, however long the platform takes to release the device.
-function runDictation(createSession: NonNullable<VoiceCommandDeps["createSession"]>, target: VoiceTarget, onState: (state: VoiceSessionState) => void, admission?: () => Promise<void> | undefined, options: { endpoint?: VoiceEndpoint; warm?: boolean; mode?: CaptureMode; wake?: boolean; canStart?(): boolean } = {}) {
+function runDictation(createSession: NonNullable<VoiceCommandDeps["createSession"]>, target: VoiceTarget, onState: (state: VoiceSessionState) => void, admission?: () => Promise<void> | undefined, options: { endpoint?: VoiceEndpoint; warm?: boolean; mode?: CaptureMode; wake?: boolean; canStart?(): boolean; wakeReservation?: ListenerWakeReservation } = {}) {
 	let settled = false;
 	let stopping = false;
 	let cancelled = false;
@@ -302,7 +302,7 @@ function runDictation(createSession: NonNullable<VoiceCommandDeps["createSession
 			/* the observer is advisory */
 		}
 	};
-	const session = createSession({ target, onStateChange, endpoint: options.endpoint, warm: options.warm, mode: options.mode, wake: options.wake, wakeValid: options.canStart });
+	const session = createSession({ target, onStateChange, endpoint: options.endpoint, warm: options.warm, mode: options.mode, wake: options.wake, wakeValid: options.canStart, wakeReservation: options.wakeReservation });
 	const begin = () => {
 		// A run cancelled, stopped or settled while it waited never starts.
 		if (cancelled || settled) return;
@@ -510,12 +510,13 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	// A voice-off startup connects only to an existing listener: it must never
 	// start one and open the spot-only microphone on its own.
 	let passiveClient: VoiceListenerClient | undefined;
+	const adoptedPassives = new WeakMap<VoiceListenerClient, SessionListenerLink>();
 	const closePassive = () => {
 		const client = passiveClient;
 		passiveClient = undefined;
 		client?.close();
 	};
-	const receiveVoice = (command: "voice-on" | "voice-off", wake: boolean, awake: boolean) => {
+	const receiveVoice = (command: "voice-on" | "voice-off", wake: boolean, awake: boolean, wakeLink?: SessionListenerLink) => {
 		const ctx = sessionCtx;
 		if (!ctx) return;
 		if (command === "voice-off") {
@@ -523,12 +524,14 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			if (toggling?.wakeReserved && toggling.cue === "none") cancelToggle(toggling);
 			return;
 		}
-		if (wake) wakeConversation(ctx, awake);
+		if (wake) wakeConversation(ctx, awake, wakeLink, awake ? wakeLink?.captureWake?.() : undefined);
 	};
-	const listener = (): SessionListenerLink => {
+	const listener = (adoptedClient?: VoiceListenerClient): SessionListenerLink => {
 		if (sessionLink) return sessionLink;
+		const ownerSession = sessionIdOf(sessionCtx);
 		const link = createSessionListenerLink({
 			dir: resolveVoiceHome(env),
+			adoptedClient,
 			start: () => startVoiceListenerProcess(env),
 			session: () => {
 				const id = sessionIdOf(sessionCtx);
@@ -539,7 +542,8 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			},
 			onVoice: (command, wake, awake) => {
 				// An in-flight old hello can receive a frame after its session ended.
-				if (sessionLink === link) receiveVoice(command, wake, awake);
+				if (sessionLink === link) receiveVoice(command, wake, awake, link);
+				else if (wake && awake) voiceLog("wake.dropped", { session: ownerSession, reason: "ignored:stale" });
 			},
 		});
 		sessionLink = link;
@@ -556,6 +560,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			endpoint: options.endpoint,
 			wake: options.wake,
 			wakeValid: options.wakeValid,
+			wakeReservation: options.wakeReservation,
 			onStateChange: options.onStateChange,
 			fallback: () => localDictation(options),
 		});
@@ -1003,7 +1008,16 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		// off session never starts a listener; an on session may join/start one.
 		const liveCtx = sessionCtx;
 		if (!deps.createSession && liveCtx && sessionIdOf(liveCtx) === id) {
-			if (passiveClient?.connected) {
+			if (enabled && passiveClient?.connected && !sessionLink) {
+				// Keep the accepted socket and its wake reservations when voice is
+				// enabled; replacing it later would turn an awake wake into an
+				// ordinary, unvalidated capture.
+				const client = passiveClient;
+				const link = listener(client);
+				adoptedPassives.set(client, link);
+				passiveClient = undefined;
+				link.updateVoice?.(true);
+			} else if (passiveClient?.connected) {
 				passiveClient.updateVoice(enabled);
 			} else if (sessionLink) {
 				closePassive();
@@ -1481,6 +1495,9 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		send: boolean;
 		// Only an awake spoken wake reserves the listener before preparation.
 		wakeReserved: boolean;
+		// The link and unique socket-bound wake accepted by this run.
+		wakeLink?: SessionListenerLink;
+		wakeReservation?: ListenerWakeReservation;
 		// The microphone cue already played for this capture.
 		cue: "none" | "open" | "closed";
 		cancelled: boolean;
@@ -1540,7 +1557,11 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	const releaseToggleWake = (current: ToggleRun): void => {
 		if (!current.wakeReserved) return;
 		current.wakeReserved = false;
-		sessionLink?.cancelWake?.();
+		// The run itself identifies the wake. A late finally must never cancel a
+		// newer run, even if it uses the same link or the session was reloaded.
+		if (current.run.generation !== generation || toggling !== current || !current.wakeLink || sessionLink !== current.wakeLink) return;
+		if (current.wakeReservation) current.wakeReservation.cancel();
+		else current.wakeLink.cancelWake?.();
 	};
 
 	const cancelToggle = (current: ToggleRun) => {
@@ -1556,8 +1577,8 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		current.dictation.cancel();
 	};
 
-	const openToggle = (ctx: ExtensionContext, send: boolean, wakeReserved = false): ToggleRun => {
-		const current: ToggleRun = { ctx, run: { generation, abort: () => {} }, stopRequested: false, send, wakeReserved, cue: "none", cancelled: false, unsubscribe: () => {} };
+	const openToggle = (ctx: ExtensionContext, send: boolean, wakeReserved = false, wakeLink?: SessionListenerLink, wakeReservation?: ListenerWakeReservation): ToggleRun => {
+		const current: ToggleRun = { ctx, run: { generation, abort: () => {} }, stopRequested: false, send, wakeReserved, wakeLink, wakeReservation, cue: "none", cancelled: false, unsubscribe: () => {} };
 		toggling = current;
 		active = current.run;
 		// Esc has to cancel without reaching the editor's own interrupt.
@@ -1581,6 +1602,10 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		const live = () => current.run.generation === generation && toggling === current;
 		const wakeLive = (): boolean => {
 			if (!live()) return false;
+			if (current.wakeReserved && (!current.wakeLink || sessionLink !== current.wakeLink || !current.wakeReservation?.isCurrent())) {
+				voiceLog("wake.dropped", { session: sessionIdOf(ctx), reason: "ignored:stale" });
+				return false;
+			}
 			if (voiceOn(ctx)) return true;
 			voiceLog("wake.dropped", { session: sessionIdOf(ctx), reason: "ignored:voice-off" });
 			return false;
@@ -1610,6 +1635,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 				warm: current.send,
 				mode: current.send ? "conversation" : "dictation",
 				wake: current.wakeReserved,
+				wakeReservation: current.wakeReservation,
 				...(current.wakeReserved ? { canStart: wakeLive } : {}),
 			});
 			current.dictation = dictation;
@@ -1710,15 +1736,20 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	// capture plays the one open cue and the transcript is sent. A session that
 	// cannot record right now only turns voice on: nothing beeps and nothing is
 	// claimed for a microphone it never opened.
-	const wakeConversation = (ctx: ExtensionContext, awake: boolean): void => {
-		if (!supportedSession(ctx)) { if (awake) sessionLink?.cancelWake?.(); return; }
+	const wakeConversation = (ctx: ExtensionContext, awake: boolean, wakeLink?: SessionListenerLink, wakeReservation?: ListenerWakeReservation): void => {
+		const releaseWake = () => {
+			if (!awake || !wakeLink || sessionLink !== wakeLink) return;
+			if (wakeReservation) wakeReservation.cancel();
+			else wakeLink.cancelWake?.();
+		};
+		if (!supportedSession(ctx)) { releaseWake(); return; }
 		// Only an asleep wake turns voice on. An awake wake must never revive a
 		// session whose voice was turned off before the frame was delivered.
 		if (!awake && !voiceOn(ctx)) setVoice(ctx, true, (message, type) => ctx.ui.notify(message, type));
 		const busy = !voiceOn(ctx) ? "voice-refused" : toggling ? "dictation-running" : active ? "voice-busy" : reading ? "reading" : undefined;
 		voiceLog("wake.conversation", { session: sessionIdOf(ctx), result: busy ? "skipped" : "opened", reason: busy });
-		if (busy) { if (awake) sessionLink?.cancelWake?.(); return; }
-		void runToggle(openToggle(ctx, true, awake));
+		if (busy) { releaseWake(); return; }
+		void runToggle(openToggle(ctx, true, awake, wakeLink, wakeReservation));
 	};
 
 	// Join the same link dictation uses, with the session's current voice flag.
@@ -1736,7 +1767,19 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 						? { sessionId: id, paneId: paneIdOf(), label: labelOf(sessionCtx), voiceOn: voiceOn(sessionCtx) }
 						: undefined,
 					onFrame: (frame) => {
-						if (passiveClient !== client) return;
+						const awakeWake = frame.type === "command" && frame.command === "voice-on" && frame.wake === true && client.listenerState !== "asleep";
+						if (passiveClient !== client) {
+							if (awakeWake && adoptedPassives.get(client) !== sessionLink) voiceLog("wake.dropped", { session: id, reason: "ignored:stale" });
+							return;
+						}
+						if (awakeWake) {
+							// A wake on a passive socket that is about to be replaced must
+							// never be rerouted as an ordinary capture on a new socket.
+							voiceLog("wake.dropped", { session: id, reason: "ignored:stale" });
+							closePassive();
+							if (voiceOn(ctx)) joinAtStart(ctx);
+							return;
+						}
 						if (frame.type === "command") receiveVoice(frame.command, frame.wake === true, client.listenerState !== "asleep");
 						else if (frame.type === "transcript") receiveTranscript(frame.text, frame.truncated === true);
 					},
@@ -1805,6 +1848,9 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		const current = toggling;
 		toggling = undefined;
 		if (current) {
+			if (current.wakeReserved && current.cue === "none" && !current.cancelled) {
+				voiceLog("wake.dropped", { session: sessionIdOf(current.ctx), reason: "ignored:stale" });
+			}
 			try {
 				current.unsubscribe();
 			} catch {

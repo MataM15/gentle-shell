@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test, { after } from "node:test";
 import { fileURLToPath } from "node:url";
-import { createSessionListenerLink, cutListenerReading, ensureListener, LISTENER_DICTATE_TIMEOUT_MS, ListenerDeliveryError, listenerReadingTurn, sessionDisplayLabel, SESSION_LABEL_MAX, VoiceListenerClient, type ListenerSession, type SessionDictation } from "../lib/voice-listener-client.ts";
+import { createSessionListenerLink, cutListenerReading, ensureListener, LISTENER_DICTATE_TIMEOUT_MS, ListenerDeliveryError, listenerReadingTurn, sessionDisplayLabel, SESSION_LABEL_MAX, VoiceListenerClient, type ListenerSession, type ListenerWakeReservation, type SessionDictation } from "../lib/voice-listener-client.ts";
 import { VoiceSessionError, type VoiceSessionErrorCode, type VoiceSessionState } from "../lib/voice-session.ts";
 import type { VoiceOverlay } from "../lib/voice-overlay.ts";
 import { listenerPaths, readListenerLock, takeListenerLock, VoiceListener, type ListenerDictation, type ListenerDictationRequest } from "../lib/voice-listener.ts";
@@ -849,6 +849,88 @@ test("T19-R2: a declined wake releases its reservation even when it arrives with
 		link.close();
 		for (const socket of sockets) socket.destroy();
 		await new Promise<void>((resolve) => server.close(() => resolve()));
+	}
+});
+
+test("T19-R3: a wake token belongs to its socket and cannot cancel a newer wake or a replaced connection", async () => {
+	const written: Array<Record<string, unknown>> = [];
+	class FakeSocket extends EventEmitter {
+		destroyed = false;
+		setEncoding() {}
+		write(chunk: string) { written.push(JSON.parse(chunk) as Record<string, unknown>); return true; }
+		destroy() { this.destroyed = true; return this; }
+	}
+	const socket = new FakeSocket();
+	const client = new VoiceListenerClient({ dir: scratch(), session: session("s-1"), dial: () => socket as unknown as Socket });
+	const connecting = client.connect();
+	queueMicrotask(() => socket.emit("connect"));
+	await waitFor(() => written.length === 1);
+	socket.emit("data", encodeListenerFrame({ type: "welcome", id: String(written[0]!.id), listenerPid: 1, proto: 1, state: "listening" }));
+	await connecting;
+	const wakes: ListenerWakeReservation[] = [];
+	const link = createSessionListenerLink({
+		dir: scratch(), session: () => session("s-1"), adoptedClient: client,
+		onVoice: (_command, wake, awake) => { if (wake && awake) wakes.push(link.captureWake!()!); },
+	});
+	try {
+		const wake = encodeListenerFrame({ type: "command", command: "voice-on", wake: true });
+		socket.emit("data", wake);
+		socket.emit("data", wake);
+		assert.equal(wakes.length, 2);
+		assert.equal(wakes[0]!.isCurrent(), false);
+		assert.equal(wakes[1]!.isCurrent(), true);
+		wakes[0]!.cancel();
+		assert.equal(written.filter((frame) => frame.type === "cancel").length, 0);
+		socket.emit("data", encodeListenerFrame({ type: "bye", reason: "replaced" }));
+		assert.equal(socket.destroyed, false, "the peer can announce replacement before closing the socket");
+		assert.equal(wakes[1]!.isCurrent(), false, "a replaced connection is stale immediately");
+		wakes[1]!.cancel();
+		assert.equal(written.filter((frame) => frame.type === "cancel").length, 0);
+	} finally {
+		link.close();
+	}
+});
+
+test("T19-R3: cancelling an old awake capture never sends cancel on its reconnected socket", async () => {
+	class FakeSocket extends EventEmitter {
+		destroyed = false;
+		readonly written: Array<Record<string, unknown>> = [];
+		setEncoding() {}
+		write(chunk: string) {
+			const frame = JSON.parse(chunk) as { type: string; id?: string };
+			this.written.push(frame);
+			if (frame.type === "dictate" || frame.type === "cancel") {
+				queueMicrotask(() => this.emit("data", encodeListenerFrame({ type: "ok", id: frame.id, request: frame.type as "dictate" | "cancel" })));
+			}
+			return true;
+		}
+		destroy() { this.destroyed = true; return this; }
+	}
+	const sockets = [new FakeSocket(), new FakeSocket()];
+	let next = 0;
+	const client = new VoiceListenerClient({ dir: scratch(), session: session("s-1"), dial: () => sockets[next++] as unknown as Socket });
+	const join = async (socket: FakeSocket) => {
+		const connecting = client.connect();
+		queueMicrotask(() => socket.emit("connect"));
+		await waitFor(() => socket.written.some((frame) => frame.type === "hello"));
+		const hello = socket.written.find((frame) => frame.type === "hello")!;
+		socket.emit("data", encodeListenerFrame({ type: "welcome", id: String(hello.id), listenerPid: 1, proto: 1, state: "listening" }));
+		await connecting;
+	};
+	await join(sockets[0]!);
+	const link = createSessionListenerLink({ dir: scratch(), session: () => session("s-1"), adoptedClient: client });
+	try {
+		const wake = link.captureWake!()!;
+		const dictation = link.dictate({ mode: "conversation", wake: true, wakeValid: () => wake.isCurrent(), wakeReservation: wake, onStateChange: () => {}, fallback: () => localCapture().dictation });
+		await dictation.start();
+		sockets[0]!.destroy();
+		sockets[0]!.emit("close");
+		await join(sockets[1]!);
+		assert.equal(wake.isCurrent(), false);
+		await dictation.cancel();
+		assert.equal(sockets[1]!.written.filter((frame) => frame.type === "cancel").length, 0, "the old capture cannot cancel a newer socket's work");
+	} finally {
+		link.close();
 	}
 });
 

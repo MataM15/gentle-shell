@@ -144,6 +144,11 @@ export class VoiceListenerClient {
 		return this.currentState;
 	}
 
+	// Opaque identity of the current socket, including before welcome completes.
+	get connectionToken(): object | undefined {
+		return !this.closed && !this.replaced && this.socket && !this.socket.destroyed ? this.socket : undefined;
+	}
+
 	onFrame(handler: (frame: ListenerFrame) => void): () => void {
 		this.listeners.add(handler);
 		return () => this.listeners.delete(handler);
@@ -599,12 +604,18 @@ export class ListenerDeliveryError extends Error {
 	}
 }
 
+export interface ListenerWakeReservation {
+	isCurrent(): boolean;
+	cancel(): Promise<void>;
+}
+
 export interface ListenerDictationOptions {
 	mode: CaptureMode;
 	endpoint?: VoiceEndpoint;
 	// An awake spoken wake must never fall back to an unvalidated local capture.
 	wake?: boolean;
 	wakeValid?(): boolean;
+	wakeReservation?: ListenerWakeReservation;
 	onStateChange(state: VoiceSessionState): void;
 	// What records when the listener cannot be reached: the session's own capture,
 	// exactly as it worked before the listener existed.
@@ -617,6 +628,7 @@ export interface SessionListenerLink {
 	// Optional for injected links; production updates the joined registration.
 	updateVoice?(voiceOn: boolean): void;
 	cancelWake?(): void;
+	captureWake?(): ListenerWakeReservation | undefined;
 	dictate(options: ListenerDictationOptions): SessionDictation;
 	close(): void;
 }
@@ -624,6 +636,8 @@ export interface SessionListenerLink {
 export interface SessionListenerLinkOptions {
 	dir: string;
 	session(): ListenerSession | undefined;
+	// Transfer a connected passive session without replacing its socket.
+	adoptedClient?: VoiceListenerClient;
 	start?: () => void | Promise<void>;
 	waitMs?: number;
 	probe?: (path: string) => Promise<boolean>;
@@ -646,7 +660,8 @@ export interface SessionListenerLinkOptions {
 // before the role existed, so only a reading declares itself (S6).
 export function createSessionListenerLink(options: SessionListenerLinkOptions): SessionListenerLink {
 	type PendingJoin = { controller: AbortController; promise: Promise<boolean>; client?: VoiceListenerClient; allowStart: boolean };
-	let client: VoiceListenerClient | undefined;
+	let client: VoiceListenerClient | undefined = options.adoptedClient;
+	let wakeIdentity: object | undefined;
 	let joining: PendingJoin | undefined;
 	let handler: ((frame: ListenerFrame) => boolean) | undefined;
 	const retireJoin = (pending: PendingJoin | undefined): void => {
@@ -667,6 +682,7 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 		// No capture of this session asked for it: the focus sent it here (S6).
 		if (frame.type === "transcript") options.onTranscript?.(frame.text, frame.truncated === true);
 	};
+	let detachAdopted = options.adoptedClient?.onFrame(route);
 
 	const ensure = (): Promise<boolean> => {
 		if (client?.connected) return Promise.resolve(true);
@@ -678,6 +694,14 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 			try {
 				const session = options.session();
 				if (!session) return false;
+				if (client && client === options.adoptedClient && !client.connected) {
+					// The transferred socket is gone. Retire its reconnect timer before
+					// creating another client, so the two can never evict each other.
+					detachAdopted?.();
+					detachAdopted = undefined;
+					client.close();
+					client = undefined;
+				}
 				if (client) {
 					pending.client = client;
 					try {
@@ -726,12 +750,30 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 
 	// A declined wake uses the existing cancel request on the same session link.
 	const cancelWake = (): void => {
+		wakeIdentity = undefined;
 		// A wake can share the welcome's socket chunk, before connect() marks the
 		// client joined. Its hello was already accepted, so cancel is safe now.
 		if (client) void client.request({ type: "cancel" }).catch(() => {});
 	};
+	const captureWake = (): ListenerWakeReservation | undefined => {
+		const owner = client;
+		const connection = owner?.connectionToken;
+		if (!owner || !connection) return undefined;
+		const identity = {};
+		wakeIdentity = identity;
+		const isCurrent = () => wakeIdentity === identity && client === owner && owner.connectionToken === connection;
+		return {
+			isCurrent,
+			cancel: async () => {
+				if (!isCurrent()) return;
+				wakeIdentity = undefined;
+				try { await owner.request({ type: "cancel" }); } catch { /* the original socket is already gone */ }
+			},
+		};
+	};
 
 	const dictate = (request: ListenerDictationOptions): SessionDictation => {
+		const releaseWake = () => request.wakeReservation ? request.wakeReservation.cancel() : cancelWake();
 		let state: VoiceSessionState = "idle";
 		let fallback: SessionDictation | undefined;
 		let stopSent = false;
@@ -815,7 +857,7 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 					waitingForJoin = undefined;
 					if (cancelled) return;
 					if (request.wake && (!joined || !client || !request.wakeValid?.())) {
-						cancelWake();
+						releaseWake();
 						throw new VoiceSessionError("cancelled");
 					}
 					if (!joined) return local();
@@ -834,7 +876,8 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 							if (request.wake) throw new VoiceSessionError("cancelled");
 							return local();
 						}
-						void active.request({ type: "cancel" }).catch(() => {});
+						if (request.wake && request.wakeReservation) void request.wakeReservation.cancel();
+						else void active.request({ type: "cancel" }).catch(() => {});
 						throw new VoiceSessionError("timeout");
 					}
 					if (cancelled) return;
@@ -868,13 +911,14 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 				cancelled = true;
 				if (fallback) return fallback.cancel();
 				if (settled || !requested) {
-					if (request.wake && !requested) cancelWake();
+					if (request.wake && !requested) releaseWake();
 					retireJoin(waitingForJoin);
 					settle({ error: new VoiceSessionError("cancelled") });
 					return;
 				}
 				try {
-					await client?.request({ type: "cancel" });
+					if (request.wake && request.wakeReservation) await request.wakeReservation.cancel();
+					else await client?.request({ type: "cancel" });
 				} catch {
 					/* the listener is gone: nothing is recording there any more */
 				}
@@ -885,6 +929,7 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 	return {
 		ensure,
 		cancelWake,
+		captureWake,
 		updateVoice: (voiceOn) => {
 			if (joining) {
 				joining.allowStart = voiceOn;
@@ -895,6 +940,9 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 		dictate,
 		close: () => {
 			retireJoin(joining);
+			wakeIdentity = undefined;
+			detachAdopted?.();
+			detachAdopted = undefined;
 			handler = undefined;
 			client?.close();
 			client = undefined;
