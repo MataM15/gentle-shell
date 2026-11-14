@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=1280">
+<title>Burbuja de voz 02 · línea del cuadro</title><style>
+*{box-sizing:border-box}
+html,body{margin:0;background:#0d0709;color:#f0e2da}
+body{font:15px/1.5 "Segoe UI",system-ui,-apple-system,Arial,sans-serif;padding:24px 32px 64px;max-width:1280px}
+h1{font-size:22px;margin:0 0 6px}
+.lead{max-width:105ch;color:#cfc3bb;margin:0 0 14px}
+nav{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 20px}
+nav a{color:#f0e2da;border:1.5px solid #74524f;border-radius:8px;padding:6px 12px;text-decoration:none;font-weight:600}
+nav a:hover,nav a:focus-visible{border-color:#e19caa;outline:none}
+section{margin:0 0 30px}
+h2{font-size:17px;margin:0;display:flex;align-items:center;gap:10px}
+h2 small{font-weight:400;color:#b0a29a;font-size:14px}
+.sw{width:14px;height:14px;border-radius:3px;display:inline-block}
+.note{margin:2px 0 8px;color:#cfc3bb;max-width:105ch;min-height:1.5em}
+/* rejilla de celdas: 105 columnas fijas, una celda = 1ch x 20px */
+.term{font-family:"Cascadia Mono","Cascadia Code","DejaVu Sans Mono",Consolas,monospace;font-size:16px;line-height:19px;width:105ch;background:#190d10;border:1px solid #3a2227;color:#f0e2da;overflow:hidden;font-variant-ligatures:none}
+.r{white-space:pre;height:19px;overflow:hidden}
+.r span{white-space:pre}
+.tx{color:#f0e2da}.mu{color:#b0a29a}.dm{color:#8a6f6a}.pk{color:#e19caa}.rd{color:#d35e6b}.gn{color:#91bba2}.am{color:#e6bb62}.bl{color:#8ec6ee}
+.s{color:var(--s)}.b{font-weight:700}
+.I{background:var(--s);color:#1a1116;font-weight:700}
+.copy{max-width:105ch;color:#cfc3bb}.copy code{color:#f0e2da}
+</style></head><body>
+<h1>Burbuja de voz 02 · línea del cuadro</h1>
+<p class="lead">El estado de voz se funde con el cuadro de entrada: el borde superior dice qué pasa y el inferior qué se puede decir. No suma filas.</p>
+<nav aria-label="Estados"><a href="#off">Apagada</a><a href="#listening">Escuchando</a><a href="#transcribing">Transcribiendo</a><a href="#reading">Leyendo</a><a href="#asleep">Dormido</a><a href="#confirm">Confirmar</a><a href="#english">Modo inglés</a></nav>
+<div id="frames"></div>
+<div class="copy"><p><b>Celdas:</b> 105 columnas × filas de 19 px, solo caracteres, color de texto y fondo de celda (etiqueta invertida), negrita; bloques ▁▂▃▄▅▆▇█ para la onda. Paleta sakura del 03: escuchando #E19CAA, transcribiendo #E6BB62, leyendo #91BBA2, dormido #B0A29A, confirmar #E0A172, inglés #8EC6EE. Cada frame muestra el pie de la sesión: cola del chat, lo de voz, barra de agentes, cuadro, panel Breaks y pie, tal como los ve Pablo.</p><p><b>Copy inventado:</b> «micrófono cerrado · el texto aparece en el cuadro» (transcribiendo); «sale del inglés»; «para despertar» tras «Gentle Voice on»; «→ voice-control» / «de voice-control». Comandos y estados salen de 03, 04 y 05.</p><p><b>Filas:</b> 0 añadidas en todos los estados: se reutilizan los dos bordes del cuadro (arriba estado, abajo comandos). <b>Afordancia movida:</b> «≡ commands · alt+k» pasa del borde superior al inferior (derecha) mientras la voz está activa; dormido la mantiene arriba. «[ Panel ]» no se mueve.</p></div>
+<script>
+(function(){
+const W=105, BW=103, IN=99;
+const esc=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;');
+const len=s=>Array.from(s).length;
+const plen=ps=>ps.reduce((n,p)=>n+len(p[0]),0);
+const txt=ps=>ps.map(p=>p[0]).join('');
+function row(ps){
+  const n=plen(ps);
+  if(n>W) throw new Error('fila ancha '+n+': '+txt(ps));
+  const h=ps.filter(p=>p[0]!=='').map(p=>p[1]?'<span class="'+p[1]+'">'+esc(p[0])+'</span>':esc(p[0])).join('');
+  return {h:h+' '.repeat(W-n), t:txt(ps)+' '.repeat(W-n)};
+}
+const SP=[' ',''];
+const HV={r:{tl:'╭',tr:'╮',bl:'╰',br:'╯',h:'─',v:'│'},h:{tl:'┏',tr:'┓',bl:'┗',br:'┛',h:'━',v:'┃'}};
+// borde superior/inferior de una caja de 103 columnas; fill(n) devuelve partes
+function edge(g,which,L,R,bs,fill){
+  const n=BW-2-plen(L)-plen(R);
+  if(n<1) throw new Error('borde sin espacio: '+txt(L)+txt(R));
+  const f=fill?fill(n):[[g.h.repeat(n),bs]];
+  return row([SP,[which==='t'?g.tl:g.bl,bs],...L,...f,...R,[which==='t'?g.tr:g.br,bs],SP]);
+}
+function inner(g,ps,bs){
+  const n=plen(ps);
+  if(n>IN) throw new Error('contenido ancho '+n+': '+txt(ps));
+  return row([SP,[g.v,bs],SP,...ps,[' '.repeat(IN-n),''],SP,[g.v,bs],SP]);
+}
+function lr(L,R){const n=IN-plen(L)-plen(R);if(n<1)throw new Error('lr: '+txt(L)+txt(R));return [...L,[' '.repeat(n),''],...R];}
+// ---- datos vivos ----
+const N=300, levels=new Array(N).fill(0.03), rlev=new Array(N).fill(0.03);
+let tt=0,speaking=true,left=1.4,env=.03,amp=.7,ph=0,renv=.03,rph=2;
+function step(dt){
+  tt+=dt;left-=dt;
+  if(left<=0){speaking=!speaking;left=speaking?.9+Math.random()*1.6:.35+Math.random()*.8;amp=.4+Math.random()*.6;ph=Math.random()*6;}
+  const syl=Math.pow(Math.abs(Math.sin(tt*2*Math.PI*2.3+ph)),.8);
+  const target=speaking?amp*(.25+.75*syl)*(.85+Math.random()*.15):.02+Math.random()*.03;
+  env+=(target-env)*.5;levels.push(Math.min(1,env));levels.shift();
+  const rt=.15+.55*Math.abs(Math.sin(tt*2*Math.PI*3.1+rph))*(.7+Math.random()*.3);
+  renv+=(rt-renv)*.45;rlev.push(Math.min(1,renv));rlev.shift();
+}
+const BARS=' ▁▂▃▄▅▆▇█';
+const wave=(n,src,g=1.7)=>src.slice(-n).map(l=>Math.min(1,l*g)).map(l=>BARS[Math.max(1,Math.min(8,Math.round(l*8)))]).join('');
+const SPIN='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏';
+let frameNo=0, cdStart=0;
+const CD=3000;
+function cd(){const rem=Math.max(0,CD-((performance.now?performance.now():0)-cdStart));return {frac:rem/CD,secs:Math.max(1,Math.ceil(rem/1000))};}
+function sweep(n,color){const seg=14,span=n-seg,p=Math.abs(((frameNo*.9)%(2*span))-span);const a=Math.round(span-p);
+  return [['─'.repeat(a),'dm'],['━'.repeat(seg),color],['─'.repeat(n-seg-a),'dm']];}
+function countbar(n,frac,color){const f=Math.round(frac*n);return [['━'.repeat(f),color],['─'.repeat(n-f),'dm']];}
+// ---- estados ----
+const ST={
+ off:{name:'Voz apagada (hoy)',col:'#d35e6b'},
+ listening:{name:'Escuchando',col:'#e19caa'},
+ transcribing:{name:'Transcribiendo',col:'#e6bb62'},
+ reading:{name:'Leyendo (te estoy hablando)',col:'#91bba2'},
+ asleep:{name:'Dormido',col:'#b0a29a'},
+ confirm:{name:'Confirmar (cuenta de 3 s)',col:'#e0a172'},
+ english:{name:'Modo inglés',col:'#8ec6ee'}
+};
+const ORDER=['off','listening','transcribing','reading','asleep','confirm','english'];
+const QUOTE='«Sí, seguí con la ventana de la onda y avisame cuando termine.»';
+const SESS='voice-control';
+const cmd=t=>[t,'s b'];
+function hint(st){
+  switch(st){
+   case 'listening':return [cmd('«Gentle Voice off»'),[' apaga · ','mu'],cmd('«cancel»'),[' / ','mu'],cmd('«stop»'),[' descarta','mu']];
+   case 'english':return [cmd('«English off»'),[' sale del inglés · ','mu'],cmd('«cancel»'),[' / ','mu'],cmd('«stop»'),[' descarta','mu']];
+   case 'reading':return [cmd('«cancel»'),[' / ','mu'],cmd('«stop»'),[' corta y escucha','mu']];
+   case 'confirm':return [['silencio','tx b'],[' envía · ','mu'],cmd('«cancel»'),[' descarta','mu']];
+   case 'transcribing':return [['micrófono cerrado · el texto aparece en el cuadro','mu']];
+   default:return [];
+  }
+}
+function label(st){
+  const c=cd();
+  return {listening:' ● ESCUCHANDO ',transcribing:' '+SPIN[frameNo%10]+' TRANSCRIBIENDO ',reading:' ▶ LEYENDO ',asleep:' ○ DORMIDO ',
+          confirm:' ▸ ENVIANDO EN '+c.secs+'… ',english:' ● MODO INGLÉS '}[st];
+}
+const lang=st=>st==='english'?' EN ':' ES ';
+// ---- trozos fijos de la pantalla de Pablo ----
+function chat(){
+  const b='rd';
+  return [
+   inner(HV.r,[['Pendiente de tu lado: la salida de la segunda prueba de frases y la elección entre los','tx']],b),
+   inner(HV.r,[['diseños 04 y 05.','tx']],b),
+   edge(HV.r,'b',[],[],b)
+  ];
+}
+const agentsRow=()=>row([SP,['▸ ','mu'],['● ','pk'],['2 agents','tx']]);
+function inputPlain(){ // reposo: caja normal
+  return [
+   edge(HV.r,'t',[['─ ','rd'],['≡ commands','pk b'],[' · alt+k ','mu']],[[' [ Panel ] ','pk'],['─','rd']],'rd'),
+   inner(HV.r,[['▌','pk'],['type, or / for commands','mu']],'rd'),
+   edge(HV.r,'b',[],[],'rd')
+  ];
+}
+function breaks(){
+  const b='am',g=HV.r;
+  const rows=[
+   edge(g,'t',[['─ ','am'],['Breaks','am b'],[' ','']],[],b),
+   inner(g,lr([['Agua      ','tx'],['Ahora','am']],[['18:56','am b']]),b),
+   inner(g,[['Descanso  ','tx'],['13m','mu']],b),
+   inner(g,lr([['Estirar   ','tx'],['43m','mu']],[['vie, 13 nov 2026','tx']]),b),
+   inner(g,[['Cena      ','tx'],['2h 4m','mu']],b),
+   edge(g,'b',[],[],b)
+  ];
+  return rows;
+}
+function footer(){
+  return [
+   row([SP,['3 files · ','mu'],['+253','gn'],[' ',''],['-30','rd'],[' '.repeat(W-19-15-1),''],['/gentle:changes','mu']]),
+   row([SP,['feat/voice-control','tx'],[' ±3 ','mu'],['│ ','dm'],['SUPER-YOLO','am b']])
+  ];
+}
+// ---- montaje ----
+function mount(buildFn){
+  const host=document.getElementById('frames');
+  ORDER.forEach(id=>{
+    const sec=document.createElement('section');sec.id=id;
+    sec.innerHTML='<h2><span class="sw" style="background:'+ST[id].col+'"></span>'+ST[id].name+'<small class="rw"></small></h2><p class="note"></p><div class="term" style="--s:'+ST[id].col+'"></div>';
+    host.appendChild(sec);
+  });
+  function render(){
+    frameNo++;
+    ORDER.forEach(id=>{
+      const r=buildFn(id);
+      const sec=document.getElementById(id);
+      sec.querySelector('.term').innerHTML=r.rows.map(x=>'<div class="r">'+x.h+'</div>').join('');
+      sec.querySelector('.rw').textContent=' · filas añadidas: '+r.added;
+      sec.querySelector('.note').textContent=r.note;
+    });
+  }
+  cdStart=performance.now();
+  for(let i=0;i<N*2;i++)step(.05);
+  render();
+  if(!matchMedia('(prefers-reduced-motion: reduce)').matches){
+    setInterval(()=>{step(.06);if(performance.now()-cdStart>CD+900)cdStart=performance.now();render();},90);
+  }
+}
+
+// 02: el estado de voz vive en el borde superior del cuadro; sugerencias en el borde inferior
+function box02(st){
+  if(st==='off') return inputPlain();
+  const g=st==='asleep'?HV.r:HV.h, bs=st==='asleep'?'dm':'s';
+  const chip=[label(st),'I'];
+  let L,R,fill;
+  if(st==='asleep'){
+    L=[['─ ',bs],['≡ commands',"pk b"],[' · alt+k ','mu'],['─ ',bs],chip,SP,['di ','mu'],cmd('«Gentle Voice on»'),[' para despertar ','mu']];
+    R=[[' [ Panel ] ','pk'],['─',bs]];
+  }else{
+    const w=st==='reading'?wave(26,rlev,1):(st==='listening'||st==='english')?wave(26,levels):null;
+    L=[['━ ',bs],chip,SP];
+    if(w)L.push([w,'s'],SP);
+    L.push([st==='reading'?'de '+SESS:'→ '+SESS,'tx'],SP);
+    R=[SP,[lang(st),'I'],[' ',''],['[ Panel ]','pk'],[' ━',bs]];
+    if(st==='transcribing'){fill=n=>sweep(n,'s');}
+    if(st==='confirm'){const c=cd();fill=n=>countbar(n,c.frac,'s');}
+  }
+  const top=edge(g,'t',L,R,bs,fill);
+  const mid=inner(g,st==='confirm'?[[QUOTE,'s b']]:[['▌','pk'],['type, or / for commands','mu']],bs);
+  let bot;
+  if(st==='asleep') bot=edge(g,'b',[],[],bs);
+  else bot=edge(g,'b',[['━ ',bs],...hint(st),SP],[SP,['≡ commands · alt+k','mu'],[' ━',bs]],bs);
+  return [top,mid,bot];
+}
+function build02(st){
+  const rows=[...chat(),agentsRow(),...box02(st),...breaks(),...footer()];
+  const notes={off:'Línea base: así se ve hoy.',
+   listening:'Sin filas nuevas. El borde del cuadro pasa a trazo grueso y color de estado; arriba etiqueta invertida, onda corta, sesión e idioma; abajo los comandos. «≡ commands · alt+k» se muda al borde inferior, a la derecha.',
+   transcribing:'Etiqueta con spinner y una barra ámbar que barre el borde superior. Micrófono cerrado.',
+   reading:'Onda verde de la sonoridad real de la lectura en el borde superior; abajo, cómo cortarla.',
+   asleep:'Trazo fino y tenue, el cuadro sigue usable. La invitación «Gentle Voice on» queda en el borde superior, entre los textos de siempre.',
+   confirm:'El texto dictado ocupa la fila del cuadro; el borde superior es la cuenta de 3 s (se acorta).',
+   english:'Igual que escuchando con borde, onda y chip azules.'};
+  return {rows,added:0,note:notes[st]};
+}
+mount(build02);
+
+})();
+</script></body></html>
