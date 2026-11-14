@@ -240,6 +240,37 @@ test("a terminal error settles its result before the capture reports microphone 
 	}
 });
 
+test("D2: a spot start refused with capture waits for the failed child to exit", async () => {
+	const h = harness();
+	const dictation = h.warm.session({ onStateChange: () => {} });
+	const recording = dictation.start();
+	await h.until(() => h.workers.length === 1 && h.workers[0]!.received.length === 1);
+	const child = h.workers[0]!;
+	try {
+		child.say({ type: "recording" });
+		await recording;
+		child.say({ type: "transcribing" });
+		const outcome = dictation.stop();
+		child.say({ type: "result", text: "seguí con eso", truncated: false });
+		assert.deepEqual(await outcome, { text: "seguí con eso", truncated: false });
+		const spot = h.warm.spot({ kws: KWS });
+		const started = spot.start();
+		await h.until(() => child.received.filter((message) => message.type === "start").length === 2);
+		child.say({ type: "error", code: "capture" });
+		await assert.rejects(started, (error: unknown) => error instanceof VoiceSessionError && error.code === "capture");
+		let settled = false;
+		const ready = spot.waitUntilSettled().then(() => { settled = true; });
+		await Promise.resolve();
+		assert.equal(settled, false, "a terminal error is not the child's microphone release");
+		child.exit();
+		await ready;
+		assert.equal(settled, true);
+	} finally {
+		child.exit();
+		await h.warm.close();
+	}
+});
+
 nodeTest("a terminal error kills a stuck child at the existing grace timeout before releasing the microphone", { timeout: 5_000 }, async (t) => {
 	t.mock.timers.enable({ apis: ["setTimeout"] });
 	const h = harness();

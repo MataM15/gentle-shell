@@ -61,6 +61,17 @@ export const READING_LEASE_MS = 15_000;
 // A released reading keeps the state for the tail still audible in the speaker
 // (design §2.4), so the next reading never starts over the last word.
 export const READING_TAIL_MS = 250;
+// The worker's keyword hit is at most 2.6 s after speech began; its
+// whole-utterance confirmation can delay the reported command by another 1 s.
+const COMMAND_MAX_REPORT_MS = 3_600;
+const SPOT_RETRY_MIN_MS = 100;
+const SPOT_RETRY_MAX_MS = 5_000;
+const RECONNECT_WINDOW_MS = 10_000;
+const RECONNECT_HELLOS = 5;
+const RECONNECT_MIN_MS = 2_000;
+const RECONNECT_MAX_MS = 60_000;
+const RECONNECT_STABLE_MS = 60_000;
+const RECONNECT_TRACKED_LIMIT = 1_024;
 // The ceiling on published levels: one per 50 ms of audio, twenty a second.
 export const LEVEL_MIN_INTERVAL_MS = 50;
 
@@ -266,6 +277,13 @@ interface Client {
 	windowStart: number;
 }
 
+interface ReconnectWindow {
+	hellos: number[];
+	lastAttemptAt: number;
+	blockedUntil: number;
+	nextDelay: number;
+}
+
 // The one reading turn (slice B): the listener arbitrates it, the session that
 // holds it speaks. `ended` stays true through the tail, while the turn is still
 // not available to anyone else.
@@ -278,6 +296,7 @@ interface ActiveReading {
 	lease?: ReturnType<typeof setTimeout>;
 	tail?: ReturnType<typeof setTimeout>;
 	ended: boolean;
+	tailEndsAt?: number;
 	// The loudness of the chunk the player began (T13), queued here and drawn one
 	// value per frame of audio. A new chunk replaces it; the end clears it.
 	levels?: { readonly values: readonly number[]; at: number };
@@ -432,9 +451,10 @@ interface ActiveCapture {
 	readonly sessionId: string;
 	readonly mode: CaptureMode;
 	readonly dictation: ListenerDictation;
-	// A command from this capture may have come from the reading's audible tail,
-	// even if the worker reports it only after that tail is gone.
-	readonly overlapsReading: boolean;
+	// When this capture opened during a reading tail, retain its end even after
+	// the reading is released. A late enough utterance is no longer an echo.
+	readonly readingTailEndsAt?: number;
+	finishedAt?: number;
 	collecting: boolean;
 	// Stop requests that arrived while the outcome was being collected: answered
 	// once it is known, so a requester has its transcript when its stop returns.
@@ -485,14 +505,17 @@ export class VoiceListener {
 	// The spot-only capture, and the release of the one just stopped: the
 	// microphone is handed over only once it is free.
 	private spotting: ListenerSpotting | undefined;
-	// A real spotter failure disables it: a transient busy start gets one retry.
+	// Device and busy refusals are retried after settlement, with bounded backoff.
 	private spotDisabled = false;
+	private spotRetryMs = SPOT_RETRY_MIN_MS;
+	private spottingRetry: ReturnType<typeof setTimeout> | undefined;
 	private spottingStop: Promise<void> | undefined;
 	// True only while the capture really records, from the worker's own report to
 	// the moment the recording ends (S10). Levels never change it.
 	private recording = false;
 	private server: Server | undefined;
 	private readonly clients = new Map<Socket, Client>();
+	private readonly reconnects = new Map<string, ReconnectWindow>();
 	private currentState: ListenerState = "asleep";
 	private heartbeat: ReturnType<typeof setInterval> | undefined;
 	private idleTimer: ReturnType<typeof setTimeout> | undefined;
@@ -770,6 +793,12 @@ export class VoiceListener {
 	private register(client: Client, hello: Extract<ListenerRequest, { type: "hello" }>): void {
 		// A hello written before the role existed is the session's own connection.
 		const role = hello.role ?? "session";
+		if (this.reconnectBlocked(hello.sessionId, role)) {
+			// Refuse before a stale hello can replace the live owner or its flags.
+			// A loop gets one episode log, not a log line per refused attempt.
+			this.reject(client, "rate-limit", true);
+			return;
+		}
 		// Publish the replacement before retiring its old socket, so an unchanged
 		// voice-on reload never briefly looks like the last session went away.
 		const owner = role === "reading" ? [...this.clients.values()].find((other) => other.sessionId === hello.sessionId && other.role === "session") : undefined;
@@ -786,6 +815,7 @@ export class VoiceListener {
 			// stale one, while the connection its reading is held on survives, and a
 			// session keeps talking to the listener that is reading for it.
 			if (other === client || other.sessionId !== hello.sessionId || other.role !== role) continue;
+			this.log("listener.replaced", { sessionId: hello.sessionId, role });
 			// Told and flushed before the socket goes: a connection replaced without
 			// hearing why reconnects, and the two evict each other for ever.
 			this.forget(other, (socket) => {
@@ -795,12 +825,57 @@ export class VoiceListener {
 			});
 		}
 		this.say(client, withId({ type: "welcome", listenerPid: this.pid, proto: 1, state: this.currentState }, hello.id));
+		if (!this.clients.has(client.socket)) return;
 		client.welcomed = true;
+		this.recordHello(hello.sessionId, role);
 		this.log("listener.hello", { sessionId: hello.sessionId, role, voiceOn: hello.voiceOn, clients: this.clients.size });
 		if (client.voiceOn && this.currentState === "asleep") this.setState("listening");
 		else if (role === "session" && !client.voiceOn && this.voiceSessions.length === 0) this.sleepWithoutVoice();
 		else this.refreshSpotting();
 		this.armIdle();
+	}
+
+	// A quiet minute resets the escalating delay. Refusals count as activity,
+	// so a client retrying throughout the quiet period cannot reset the guard.
+	private reconnectBlocked(sessionId: string, role: ListenerConnectionRole): boolean {
+		const key = `${role}:${sessionId}`;
+		const entry = this.reconnects.get(key);
+		if (!entry) return false;
+		const now = this.now();
+		if (now - entry.lastAttemptAt >= RECONNECT_STABLE_MS) {
+			this.reconnects.delete(key);
+			return false;
+		}
+		entry.lastAttemptAt = now;
+		return now < entry.blockedUntil;
+	}
+
+	// Only a completed welcome counts. Bound the registry even if clients send
+	// many distinct session ids; inactive entries are the first to go.
+	private recordHello(sessionId: string, role: ListenerConnectionRole): void {
+		const now = this.now();
+		const key = `${role}:${sessionId}`;
+		let entry = this.reconnects.get(key);
+		if (!entry) {
+			if (this.reconnects.size >= RECONNECT_TRACKED_LIMIT) {
+				let oldest: string | undefined;
+				let oldestAt = Infinity;
+				for (const [id, candidate] of this.reconnects) {
+					if (candidate.lastAttemptAt < oldestAt) { oldest = id; oldestAt = candidate.lastAttemptAt; }
+				}
+				if (oldest !== undefined) this.reconnects.delete(oldest);
+			}
+			entry = { hellos: [], lastAttemptAt: now, blockedUntil: 0, nextDelay: RECONNECT_MIN_MS };
+			this.reconnects.set(key, entry);
+		}
+		entry.lastAttemptAt = now;
+		entry.hellos = entry.hellos.filter((at) => now - at < RECONNECT_WINDOW_MS);
+		entry.hellos.push(now);
+		if (entry.hellos.length > RECONNECT_HELLOS) {
+			entry.blockedUntil = now + entry.nextDelay;
+			entry.nextDelay = Math.min(entry.nextDelay * 2, RECONNECT_MAX_MS);
+			this.log("listener.reconnect-throttled", { sessionId });
+		}
 	}
 
 	private setSessionVoice(sessionId: string | undefined, voiceOn: boolean): void {
@@ -1005,7 +1080,7 @@ export class VoiceListener {
 			kws: this.options.keyword,
 			onKeywordRejected: (hit) => this.logKeywordRejection(hit),
 		});
-		const capture: ActiveCapture = { client, sessionId, mode: request.mode, dictation, overlapsReading: this.reading !== undefined, collecting: false, afterCollect: [], cue: "none" };
+		const capture: ActiveCapture = { client, sessionId, mode: request.mode, dictation, readingTailEndsAt: this.reading?.tailEndsAt, collecting: false, afterCollect: [], cue: "none" };
 		this.capture = capture;
 		this.capturePending = undefined;
 		this.levelAt = undefined;
@@ -1026,6 +1101,9 @@ export class VoiceListener {
 	private captureState(client: Client, state: VoiceSessionState): void {
 		const capture = this.capture;
 		if (!capture || capture.client !== client) return;
+		// The result promise may be collected later; timestamp the worker's edge,
+		// not that later delivery, so an echo cannot age into a valid command.
+		if (state === "finished" && capture.finishedAt === undefined) capture.finishedAt = this.now();
 		if (state === "recording") {
 			if (capture.cue !== "none") return;
 			capture.cue = "open";
@@ -1123,7 +1201,8 @@ export class VoiceListener {
 		}
 		// The event name and the command id only: the audio is never kept.
 		this.log("capture.command", { sessionId: capture.sessionId, mode: capture.mode, command });
-		const reason = capture.overlapsReading || this.reading ? "ignored:reading" : command === "voice-off" ? "whole-utterance" : command === "voice-on" ? "ignored:awake-voice-on" : "ignored:unsupported";
+		const couldBeEcho = capture.readingTailEndsAt !== undefined && (capture.finishedAt ?? this.now()) - COMMAND_MAX_REPORT_MS <= capture.readingTailEndsAt;
+		const reason = couldBeEcho || this.reading ? "ignored:reading" : command === "voice-off" ? "whole-utterance" : command === "voice-on" ? "ignored:awake-voice-on" : "ignored:unsupported";
 		this.log("kws.hit", { command, reason });
 		if (reason === "whole-utterance") this.voiceOffEverywhere();
 		// The same outcome as a recording that heard nothing: the close cue, the
@@ -1253,7 +1332,7 @@ export class VoiceListener {
 		this.log("kws.hit", { command: hit.command, reason: hit.reason === "cancelled" ? "ignored:cancelled" : `rejected:${hit.reason}` });
 	}
 
-	private startSpotting(retried = false): void {
+	private startSpotting(): void {
 		const factory = this.options.spot;
 		if (!this.options.keyword || !factory || this.spotDisabled || this.closing) return;
 		if (this.spotting || !this.shouldSpot()) return;
@@ -1273,26 +1352,38 @@ export class VoiceListener {
 		this.spotting = capture;
 		try {
 			void capture.start().then(
-				() => this.awaitSpotting(capture),
-				(error: unknown) => this.spottingStartFailed(capture, error, retried),
+				() => {
+					if (this.spotting !== capture) return;
+					this.awaitSpotting(capture);
+				},
+				(error: unknown) => this.spottingFailed(capture, error),
 			);
 		} catch (error) {
-			this.spottingStartFailed(capture, error, retried);
+			this.spottingFailed(capture, error);
 		}
 	}
 
-	private spottingStartFailed(capture: ListenerSpotting, error: unknown, retried: boolean): void {
+	private spottingFailed(capture: ListenerSpotting, error: unknown): void {
 		if (this.spotting !== capture) return;
-		if (!retried && error instanceof VoiceSessionError && error.code === "invalid-state") {
-			// Keep the failed attempt reserved while waiting, so state refreshes
-			// cannot launch extra retries. A stop or new capture retires it.
+		if (error instanceof VoiceSessionError && (error.code === "invalid-state" || error.code === "capture")) {
+			// Keep this attempt reserved until the owner (or failed child) really
+			// settles. A new capture, shutdown or state change can retire it.
 			let settled: Promise<void>;
 			try { settled = capture.waitUntilSettled?.() ?? Promise.resolve(); }
 			catch (failure) { this.spotting = undefined; this.failSpotting(failure); return; }
+			this.log("kws.retry", { reason: error.code });
 			void settled.then(() => {
 				if (this.spotting !== capture) return;
-				this.spotting = undefined;
-				if (this.shouldSpot()) this.startSpotting(true);
+				const delay = this.spotRetryMs;
+				this.spotRetryMs = Math.min(delay * 2, SPOT_RETRY_MAX_MS);
+				const timer = setTimeout(() => {
+					if (this.spottingRetry === timer) this.spottingRetry = undefined;
+					if (this.spotting !== capture) return;
+					this.spotting = undefined;
+					if (this.shouldSpot()) this.startSpotting();
+				}, delay);
+				timer.unref?.();
+				this.spottingRetry = timer;
 			}, (failure: unknown) => {
 				if (this.spotting !== capture) return;
 				this.spotting = undefined;
@@ -1308,11 +1399,7 @@ export class VoiceListener {
 	private awaitSpotting(capture: ListenerSpotting): void {
 		void capture.heard().then(
 			(command) => this.spottingHeard(capture, command),
-			(error: unknown) => {
-				if (this.spotting !== capture) return;
-				this.spotting = undefined;
-				this.failSpotting(error);
-			},
+			(error: unknown) => this.spottingFailed(capture, error),
 		);
 	}
 
@@ -1322,6 +1409,7 @@ export class VoiceListener {
 			return;
 		}
 		this.spotting = undefined;
+		this.spotRetryMs = SPOT_RETRY_MIN_MS;
 		if (command === undefined) return;
 		// Reading text is not carried by the protocol. Fail closed for the whole
 		// reading and its audible tail, rather than reacting to its own speech.
@@ -1426,6 +1514,8 @@ export class VoiceListener {
 	// Releasing the microphone is asynchronous: a capture that must start waits on
 	// this promise instead of opening a second one.
 	private stopSpotting(): Promise<void> {
+		if (this.spottingRetry) clearTimeout(this.spottingRetry);
+		this.spottingRetry = undefined;
 		const capture = this.spotting;
 		if (!capture) return this.spottingStop ?? Promise.resolve();
 		this.spotting = undefined;
@@ -1583,6 +1673,7 @@ export class VoiceListener {
 		const reading = this.reading;
 		if (!reading || reading.ended) return;
 		reading.ended = true;
+		reading.tailEndsAt = this.now() + this.readTailMs;
 		this.publishDisplay();
 		if (reading.lease) clearTimeout(reading.lease);
 		reading.lease = undefined;
@@ -1698,13 +1789,13 @@ export class VoiceListener {
 	}
 
 	// One error frame and the connection closes, with the frame flushed first.
-	private reject(client: Client, code: ListenerErrorCode): void {
+	private reject(client: Client, code: ListenerErrorCode, quiet = false): void {
 		if (!this.clients.has(client.socket)) return;
-		this.forget(client, (socket) => socket.end(encodeListenerFrame({ type: "error", code })));
-		this.log("listener.rejected", { code, sessionId: client.sessionId });
+		this.forget(client, (socket) => socket.end(encodeListenerFrame({ type: "error", code })), quiet);
+		if (!quiet) this.log("listener.rejected", { code, sessionId: client.sessionId });
 	}
 
-	private forget(client: Client, close: (socket: Socket) => void = (socket) => socket.destroy()): void {
+	private forget(client: Client, close: (socket: Socket) => void = (socket) => socket.destroy(), quiet = false): void {
 		if (!this.clients.delete(client.socket)) return;
 		if (this.reading && !this.reading.ended && this.reading.socket === client.socket) this.endReading("closed");
 		// The session that was recording is gone: the microphone goes with it.
@@ -1719,7 +1810,7 @@ export class VoiceListener {
 		}
 		if (this.awakeWake?.client === client) this.awakeWake = undefined;
 		close(client.socket);
-		this.log("listener.client-closed", { sessionId: client.sessionId, clients: this.clients.size });
+		if (!quiet) this.log("listener.client-closed", { sessionId: client.sessionId, clients: this.clients.size });
 		if (client.voiceOn && this.voiceSessions.length === 0) this.sleepWithoutVoice();
 		else this.refreshSpotting();
 		this.armIdle();

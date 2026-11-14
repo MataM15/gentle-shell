@@ -383,7 +383,9 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 				result: () => resultPromise,
 				// Reuse the capture release that the busy-spot retry already waits for.
 				waitUntilReleased: () => blockedBy ?? released,
-				waitUntilSettled: () => blockedBy ?? Promise.resolve(),
+				// A refused busy start waits on its owner; a terminal start error
+				// waits on this capture's child, not merely on the error message.
+				waitUntilSettled: () => blockedBy ?? (capture.state === "idle" ? Promise.resolve() : released),
 				async start() {
 					if (capture.state !== "idle") throw fail("invalid-state");
 					if (current) {
