@@ -1,0 +1,691 @@
+diff --git a/odd/probes/voice-kws-capture-probe.mjs b/odd/probes/voice-kws-capture-probe.mjs
+index 8b855d81c..cbae19880 100644
+--- a/odd/probes/voice-kws-capture-probe.mjs
++++ b/odd/probes/voice-kws-capture-probe.mjs
+@@ -5,7 +5,7 @@
+ // with one that feeds synthesized clips (Windows OneCore voices, synthesized to
+ // memory and never played). Nothing is recorded and nothing is audible.
+ //
+-//   node --experimental-strip-types odd/probes/voice-kws-capture-probe.mjs [--scenario name] [--voice en|es]
++//   node --experimental-strip-types odd/probes/voice-kws-capture-probe.mjs [--scenario name] [--voice en|es] [--warm|--direct] [--windows] [--details]
+ //
+ // For every scenario it prints the worker's final message (`command`, `result`
+ // or an error) and every hit the spotter reported, with its audio time, so a
+@@ -106,6 +106,20 @@ function scale(samples, gain) {
+ 	return samples.map((value) => value * gain);
+ }
+ 
++// Keep the synthetic speech near the measured microphone level, not the much
++// louder OneCore output. Remove its digital padding so the inserted pause is
++// the pause being tested.
++function speechAtRms(samples, target) {
++	let first = 0;
++	let last = samples.length;
++	while (first < last && Math.abs(samples[first]) < 0.001) first++;
++	while (last > first && Math.abs(samples[last - 1]) < 0.001) last--;
++	const trimmed = samples.slice(first, last);
++	const rms = Math.sqrt(trimmed.reduce((sum, value) => sum + value * value, 0) / trimmed.length);
++	if (!Number.isFinite(rms) || rms === 0) throw new Error("empty synthesized speech");
++	return scale(trimmed, target / rms);
++}
++
+ // Adds a noise bed under the whole clip.
+ function withBed(samples, rate, rms) {
+ 	const bed = noise(rate, samples.length / rate, rms, 7);
+@@ -163,7 +177,10 @@ async function runScenario({ name, clip, rate, manualStopAfterSeconds }, base, k
+ 			}
+ 			getResult(stream) {
+ 				const result = super.getResult(stream);
+-				if (result?.keyword) hits.push({ keyword: result.keyword, fedSeconds: Number(fed.seconds.toFixed(2)) });
++				if (result?.keyword) {
++					if (args.includes("--details")) console.log(`spotter result ${JSON.stringify(result)}`);
++					hits.push({ keyword: result.keyword, fedSeconds: Number(fed.seconds.toFixed(2)) });
++				}
+ 				return result;
+ 			}
+ 		}
+@@ -190,7 +207,7 @@ async function runScenario({ name, clip, rate, manualStopAfterSeconds }, base, k
+ 	const afterFeed = () => {
+ 		if (manualStopAfterSeconds !== undefined) input.emit("data", `${JSON.stringify({ schema: "gentle.voice/v1", type: "stop" })}\n`);
+ 	};
+-	const request = { ...base, kws, endpoint: { endOfSpeechMs: 2500, noSpeechMs: 8000 } };
++	const request = { ...base, kws, keywordDiagnostics: true, endpoint: { endOfSpeechMs: 2500, noSpeechMs: 8000 } };
+ 	if (manualStopAfterSeconds !== undefined) request.endpoint = { endOfSpeechMs: 5000, noSpeechMs: 60000 };
+ 	delete request.keepAlive;
+ 	const run = runVoiceWorker(io);
+@@ -198,7 +215,7 @@ async function runScenario({ name, clip, rate, manualStopAfterSeconds }, base, k
+ 	const final = await Promise.race([done, new Promise((resolve) => setTimeout(() => resolve({ type: "timeout" }), 60000))]);
+ 	input.emit("end");
+ 	await Promise.race([run, new Promise((resolve) => setTimeout(resolve, 1000))]);
+-	return { name, final: final.type === "command" ? `command ${final.command}` : final.type === "result" ? `result ${JSON.stringify(final.text)}` : JSON.stringify(final), hits };
++	return { name, final: final.type === "command" ? `command ${final.command}` : final.type === "result" ? `result ${JSON.stringify(final.text)}` : JSON.stringify(final), hits, rejected: messages.filter((message) => message.type === "keyword-rejected").map(({ command, reason }) => ({ command, reason })) };
+ }
+ 
+ // Feeds a clip straight into a fresh real spotter stream, 100 ms at a time,
+@@ -266,7 +283,10 @@ async function runWarm(scenarios, rate, base, kws) {
+ 		class ObservedSpotter extends loaded.KeywordSpotter {
+ 			getResult(stream) {
+ 				const result = super.getResult(stream);
+-				if (result?.keyword) current.hits.push(result.keyword);
++				if (result?.keyword) {
++					if (args.includes("--details")) console.log(`spotter result ${JSON.stringify(result)}`);
++					current.hits.push(result.keyword);
++				}
+ 				return result;
+ 			}
+ 		}
+@@ -278,6 +298,7 @@ async function runWarm(scenarios, rate, base, kws) {
+ 			for (const text of String(line).split("\n").filter(Boolean)) {
+ 				const message = JSON.parse(text);
+ 				const capture = current;
++				if (message.type === "keyword-rejected") capture.rejected.push({ command: message.command, reason: message.reason });
+ 				if (message.type === "recording") setTimeout(() => void capture.stream.feed(capture.clip).then(() => {
+ 					if (capture.manualStopAfterSeconds !== undefined && !capture.settled) input.emit("data", `${JSON.stringify({ schema: "gentle.voice/v1", type: "stop" })}\n`);
+ 				}), 10);
+@@ -293,12 +314,12 @@ async function runWarm(scenarios, rate, base, kws) {
+ 	const run = runVoiceWorker(io);
+ 	const out = [];
+ 	for (const scenario of scenarios) {
+-		current = { ...scenario, hits: [] };
++		current = { ...scenario, hits: [], rejected: [] };
+ 		const done = new Promise((resolve) => (settle = resolve));
+ 		const endpoint = scenario.manualStopAfterSeconds !== undefined ? { endOfSpeechMs: 5000, noSpeechMs: 60000 } : { endOfSpeechMs: 2500, noSpeechMs: 8000 };
+-		input.emit("data", `${JSON.stringify({ ...base, kws, endpoint, keepAlive: true })}\n`);
++		input.emit("data", `${JSON.stringify({ ...base, kws, endpoint, keepAlive: true, keywordDiagnostics: true })}\n`);
+ 		const final = await Promise.race([done, new Promise((resolve) => setTimeout(() => resolve({ type: "timeout" }), 60000))]);
+-		out.push({ name: scenario.name, final: final.type === "command" ? `command ${final.command}` : final.type === "result" ? `result ${JSON.stringify(final.text)}` : JSON.stringify(final), hits: current.hits });
++		out.push({ name: scenario.name, final: final.type === "command" ? `command ${final.command}` : final.type === "result" ? `result ${JSON.stringify(final.text)}` : JSON.stringify(final), hits: current.hits, rejected: current.rejected });
+ 		if (final.type === "error" || final.type === "timeout" || final.type === "exit") break;
+ 	}
+ 	input.emit("data", `${JSON.stringify({ schema: "gentle.voice/v1", type: "close" })}\n`);
+@@ -316,6 +337,8 @@ async function main() {
+ 	const results = [];
+ 	for (const language of voices) {
+ 		const phrase = decodeWav(await synthesize(language, "Gentle Voice off."));
++		const phraseOn = decodeWav(await synthesize(language, "Gentle Voice on."));
++		const preceding = decodeWav(await synthesize(language, language === "es" ? "Bueno, voy a seguir hablando de este tema durante varios segundos antes de hacer una pausa." : "Well, I will keep talking about this subject for several more seconds before taking a pause."));
+ 		const sentence = decodeWav(await synthesize(language, language === "es" ? "Bueno, entonces decime si Gentle Voice off funciona bien." : "Well, tell me whether Gentle Voice off works fine today."));
+ 		const { rate } = phrase;
+ 		const silence = (seconds) => new Float32Array(Math.round(rate * seconds));
+@@ -332,20 +355,60 @@ async function main() {
+ 			{ name: "manual stop 0.3 s after phrase", clip: withBed(concat([silence(0.8), phrase.samples, silence(0.3)]), rate, bed), manualStopAfterSeconds: 0.3 },
+ 			{ name: "inside a sentence (must not fire)", clip: withBed(concat([silence(0.8), sentence.samples, silence(3.5)]), rate, bed) },
+ 		];
++		// WSLg may start with digital silence before its room floor arrives. An
++		// all-time minimum then keeps the old gate's threshold stuck at 0.005.
++		// Compare isolated phrases with the same phrases after real synthesized
++		// speech and a 0.6 s pause; stop explicitly because a noisy endpoint may
++		// otherwise never finish. All audio remains in memory and is never played.
++		const speech = speechAtRms(preceding.samples, 0.016);
++		for (const noiseRms of [0.004, 0.006, 0.008]) {
++			for (const [command, wav] of [["voice-off", phrase], ["voice-on", phraseOn]]) {
++				const words = speechAtRms(wav.samples, 0.016);
++				for (const [kind, prefix] of [["alone", []], ["after-speech-0.4s", [speech, silence(0.4)]], ["after-speech-0.6s", [speech, silence(0.6)]]]) {
++					const clip = concat([silence(0.3), withBed(concat([silence(1), ...prefix, words, silence(3.5)]), rate, noiseRms)]);
++					scenarios.push({ name: `noise ${noiseRms} ${kind} ${command}`, clip, manualStopAfterSeconds: 0 });
++				}
++				if (language === "es") {
++					const peak = words.reduce((max, value) => Math.max(max, Math.abs(value)), 0);
++					const boosted = scale(words, 10 ** (-14 / 20) / peak);
++					const clip = concat([silence(0.3), withBed(concat([silence(1), speech, silence(0.4), boosted, silence(3.5)]), rate, noiseRms)]);
++					scenarios.push({ name: `noise ${noiseRms} after-speech-0.4s ${command} peak-14dB`, clip, manualStopAfterSeconds: 0 });
++				}
++			}
++		}
++		// Five noise conditions per voice: an embedded mention must not become
++		// a command, and a spotter miss is reported separately from a rejection.
++		for (const noiseRms of [0.003, 0.004, 0.006, 0.008, 0.010]) {
++			const words = speechAtRms(sentence.samples, 0.016);
++			const peak = words.reduce((max, value) => Math.max(max, Math.abs(value)), 0);
++			for (const [label, sample] of [["", words], [" peak-14dB", scale(words, 10 ** (-14 / 20) / peak)]]) {
++				const clip = concat([silence(0.3), withBed(concat([silence(1), sample, silence(3.5)]), rate, noiseRms)]);
++				scenarios.push({ name: `noise ${noiseRms} sentence${label}`, clip, manualStopAfterSeconds: 0 });
++			}
++		}
+ 		if (args.includes("--warm")) {
+ 			const picked = scenarios.filter((scenario) => !onlyScenario || scenario.name.includes(onlyScenario));
+-			for (const outcome of await runWarm([...picked, ...picked], rate, base, kws)) console.log(`${language} | warm | ${outcome.name} | ${outcome.final} | hits ${JSON.stringify(outcome.hits)}`);
++			for (const outcome of await runWarm([...picked, ...picked], rate, base, kws)) console.log(`${language} | warm | ${outcome.name} | ${outcome.final} | hits ${JSON.stringify(outcome.hits)} | rejected ${JSON.stringify(outcome.rejected)}`);
+ 			continue;
+ 		}
+ 		for (const scenario of scenarios) {
+ 			if (onlyScenario && !scenario.name.includes(onlyScenario)) continue;
++			if (args.includes("--windows")) {
++				const size = Math.round(rate * 0.1);
++				const windows = [];
++				for (let at = 0; at + size <= scenario.clip.length; at += size) {
++					const part = scenario.clip.subarray(at, at + size);
++					windows.push(Number(Math.sqrt(part.reduce((sum, value) => sum + value * value, 0) / size).toFixed(4)));
++				}
++				console.log(`${language} | ${scenario.name} | 100ms RMS ${JSON.stringify(windows)}`);
++			}
+ 			if (args.includes("--direct")) {
+ 				console.log(`${language} | ${scenario.name} | direct hits ${JSON.stringify(spotDirect({ ...kws, runtimeRoot: base.runtime.root }, scenario.clip, rate))}`);
+ 				continue;
+ 			}
+ 			const outcome = await runScenario({ ...scenario, rate }, base, kws);
+ 			results.push({ voice: language, ...outcome });
+-			console.log(`${language} | ${outcome.name} | ${outcome.final} | hits ${JSON.stringify(outcome.hits)}`);
++			console.log(`${language} | ${outcome.name} | ${outcome.final} | hits ${JSON.stringify(outcome.hits)} | rejected ${JSON.stringify(outcome.rejected)}`);
+ 		}
+ 	}
+ }
+diff --git a/scripts/voice-worker.cjs b/scripts/voice-worker.cjs
+index 6c25238b0..3d304cc79 100644
+--- a/scripts/voice-worker.cjs
++++ b/scripts/voice-worker.cjs
+@@ -305,6 +305,16 @@ const SPIKE = 2;
+ // Quiet this long closes an utterance, and is the silence a command must be
+ // followed by.
+ const KWS_QUIET_WINDOWS = 4;
++// Unlike the dictation endpoint, the keyword gate must recover from digital
++// silence at startup and from a changing room floor. Keep a bounded recent
++// history and estimate its low percentile from plausible ambient windows.
++// Do not learn a sustained voice as the floor during a long conversation.
++const KWS_FLOOR_WINDOWS = 60;
++const KWS_FLOOR_PERCENTILE = 0.2;
++const KWS_MAX_FLOOR = 0.01;
++// Use the same conservative margin before and after a hit: weak speech above
++// the learned ambient floor is not an utterance boundary or confirmation.
++const KWS_FLOOR_RATIO = 1.1;
+ // From the start of the utterance to the hit: the longest phrase (about 1.6 s)
+ // plus the spotter's own delay after the words (0.65 s at most when measured)
+ // and a margin. More speech than that before the hit means the phrase came
+@@ -583,12 +593,14 @@ class WorkerSession {
+ 			chunks: [],
+ 			frames: 0,
+ 			energy: 0,
+-			floor: Infinity,
++			floor: 0,
++			floorWindows: [],
+ 			// Audio time handed to the spotter, in seconds.
+ 			time: 0,
+ 			// A capture starts as if silence came before it.
+ 			quietRun: KWS_QUIET_WINDOWS,
+ 			utteranceStart: undefined,
++			shortPause: false,
+ 			pending: undefined,
+ 		};
+ 	}
+@@ -640,7 +652,13 @@ class WorkerSession {
+ 		const kws = this.kws;
+ 		if (!kws.commands.has(keyword)) return "unknown-command";
+ 		if (kws.utteranceStart === undefined) return "no-utterance";
+-		return kws.time - kws.utteranceStart <= KWS_MAX_LEAD_SECONDS ? undefined : "lead";
++		return !kws.shortPause && kws.time - kws.utteranceStart <= KWS_MAX_LEAD_SECONDS ? undefined : "lead";
++	}
++
++	// With no usable ambient floor, retain the fixed speech minimum.
++	kwsSpeechLoud(rms) {
++		const floor = this.kws.floor;
++		return rms >= (floor > 0 ? floor * KWS_FLOOR_RATIO : MIN_SPEECH_LEVEL);
+ 	}
+ 
+ 	// Called for every device chunk of a capture that asked for keywords.
+@@ -655,10 +673,22 @@ class WorkerSession {
+ 		if (kws.frames < kws.windowFrames) return undefined;
+ 		const rms = Math.sqrt(kws.energy / kws.frames);
+ 		const windows = Math.max(1, Math.round(kws.frames / kws.windowFrames));
+-		kws.floor = Math.min(kws.floor, rms);
+-		const loud = rms >= Math.max(MIN_SPEECH_LEVEL, kws.floor * SPEECH_FLOOR_RATIO);
++		// Retain only recent windows in audio time, including long speech, so an
++		// old exceptionally quiet window cannot pin the estimate indefinitely.
++		// Digital zero is not a room floor; loud speech is not a floor either.
++		for (let i = 0; i < windows; i++) kws.floorWindows.push(rms);
++		if (kws.floorWindows.length > KWS_FLOOR_WINDOWS) kws.floorWindows.splice(0, kws.floorWindows.length - KWS_FLOOR_WINDOWS);
++		const ambient = kws.floorWindows.filter((level) => level > 0.0001 && level <= KWS_MAX_FLOOR).sort((a, b) => a - b);
++		if (ambient.length > 0) kws.floor = ambient[Math.floor((ambient.length - 1) * KWS_FLOOR_PERCENTILE)];
++		const loud = this.kwsSpeechLoud(rms);
+ 		if (loud) {
+-			if (kws.quietRun >= KWS_QUIET_WINDOWS) kws.utteranceStart = kws.time;
++			if (kws.quietRun >= KWS_QUIET_WINDOWS) {
++				kws.utteranceStart = kws.time;
++				kws.shortPause = false;
++			} else if (kws.quietRun > 0) {
++				// A short pause followed by more speech does not separate a phrase.
++				kws.shortPause = true;
++			}
+ 			kws.quietRun = 0;
+ 		} else {
+ 			kws.quietRun += windows;
+@@ -669,38 +699,39 @@ class WorkerSession {
+ 			this.rejectPendingKws("superseded");
+ 			const reason = this.keywordRejection(keyword);
+ 			if (reason) this.rejectKws(keyword, reason);
+-			else kws.pending = { command: keyword, deadline: kws.time + KWS_CONFIRM_SECONDS };
++			else kws.pending = { command: keyword, deadline: kws.time + KWS_CONFIRM_SECONDS, quietAfter: 0 };
++			// Quiet from before the hit cannot confirm what follows it.
++			return undefined;
+ 		}
+ 		if (!kws.pending) return undefined;
+-		if (kws.quietRun >= KWS_QUIET_WINDOWS) {
+-			const command = kws.pending.command;
+-			kws.pending = undefined;
+-			return command;
++		if (loud) {
++			this.rejectPendingKws("speech-after");
++		} else {
++			kws.pending.quietAfter += windows;
++			if (kws.pending.quietAfter >= KWS_QUIET_WINDOWS) {
++				const command = kws.pending.command;
++				kws.pending = undefined;
++				return command;
++			}
+ 		}
+-		// Speech went on after the phrase: it was part of a sentence.
+-		if (kws.time >= kws.pending.deadline) this.rejectPendingKws("speech-after");
++		if (kws.pending && kws.time >= kws.pending.deadline) this.rejectPendingKws("speech-after");
+ 		return undefined;
+ 	}
+ 
+-	// When the recording ends: the end itself is the silence after the phrase,
+-	// so a hit still waiting for it counts, and so does a phrase said right
+-	// before the end, which the spotter only reports after a little more audio.
++	// Stopping is not measured silence. A pending hit needs four fresh quiet
++	// windows, and the synthetic decode tail cannot satisfy that condition.
++	// Inspect an incomplete post-hit window before dropping it on stop.
+ 	finalKwsCommand() {
+ 		const kws = this.kws;
+ 		if (kws.pending) {
+-			const command = kws.pending.command;
+-			kws.pending = undefined;
+-			return command;
++			const continued = kws.frames > 0 && this.kwsSpeechLoud(Math.sqrt(kws.energy / kws.frames));
++			this.rejectPendingKws(continued ? "speech-after" : "stopped");
++			return undefined;
+ 		}
+ 		kws.time += kws.frames / kws.sampleRate;
+ 		const keyword = this.decodeKws(KWS_TAIL_SECONDS);
+-		if (!keyword) return undefined;
+-		const reason = this.keywordRejection(keyword);
+-		if (reason) {
+-			this.rejectKws(keyword, reason);
+-			return undefined;
+-		}
+-		return keyword;
++		if (keyword) this.rejectKws(keyword, this.keywordRejection(keyword) ?? "stopped");
++		return undefined;
+ 	}
+ 
+ 	// Loads sherpa-onnx and the recognizer; only called once the model verified.
+diff --git a/tests/voice-worker.test.ts b/tests/voice-worker.test.ts
+index 1559a730f..06fdab80e 100644
+--- a/tests/voice-worker.test.ts
++++ b/tests/voice-worker.test.ts
+@@ -3,17 +3,16 @@ import { createHash } from "node:crypto";
+ import { EventEmitter } from "node:events";
+ import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+ import { createRequire } from "node:module";
++import { tmpdir } from "node:os";
+ import { dirname, join } from "node:path";
+ import { Readable } from "node:stream";
+ import test from "node:test";
+-import { fileURLToPath } from "node:url";
+ 
+ // The voice worker (S1-S3) runs in its own process; here its entry function is
+ // driven in-process with fake capture and recognizer modules, so no native code
+ // or microphone is ever touched. The installed files it validates are real
+ // files in an owned scratch directory under tmp/.
+ 
+-const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+ const { runVoiceWorker } = createRequire(import.meta.url)("../scripts/voice-worker.cjs");
+ 
+ const SCHEMA = "gentle.voice/v1";
+@@ -34,9 +33,7 @@ interface Install {
+ }
+ 
+ function install(t: test.TestContext): Install {
+-	const base = join(repoRoot, "tmp");
+-	mkdirSync(base, { recursive: true });
+-	const dir = mkdtempSync(join(base, "voice-worker-"));
++	const dir = mkdtempSync(join(tmpdir(), "voice-worker-"));
+ 	t.after(() => rmSync(dir, { recursive: true, force: true }));
+ 	const runtimeRoot = join(dir, "runtime");
+ 	for (const file of [SHERPA_ENTRY, CPAL_ENTRY, NATIVE, PULSE_ENTRY, PULSE_NATIVE, KWS_ENTRY]) {
+@@ -900,6 +897,258 @@ const feed = (stream: FakeStream, windows: number, level: number) => {
+ 	for (let i = 0; i < windows; i++) stream.options.onData(chunk(100, level));
+ };
+ 
++test("room-level pauses separate commands after speech despite initial digital silence", async (t) => {
++	for (const noise of [0.004, 0.006, 0.008]) {
++		for (const pause of [4, 6]) {
++			for (const command of ["voice-off", "voice-on"]) {
++				await t.test(`${noise} RMS, ${pause * 100} ms, ${command}`, async (st) => {
++					const hitAt = 0.3 + 1 + 4 + pause / 10 + 1.2 + 0.2;
++					const worker = harness(st, { ...mono8k, fires: [{ at: fedAfter(hitAt), keyword: command }] });
++					worker.send(kwsStart(worker, { spot: true, keywordDiagnostics: true }));
++					await worker.waitFor(() => worker.types().includes("spotting"));
++					const stream = worker.streams[0]!;
++					feed(stream, 3, 0); // The microphone can begin with digital silence.
++					feed(stream, 10, noise);
++					feed(stream, 40, 0.016); // Previous speech, longer than the lead limit.
++					feed(stream, pause, noise);
++					feed(stream, 12, 0.016);
++					feed(stream, 10, noise);
++					await settle();
++					if (!worker.types().includes("command")) worker.send({ schema: SCHEMA, type: "stop" });
++					await worker.done;
++					assert.deepEqual(worker.messages, [
++						{ schema: SCHEMA, type: "spotting" },
++						{ schema: SCHEMA, type: "command", command },
++					]);
++					assert.equal(worker.exitCode(), 0);
++					assert.equal(stream.closes, 1);
++					assert.equal(worker.recognizers.length, 0);
++				});
++			}
++		}
++	}
++});
++
++test("the room floor can rise during a long capture without an old minimum pinning it", async (t) => {
++	const hitAt = 0.3 + 2 + 7 + 4 + 0.4 + 1.2 + 0.2;
++	const worker = harness(t, { ...mono8k, fires: [{ at: fedAfter(hitAt), keyword: "voice-off" }] });
++	worker.send(kwsStart(worker, { spot: true, keywordDiagnostics: true }));
++	await worker.waitFor(() => worker.types().includes("spotting"));
++	const stream = worker.streams[0]!;
++	feed(stream, 3, 0);
++	feed(stream, 20, 0.003);
++	feed(stream, 70, 0.008); // The room becomes louder for seven seconds.
++	feed(stream, 40, 0.016);
++	feed(stream, 4, 0.008);
++	feed(stream, 12, 0.016);
++	feed(stream, 10, 0.008);
++	await settle();
++	if (!worker.types().includes("command")) worker.send({ schema: SCHEMA, type: "stop" });
++	await worker.done;
++	assert.deepEqual(worker.messages, [
++		{ schema: SCHEMA, type: "spotting" },
++		{ schema: SCHEMA, type: "command", command: "voice-off" },
++	]);
++	assert.equal(worker.exitCode(), 0);
++	assert.equal(stream.closes, 1);
++	assert.equal(worker.recognizers.length, 0);
++});
++
++test("speech continuing after a keyword hit cannot be mistaken for a whole command", async (t) => {
++	const worker = harness(t, { ...mono8k, fires: [{ at: fedAfter(4.4), keyword: "voice-off" }] });
++	worker.send(kwsStart(worker, { spot: true, keywordDiagnostics: true }));
++	await worker.waitFor(() => worker.types().includes("spotting"));
++	const stream = worker.streams[0]!;
++	feed(stream, 3, 0);
++	feed(stream, 10, 0.003);
++	feed(stream, 3, 0.020); // A short introductory word.
++	feed(stream, 5, 0.003); // A pause within the same sentence.
++	feed(stream, 23, 0.020); // More words including the mention; the model hits.
++	feed(stream, 3, 0.020); // The sentence continues after the hit.
++	feed(stream, 10, 0.003);
++	await settle();
++	if (!worker.types().includes("command")) worker.send({ schema: SCHEMA, type: "stop" });
++	await worker.done;
++	assert.deepEqual(worker.messages, [
++		{ schema: SCHEMA, type: "spotting" },
++		{ schema: SCHEMA, type: "keyword-rejected", command: "voice-off", reason: "speech-after" },
++		{ schema: SCHEMA, type: "stopped" },
++	]);
++	assert.equal(worker.exitCode(), 0);
++	assert.equal(stream.closes, 1);
++	assert.equal(worker.recognizers.length, 0);
++});
++
++test("one speech window after a hit is rejected even over a 0.01 RMS room floor", async (t) => {
++	const worker = harness(t, { ...mono8k, fires: [{ at: fedAfter(4.4), keyword: "voice-off" }] });
++	worker.send(kwsStart(worker, { spot: true, keywordDiagnostics: true }));
++	await worker.waitFor(() => worker.types().includes("spotting"));
++	const stream = worker.streams[0]!;
++	feed(stream, 3, 0);
++	feed(stream, 10, 0.010);
++	feed(stream, 3, 0.020);
++	feed(stream, 5, 0.010);
++	feed(stream, 23, 0.020);
++	feed(stream, 1, 0.016); // A short continuation after the spotter hit.
++	feed(stream, 10, 0.010);
++	await settle();
++	if (!worker.types().includes("command")) worker.send({ schema: SCHEMA, type: "stop" });
++	await worker.done;
++	assert.deepEqual(worker.messages, [
++		{ schema: SCHEMA, type: "spotting" },
++		{ schema: SCHEMA, type: "keyword-rejected", command: "voice-off", reason: "speech-after" },
++		{ schema: SCHEMA, type: "stopped" },
++	]);
++	assert.equal(worker.exitCode(), 0);
++	assert.equal(stream.closes, 1);
++});
++
++test("a mention with less than 400 ms between preceding speech and the phrase never fires", async (t) => {
++	for (const noise of [0.003, 0.006, 0.010]) {
++		for (const pause of [0, 1, 2, 3]) {
++			await t.test(`${noise} RMS, ${pause * 100} ms`, async (st) => {
++				const worker = harness(st, { ...mono8k, fires: [{ at: fedAfter(3.0 + pause / 10), keyword: "voice-off" }] });
++				worker.send(kwsStart(worker, { spot: true, keywordDiagnostics: true }));
++				await worker.waitFor(() => worker.types().includes("spotting"));
++				const stream = worker.streams[0]!;
++				feed(stream, 3, 0);
++				feed(stream, 10, noise);
++				feed(stream, 3, 0.020); // Short preceding word.
++				feed(stream, pause, noise); // Less than 400 ms: not a separate utterance.
++				feed(stream, 12, 0.020);
++				feed(stream, 10, noise);
++				await settle();
++				if (!worker.types().includes("command")) worker.send({ schema: SCHEMA, type: "stop" });
++				await worker.done;
++				assert.deepEqual(worker.messages, [
++					{ schema: SCHEMA, type: "spotting" },
++					{ schema: SCHEMA, type: "keyword-rejected", command: "voice-off", reason: "lead" },
++					{ schema: SCHEMA, type: "stopped" },
++				]);
++				assert.equal(worker.exitCode(), 0);
++				assert.equal(stream.closes, 1);
++				assert.equal(worker.recognizers.length, 0);
++			});
++		}
++	}
++});
++
++test("weak speech over the measured floor after a hit rejects the mention at every tested noise level", async (t) => {
++	for (const noise of [0.003, 0.004, 0.006, 0.008, 0.010]) {
++		await t.test(`${noise} RMS`, async (st) => {
++			const worker = harness(st, { ...mono8k, fires: [{ at: fedAfter(2.5), keyword: "voice-off" }] });
++			worker.send(kwsStart(worker, { spot: true, keywordDiagnostics: true }));
++			await worker.waitFor(() => worker.types().includes("spotting"));
++			const stream = worker.streams[0]!;
++			feed(stream, 3, 0);
++			feed(stream, 10, noise);
++			feed(stream, 12, 0.020); // The hit arrives on the last phrase window.
++			feed(stream, 1, noise * 1.2); // Quiet continuation, above the same room floor.
++			feed(stream, 10, noise);
++			await settle();
++			if (!worker.types().includes("command")) worker.send({ schema: SCHEMA, type: "stop" });
++			await worker.done;
++			assert.deepEqual(worker.messages, [
++				{ schema: SCHEMA, type: "spotting" },
++				{ schema: SCHEMA, type: "keyword-rejected", command: "voice-off", reason: "speech-after" },
++				{ schema: SCHEMA, type: "stopped" },
++			]);
++			assert.equal(worker.exitCode(), 0);
++			assert.equal(stream.closes, 1);
++			assert.equal(worker.recognizers.length, 0);
++		});
++	}
++});
++
++test("stopping before four fresh quiet windows cannot confirm a pending hit", async (t) => {
++	const worker = harness(t, { ...mono8k, fires: [{ at: fedAfter(1.5), keyword: "voice-off" }] });
++	worker.send(kwsStart(worker, { keywordDiagnostics: true }));
++	await worker.waitFor(() => worker.types().includes("recording"));
++	const stream = worker.streams[0]!;
++	feed(stream, 3, 0);
++	feed(stream, 12, 0.3);
++	feed(stream, 3, 0); // Only 300 ms of post-hit quiet.
++	worker.send({ schema: SCHEMA, type: "stop" });
++	await worker.done;
++	assert.deepEqual(worker.messages, [
++		{ schema: SCHEMA, type: "recording" },
++		{ schema: SCHEMA, type: "keyword-rejected", command: "voice-off", reason: "stopped" },
++		{ schema: SCHEMA, type: "transcribing" },
++		{ schema: SCHEMA, type: "result", text: "hello world", truncated: false },
++	]);
++	assert.equal(worker.exitCode(), 0);
++	assert.equal(stream.closes, 1);
++	assert.equal(worker.recognizers.length, 1);
++});
++
++test("a partial speech window after a hit is not lost when dictation stops", async (t) => {
++	const worker = harness(t, { ...mono8k, fires: [{ at: fedAfter(1.5), keyword: "voice-off" }] });
++	worker.send(kwsStart(worker, { keywordDiagnostics: true }));
++	await worker.waitFor(() => worker.types().includes("recording"));
++	const stream = worker.streams[0]!;
++	feed(stream, 3, 0);
++	feed(stream, 12, 0.3); // The hit is pending.
++	stream.options.onData(chunk(10, 0.3)); // Speech continues, but the 100 ms window is incomplete.
++	worker.send({ schema: SCHEMA, type: "stop" });
++	await worker.done;
++	assert.deepEqual(worker.messages, [
++		{ schema: SCHEMA, type: "recording" },
++		{ schema: SCHEMA, type: "keyword-rejected", command: "voice-off", reason: "speech-after" },
++		{ schema: SCHEMA, type: "transcribing" },
++		{ schema: SCHEMA, type: "result", text: "hello world", truncated: false },
++	]);
++	assert.equal(worker.exitCode(), 0);
++	assert.equal(stream.closes, 1);
++	assert.equal(worker.recognizers.length, 1);
++});
++
++test("quiet before a late hit cannot confirm it; new speech after the hit is rejected", async (t) => {
++	const worker = harness(t, { ...mono8k, fires: [{ at: fedAfter(2.9), keyword: "voice-on" }] });
++	worker.send(kwsStart(worker, { spot: true, keywordDiagnostics: true }));
++	await worker.waitFor(() => worker.types().includes("spotting"));
++	const stream = worker.streams[0]!;
++	feed(stream, 3, 0);
++	feed(stream, 10, 0.004);
++	feed(stream, 12, 0.016);
++	feed(stream, 4, 0.004); // The spotter is late: four quiet windows before the hit.
++	await settle();
++	const beforeSpeech = [...worker.messages];
++	feed(stream, 3, 0.016);
++	feed(stream, 10, 0.004);
++	await settle();
++	if (!worker.types().includes("command")) worker.send({ schema: SCHEMA, type: "stop" });
++	await worker.done;
++	assert.deepEqual(beforeSpeech, [{ schema: SCHEMA, type: "spotting" }]);
++	assert.deepEqual(worker.messages, [
++		{ schema: SCHEMA, type: "spotting" },
++		{ schema: SCHEMA, type: "keyword-rejected", command: "voice-on", reason: "speech-after" },
++		{ schema: SCHEMA, type: "stopped" },
++	]);
++	assert.equal(worker.exitCode(), 0);
++	assert.equal(stream.closes, 1);
++});
++
++test("long continuous speech remains an embedded mention even after the room floor adapts", async (t) => {
++	const worker = harness(t, { ...mono8k, fires: [{ at: fedAfter(11.3), keyword: "voice-off" }] });
++	worker.send(kwsStart(worker, { spot: true, keywordDiagnostics: true }));
++	await worker.waitFor(() => worker.types().includes("spotting"));
++	const stream = worker.streams[0]!;
++	feed(stream, 3, 0);
++	feed(stream, 10, 0.008);
++	feed(stream, 100, 0.016);
++	feed(stream, 10, 0.008);
++	await settle();
++	if (!worker.types().includes("command")) worker.send({ schema: SCHEMA, type: "stop" });
++	await worker.done;
++	assert.deepEqual(worker.messages, [
++		{ schema: SCHEMA, type: "spotting" },
++		{ schema: SCHEMA, type: "keyword-rejected", command: "voice-off", reason: "lead" },
++		{ schema: SCHEMA, type: "stopped" },
++	]);
++	assert.equal(worker.exitCode(), 0);
++	assert.equal(stream.closes, 1);
++});
++
+ test("diagnostic hits explain rejected lead and speech-after without ending the spot capture", async (t) => {
+ 	for (const [reason, at, loud] of [["lead", 4.5, 40], ["speech-after", 1.5, 30]] as const) {
+ 		await t.test(reason, async (st) => {
+@@ -948,6 +1197,26 @@ test("a pending spotter hit is diagnosed when stop or cancel ends it before conf
+ 	}
+ });
+ 
++test("stopping after speech resumes does not turn a pending hit into a command", async (t) => {
++	const worker = harness(t, { ...mono8k, fires: [{ at: fedAfter(1.7), keyword: "voice-off" }] });
++	worker.send(kwsStart(worker, { keywordDiagnostics: true }));
++	await worker.waitFor(() => worker.types().includes("recording"));
++	feed(worker.streams[0]!, 3, 0);
++	feed(worker.streams[0]!, 12, 0.3);
++	feed(worker.streams[0]!, 2, 0); // The hit is pending.
++	feed(worker.streams[0]!, 1, 0.3); // Speech resumes just before stop.
++	worker.send({ schema: SCHEMA, type: "stop" });
++	await worker.done;
++	assert.deepEqual(worker.messages, [
++		{ schema: SCHEMA, type: "recording" },
++		{ schema: SCHEMA, type: "keyword-rejected", command: "voice-off", reason: "speech-after" },
++		{ schema: SCHEMA, type: "transcribing" },
++		{ schema: SCHEMA, type: "result", text: "hello world", truncated: false },
++	]);
++	assert.equal(worker.exitCode(), 0);
++	assert.equal(worker.streams[0]!.closes, 1);
++});
++
+ test("a diagnostic rejection found on final decoding does not change the dictated transcript", async (t) => {
+ 	const worker = harness(t, { ...mono8k, fires: [{ at: fedAfter(4.3) + 1, keyword: "voice-off" }] });
+ 	worker.send(kwsStart(worker, { keywordDiagnostics: true }));
+@@ -974,8 +1243,8 @@ test("a phrase that is the whole utterance is reported as its command and never
+ 	feed(stream!, 12, 0.3);
+ 	feed(stream!, 3, 0);
+ 	await settle();
+-	assert.deepEqual(worker.types(), ["recording"], "a hit waits for the silence that closes the utterance");
+-	feed(stream!, 1, 0);
++	assert.deepEqual(worker.types(), ["recording"], "a hit waits for fresh silence after the hit");
++	feed(stream!, 3, 0);
+ 	await worker.done;
+ 	assert.deepEqual(worker.messages, [
+ 		{ schema: SCHEMA, type: "recording" },
+@@ -1041,11 +1310,11 @@ test("a keyword the request did not name is ignored", async (t) => {
+ 	assert.deepEqual(worker.types(), ["recording", "transcribing", "result"]);
+ });
+ 
+-test("a recording stopped right after the phrase still ends as its command", async (t) => {
+-	// The spotter needs a little audio after the words; the worker gives it
+-	// silence when the recording ends, so the hit lands on the padding.
++test("padding for a final spotter hit cannot stand in for observed quiet", async (t) => {
++	// The hit is only decoded after stop, from the synthetic tail; it has no
++	// observed post-hit gap and must not suppress the dictated text.
+ 	const worker = harness(t, { ...mono8k, fires: [{ at: fedAfter(1.5) + 1, keyword: "cancel" }] });
+-	worker.send(kwsStart(worker));
++	worker.send(kwsStart(worker, { keywordDiagnostics: true }));
+ 	await worker.waitFor(() => worker.types().includes("recording"));
+ 	const [stream] = worker.streams;
+ 	feed(stream!, 3, 0);
+@@ -1054,9 +1323,13 @@ test("a recording stopped right after the phrase still ends as its command", asy
+ 	await worker.done;
+ 	assert.deepEqual(worker.messages, [
+ 		{ schema: SCHEMA, type: "recording" },
+-		{ schema: SCHEMA, type: "command", command: "cancel" },
++		{ schema: SCHEMA, type: "keyword-rejected", command: "cancel", reason: "stopped" },
++		{ schema: SCHEMA, type: "transcribing" },
++		{ schema: SCHEMA, type: "result", text: "hello world", truncated: false },
+ 	]);
+-	assert.equal(worker.recognizers.length, 0);
++	assert.equal(worker.exitCode(), 0);
++	assert.equal(stream!.closes, 1);
++	assert.equal(worker.recognizers.length, 1);
+ });
+ 
+ test("a malformed keyword option is refused before anything is loaded", async (t) => {
+@@ -1135,7 +1408,7 @@ test("a warm worker reports a command, takes the next recording and keeps its on
+ 	await worker.waitFor(() => worker.types().includes("recording"));
+ 	feed(worker.streams[0]!, 3, 0);
+ 	feed(worker.streams[0]!, 12, 0.3);
+-	feed(worker.streams[0]!, 4, 0);
++	feed(worker.streams[0]!, 6, 0);
+ 	await worker.waitFor(() => worker.types().includes("command"));
+ 	assert.deepEqual(worker.types(), ["recording", "command"]);
+ 	assert.equal(worker.streams[0]!.closes, 1, "the microphone is released with the command");
+@@ -1173,7 +1446,7 @@ test("a spot-only capture hears a command without the dictation model, a time li
+ 	assert.deepEqual(worker.types(), ["spotting"], "no limit, no endpoint, nothing reported while nothing is said");
+ 	feed(stream!, 3, 0);
+ 	feed(stream!, 12, 0.3);
+-	feed(stream!, 4, 0);
++	feed(stream!, 6, 0);
+ 	await worker.waitFor(() => worker.types().includes("command"));
+ 	assert.deepEqual(worker.messages, [
+ 		{ schema: SCHEMA, type: "spotting" },
