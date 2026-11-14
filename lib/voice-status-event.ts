@@ -1,15 +1,24 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { VoiceSessionState } from "./voice-session.ts";
+import type { ListenerDisplayState, ListenerLanguage } from "./voice-listener-protocol.ts";
 
-// The display-only voice state the parent shell draws (the sidebar tab). The
-// extension that draws it cannot reach this module, so the state travels as one
-// event per change, keyed by the session that owns it. The payload is exactly
-// { schema, sessionId, state }: no transcript, path, error text or other
-// content ever leaves the voice command. Importing this module has no side
-// effects: it registers nothing and starts nothing.
+// Display-only events for the session's voice bubble. The legacy local-capture
+// state remains exactly { schema, sessionId, state }; listener snapshots and
+// levels use separate versioned channels. No transcript, path, or error text
+// leaves the voice command. Importing this module has no side effects.
 
 export const VOICE_STATE_EVENT = "gentle-ai:voice-state";
 export const VOICE_STATE_SCHEMA = "gentle-pi.voice-state/v1";
+export const VOICE_DISPLAY_EVENT = "gentle-ai:voice-display";
+export const VOICE_DISPLAY_SCHEMA = "gentle-pi.voice-display/v1";
+export const VOICE_LEVEL_EVENT = "gentle-ai:voice-level";
+export const VOICE_LEVEL_SCHEMA = "gentle-pi.voice-level/v1";
+
+export interface VoiceDisplaySnapshot {
+	state: ListenerDisplayState;
+	language: ListenerLanguage;
+	label?: string;
+}
 
 export type VoiceDisplayState = "idle" | "preparing" | "listening" | "transcribing";
 
@@ -57,6 +66,8 @@ export interface VoiceStatePublisher {
 	// state repeated for this session, and a context without a session id all
 	// publish nothing.
 	publish(state: VoiceDisplayState, live?: () => boolean): boolean;
+	publishDisplay(snapshot: VoiceDisplaySnapshot): void;
+	publishLevel(source: "listening" | "reading", rms: number): void;
 	// After close() the publisher is inert, so a callback from a replaced session
 	// can never reach the display of the session that replaced it.
 	close(): void;
@@ -82,6 +93,18 @@ export function createVoiceStatePublisher(pi: Pick<ExtensionAPI, "events">, ctx:
 			}
 			last = state;
 			return true;
+		},
+		publishDisplay(snapshot) {
+			if (closed || !sessionId) return;
+			try {
+				pi.events.emit(VOICE_DISPLAY_EVENT, { schema: VOICE_DISPLAY_SCHEMA, sessionId, ...snapshot });
+			} catch { /* the display is advisory */ }
+		},
+		publishLevel(source, rms) {
+			if (closed || !sessionId) return;
+			try {
+				pi.events.emit(VOICE_LEVEL_EVENT, { schema: VOICE_LEVEL_SCHEMA, sessionId, source, rms });
+			} catch { /* the display is advisory */ }
 		},
 		close() {
 			closed = true;

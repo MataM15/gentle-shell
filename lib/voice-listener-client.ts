@@ -93,6 +93,8 @@ export interface VoiceListenerClientOptions {
 	dial?: (path: string) => Socket;
 	backoffMs?: readonly number[];
 	onFrame?: (frame: ListenerFrame) => void;
+	// Opt in to display snapshots after each welcome; never wait for them.
+	display?: boolean;
 }
 
 interface Pending {
@@ -205,6 +207,9 @@ export class VoiceListenerClient {
 		this.attempt = 0;
 		const current = this.session();
 		if (current && current.sessionId === sessionId && current.voiceOn !== voiceOn) this.updateVoice(current.voiceOn);
+		if (this.options.display) {
+			try { void this.request({ type: "display", on: true }).catch(() => {}); } catch { /* display never blocks the connection */ }
+		}
 		return frame.state;
 	}
 
@@ -263,7 +268,9 @@ export class VoiceListenerClient {
 		// wire order instead of overwriting the newer state after await resumes.
 		if (frame.type === "welcome" || frame.type === "state") this.currentState = frame.state;
 		if (frame.type === "bye" && frame.reason === "replaced") this.replaced = true;
-		for (const listener of [...this.listeners]) listener(frame);
+		for (const listener of [...this.listeners]) {
+			try { listener(frame); } catch { /* a display or observer cannot break voice */ }
+		}
 	}
 
 	private disconnected(socket: Socket): void {
@@ -271,6 +278,7 @@ export class VoiceListenerClient {
 		this.socket = undefined;
 		this.joined = false;
 		this.failPending(new Error("the voice listener connection closed"));
+		if (this.options.display) this.dispatch({ type: "display", state: "off", language: "es" });
 		if (this.replaced) return;
 		this.scheduleReconnect();
 	}
@@ -651,6 +659,7 @@ export interface SessionListenerLinkOptions {
 	// woken by voice (the frame says so) or because another session turned it on,
 	// and off when voice off reached every session (S7, L10).
 	onVoice?(command: ListenerCommand, wake: boolean, awake: boolean): void;
+	onDisplay?(frame: Extract<ListenerFrame, { type: "display" | "level" }>): void;
 }
 
 // One connection per session carries both roles: it registers the pane that the
@@ -674,6 +683,7 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 		}
 	};
 	const route = (frame: ListenerFrame): void => {
+		if (frame.type === "display" || frame.type === "level") { options.onDisplay?.(frame); return; }
 		if (handler?.(frame)) return;
 		if (frame.type === "command") {
 			options.onVoice?.(frame.command, frame.wake === true, client?.listenerState !== "asleep");
@@ -732,6 +742,7 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 								return current?.sessionId === session.sessionId ? current : undefined;
 							},
 							backoffMs: options.backoffMs,
+							display: Boolean(options.onDisplay),
 							onFrame: route,
 						}));
 					},

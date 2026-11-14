@@ -28,6 +28,35 @@ test('actual publisher events reach the receiver, clear on idle, and reject stal
  assert.equal(renders, rendersBefore, 'a rejected update never asks for a render');
  receiver.reset(); publisher.close();
 });
+test('display snapshots and levels build a bounded, normalized session bubble without accepting foreign data', t => {
+ const listeners=new Map<string,(value:unknown)=>void>();
+ const events={on:(name:string,fn:(value:unknown)=>void)=>{listeners.set(name,fn);return ()=>listeners.delete(name);}};
+ let session='one'; let renders=0;
+ const receiver=createVoiceReceiver(events,()=>session,()=>{renders++;});
+ t.after(()=>receiver.dispose());
+ const display=(state:string, language='es', label?:string, id='one') => listeners.get('gentle-ai:voice-display')?.({schema:'gentle-pi.voice-display/v1',sessionId:id,state,language,...(label === undefined ? {} : {label})});
+ const level=(source:string,rms:number,id='one') => listeners.get('gentle-ai:voice-level')?.({schema:'gentle-pi.voice-level/v1',sessionId:id,source,rms});
+ assert.deepEqual(receiver.model(),{state:'off',levels:[],language:'es',englishMode:false});
+ display('reading','en','voice-control');
+ assert.deepEqual(receiver.model(),{state:'reading',levels:[],session:'voice-control',language:'en',englishMode:false});
+ level('reading',0.1); level('reading',0.25);
+ assert.ok(receiver.model().levels[0]! > 0.5 && receiver.model().levels[0]! < 0.8, 'typical reading fills most of the wave');
+ assert.equal(receiver.model().levels[1],1, 'loud output is capped');
+ const before=receiver.model(); const count=renders;
+ display('asleep','es',undefined,'other'); level('reading',1,'other'); level('listening',1); level('reading',NaN);
+ assert.deepEqual(receiver.model(),before); assert.equal(renders,count, 'invalid and foreign events cannot redraw');
+ display('listening','es','voice-control'); level('listening',0.0031); level('listening',0.016);
+ assert.deepEqual(receiver.model().levels,[0,1], 'measured mic floor and normal speech');
+ for (let i=0;i<300;i++) level('listening',i/300);
+ assert.ok(receiver.model().levels.length <= 160, 'history is bounded');
+ assert.ok(receiver.model().levels.at(-1)! > 0.99, 'newest is last');
+ display('transcribing'); assert.deepEqual(receiver.model().levels,[]);
+ display('asleep'); assert.equal(receiver.model().state,'asleep');
+ display('off'); assert.equal(receiver.model().state,'off');
+ display('confirm'); assert.equal(receiver.model().state,'off', 'T9 is not fed');
+ session='two'; assert.equal(receiver.model().state,'off', 'replacement cannot inherit the old session');
+});
+
 test('accept only exact schema and active session, including idle clear', () => {
  const event={schema:'gentle-pi.voice-state/v1',sessionId:'here',state:'listening'};
  assert.equal(acceptedVoiceState('here',event),'listening');

@@ -25,6 +25,9 @@ export type ListenerState = (typeof LISTENER_STATES)[number];
 // window shows the right one without asking; the listener knows it, not the wire.
 export const LISTENER_LANGUAGES = ["es", "en"] as const;
 export type ListenerLanguage = (typeof LISTENER_LANGUAGES)[number];
+// Per-session display, unlike the shared listener state, may also be hidden.
+export const LISTENER_DISPLAY_STATES = ["off", "asleep", "listening", "transcribing", "reading"] as const;
+export type ListenerDisplayState = (typeof LISTENER_DISPLAY_STATES)[number];
 // "off" is the absence of a listener process, never a state a listener reports.
 export const LISTENER_COMMANDS = ["voice-off", "voice-on"] as const;
 export type ListenerCommand = (typeof LISTENER_COMMANDS)[number];
@@ -121,7 +124,9 @@ export type ListenerRequest =
 	| { type: "cancel"; id?: string }
 	// The display levels (slice D): one frame per 50 ms while a capture records,
 	// sent only to the sessions that ask for them.
-	| { type: "levels"; id?: string; on: boolean };
+	| { type: "levels"; id?: string; on: boolean }
+	// Opt in to this session's bubble snapshots and its visible levels.
+	| { type: "display"; id?: string; on: boolean };
 
 export interface WelcomeFrame {
 	type: "welcome";
@@ -141,6 +146,7 @@ export type ListenerFrame =
 	| { type: "state"; state: ListenerState; at: number; language?: ListenerLanguage; paneId?: string; label?: string }
 	// One display level: the microphone RMS, 0..1, and when it was measured.
 	| { type: "level"; rms: number; at: number }
+	| { type: "display"; state: ListenerDisplayState; language: ListenerLanguage; label?: string }
 	| { type: "command"; command: ListenerCommand; wake?: boolean }
 	| { type: "transcript"; text: string; truncated?: boolean }
 	// What became of the capture: its phase, why it failed, and where the
@@ -163,6 +169,7 @@ type Kind =
 	| "session"
 	| "sessions"
 	| "state"
+	| "display-state"
 	| "command"
 	| "error"
 	| "reason"
@@ -193,6 +200,7 @@ const KINDS: Record<Kind, (value: unknown) => boolean> = {
 	session: (value) => typeof value === "string" && SESSION_ID.test(value),
 	sessions: (value) => Array.isArray(value) && value.length <= LISTENER_MAX_CLIENTS && value.every((id) => typeof id === "string" && SESSION_ID.test(id)),
 	state: (value) => LISTENER_STATES.includes(value as ListenerState),
+	"display-state": (value) => LISTENER_DISPLAY_STATES.includes(value as ListenerDisplayState),
 	command: (value) => LISTENER_COMMANDS.includes(value as ListenerCommand),
 	error: (value) => LISTENER_ERRORS.includes(value as ListenerErrorCode),
 	reason: (value) => LISTENER_BYE_REASONS.includes(value as ListenerByeReason),
@@ -250,6 +258,7 @@ const REQUEST_SPECS: Record<string, Spec> = {
 	stop: { required: {}, optional: { ...ID } },
 	cancel: { required: {}, optional: { ...ID } },
 	levels: { required: { on: "boolean" }, optional: { ...ID } },
+	display: { required: { on: "boolean" }, optional: { ...ID } },
 };
 
 const FRAME_SPECS: Record<string, Spec> = {
@@ -258,6 +267,7 @@ const FRAME_SPECS: Record<string, Spec> = {
 	snapshot: { required: { state: "state", listenerPid: "pid", clients: "counter", sessions: "sessions" }, optional: { ...ID } },
 	state: { required: { state: "state", at: "number" }, optional: { language: "language", paneId: "string", label: "string" } },
 	level: { required: { rms: "rms", at: "counter" } },
+	display: { required: { state: "display-state", language: "language" }, optional: { label: "string" } },
 	// Only a voice on can be a wake: nothing else means "start listening here".
 	command: { required: { command: "command" }, optional: { wake: "boolean" }, check: (record) => record.wake === undefined || record.command === "voice-on" },
 	transcript: { required: { text: "text" }, optional: { truncated: "boolean" } },

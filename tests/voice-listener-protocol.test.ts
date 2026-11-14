@@ -268,6 +268,22 @@ test("the reading's loudness parses as one bounded frame of levels", () => {
 	}
 });
 
+test("a display subscription and its session-scoped snapshots have exact keys", () => {
+	for (const on of [true, false]) assert.deepEqual(parseListenerRequestLine(line({ type: "display", on })), { type: "display", on });
+	for (const bad of [{ type: "display" }, { type: "display", on: "yes" }, { type: "display", on: true, extra: 1 }]) assert.equal(parseListenerRequestLine(line(bad)), undefined);
+	for (const state of ["off", "asleep", "listening", "transcribing", "reading"]) {
+		const frame = { type: "display", state, language: "es", ...(state === "reading" ? { label: "repo" } : {}) };
+		assert.deepEqual(parseListenerFrameLine(line(frame)), frame);
+	}
+	for (const bad of [
+		{ type: "display", state: "confirm", language: "es" },
+		{ type: "display", state: "reading", language: "fr" },
+		{ type: "display", state: "reading" },
+		{ type: "display", state: "reading", language: "es", transcript: "private" },
+		{ type: "display", state: "reading", language: "es", label: "x".repeat(257) },
+	]) assert.equal(parseListenerFrameLine(line(bad)), undefined, JSON.stringify(bad));
+});
+
 // --- levels and the owning session (T4, S5) ------------------------------------------
 
 test("levels subscribe and unsubscribe, and nothing else is accepted", () => {

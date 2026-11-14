@@ -145,7 +145,6 @@ import { JOBS_FINISHED_TTL_MS, renderJobsSection } from "../lib/jobs-widget.ts";
 import { NativePointerRegion } from "../lib/native-pointer-region.ts";
 import { acceptedJobs } from "../lib/shell-activity-state.ts";
 import { createVoiceReceiver } from "../lib/shell-voice-state.ts";
-import { renderVoiceIndicator } from "../lib/shell-voice-indicator.ts";
 import { renderVoiceBubble, type VoiceBubbleModel } from "../lib/shell-voice-bubble.ts";
 import { acceptedSessionSnapshot, createSessionRefresh, readSessionSnapshot, sessionRows, SESSION_REFRESH_EVENT, SESSION_SNAPSHOT_EVENT, SESSIONS_CARD_TITLE, type SessionSnapshot } from "../lib/shell-session-state.ts";
 import { installSessionChangeCapture } from "../lib/session-change-capture.ts";
@@ -2606,18 +2605,9 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		renderHost?.requestRender();
 	};
 	const sessionId = () => currentContext?.sessionManager.getSessionId();
-	// The persistent voice bubble above the input (S18). This is the one place that
-	// turns the receiver's state into a bubble model; the reading, asleep and confirm
-	// states, the wave levels, the session label and the language extend it here.
-	const voiceBubbleModel = (): VoiceBubbleModel => {
-		const state = voiceReceiver.current() ?? "idle";
-		return {
-			state: state === "idle" ? "off" : state === "transcribing" ? "transcribing" : "listening",
-			levels: [],
-			language: "es",
-			englishMode: false,
-		};
-	};
+	// The persistent voice bubble above the input (S18). The receiver owns its
+	// session-scoped model; confirm and English mode stay unfed until T9 and T8.
+	const voiceBubbleModel = (): VoiceBubbleModel => voiceReceiver.model();
 	// The spinner and the sweep move with the clock, so a frame timer runs only while transcribing.
 	let voiceBubbleTimer: ReturnType<typeof setInterval> | undefined;
 	const syncVoiceBubbleTimer = () => {
@@ -3104,11 +3094,6 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 				surface: "panel",
 				invalidate() {},
 			});
-			const voicePart = sidebarPart(tui, "voice", { render: () => [], invalidate() {}, dispose() {} }, {
-				digest: () => voiceReceiver.current() ?? "idle",
-				render: (width) => renderVoiceIndicator(voiceReceiver.current(), theme, width),
-				invalidate() {},
-			});
 			// An active dev-binary override is one `Build` line pinned in the rail on every tab but Status (S20);
 			// the Status tab lists it under Integrations and the panel sheet's Status carries it too.
 			const buildPart = sidebarPart(tui, "build", { render: () => [], invalidate() {}, dispose() {} }, {
@@ -3209,7 +3194,6 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 				if (disposeFooter === dispose) disposeFooter = undefined;
 				clearInterval(jobsTimer);
 				jobsPart.dispose();
-				voicePart.dispose?.();
 				buildPart.dispose?.();
 				limitsPart.dispose?.();
 				sessionsPart.dispose?.();

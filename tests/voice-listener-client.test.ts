@@ -9,7 +9,6 @@ import test, { after } from "node:test";
 import { fileURLToPath } from "node:url";
 import { createSessionListenerLink, cutListenerReading, ensureListener, LISTENER_DICTATE_TIMEOUT_MS, ListenerDeliveryError, listenerReadingTurn, sessionDisplayLabel, SESSION_LABEL_MAX, VoiceListenerClient, type ListenerSession, type ListenerWakeReservation, type SessionDictation } from "../lib/voice-listener-client.ts";
 import { VoiceSessionError, type VoiceSessionErrorCode, type VoiceSessionState } from "../lib/voice-session.ts";
-import type { VoiceOverlay } from "../lib/voice-overlay.ts";
 import { listenerPaths, readListenerLock, takeListenerLock, VoiceListener, type ListenerDictation, type ListenerDictationRequest } from "../lib/voice-listener.ts";
 import { encodeListenerFrame, type ListenerFrame } from "../lib/voice-listener-protocol.ts";
 
@@ -353,24 +352,21 @@ test("the reading turn sends the played loudness to the listener and survives a 
 	const dir = scratch();
 	const levels: number[] = [];
 	const states: string[] = [];
-	const overlay: VoiceOverlay = {
-		show: (snapshot) => {
-			states.push(snapshot.state);
-		},
-		level: (value) => {
-			levels.push(value);
-		},
-		dispose: () => {},
-	};
-	const server = new VoiceListener({ dir, overlay, readTailMs: 5 });
+	const server = new VoiceListener({ dir, readTailMs: 5 });
 	await server.listen();
+	const display = new VoiceListenerClient({ dir, session: session("s-1"), display: true, onFrame: (frame) => {
+		if (frame.type === "display") states.push(frame.state);
+		if (frame.type === "level") levels.push(frame.rms);
+	} });
+	await display.connect();
+	await waitFor(() => states.includes("off"));
 	const reading = await listenerReadingTurn({ dir, session: session("s-1"), chars: 20, signal: new AbortController().signal });
 	assert.ok(reading && reading.kind === "granted", "the free turn is granted");
-	assert.deepEqual(states, ["listening", "reading"], "the voice-on hello wakes the listener before the overlay draws the reading");
+	await waitFor(() => states.includes("reading"));
 
 	reading.levels({ frameMs: 50, durationMs: 200, levels: [0.25, 0.5, 0.75] });
 	await waitFor(() => levels.length === 3, 2_000);
-	assert.deepEqual(levels, [0.25, 0.5, 0.75], "the loudness reaches the overlay as it is");
+	assert.deepEqual(levels, [0.25, 0.5, 0.75], "the loudness reaches the owning display as it is");
 
 	// The wire refuses a malformed frame by closing the connection, so the client
 	// sanitizes instead: the reading never dies over a value it cannot draw.
@@ -384,6 +380,7 @@ test("the reading turn sends the played loudness to the listener and survives a 
 	reading.levels({ frameMs: 50, durationMs: 50, levels: [1] });
 	await new Promise((resolve) => setTimeout(resolve, 120));
 	assert.equal(levels.length, 6, "a released reading sends nothing");
+	display.close();
 	await server.close();
 });
 
@@ -979,6 +976,28 @@ test("a voice change while hello awaits welcome is sent after the join", async (
 	} finally {
 		client.close();
 	}
+});
+
+test("a display client subscribes after welcome without waiting on the display", async () => {
+ const written: Array<Record<string,unknown>>=[];
+ class FakeSocket extends EventEmitter {
+  destroyed=false; setEncoding() {};
+  write(chunk:string) { const frame=JSON.parse(chunk); written.push(frame); if(frame.type==='hello') queueMicrotask(()=>this.emit('data',encodeListenerFrame({type:'welcome',id:frame.id,listenerPid:1,proto:1,state:'asleep'}))); return true; }
+  destroy() { this.destroyed=true; return this; }
+ }
+ const socket=new FakeSocket();
+ const client=new VoiceListenerClient({dir:scratch(),session:session('s-1',false),display:true,dial:()=>socket as unknown as Socket} as never);
+ queueMicrotask(()=>socket.emit('connect'));
+ try {
+  assert.equal(await client.connect(),'asleep');
+  assert.deepEqual(written.map(frame=>frame.type),['hello','display']);
+  assert.equal(written[1]!.on,true);
+ } finally {client.close();}
+});
+
+test("the production listener no longer wires a Windows overlay process", () => {
+ const source=readFileSync(join(import.meta.dirname,'..','scripts','voice-listener.mjs'),'utf8');
+ assert.doesNotMatch(source,/voice-overlay-windows|createOverlayForEnvironment|GENTLE_PI_VOICE_OVERLAY/);
 });
 
 test("the hello carries the display label the session sends", async () => {

@@ -536,75 +536,38 @@ a session that asks for a capture only receives the transcript.
   as it did before the spotter existed. Keyword hits and wakes are logged as
   event names, command ids and session ids only: no audio, no text and no
   level is ever stored.
-- **The overlay port.** `lib/voice-overlay.ts` is the seam the window plugs into:
-  the listener hands it a snapshot of the display (state, language, owning session) on every change and the smoothed level while recording. The
-  meter lives there, never in the detector: the same worker RMS is normalized
-  between the measured WSLg floor (0.0031) and measured speech (0.016) and
-  smoothed fast up, slow down, so the endpointer's own thresholds are
-  untouched. A reading has its own output meter (floor 0.02, full bar at 0.25),
-  because the played speech is an RMS on a 0..1 scale and silent between words.
-  An overlay that throws, rejects or never answers is logged once
-  (`overlay.failed`, the event name only, never a level or a transcript) and
-  dropped for good; capture, transcripts, cues and readings carry on without
-  it.
-
-- **The overlay window.** Under WSL or Windows the listener owns a small window
-  (`lib/voice-overlay-windows.ts`, `scripts/voice-overlay-window.ps1`, the design
-  `design/voice-overlay/03-bordes-y-pildora.html`). It is a WPF window started
-  through PowerShell on the cue host's shape: one warm process, one short line
-  per command on stdin, a state change acknowledged and the levels fire and
-  forget, at most one every 40 ms with only the newest kept. A state line is
-  followed by `rec 1` or `rec 0`: the snapshot's `recording` flag is the only
-  truth about an open microphone, so the window never has to infer it from the
-  audio. It is always on top,
-  click-through (a click on it reaches the window underneath), never takes the
-  focus, and is absent from the taskbar and Alt+Tab. There is no resting form: it
-  appears on the monitor that holds the foreground window when a state starts, and
-  draws nothing while nothing is under way. Everything is local:
-  nothing leaves the machine, and no level, session name or transcript is ever
-  logged.
-  - **Listening** (the microphone really records): the four screen edges glow in
-    rose and breathe with the microphone level, and the pill shows a mic badge,
-    "ESCUCHANDO", the session label, a mirrored wave and the language chip.
-  - **No resting form:** voice on with nothing under way draws nothing. There is
-    no pill, no badge and no glow for an armed microphone, and a wake draws no
-    window of its own; the listening form appears with the recording and goes with
-    it. The full listening
-    look is drawn from the snapshot's explicit `recording` flag, never guessed
-    from the audio: the listener sets it when the worker reports that it is
-    recording and clears it when that recording ends (a stop, a cancel, a
-    failure, the session closing or the listener leaving), in every state. Levels
-    never turn it on and a quiet microphone never turns it off, so the window
-    cannot say the microphone is open when it is not, and a silent moment never
-    hides an open microphone.
-  - **Transcribing:** an amber bar sweeps along the top edge and the pill shows a
-    spinner and "TRANSCRIBIENDO…".
-  - **Reading:** a green glow along the bottom edge only, a speaker badge,
-    "LEYENDO", "de" plus the session label, and bars rising from the baseline that
-    follow the level of the speech the player actually started. If no level has
-    arrived for 300 ms the bars fall back to a gentle synthesized motion.
-  - **Asleep:** nothing is drawn. The keyword is still heard by the listener,
-    which is the only thing awake, and the window has no form to show for it.
-  - **Language:** the chip shows `ES`; `EN` is drawn as the filled blue English
-    chip. The rest of the English mode (blue edges) and the confirmation state are
-    designed but not wired yet.
-  - **Turn it off:** `GENTLE_PI_VOICE_OVERLAY=off` before the listener starts
-    (there is no settings key). With no PowerShell, or off Windows and WSL, no
-    window is built and voice is unchanged. If the window process exits, refuses
-    or hangs, the listener logs `overlay.failed` once, drops it for the rest of
-    its life and carries on; it is never restarted in a loop. The window closes
-    with the listener, and closes by itself if the listener dies.
-  - **Known limits:** the window follows the Windows "show animations" setting
-    (off: a still spinner and sweep, no synthesized reading motion). It is drawn
-    at the DPI of the monitor it opens on; only 100% scaling was exercised. The
-    PowerShell host costs about 4 to 5% of one core while listening with a moving
-    wave (about 1% once warm), 1 to 2% while transcribing or reading, and nothing
-    when idle, and holds about 150 MiB. A full-screen game or a window that
-    outranks topmost windows can cover it.
-  - **See it without talking:**
-    `node --experimental-strip-types scripts/voice-overlay-demo.mjs` shows the
-    real window state by state for about 36 seconds with synthetic levels. It
-    opens no microphone, plays no audio and closes the window when it ends.
+- **The display feed.** The listener sends what a session's display needs over
+  the same socket, only to a session that opts in: a snapshot of the display
+  (state, language, owning session, the explicit `recording` flag) on every
+  change, the microphone level while recording and the loudness of the reply
+  being read, paced to at most one level frame per 50 ms and dropped, never
+  queued, when the session cannot keep up. Levels are normalized in
+  `lib/voice-overlay.ts`, never in the detector: the worker RMS between the
+  measured WSLg floor (0.0031) and measured speech (0.016), and the played
+  speech with its own output meter (floor 0.02, full bar at 0.25). A display that
+  disconnects or stalls never holds up capture, transcripts, cues or readings,
+  and no level, session name or transcript is ever logged.
+- **The voice bubble.** Each Pi session draws the voice state inside Gentle
+  Shell, right above the input box and below the agents row
+  (`lib/shell-voice-bubble.ts`, the design
+  `design/voice-bubble/01-sobre-el-cuadro.html`). It pushes the chat up instead
+  of covering it, and draws nothing while voice is off or nothing is under way.
+  - **Listening** (the microphone really records, from the `recording` flag):
+    four rows: "ESCUCHANDO" with the session and the language, a one-row wave
+    from the microphone level, the commands that apply («Gentle Voice off»
+    apaga · «cancel» / «stop» descarta) and the bottom border.
+  - **Transcribing:** a spinner and a sweep, "micrófono cerrado · el texto
+    aparece en el cuadro".
+  - **Reading:** "LEYENDO", the session that speaks, and a wave that follows the
+    loudness of the speech the player actually started.
+  - **Asleep:** one row, «Gentle Voice on» para despertar.
+  - **Language:** the chip shows the listener's dictation language (`ES` by
+    default). The current dictation model detects the language per utterance and
+    does not report it, so the chip cannot follow a detected switch yet.
+  - **Not wired yet:** the confirmation countdown (T9) and the English mode (T8)
+    are designed and rendered but never fed.
+  - The Windows overlay window that drew these states before is gone, together
+    with `GENTLE_PI_VOICE_OVERLAY`; no PowerShell window process is started.
 
 A session dictates through the listener: the lock, the socket, the turn and the
 microphone are live, and a reply is read only in the pane herdr reports focused

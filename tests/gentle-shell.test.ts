@@ -8385,7 +8385,7 @@ test("the Resources tab carries the Limits card, one block per provider, a claud
 	} finally { rail.dispose(); await fire(handlers, "session_shutdown", ctx); }
 });
 
-test("scoped voice events paint the pinned voice line of the wide rail and clear on idle and replacement (S10)", async (t) => {
+test("voice lives in the bubble, not the pinned rail, and remains session-scoped (S18, L45)", async (t) => {
 	const home = scopedDoubleEscCancelConfigHome(t);
 	const { pi, handlers } = fakePi();
 	gentleShell(pi, { GENTLE_PI_CONFIG_HOME: home, GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, { activeProfile: () => "team" });
@@ -8394,16 +8394,20 @@ test("scoped voice events paint the pinned voice line of the wide rail and clear
 	const rail = tabbedRail(handlers, ctx, ui);
 	const voice = createVoiceStatePublisher(pi, ctx);
 	const pinned = () => { rail.screen(); return rail.pinned().render(50).map(stripAnsi).join("\n"); };
+	const bubble = () => (ui.widgets.get("gentle-shell-voice-bubble") as (tui: unknown, theme: unknown) => { render(width: number): string[] })(rail.tui, plainTheme).render(100).map(stripAnsi);
 	const badge = /● (Preparando|Escuchando|Transcribiendo) /;
 	try {
-		assert.doesNotMatch(pinned(), badge);
-		voice.publish("preparing"); assert.match(pinned(), /● Preparando /);
-		voice.publish("listening"); assert.match(pinned(), /● Escuchando /);
+		assert.deepEqual(bubble(), []);
+		voice.publish("listening");
+		assert.doesNotMatch(pinned(), badge); assert.match(bubble().join("\n"), /ESCUCHANDO/);
 		pi.events.emit(VOICE_STATE_EVENT, { schema: VOICE_STATE_SCHEMA, sessionId: "foreign", state: "transcribing" });
-		assert.match(pinned(), /● Escuchando /, "another session's event is ignored");
-		rail.select("Resources"); assert.match(pinned(), /● Escuchando /, "the line follows every tab");
-		voice.publish("transcribing"); assert.match(pinned(), /● Transcribiendo /);
-		voice.publish("idle"); assert.doesNotMatch(pinned(), badge);
+		assert.match(bubble().join("\n"), /ESCUCHANDO/, "another session's event is ignored");
+		rail.select("Resources"); assert.doesNotMatch(pinned(), badge);
+		voice.publish("idle"); assert.deepEqual(bubble(), []);
+		const display = (state: string) => pi.events.emit("gentle-ai:voice-display", { schema: "gentle-pi.voice-display/v1", sessionId: "shell-session", state, language: "es", ...(state === "reading" ? { label: "repo" } : {}) });
+		display("reading"); assert.equal(bubble().length, 4); assert.match(bubble()[0]!, /LEYENDO.*repo/);
+		display("asleep"); assert.equal(bubble().length, 1); assert.match(bubble()[0]!, /DORMIDO/);
+		display("off"); assert.deepEqual(bubble(), []); assert.doesNotMatch(pinned(), badge);
 	} finally { rail.dispose(); await fire(handlers, "session_shutdown", ctx); }
 });
 

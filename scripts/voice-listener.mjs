@@ -9,7 +9,6 @@ import { createCuePlayer } from "../lib/voice-cues.ts";
 import { createVoiceLog } from "../lib/voice-diagnostics.ts";
 import { resolveVoiceHome } from "../lib/voice-install.ts";
 import { buildVoiceKeywordOption, createHerdrFocus, VoiceListener } from "../lib/voice-listener.ts";
-import { createOverlayForEnvironment } from "../lib/voice-overlay-windows.ts";
 import { diagnoseVoicePlatform, readVoicePlatformProbe } from "../lib/voice-platform.ts";
 import { createWarmVoiceWorker } from "../lib/voice-warm.ts";
 
@@ -27,10 +26,6 @@ if (!warm) log("listener.capture-unavailable", { reason: diagnosis.limitations[0
 
 // The cues are played where the microphone is: this process, next to the worker.
 const cues = createCuePlayer({ env });
-// The overlay window (T12): only on WSL or Windows with a PowerShell to start it,
-// and never with GENTLE_PI_VOICE_OVERLAY=off. Nothing starts until the first
-// state; a failure drops it and voice carries on.
-const overlay = createOverlayForEnvironment({ env });
 // Focus comes from herdr; a failed lookup focuses nothing, so nothing is
 // delivered and the microphone stays closed.
 //
@@ -53,9 +48,6 @@ const listener = new VoiceListener({
 	// Spotting shares the warm worker while asleep, between turns and during readings.
 	keyword: keywordOption,
 	spot: warm && keywordOption ? (onKeywordRejected) => warm.spot({ kws: keywordOption, onKeywordRejected }) : undefined,
-	// Without a window the listener publishes the levels to the sessions that ask
-	// for them and to nobody else.
-	overlay,
 });
 
 let stopping = false;

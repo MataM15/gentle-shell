@@ -1402,17 +1402,19 @@ test("a replaced startup connection sends no late hello or command to the new se
 		let buffered = "";
 		socket.on("data", (chunk) => {
 			buffered += chunk;
-			const newline = buffered.indexOf("\n");
-			if (newline < 0) return;
-			const hello = JSON.parse(buffered.slice(0, newline)) as { type: string; id: string; sessionId: string };
-			if (hello.type !== "hello") return;
-			hellos.push(hello.sessionId);
-			const welcome = encodeListenerFrame({ type: "welcome", id: hello.id, listenerPid: process.pid, proto: 1, state: "asleep" });
-			// Both frames arrive together, before the pending join can close itself.
-			const stale = hello.sessionId === "session-alpha"
-				? encodeListenerFrame({ type: "transcript", text: "stale" }) + encodeListenerFrame({ type: "command", command: "voice-off" })
-				: "";
-			socket.write(welcome + stale);
+			let newline: number;
+			while ((newline = buffered.indexOf("\n")) >= 0) {
+				const hello = JSON.parse(buffered.slice(0, newline)) as { type: string; id: string; sessionId: string };
+				buffered = buffered.slice(newline + 1);
+				if (hello.type !== "hello") continue;
+				hellos.push(hello.sessionId);
+				const welcome = encodeListenerFrame({ type: "welcome", id: hello.id, listenerPid: process.pid, proto: 1, state: "asleep" });
+				// Both frames arrive together, before the pending join can close itself.
+				const stale = hello.sessionId === "session-alpha"
+					? encodeListenerFrame({ type: "transcript", text: "stale" }) + encodeListenerFrame({ type: "command", command: "voice-off" })
+					: "";
+				socket.write(welcome + stale);
+			}
 		});
 	});
 	await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(listenerPaths(dir).socket, resolve); });
@@ -2860,6 +2862,23 @@ async function awakeConversationFixture(busy: boolean, installGate?: Promise<voi
 		close: async () => { await pi.fire("session_shutdown", ui.ctx); await server.close(); rmSync(home, { recursive: true, force: true }); },
 	};
 }
+
+test("the real listener sends this session's reading and its played levels to the display bus", async () => {
+ const f=await awakeConversationFixture(false);
+ const display=()=>f.pi.emitted.filter(e=>e.channel==='gentle-ai:voice-display').map(e=>e.data as {state:string;sessionId:string});
+ const levels=()=>f.pi.emitted.filter(e=>e.channel==='gentle-ai:voice-level').map(e=>e.data as {source:string;rms:number});
+ try {
+  await settleReply(f.pi,f.ui.ctx,'Respuesta para esta sesión.');
+  await f.reached(()=>f.readings.length===1 && display().some(e=>e.state==='reading'));
+  assert.equal(display().at(-1)?.sessionId,'session-alpha');
+  f.readings[0]!.options.onChunk!({frameMs:50,durationMs:100,levels:[0.1,0.2]});
+  await f.reached(()=>levels().length===2);
+  assert.deepEqual(levels().map(e=>[e.source,e.rms]),[['reading',0.1],['reading',0.2]]);
+  f.readings[0]!.finish('done');
+  await f.reached(()=>display().at(-1)?.state==='off');
+  assert.deepEqual(f.pi.sent,[]);
+ } finally { await f.close(); }
+});
 
 // Both wakes share the unresolved install check, but belong to different links.
 async function replaceAcceptedAwakeWake(f: Awaited<ReturnType<typeof awakeConversationFixture>>) {

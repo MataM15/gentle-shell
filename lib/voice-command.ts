@@ -11,7 +11,7 @@ import { createReplyReader, defaultSpeechEngineResolver, lastAssistantText, repl
 import { createVoiceSpeechPublisher, type VoiceSpeechChunk, type VoiceSpeechReading } from "./voice-speech-events.ts";
 import { acquireLocalReadingTurn, paneFocus as herdrPaneFocus, paneFocused as herdrPaneFocused, type PaneFocus } from "./voice-presence.ts";
 import { cutListenerReading, createSessionListenerLink, listenerReadingTurn, sessionDisplayLabel, startVoiceListenerProcess, VoiceListenerClient, type ListenerReading, type ListenerSession, type ListenerWakeReservation, type SessionDictation, type SessionListenerLink } from "./voice-listener-client.ts";
-import type { ReadingReleaseReason, CaptureMode } from "./voice-listener-protocol.ts";
+import type { ReadingReleaseReason, CaptureMode, ListenerFrame, ListenerDisplayState } from "./voice-listener-protocol.ts";
 import { createCuePlayer, type CueName, type CuePlayer, type CueResult } from "./voice-cues.ts";
 import { createVoiceLog, type VoiceLog } from "./voice-diagnostics.ts";
 import { matchSpokenCommand } from "./voice-spoken-command.ts";
@@ -540,6 +540,9 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			onTranscript: (text, truncated) => {
 				if (sessionLink === link) receiveTranscript(text, truncated);
 			},
+			onDisplay: (frame) => {
+				if (sessionLink === link && sessionCtx && sessionIdOf(sessionCtx) === ownerSession) receiveDisplay(sessionCtx, frame);
+			},
 			onVoice: (command, wake, awake) => {
 				// An in-flight old hello can receive a frame after its session ended.
 				if (sessionLink === link) receiveVoice(command, wake, awake, link);
@@ -591,6 +594,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	// a late callback can neither publish nor paint into the next session.
 	let statePublisher: VoiceStatePublisher | undefined;
 	let statePublisherCtx: ExtensionContext | undefined;
+	let listenerDisplayState: ListenerDisplayState = "off";
 	// The context of the session that owns voice right now; a replacement ends it.
 	let sessionCtx: ExtensionContext | undefined;
 	const publisherFor = (ctx: ExtensionContext): VoiceStatePublisher => {
@@ -610,6 +614,16 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		} catch {
 			/* the display is advisory */
 		}
+	};
+	const receiveDisplay = (ctx: ExtensionContext, frame: Extract<ListenerFrame, { type: "display" | "level" }>): void => {
+		try {
+			if (frame.type === "display") {
+				listenerDisplayState = frame.state;
+				publisherFor(ctx).publishDisplay({ state: frame.state, language: frame.language, ...(frame.label === undefined ? {} : { label: frame.label }) });
+			} else if (listenerDisplayState === "listening" || listenerDisplayState === "reading") {
+				publisherFor(ctx).publishLevel(listenerDisplayState, frame.rms);
+			}
+		} catch { /* display failures must not interrupt voice */ }
 	};
 	const setVoiceFooter = (ctx: ExtensionContext | undefined, live: () => boolean, text: string | undefined): void => {
 		if (!ctx || !live()) return;
@@ -1763,6 +1777,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			try {
 				const client = new VoiceListenerClient({
 					dir: resolveVoiceHome(env),
+					display: true,
 					session: () => sessionIdOf(sessionCtx) === id
 						? { sessionId: id, paneId: paneIdOf(), label: labelOf(sessionCtx), voiceOn: voiceOn(sessionCtx) }
 						: undefined,
@@ -1781,6 +1796,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 							return;
 						}
 						if (frame.type === "command") receiveVoice(frame.command, frame.wake === true, client.listenerState !== "asleep");
+						else if (frame.type === "display" || frame.type === "level") receiveDisplay(ctx, frame);
 						else if (frame.type === "transcript") receiveTranscript(frame.text, frame.truncated === true);
 					},
 				});
@@ -1864,6 +1880,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		statePublisher?.close();
 		statePublisher = undefined;
 		statePublisherCtx = undefined;
+		listenerDisplayState = "off";
 	};
 
 	pi.registerCommand(VOICE_COMMAND_NAME, {
