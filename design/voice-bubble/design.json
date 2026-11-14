@@ -1,0 +1,9 @@
+{
+  "title": "Gentle Voice: burbuja dentro de Gentle Shell",
+  "brief": "La burbuja de voz se dibuja dentro de la TUI de Pi (Gentle Shell) en todos los estados: escuchando con onda en caracteres, transcribiendo, leyendo con la sonoridad real, dormido, confirmar (cuenta de ~3 s) y modo inglés, con los comandos hablados de cada estado. Reemplaza la ventana de Windows (S18 revisado, L41). Rejilla de 105 columnas, solo caracteres y colores de terminal.",
+  "feature": "odd/tasks/voice-control.md",
+  "artboards": [
+    { "file": "01-sobre-el-cuadro.html", "title": "Burbuja sobre el cuadro", "tradeoff": "Se ve mejor desde lejos y deja espacio para onda, sesión y comandos; ocupa 4 filas mientras la voz está activa (1 dormido) y el chat sube esas filas", "width": 1100, "height": 1000 },
+    { "file": "02-linea-del-cuadro.html", "title": "Estado en el borde del cuadro", "tradeoff": "No ocupa ninguna fila extra; la onda es más corta (26 columnas) y el atajo de comandos pasa al borde inferior mientras la voz está activa", "width": 1100, "height": 1000 }
+  ]
+}
