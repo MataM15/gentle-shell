@@ -64,8 +64,8 @@ export const READING_TAIL_MS = 250;
 // The worker's keyword hit is at most 2.6 s after speech began; its
 // whole-utterance confirmation can delay the reported command by another 1 s.
 const COMMAND_MAX_REPORT_MS = 3_600;
-const SPOT_RETRY_MIN_MS = 100;
-const SPOT_RETRY_MAX_MS = 5_000;
+const SPOT_RETRY_MS = [1_000, 5_000, 30_000, 60_000] as const;
+const SPOT_STABLE_MS = 60_000;
 const RECONNECT_WINDOW_MS = 10_000;
 const RECONNECT_HELLOS = 5;
 const RECONNECT_MIN_MS = 2_000;
@@ -505,10 +505,13 @@ export class VoiceListener {
 	// The spot-only capture, and the release of the one just stopped: the
 	// microphone is handed over only once it is free.
 	private spotting: ListenerSpotting | undefined;
-	// Device and busy refusals are retried after settlement, with bounded backoff.
+	// Failed attempts wait for release and retain their backoff across state edges.
 	private spotDisabled = false;
-	private spotRetryMs = SPOT_RETRY_MIN_MS;
+	private spotFailure = false;
+	private spotRetryAttempt = 0;
 	private spottingRetry: ReturnType<typeof setTimeout> | undefined;
+	private spottingStable: ReturnType<typeof setTimeout> | undefined;
+	private spottingSettling: Promise<void> | undefined;
 	private spottingStop: Promise<void> | undefined;
 	// True only while the capture really records, from the worker's own report to
 	// the moment the recording ends (S10). Levels never change it.
@@ -1335,7 +1338,7 @@ export class VoiceListener {
 	private startSpotting(): void {
 		const factory = this.options.spot;
 		if (!this.options.keyword || !factory || this.spotDisabled || this.closing) return;
-		if (this.spotting || !this.shouldSpot()) return;
+		if (this.spotting || this.spottingSettling || this.spottingRetry || !this.shouldSpot()) return;
 		// A capture that is still closing holds the microphone: the next one waits.
 		const stopping = this.spottingStop;
 		if (stopping) {
@@ -1354,6 +1357,16 @@ export class VoiceListener {
 			void capture.start().then(
 				() => {
 					if (this.spotting !== capture) return;
+					if (this.spotFailure) {
+						this.spotFailure = false;
+						this.log("kws.recovered");
+					}
+					const stable = setTimeout(() => {
+						if (this.spotting === capture) this.spotRetryAttempt = 0;
+						if (this.spottingStable === stable) this.spottingStable = undefined;
+					}, SPOT_STABLE_MS);
+					stable.unref?.();
+					this.spottingStable = stable;
 					this.awaitSpotting(capture);
 				},
 				(error: unknown) => this.spottingFailed(capture, error),
@@ -1365,34 +1378,22 @@ export class VoiceListener {
 
 	private spottingFailed(capture: ListenerSpotting, error: unknown): void {
 		if (this.spotting !== capture) return;
-		if (error instanceof VoiceSessionError && (error.code === "invalid-state" || error.code === "capture")) {
-			// Keep this attempt reserved until the owner (or failed child) really
-			// settles. A new capture, shutdown or state change can retire it.
-			let settled: Promise<void>;
-			try { settled = capture.waitUntilSettled?.() ?? Promise.resolve(); }
-			catch (failure) { this.spotting = undefined; this.failSpotting(failure); return; }
-			this.log("kws.retry", { reason: error.code });
-			void settled.then(() => {
-				if (this.spotting !== capture) return;
-				const delay = this.spotRetryMs;
-				this.spotRetryMs = Math.min(delay * 2, SPOT_RETRY_MAX_MS);
-				const timer = setTimeout(() => {
-					if (this.spottingRetry === timer) this.spottingRetry = undefined;
-					if (this.spotting !== capture) return;
-					this.spotting = undefined;
-					if (this.shouldSpot()) this.startSpotting();
-				}, delay);
-				timer.unref?.();
-				this.spottingRetry = timer;
-			}, (failure: unknown) => {
-				if (this.spotting !== capture) return;
-				this.spotting = undefined;
-				this.failSpotting(failure);
-			});
-			return;
-		}
-		this.spotting = undefined;
-		this.failSpotting(error);
+		if (this.spottingStable) clearTimeout(this.spottingStable);
+		this.spottingStable = undefined;
+		this.recordSpotFailure(error);
+		// A terminal error can precede the child's exit, and a busy refusal can
+		// still have another capture owning the worker. Neither may be overtaken.
+		let settled: Promise<void>;
+		try { settled = Promise.resolve(capture.waitUntilSettled?.()); }
+		catch { settled = Promise.resolve().then(() => capture.cancel()).catch(() => {}); }
+		const waiting = settled.catch(() => Promise.resolve().then(() => capture.cancel()).catch(() => {}));
+		this.spottingSettling = waiting;
+		void waiting.then(() => {
+			if (this.spottingSettling !== waiting) return;
+			this.spottingSettling = undefined;
+			if (this.spotting === capture) this.spotting = undefined;
+			this.scheduleSpotRetry();
+		});
 	}
 
 	// The command the open spotter heard, or nothing when it was stopped here.
@@ -1409,8 +1410,10 @@ export class VoiceListener {
 			return;
 		}
 		this.spotting = undefined;
-		this.spotRetryMs = SPOT_RETRY_MIN_MS;
+		if (this.spottingStable) clearTimeout(this.spottingStable);
+		this.spottingStable = undefined;
 		if (command === undefined) return;
+		this.spotRetryAttempt = 0;
 		// Reading text is not carried by the protocol. Fail closed for the whole
 		// reading and its audible tail, rather than reacting to its own speech.
 		if (this.reading) {
@@ -1502,20 +1505,41 @@ export class VoiceListener {
 		// and only once the microphone is really recording.
 	}
 
-	// A spotter that cannot open the microphone is dropped for the rest of the
-	// listener's life: voice keeps working, asleep and without spotting.
+	private recordSpotFailure(error: unknown): void {
+		if (!this.spotFailure) {
+			this.spotFailure = true;
+			// Fixed codes only: native errors can contain paths, device names or audio.
+			this.log("kws.failed", { reason: captureErrorCode(error) });
+		}
+		// A missing or invalid model is configuration, not a transient device fault.
+		if (error instanceof VoiceSessionError && (error.code === "not-installed" || error.code === "model-invalid")) this.spotDisabled = true;
+	}
+
 	private failSpotting(error: unknown): void {
-		if (this.spotDisabled) return;
-		this.spotDisabled = true;
-		// Fixed codes only: native errors can contain paths, device names or audio.
-		this.log("kws.failed", { reason: captureErrorCode(error) });
+		this.recordSpotFailure(error);
+		this.scheduleSpotRetry();
+	}
+
+	private scheduleSpotRetry(): void {
+		if (this.closing || this.spotDisabled || this.spottingRetry) return;
+		const delay = SPOT_RETRY_MS[Math.min(this.spotRetryAttempt, SPOT_RETRY_MS.length - 1)]!;
+		this.spotRetryAttempt += 1;
+		const timer = setTimeout(() => {
+			if (this.spottingRetry !== timer) return;
+			this.spottingRetry = undefined;
+			this.refreshSpotting();
+		}, delay);
+		timer.unref?.();
+		this.spottingRetry = timer;
 	}
 
 	// Releasing the microphone is asynchronous: a capture that must start waits on
 	// this promise instead of opening a second one.
 	private stopSpotting(): Promise<void> {
-		if (this.spottingRetry) clearTimeout(this.spottingRetry);
-		this.spottingRetry = undefined;
+		if (this.closing && this.spottingRetry) clearTimeout(this.spottingRetry);
+		if (this.closing) this.spottingRetry = undefined;
+		if (this.spottingStable) clearTimeout(this.spottingStable);
+		this.spottingStable = undefined;
 		const capture = this.spotting;
 		if (!capture) return this.spottingStop ?? Promise.resolve();
 		this.spotting = undefined;

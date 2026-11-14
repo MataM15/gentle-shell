@@ -991,6 +991,81 @@ test("a voice-off startup keeps one display connection to a healthy listener", a
 	}
 });
 
+for (const voiceOn of [false, true]) test(`RC-R1: a ${voiceOn ? "voice-on" : "passive"} reload rejoins after a hello storm and hears focused wake`, async () => {
+	const home = mkdtempSync(join(tmpdir(), "voice-command-rate-reload-"));
+	const dir = join(home, "voice");
+	let clock = 10_000;
+	let heard: ((command: string | undefined) => void) | undefined;
+	const requests: ListenerDictationRequest[] = [];
+	const events: Array<{ event: string } & Record<string, unknown>> = [];
+	const server = new VoiceListener({
+		dir, now: () => clock,
+		keyword: { model: { root: "/fake", files: {} }, keywords: [{ tokens: "on", command: "voice-on" }], boost: 2, threshold: 0.25, maxActivePaths: 16, trailingBlanks: 2 },
+		spot: () => {
+			let settle!: (command: string | undefined) => void;
+			const waiting = new Promise<string | undefined>((resolve) => { settle = resolve; });
+			heard = settle;
+			return { start: async () => {}, heard: () => waiting, stop: async () => settle(undefined), cancel: async () => settle(undefined) };
+		},
+		dictation: (request) => {
+			requests.push(request);
+			return { start: async () => request.onStateChange("recording"), stop: async () => ({ text: "hola", truncated: false }), cancel: async () => request.onStateChange("finished") };
+		},
+		focus: { focusedPaneId: async () => ({ focused: "w1:p1" }) },
+		log: (event, fields) => events.push({ event, ...fields }),
+	});
+	await server.listen();
+	const { engine } = fakeEngine();
+	const h = harness({ installed: true, voice: voiceOn, engine, env: { HERDR_PANE_ID: "w1:p1", GENTLE_PI_CONFIG_HOME: home } });
+	delete h.deps.createSession;
+	let pi = register(h);
+	let ui = fakeContext();
+	const connect = VoiceListenerClient.prototype.connect;
+	const clients = new Set<VoiceListenerClient>();
+	let refusals = 0;
+	try {
+		for (let i = 0; i < 5; i++) {
+			const previous = new VoiceListenerClient({ dir, session: { sessionId: "session-alpha", paneId: "w1:p1", voiceOn: false } });
+			await previous.connect();
+			previous.close();
+		}
+		await pi.fire("session_start", ui.ctx);
+		await until(() => events.filter((entry) => entry.event === "listener.hello" && entry.sessionId === "session-alpha").length === 6, 1_000);
+		await pi.fire("session_shutdown", ui.ctx);
+		await until(() => server.clientCount === 0, 1_000);
+		pi = register(h);
+		ui = fakeContext();
+		VoiceListenerClient.prototype.connect = function () {
+			if (!clients.has(this)) this.onFrame((frame) => { if (frame.type === "error" && frame.code === "rate-limit") refusals++; });
+			clients.add(this);
+			return connect.call(this);
+		};
+		await pi.fire("session_start", ui.ctx);
+		await until(() => refusals >= 1, 1_000);
+		assert.deepEqual(server.sessionIds, [], "the reload was refused while blocked");
+		assert.equal(events.filter((entry) => entry.event === "listener.reconnect-throttled").length, 1);
+		clock += 2_000;
+		await until(() => server.sessionIds.includes("session-alpha") && [...clients].some((client) => client.connected), 3_500);
+		assert.equal(server.clientCount, 1, "the live reload automatically re-registers once");
+		assert.equal(refusals, 1, "the retry after the block does not cause a refusal storm");
+		assert.equal(events.filter((entry) => entry.event === "listener.reconnect-throttled").length, 2, "the accepted seventh hello starts only the next episode");
+		assert.equal(requests.length, 0);
+		assert.equal(pi.counts.sends, 0);
+		assert.equal(ui.editor(), "draft: ");
+		assert.ok(heard);
+		heard!("voice-on");
+		await until(() => requests.length === 1, 1_000);
+		assert.equal(requests[0]!.mode, "conversation");
+		assert.deepEqual(h.voice.sessions, ["session-alpha"]);
+		assert.equal(pi.counts.sends, 0);
+	} finally {
+		VoiceListenerClient.prototype.connect = connect;
+		await pi.fire("session_shutdown", ui.ctx);
+		await server.close();
+		rmSync(home, { recursive: true, force: true });
+	}
+});
+
 test("a passive session backs off when a listener repeatedly rejects its display subscription", async () => {
 	const home = mkdtempSync(join(tmpdir(), "voice-command-passive-reject-"));
 	const dir = join(home, "voice");

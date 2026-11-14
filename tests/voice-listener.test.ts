@@ -2026,44 +2026,25 @@ test("spotting continues while a reply is read and afterwards (S14)", async (t) 
 	await started.listener.close();
 });
 
-test("a spotter that cannot start, or that dies, is logged once and voice carries on (S7)", async () => {
-	const dir = scratch();
-	const spot = fakeSpotting({ failStart: true });
-	const capture = fakeCapture({ text: "hola" });
-	const started = await startListener(dir, { keyword: keywordOption(), spot: spot.factory, dictation: capture.factory, cues: cuePlayer(), focus: { focusedPaneId: async () => ({ focused: "w1:p1" }) } });
-	await waitFor(() => started.events.some((entry) => entry.event === "kws.failed"));
+test("a spotter that dies while listening retries and reports recovery (S7)", async (t) => {
+	const spot = fakeSpotting();
+	const started = await startListener(scratch(), { keyword: keywordOption(), spot: spot.factory, focus: { focusedPaneId: async () => ({ focused: "w1:p1" }) } });
+	t.after(() => started.listener.close());
 	const client = await started.client();
 	client.hello("s-1", "w1:p1", true);
-	await waitFor(() => framesOf(client, "welcome").length === 1);
-	assert.equal(started.listener.state, "listening", "voice can wake without a working spotter");
-	// Voice works as it always did: a capture records, transcribes and delivers.
-	client.send({ type: "dictate", id: "d1", mode: "dictation" });
-	assert.equal((await awaitFrame(client, (frame) => "id" in frame && frame.id === "d1")).type, "ok");
-	client.send({ type: "stop" });
-	assert.deepEqual(await awaitFrame(client, (frame) => frame.type === "transcript"), { type: "transcript", text: "hola" });
-	// Leaving asleep and coming back never retries the spotter.
-	client.send({ type: "wake", id: "w1" });
-	await awaitFrame(client, (frame) => "id" in frame && frame.id === "w1");
-	client.send({ type: "sleep", id: "s1" });
-	await awaitFrame(client, (frame) => "id" in frame && frame.id === "s1");
-	await waitFor(() => started.listener.state === "asleep");
-	assert.equal(spot.starts, 1, "a spotter that failed once is never asked again");
-	const failed = started.events.filter((entry) => entry.event === "kws.failed");
-	assert.deepEqual(failed.map((entry) => entry.fields), [{ reason: "no-input-device" }], "only the fixed error code is logged");
-	client.socket.destroy();
-	await started.listener.close();
-
-	// A spot capture that dies mid-listen is the same failure.
-	const secondDir = scratch();
-	const dying = fakeSpotting();
-	const listener = await startListener(secondDir, { keyword: keywordOption(), spot: dying.factory, cues: cuePlayer() });
-	await waitFor(() => dying.starts === 1);
-	dying.dying();
-	await waitFor(() => listener.events.some((entry) => entry.event === "kws.failed"));
-	assert.equal(listener.listener.state, "asleep");
-	assert.equal(dying.starts, 1);
-	assert.deepEqual(listener.events.filter((entry) => entry.event === "kws.failed").map((entry) => entry.fields), [{ reason: "worker-exited" }]);
-	await listener.listener.close();
+	await awaitFrame(client, (frame) => frame.type === "welcome");
+	spot.dying();
+	await waitFor(() => started.events.some((entry) => entry.event === "kws.failed"));
+	await waitFor(() => spot.starts === 2);
+	assert.deepEqual(started.events.filter((entry) => entry.event === "kws.failed").map((entry) => entry.fields), [{ reason: "worker-exited" }]);
+	assert.equal(started.events.filter((entry) => entry.event === "kws.recovered").length, 1);
+	spot.hearing("voice-off");
+	assert.deepEqual(await awaitFrame(client, (frame) => frame.type === "command" && frame.command === "voice-off"), { type: "command", command: "voice-off" });
+	await waitFor(() => spot.starts === 3);
+	spot.hearing("voice-on");
+	assert.deepEqual(await awaitFrame(client, (frame) => frame.type === "command" && frame.command === "voice-on"), { type: "command", command: "voice-on", wake: true });
+	assert.deepEqual(started.listener.voiceSessions, ["s-1"]);
+	assert.deepEqual(framesOf(client, "transcript"), []);
 });
 
 test("without the keyword option the listener never opens a spot capture", async () => {
@@ -3440,6 +3421,92 @@ class RefusingWarmChild extends EventEmitter {
 	exit() { if (!this.exited) { this.exited = true; this.emit("close", 0, null); } }
 }
 
+test("D2-R1: a warm child exiting during spot start is replaced and hears off then on", async (t) => {
+	const children: RefusingWarmChild[] = [];
+	const warm = createWarmVoiceWorker({
+		target: "linux-x64", env: {},
+		prepare: async () => ({ root: "/fake", request: { schema: VOICE_WORKER_SCHEMA, type: "start" } }),
+		spawn: () => {
+			const child = new RefusingWarmChild();
+			children.push(child);
+			if (children.length === 1) {
+				const write = child.stdin.write;
+				child.stdin.write = (line: string) => {
+					const message = JSON.parse(line) as Record<string, unknown>;
+					if (message.type === "start" && message.spot === true) {
+						child.received.push(message);
+						queueMicrotask(() => child.exit());
+						return true;
+					}
+					return write(line);
+				};
+			}
+			return child;
+		},
+	});
+	const kws = keywordOption();
+	const started = await startListener(scratch(), {
+		keyword: kws, spot: (onKeywordRejected) => warm.spot({ kws, onKeywordRejected }),
+		focus: { focusedPaneId: async () => ({ focused: "w1:p1" }) },
+	});
+	t.after(async () => { for (const child of children) child.exit(); await started.listener.close(); await warm.close(); });
+	const client = await started.client();
+	client.hello("s-1", "w1:p1", true);
+	await awaitFrame(client, (frame) => frame.type === "welcome");
+	await waitFor(() => started.events.some((entry) => entry.event === "kws.failed"));
+	assert.equal(children[0]!.exited, true);
+	assert.deepEqual(started.events.filter((entry) => entry.event === "kws.failed").map((entry) => entry.fields), [{ reason: "worker-exited" }]);
+	await waitFor(() => children.length === 2 && children[1]!.received.some((message) => message.spot === true));
+	await waitFor(() => started.events.some((entry) => entry.event === "kws.recovered"));
+	children[1]!.say({ type: "command", command: "voice-off" });
+	assert.deepEqual(await awaitFrame(client, (frame) => frame.type === "command" && frame.command === "voice-off"), { type: "command", command: "voice-off" });
+	await waitFor(() => children[1]!.received.filter((message) => message.spot === true).length === 2);
+	children[1]!.say({ type: "command", command: "voice-on" });
+	assert.deepEqual(await awaitFrame(client, (frame) => frame.type === "command" && frame.command === "voice-on"), { type: "command", command: "voice-on", wake: true });
+	assert.deepEqual(started.listener.voiceSessions, ["s-1"]);
+	assert.deepEqual(framesOf(client, "transcript"), []);
+	assert.equal(started.events.filter((entry) => entry.event === "kws.recovered").length, 1);
+});
+
+test("D2-R1: repeated start failures use bounded backoff and one failure episode", async (t) => {
+	const starts: number[] = [];
+	let failFirst!: (error: unknown) => void;
+	const first = new Promise<void>((_resolve, reject) => { failFirst = reject; });
+	const errors = [new VoiceSessionError("capture"), new VoiceSessionError("invalid-state"), new Error("private device"), new VoiceSessionError("capture")];
+	const started = await startListener(scratch(), {
+		keyword: keywordOption(),
+		spot: () => {
+			const attempt = starts.length;
+			starts.push(attempt === 0 ? 0 : Date.now());
+			return {
+				start: () => attempt === 0 ? first : attempt <= errors.length ? Promise.reject(errors[attempt - 1]) : Promise.resolve(),
+				heard: () => new Promise<string | undefined>(() => {}),
+				waitUntilSettled: async () => {}, stop: async () => {}, cancel: async () => {},
+			};
+		},
+	});
+	t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+	const flush = async () => { for (let i = 0; i < 20; i++) await Promise.resolve(); };
+	try {
+		failFirst(new VoiceSessionError("worker-exited"));
+		await flush();
+		for (const delay of [1_000, 5_000, 30_000, 60_000, 60_000]) {
+			const previous = starts.length;
+			t.mock.timers.tick(delay - 1); await flush();
+			assert.equal(starts.length, previous, "no early retry");
+			t.mock.timers.tick(1); await flush();
+			assert.equal(starts.length, previous + 1);
+		}
+		assert.deepEqual(starts, [0, 1_000, 6_000, 36_000, 96_000, 156_000]);
+		assert.deepEqual(started.events.filter((entry) => entry.event === "kws.failed").map((entry) => entry.fields), [{ reason: "worker-exited" }]);
+		assert.equal(started.events.filter((entry) => entry.event === "kws.recovered").length, 1);
+		assert.equal(JSON.stringify(started.events).includes("private device"), false);
+	} finally {
+		t.mock.timers.reset();
+		await started.listener.close();
+	}
+});
+
 test("D2: a delivered capture's refused reopen waits for exit, retries, and hears off then on", async (t) => {
 	const children: RefusingWarmChild[] = [];
 	const warm = createWarmVoiceWorker({
@@ -3469,7 +3536,7 @@ test("D2: a delivered capture's refused reopen waits for exit, retries, and hear
 	await waitFor(() => child.received.filter((message) => message.type === "start").length === 3);
 	await sleep(50);
 	assert.equal(children.length, 1, "the refused worker has not exited yet");
-	assert.equal(started.events.some((entry) => entry.event === "kws.failed"), false, "a device refusal is not permanent");
+	assert.deepEqual(started.events.filter((entry) => entry.event === "kws.failed").map((entry) => entry.fields), [{ reason: "capture" }]);
 	child.exit();
 	await waitFor(() => children.length === 2 && children[1]!.received.some((message) => message.spot === true));
 	assert.equal(started.listener.state, "listening");
@@ -3483,7 +3550,7 @@ test("D2: a delivered capture's refused reopen waits for exit, retries, and hear
 	assert.deepEqual(started.listener.voiceSessions, ["s-1"]);
 	assert.equal(started.listener.state, "listening");
 	assert.deepEqual(framesOf(client, "transcript"), [{ type: "transcript", text: "seguí con eso" }]);
-	assert.equal(started.events.some((entry) => entry.event === "kws.failed"), false);
+	assert.equal(started.events.filter((entry) => entry.event === "kws.recovered").length, 1);
 });
 
 test("D2: a spotting device that repeatedly fails after opening retries with backoff", async (t) => {
@@ -3499,9 +3566,9 @@ test("D2: a spotting device that repeatedly fails after opening retries with bac
 		}),
 	});
 	t.after(() => started.listener.close());
-	await waitFor(() => starts.length >= 3);
-	assert.ok(starts[2]! - starts[1]! >= 170, `the second retry backs off, got ${starts[2]! - starts[1]!} ms`);
-	assert.equal(started.events.some((entry) => entry.event === "kws.failed"), false);
+	await waitFor(() => starts.length >= 3, 8_000);
+	assert.ok(starts[2]! - starts[1]! >= 4_900, `the second retry backs off, got ${starts[2]! - starts[1]!} ms`);
+	assert.ok(started.events.some((entry) => entry.event === "kws.failed"));
 });
 
 test("D1/D2: a delivered turn, reading, automatic reopen, off and wake reach the focused session", async (t) => {
@@ -3639,13 +3706,13 @@ test("a transient busy spot start waits for the real warm capture to settle, ret
 	await waitFor(() => spotAttempts === 2);
 	await sleep(30);
 	assert.equal(spotAttempts, 2, "the retry waits rather than spinning against a busy worker");
-	assert.equal(started.events.some((entry) => entry.event === "kws.failed"), false, "the first invalid-state is transient");
+	assert.deepEqual(started.events.filter((entry) => entry.event === "kws.failed").map((entry) => entry.fields), [{ reason: "invalid-state" }]);
 	const ending = busy.cancel();
 	children[0]!.exit();
 	await ending;
 	await waitFor(() => spotAttempts === 3 && children[1]?.received.some((message) => message.spot === true) === true);
 	assert.deepEqual(framesOf(client, "transcript"), [{ type: "transcript", text: "hola" }]);
-	assert.equal(started.events.some((entry) => entry.event === "kws.failed"), false);
+	assert.equal(started.events.filter((entry) => entry.event === "kws.recovered").length, 1);
 	children[1]!.say({ type: "command", command: "voice-off" });
 	assert.deepEqual(await awaitFrame(client, (frame) => frame.type === "command" && frame.command === "voice-off"), { type: "command", command: "voice-off" });
 	assert.equal(started.listener.state, "asleep");
@@ -3680,9 +3747,9 @@ test("D2: repeated busy spot refusals each wait for settlement and eventually re
 	await waitFor(() => attempts === 2);
 	await sleep(20);
 	assert.equal(attempts, 2, "the second refusal also waits instead of spinning");
-	assert.equal(started.events.some((entry) => entry.event === "kws.failed"), false);
+	assert.deepEqual(started.events.filter((entry) => entry.event === "kws.failed").map((entry) => entry.fields), [{ reason: "invalid-state" }]);
 	release[1]!();
-	await waitFor(() => attempts === 3 && replacement.starts === 1);
+	await waitFor(() => attempts === 3 && replacement.starts === 1, 7_000);
 	replacement.hearing("voice-off");
 	assert.deepEqual(await awaitFrame(client, (frame) => frame.type === "command" && frame.command === "voice-off"), { type: "command", command: "voice-off" });
 	assert.deepEqual(started.listener.voiceSessions, []);
@@ -3721,7 +3788,7 @@ test("a pending busy retry is retired when a new dictation takes the microphone"
 	await sleep(20);
 	assert.equal(attempts, 1, "the stale retry does not open over the recording");
 	assert.deepEqual(dictation.calls, ["start"]);
-	assert.equal(started.events.some((entry) => entry.event === "kws.failed"), false);
+	assert.deepEqual(started.events.filter((entry) => entry.event === "kws.failed").map((entry) => entry.fields), [{ reason: "invalid-state" }]);
 	client.send({ type: "stop", id: "s" });
 	assert.equal((await awaitFrame(client, (frame) => "id" in frame && frame.id === "s")).type, "ok");
 	await waitFor(() => attempts === 2 && replacement.starts === 1);

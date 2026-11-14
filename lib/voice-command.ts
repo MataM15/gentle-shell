@@ -10,7 +10,7 @@ import { installKokoro, installMiro, KOKORO_MANIFESTS, KOKORO_NOTICES, kokoroByt
 import { createReplyReader, defaultSpeechEngineResolver, lastAssistantText, replyLanguage } from "./voice-reply-speech.ts";
 import { createVoiceSpeechPublisher, type VoiceSpeechChunk, type VoiceSpeechReading } from "./voice-speech-events.ts";
 import { acquireLocalReadingTurn, paneFocus as herdrPaneFocus, paneFocused as herdrPaneFocused, type PaneFocus } from "./voice-presence.ts";
-import { cutListenerReading, createSessionListenerLink, listenerReadingTurn, sessionDisplayLabel, startVoiceListenerProcess, VoiceListenerClient, type ListenerReading, type ListenerSession, type ListenerWakeReservation, type SessionDictation, type SessionListenerLink } from "./voice-listener-client.ts";
+import { cutListenerReading, createSessionListenerLink, listenerReadingTurn, sessionDisplayLabel, startVoiceListenerProcess, ListenerRateLimitError, VoiceListenerClient, type ListenerReading, type ListenerSession, type ListenerWakeReservation, type SessionDictation, type SessionListenerLink } from "./voice-listener-client.ts";
 import type { ReadingReleaseReason, CaptureMode, ListenerFrame, ListenerDisplayState } from "./voice-listener-protocol.ts";
 import { createCuePlayer, type CueName, type CuePlayer, type CueResult } from "./voice-cues.ts";
 import { createVoiceLog, type VoiceLog } from "./voice-diagnostics.ts";
@@ -1802,8 +1802,10 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 					},
 				});
 				passiveClient = client;
-				void client.connect().catch(() => {
-					if (passiveClient === client) closePassive();
+				void client.connect().catch((error: unknown) => {
+					// A throttled hello is temporary; the client's disconnect schedules
+					// its one backoff retry. Other passive failures still close normally.
+					if (!(error instanceof ListenerRateLimitError) && passiveClient === client) closePassive();
 				});
 			} catch { /* a passive join never interrupts startup */ }
 			return;

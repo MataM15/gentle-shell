@@ -45,6 +45,8 @@ export const LISTENER_DICTATE_TIMEOUT_MS = 30_000;
 // Two quick retries preserve restart recovery; continued failures settle at two
 // attempts a minute. A welcome alone is not proof of a stable connection.
 export const LISTENER_BACKOFF_MS = [250, 1_000, 30_000] as const;
+// Hello throttling starts at two seconds; stay bounded even if it escalates.
+const LISTENER_RATE_LIMIT_BACKOFF_MS = [2_000, 4_000, 8_000, 16_000, 30_000] as const;
 export const LISTENER_STABLE_MS = 60_000;
 const PROBE_INTERVAL_MS = 50;
 
@@ -105,6 +107,14 @@ interface Pending {
 	timer: ReturnType<typeof setTimeout>;
 }
 
+// An uncorrelated rate-limit frame during hello is retryable for session joins.
+export class ListenerRateLimitError extends Error {
+	constructor() {
+		super("the voice listener temporarily rate-limited hello");
+		this.name = "ListenerRateLimitError";
+	}
+}
+
 // The listener did not answer in time, and may still be working on the request.
 class ListenerTimeoutError extends Error {
 	constructor() {
@@ -122,6 +132,7 @@ export class VoiceListenerClient {
 	private readonly pending = new Map<string, Pending>();
 	private readonly listeners = new Set<(frame: ListenerFrame) => void>();
 	private attempt = 0;
+	private rateLimited = false;
 	private joined = false;
 	private closed = false;
 	private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
@@ -228,6 +239,7 @@ export class VoiceListenerClient {
 		if (this.closed || this.socket !== socket || this.socketRetired) throw new Error("voice listener connection closed or replaced");
 		if (frame.type !== "welcome") throw new Error("the voice listener refused hello");
 		this.joined = true;
+		this.rateLimited = false;
 		const stableTimer = setTimeout(() => {
 			if (this.socket === socket && this.joined && !this.socketRetired) this.attempt = 0;
 			if (this.stableTimer === stableTimer) this.stableTimer = undefined;
@@ -293,6 +305,12 @@ export class VoiceListenerClient {
 	}
 
 	private dispatch(frame: ListenerFrame, withdrawing = false): void {
+		// A hello refusal has no request id. Preserve its reason before the peer's
+		// close otherwise turns it into an indistinguishable connection failure.
+		if (!this.joined && frame.type === "error" && frame.code === "rate-limit") {
+			this.rateLimited = true;
+			this.failPending(new ListenerRateLimitError());
+		}
 		const id = "id" in frame ? frame.id : undefined;
 		if (id !== undefined) {
 			const pending = this.pending.get(id);
@@ -343,7 +361,7 @@ export class VoiceListenerClient {
 
 	private scheduleReconnect(): void {
 		if (this.closed || this.replaced || this.reconnectTimer) return;
-		const delays = this.options.backoffMs ?? LISTENER_BACKOFF_MS;
+		const delays = this.options.backoffMs ?? (this.rateLimited ? LISTENER_RATE_LIMIT_BACKOFF_MS : LISTENER_BACKOFF_MS);
 		const delay = delays[Math.min(this.attempt, delays.length - 1)];
 		this.attempt += 1;
 		const timer = setTimeout(() => {
@@ -386,6 +404,8 @@ export interface EnsureListenerOptions {
 	// Spawns the listener process; the socket is the proof it came up.
 	start?: () => void | Promise<void>;
 	createClient?: () => VoiceListenerClient;
+	// Session startup retains a rate-limited client for its scheduled rejoin.
+	keepRetryingOnRateLimit?: boolean;
 	// Cancellation stops waiting and prevents a late probe from joining.
 	signal?: AbortSignal;
 	probe?: (path: string) => Promise<boolean>;
@@ -450,6 +470,7 @@ export async function ensureListener(options: EnsureListenerOptions): Promise<{ 
 			throwIfAborted(signal);
 			return { client, started };
 		} catch (error) {
+			if (error instanceof ListenerRateLimitError && options.keepRetryingOnRateLimit && !signal?.aborted) return { client, started };
 			client.close();
 			throw error;
 		} finally {
@@ -774,8 +795,9 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 						await withAbort(client.connect(), controller.signal);
 						throwIfAborted(controller.signal);
 						return true;
-					} catch {
+					} catch (error) {
 						throwIfAborted(controller.signal);
+						if (error instanceof ListenerRateLimitError) return false;
 						/* the lock or the socket is gone: start a listener below */
 					}
 				}
@@ -789,6 +811,7 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 					waitMs: options.waitMs,
 					probe: options.probe,
 					signal: controller.signal,
+					keepRetryingOnRateLimit: true,
 					createClient: () => {
 						throwIfAborted(controller.signal);
 						return (pending.client = client = new VoiceListenerClient({
@@ -805,7 +828,7 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 				});
 				throwIfAborted(controller.signal);
 				client = joined.client;
-				return true;
+				return client.connected;
 			} catch {
 				return false;
 			} finally {
