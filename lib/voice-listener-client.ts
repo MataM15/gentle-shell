@@ -5,8 +5,10 @@ import { fileURLToPath } from "node:url";
 import {
 	clearStaleListenerLock,
 	clearStaleListenerSocket,
+	listenerLockStale,
 	listenerPaths,
 	probeListenerSocket,
+	readListenerLock,
 	releaseListenerLock,
 	takeListenerLock,
 	type ListenerPaths,
@@ -35,8 +37,8 @@ import { VoiceSessionError, type VoiceEndpoint, type VoiceSessionState, type Voi
 // restart, ask it for the one reading turn (slice B), and, from slice C, ask it
 // for the microphone: the listener records and transcribes, and this side hands
 // the transcript back to the session that pastes it. Nothing here records audio
-// or speaks. A session that cannot reach the listener keeps its own capture, so
-// dictation works exactly as it did before the listener existed.
+// or speaks. A session that cannot reach the listener keeps its own capture,
+// unless a shutdown worker may still hold the microphone.
 
 export const LISTENER_START_TIMEOUT_MS = 10_000;
 export const LISTENER_REQUEST_TIMEOUT_MS = 5_000;
@@ -483,11 +485,18 @@ const wait = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve, r
 	signal?.addEventListener("abort", aborted, { once: true });
 });
 
-async function waitForListener(path: string, waitMs: number, probe: (path: string) => Promise<boolean>, signal?: AbortSignal): Promise<boolean> {
+function hasLiveShutdownWorker(paths: ListenerPaths, isAlive?: EnsureListenerOptions["isAlive"]): boolean {
+	const lock = readListenerLock(paths);
+	return lock?.workerPid !== undefined && !listenerLockStale(lock, { isAlive });
+}
+
+async function waitForListener(paths: ListenerPaths, waitMs: number, probe: (path: string) => Promise<boolean>, { signal, isAlive }: Pick<EnsureListenerOptions, "signal" | "isAlive">): Promise<boolean> {
 	const deadline = Date.now() + waitMs;
 	for (;;) {
 		throwIfAborted(signal);
-		if (await withAbort(probe(path), signal)) return true;
+		// A shutdown worker cannot answer a probe or publish a listener socket.
+		if (hasLiveShutdownWorker(paths, isAlive)) throw new Error("voice_listener_busy");
+		if (await withAbort(probe(paths.socket), signal)) return true;
 		if (Date.now() >= deadline) return false;
 		await wait(PROBE_INTERVAL_MS, signal);
 	}
@@ -504,15 +513,13 @@ async function ensureListenerAvailable(options: Pick<EnsureListenerOptions, "dir
 	if (await withAbort(probe(paths.socket), signal)) return false;
 	throwIfAborted(signal);
 
-	// A lock somebody is renewing means a listener is starting or running: wait
-	// for its socket instead of starting a second microphone owner.
-	if (!clearStaleListenerLock(paths, { now: options.now, isAlive: options.isAlive })) {
-		if (await waitForListener(paths.socket, waitMs, probe, signal)) return false;
-		throw new Error("voice_listener_busy");
-	}
-	const lock = takeListenerLock(paths, { now: options.now, socket: paths.socket });
+	// If another listener is starting or running, wait for its socket instead
+	// of starting a second microphone owner.
+	const lock = clearStaleListenerLock(paths, { now: options.now, isAlive: options.isAlive })
+		? takeListenerLock(paths, { now: options.now, socket: paths.socket })
+		: undefined;
 	if (!lock) {
-		if (await waitForListener(paths.socket, waitMs, probe, signal)) return false;
+		if (await waitForListener(paths, waitMs, probe, options)) return false;
 		throw new Error("voice_listener_busy");
 	}
 	// A path that is not this user's socket is refused, never unlinked.
@@ -520,7 +527,7 @@ async function ensureListenerAvailable(options: Pick<EnsureListenerOptions, "dir
 	releaseListenerLock(paths, { pid: lock.pid });
 	throwIfAborted(signal);
 	await withAbort(Promise.resolve().then(() => { throwIfAborted(signal); return options.start?.(); }), signal);
-	if (await waitForListener(paths.socket, waitMs, probe, signal)) return true;
+	if (await waitForListener(paths, waitMs, probe, options)) return true;
 	throw new Error("voice_listener_missing");
 }
 
@@ -728,6 +735,14 @@ export interface SessionDictation {
 	cancel(): Promise<void>;
 }
 
+class ShutdownWorkerBusyError extends VoiceSessionError {
+	constructor() {
+		// Same code as a listener refusing a dictate because the microphone is held.
+		super("invalid-state");
+		this.message = "The microphone is busy. Try again in a moment.";
+	}
+}
+
 // A listener reported that a finished transcript went elsewhere or was dropped.
 // Older listeners may still select a different focused pane while the owner stays.
 export class ListenerDeliveryError extends Error {
@@ -791,11 +806,15 @@ export interface SessionListenerLinkOptions {
 
 // One connection per session carries both roles: it registers the pane for
 // focus fallback, and it asks for the microphone. A capture that
-// cannot get the listener records here instead of failing the dictation. Its
-// hello carries no `role`: the session's own connection is what a listener read
+// cannot get the listener records here if no shutdown worker still holds the mic.
+// Its hello carries no `role`: the session's own connection is what a listener read
 // before the role existed, so only a reading declares itself (S6).
 export function createSessionListenerLink(options: SessionListenerLinkOptions): SessionListenerLink {
 	type PendingJoin = { controller: AbortController; promise: Promise<boolean>; client?: VoiceListenerClient; allowStart: boolean };
+	const paths = listenerPaths(options.dir);
+	const checkShutdownWorker = (): void => {
+		if (hasLiveShutdownWorker(paths)) throw new ShutdownWorkerBusyError();
+	};
 	let client: VoiceListenerClient | undefined = options.adoptedClient;
 	let wakeIdentity: object | undefined;
 	let joining: PendingJoin | undefined;
@@ -984,6 +1003,8 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 			}
 		};
 		const local = (): Promise<void> => {
+			// The fence may have appeared while joining or asking for the microphone.
+			checkShutdownWorker();
 			if (handler === handle) handler = undefined;
 			return (fallback ??= request.fallback()).start();
 		};
@@ -998,6 +1019,8 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 				setState("starting");
 				handler = handle;
 				try {
+					// Do not wait on an in-flight startup for a fenced microphone.
+					if (!request.wake) checkShutdownWorker();
 					const joiningPromise = ensure();
 					waitingForJoin = joining;
 					const joined = await joiningPromise;

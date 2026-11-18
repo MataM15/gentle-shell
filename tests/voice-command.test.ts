@@ -10,7 +10,7 @@ import gentleVoice from "../extensions/gentle-voice.ts";
 import { VoiceInstallError, type VoiceInstallProgress, type VoiceInstallResult } from "../lib/voice-install.ts";
 import { VoiceSessionError, type VoiceSessionState, type VoiceTranscript } from "../lib/voice-session.ts";
 import { createReadingTurn, CONVERSATION_ENDPOINT, HELD_REPLY_POLL_MS, HELD_REPLY_STALE_MS, VOICE_COMMAND_NAME, type VoiceCommandDeps, type VoiceDictation } from "../lib/voice-command.ts";
-import { listenerPaths, VoiceListener, type ListenerDictation, type ListenerDictationRequest, type ListenerSpotFactory } from "../lib/voice-listener.ts";
+import { listenerPaths, refreshListenerLock, takeListenerLock, VoiceListener, type ListenerDictation, type ListenerDictationRequest, type ListenerSpotFactory } from "../lib/voice-listener.ts";
 import { createSessionListenerLink, VoiceListenerClient } from "../lib/voice-listener-client.ts";
 import { createVoiceReceiver } from "../lib/shell-voice-state.ts";
 import { encodeListenerFrame, parseListenerFrameLine } from "../lib/voice-listener-protocol.ts";
@@ -1692,6 +1692,41 @@ test("an unreachable listener at startup is logged and Alt+M still records local
 		assert.deepEqual(h.cues.filter((name) => name === "open" || name === "close"), ["open", "close"]);
 	} finally {
 		await pi.fire("session_shutdown", ui.ctx);
+		rmSync(home, { recursive: true, force: true });
+	}
+});
+
+test("ordinary dictation reports a busy microphone while a shutdown worker is alive", async () => {
+	const home = mkdtempSync(join(tmpdir(), "voice-command-worker-busy-"));
+	const dir = join(home, "voice");
+	const paths = listenerPaths(dir);
+	const h = harness({ installed: true, env: { GENTLE_PI_CONFIG_HOME: home } });
+	delete h.deps.createSession;
+	const link = createSessionListenerLink({ dir, waitMs: 0, session: () => ({ sessionId: "session-alpha", voiceOn: false }) });
+	const local: string[] = [];
+	h.deps.listener = {
+		...link,
+		dictate: (request) => link.dictate({ ...request, fallback: () => ({
+			owner: "session", state: "idle",
+			start: async () => { local.push("start"); throw new VoiceSessionError("capture"); },
+			stop: async () => ({ text: "", truncated: false }),
+			cancel: async () => {},
+		}) }),
+	};
+	const pi = register(h);
+	const ui = fakeContext();
+	try {
+		assert.ok(takeListenerLock(paths));
+		assert.equal(refreshListenerLock(paths, { workerPid: process.pid, now: 0 }), true);
+		await press(pi, ui);
+		assert.deepEqual(ui.notices, [{ message: "The microphone is busy. Try again in a moment.", type: "error" }]);
+		assert.deepEqual(local, []);
+		assert.equal(ui.editor(), "draft: ");
+		assert.equal(pi.counts.sends, 0);
+		assert.equal(ui.statuses.at(-1), undefined);
+		assert.deepEqual(h.cues.filter((name) => name === "open" || name === "close"), []);
+	} finally {
+		link.close();
 		rmSync(home, { recursive: true, force: true });
 	}
 });

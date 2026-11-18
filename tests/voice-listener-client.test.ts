@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { EventEmitter } from "node:events";
+import { EventEmitter, once } from "node:events";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Socket } from "node:net";
 import { join } from "node:path";
@@ -9,7 +9,7 @@ import test, { after } from "node:test";
 import { fileURLToPath } from "node:url";
 import { createSessionListenerLink, cutListenerReading, ensureListener, LISTENER_DICTATE_TIMEOUT_MS, listenerReadingTurn, sessionDisplayLabel, SESSION_LABEL_MAX, VoiceListenerClient, type ListenerSession, type ListenerWakeReservation, type SessionDictation } from "../lib/voice-listener-client.ts";
 import { VoiceSessionError, type VoiceSessionErrorCode, type VoiceSessionState } from "../lib/voice-session.ts";
-import { listenerPaths, readListenerLock, takeListenerLock, VoiceListener, type ListenerDictation, type ListenerDictationRequest } from "../lib/voice-listener.ts";
+import { listenerPaths, readListenerLock, refreshListenerLock, takeListenerLock, VoiceListener, type ListenerDictation, type ListenerDictationRequest } from "../lib/voice-listener.ts";
 import { encodeListenerFrame, parseListenerRequestLine, VOICE_LISTENER_SCHEMA, type ListenerFrame } from "../lib/voice-listener-protocol.ts";
 
 // The session side of the one voice listener (S6, slice A): join the running
@@ -945,6 +945,66 @@ test("cancelling dictation during startup never opens a capture when the listene
 	}
 });
 
+test("a live shutdown worker refuses a dictation without starting a local capture", async () => {
+	const dir = scratch();
+	const paths = listenerPaths(dir);
+	assert.ok(takeListenerLock(paths));
+	assert.equal(refreshListenerLock(paths, { workerPid: process.pid, now: 0 }), true);
+	const local = localCapture();
+	let starts = 0;
+	let probes = 0;
+	const link = createSessionListenerLink({ dir, session: () => session("s-1"), start: () => { starts++; }, waitMs: 0, probe: async () => { probes++; return false; } });
+	try {
+		const states: VoiceSessionState[] = [];
+		const dictation = link.dictate({ mode: "dictation", onStateChange: (state) => states.push(state), fallback: () => local.dictation });
+		const failed = await dictation.start().then(() => undefined, (error: unknown) => error);
+		assert.deepEqual(local.calls, []);
+		assert.ok(failed instanceof VoiceSessionError && failed.code === "invalid-state");
+		assert.ok(probes <= 1, "a live worker fence does not wait for listener startup");
+		assert.deepEqual(states, ["starting", "finished"]);
+		assert.equal(starts, 0);
+		assert.equal(readListenerLock(paths)?.workerPid, process.pid);
+	} finally {
+		link.close();
+	}
+});
+
+test("the same session starts a listener for its next dictation after the shutdown worker exits", async () => {
+	const dir = scratch();
+	const paths = listenerPaths(dir);
+	const child = spawn(process.execPath, ["-e", "process.stdin.resume()"], { stdio: ["pipe", "ignore", "ignore"] });
+	const exited = once(child, "exit");
+	const capture = fakeCapture({ text: "after shutdown" });
+	const server = new VoiceListener({ dir, dictation: capture.factory });
+	const local = localCapture();
+	let starts = 0;
+	const link = createSessionListenerLink({ dir, session: () => session("s-1"), waitMs: 0, start: async () => { starts++; await server.listen(); } });
+	const dictate = () => link.dictate({ mode: "dictation", onStateChange: () => {}, fallback: () => local.dictation });
+	try {
+		await once(child, "spawn");
+		assert.ok(takeListenerLock(paths));
+		assert.equal(refreshListenerLock(paths, { workerPid: child.pid, now: 0 }), true);
+		const first = dictate();
+		const failed = await first.start().then(() => undefined, (error: unknown) => error);
+		child.stdin.end();
+		await exited;
+		assert.equal(readListenerLock(paths)?.workerPid, child.pid, "the old fence remains on disk");
+		const retry = dictate();
+		await retry.start();
+		assert.equal(retry.owner, "listener");
+		assert.deepEqual(await retry.stop(), { text: "after shutdown", truncated: false });
+		assert.equal(starts, 1);
+		assert.deepEqual(capture.calls, ["start", "stop"]);
+		assert.deepEqual(local.calls, [], "only the retry may start a capture, and it uses the listener");
+		assert.ok(failed instanceof VoiceSessionError && failed.code === "invalid-state");
+	} finally {
+		child.stdin.end();
+		await exited;
+		link.close();
+		if (starts) await server.close();
+	}
+});
+
 test("a session with no listener keeps its own capture instead of losing voice", async () => {
 	const dir = scratch();
 	const link = createSessionListenerLink({ dir, session: () => session("s-1"), start: () => { throw new Error("the listener could not start"); }, waitMs: 50 });
@@ -953,6 +1013,8 @@ test("a session with no listener keeps its own capture instead of losing voice",
 	await dictation.start();
 	assert.equal(dictation.owner, "session", "the session plays its own cues again");
 	assert.deepEqual(own.calls, ["start"], "the fallback records in the session as it did before");
+	assert.deepEqual(await dictation.stop(), { text: "local", truncated: false });
+	assert.equal(readListenerLock(listenerPaths(dir)), undefined, "no shutdown fence is present");
 	assert.equal(await link.ensure(), false);
 	link.close();
 });
