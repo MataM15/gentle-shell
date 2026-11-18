@@ -698,9 +698,9 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			return undefined;
 		}
 	};
-	// A transcript another session recorded, handed here because this pane had the
-	// focus when the recording ended (S6). It is pasted into this session's draft
-	// and never sent, regardless of whether this session has voice on.
+	// A transcript handed here outside this session's own capture, such as a focus
+	// fallback after its requester left. Paste it, never send it, regardless of
+	// whether this session has voice on.
 	const receiveTranscript = (text: string, truncated: boolean): void => {
 		const ctx = sessionCtx;
 		if (!ctx || !supportedSession(ctx) || !text.trim()) {

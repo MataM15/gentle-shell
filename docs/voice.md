@@ -420,15 +420,16 @@ a session that asks for a capture only receives the transcript.
   naming the session that holds it (or `asleep`, when nothing has voice on),
   and every session hears the `reading` events, so a waiting one knows the turn
   is free.
-- **One target.** A transcript goes only to the session whose pane herdr
-  reports focused when the recording ends; with nobody focused it goes to the
-  single registered session. When neither resolves (the focused pane is not a
-  registered session, several sessions and none focused, or the herdr lookup
-  failed), a finished transcript goes back to the session that started the
-  recording, logged as `transcript.delivered` with `fallback: "requester"`; it
-  is dropped and logged only when that session is gone too. A session inserts
-  a transcript it receives whether its voice is on or off. A failed herdr
-  lookup still never opens a microphone for the wrong pane.
+- **One target.** A finished dictation or conversation returns to the session
+  that started it, even when the focus moves to another pane while it is being
+  transcribed; no focus lookup is made for it. Only when that session has
+  closed does the focus decide: the session whose pane herdr reports focused,
+  or the single registered session when no pane is focused, logged as
+  `transcript.delivered` with `fallback: "focus"` and reported as `elsewhere`.
+  With neither, it is dropped and logged. A session inserts a transcript it
+  receives whether its voice is on or off. Which session a spoken
+  `Gentle Voice on` wakes still follows the focus, and a failed herdr lookup
+  never opens a microphone for the wrong pane.
 - **One reading.** The listener hands the reading turn to one session at a time
   and never speaks itself: the session reads through PowerShell exactly as it
   did before. The turn is renewed every 5 seconds against a 15-second lease, so

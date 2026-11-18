@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test, { after } from "node:test";
 import { fileURLToPath } from "node:url";
-import { createSessionListenerLink, cutListenerReading, ensureListener, LISTENER_DICTATE_TIMEOUT_MS, ListenerDeliveryError, listenerReadingTurn, sessionDisplayLabel, SESSION_LABEL_MAX, VoiceListenerClient, type ListenerSession, type ListenerWakeReservation, type SessionDictation } from "../lib/voice-listener-client.ts";
+import { createSessionListenerLink, cutListenerReading, ensureListener, LISTENER_DICTATE_TIMEOUT_MS, listenerReadingTurn, sessionDisplayLabel, SESSION_LABEL_MAX, VoiceListenerClient, type ListenerSession, type ListenerWakeReservation, type SessionDictation } from "../lib/voice-listener-client.ts";
 import { VoiceSessionError, type VoiceSessionErrorCode, type VoiceSessionState } from "../lib/voice-session.ts";
 import { listenerPaths, readListenerLock, takeListenerLock, VoiceListener, type ListenerDictation, type ListenerDictationRequest } from "../lib/voice-listener.ts";
 import { encodeListenerFrame, type ListenerFrame } from "../lib/voice-listener-protocol.ts";
@@ -756,7 +756,7 @@ test("a cut on a listener that is not running does nothing and starts nothing", 
 // --- capture through the listener (slice C) ----------------------------------
 
 // The same fake worker the listener tests use: recording, transcribing, finished.
-function fakeCapture(options: { text?: string; error?: VoiceSessionErrorCode; delayMs?: number } = {}) {
+function fakeCapture(options: { text?: string; error?: VoiceSessionErrorCode; delayMs?: number; transcriptGate?: Promise<void> } = {}) {
 	const calls: string[] = [];
 	const factory = (request: ListenerDictationRequest): ListenerDictation => {
 		const notify = request.onStateChange;
@@ -769,6 +769,7 @@ function fakeCapture(options: { text?: string; error?: VoiceSessionErrorCode; de
 			stop: async () => {
 				calls.push("stop");
 				notify("transcribing");
+				if (options.transcriptGate) await options.transcriptGate;
 				notify("finished");
 				if (options.error) throw new VoiceSessionError(options.error);
 				return { text: options.text ?? "hola", truncated: false };
@@ -956,24 +957,25 @@ test("a session with no listener keeps its own capture instead of losing voice",
 	link.close();
 });
 
-test("a transcript that went to the focused session is reported instead of waited on", async () => {
+test("a conversation result returns to its requester even when another session is focused", async () => {
 	const dir = scratch();
-	const server = new VoiceListener({ dir, dictation: fakeCapture({ text: "para el otro" }).factory, focus: focusedOn("w1:p2") });
+	const server = new VoiceListener({ dir, dictation: fakeCapture({ text: "para quien habló" }).factory, focus: focusedOn("w1:p2") });
 	await server.listen();
 	const received: Array<[string, boolean]> = [];
 	const asker = createSessionListenerLink({ dir, session: () => session("s-1") });
-	await asker.ensure();
 	const focused = createSessionListenerLink({ dir, session: () => session("s-2", true, "w1:p2"), onTranscript: (text, truncated) => received.push([text, truncated]) });
-	assert.equal(await focused.ensure(), true);
-	const dictation = asker.dictate({ mode: "conversation", onStateChange: () => {}, fallback: () => assert.fail("the listener is reachable") });
-	await dictation.start();
-	dictation.stop();
-	await assert.rejects(dictation.stop(), (error: unknown) => error instanceof ListenerDeliveryError && error.kind === "elsewhere");
-	await waitFor(() => received.length === 1);
-	assert.deepEqual(received, [["para el otro", false]], "the focused session receives what the other one recorded");
-	asker.close();
-	focused.close();
-	await server.close();
+	try {
+		assert.equal(await asker.ensure(), true);
+		assert.equal(await focused.ensure(), true);
+		const dictation = asker.dictate({ mode: "conversation", onStateChange: () => {}, fallback: () => assert.fail("the listener is reachable") });
+		await dictation.start();
+		assert.deepEqual(await dictation.stop(), { text: "para quien habló", truncated: false });
+		assert.deepEqual(received, []);
+	} finally {
+		asker.close();
+		focused.close();
+		await server.close();
+	}
 });
 
 test("a capture refused because another one is running fails the start instead of opening a second microphone", async () => {
@@ -994,26 +996,37 @@ test("a capture refused because another one is running fails the start instead o
 	await server.close();
 });
 
-test("a session whose dictate was refused still receives the transcript the focus sends it", async () => {
+test("a refused capture still receives a focus fallback after the requester disconnects", async () => {
 	const dir = scratch();
-	const server = new VoiceListener({ dir, dictation: fakeCapture({ text: "para el enfocado" }).factory, focus: focusedOn("w1:p2") });
+	let release!: () => void;
+	const gate = new Promise<void>((resolve) => { release = resolve; });
+	const server = new VoiceListener({ dir, dictation: fakeCapture({ text: "para el enfocado", transcriptGate: gate }).factory, focus: focusedOn("w1:p2") });
 	await server.listen();
 	const asker = createSessionListenerLink({ dir, session: () => session("s-1", true, "w1:p1") });
-	assert.equal(await asker.ensure(), true);
 	const received: string[] = [];
 	const focused = createSessionListenerLink({ dir, session: () => session("s-2", true, "w1:p2"), onTranscript: (text) => received.push(text) });
-	assert.equal(await focused.ensure(), true);
-	const recording = asker.dictate({ mode: "conversation", onStateChange: () => {}, fallback: () => assert.fail("the listener is reachable") });
-	await recording.start();
-	const refused = focused.dictate({ mode: "conversation", onStateChange: () => {}, fallback: () => assert.fail("no second microphone") });
-	await assert.rejects(refused.start(), (error: unknown) => error instanceof VoiceSessionError && error.code === "invalid-state");
-	recording.stop();
-	await assert.rejects(recording.stop(), (error: unknown) => error instanceof ListenerDeliveryError && error.kind === "elsewhere");
-	await waitFor(() => received.length === 1);
-	assert.deepEqual(received, ["para el enfocado"], "a refused start left no handler swallowing the focused transcript");
-	asker.close();
-	focused.close();
-	await server.close();
+	try {
+		assert.equal(await asker.ensure(), true);
+		assert.equal(await focused.ensure(), true);
+		const recording = asker.dictate({ mode: "conversation", onStateChange: () => {}, fallback: () => assert.fail("the listener is reachable") });
+		await recording.start();
+		const refused = focused.dictate({ mode: "conversation", onStateChange: () => {}, fallback: () => assert.fail("no second microphone") });
+		await assert.rejects(refused.start(), (error: unknown) => error instanceof VoiceSessionError && error.code === "invalid-state");
+		const outcome = recording.stop();
+		outcome.catch(() => {});
+		await waitFor(() => recording.state === "transcribing");
+		asker.close();
+		await waitFor(() => server.clientCount === 1);
+		release();
+		await waitFor(() => received.length === 1);
+		assert.deepEqual(received, ["para el enfocado"]);
+		await assert.rejects(outcome, (error: unknown) => error instanceof VoiceSessionError && error.code === "worker-exited");
+	} finally {
+		release();
+		asker.close();
+		focused.close();
+		await server.close();
+	}
 });
 
 test("a slow capture start never opens a second microphone in the session", async () => {

@@ -726,8 +726,8 @@ export interface SessionDictation {
 	cancel(): Promise<void>;
 }
 
-// The utterance was transcribed and then delivered somewhere else: the focused
-// pane decides, and a session that is not it never receives a copy (S6).
+// A listener reported that a finished transcript went elsewhere or was dropped.
+// Older listeners may still select a different focused pane while the owner stays.
 export class ListenerDeliveryError extends Error {
 	readonly kind: "elsewhere" | "dropped";
 	constructor(kind: "elsewhere" | "dropped") {
@@ -777,8 +777,8 @@ export interface SessionListenerLinkOptions {
 	// How long the listener gets to accept a dictate, before the start fails.
 	dictateTimeoutMs?: number;
 	backoffMs?: readonly number[];
-	// A transcript the listener handed to this session: another session recorded
-	// it and this pane had the focus. It is handed over once, never buffered.
+	// A transcript handed to this session outside its own capture, such as a
+	// focus fallback for a departed requester. It is handed over once, never buffered.
 	onTranscript?(text: string, truncated: boolean): void;
 	// The listener telling this session about its own voice: on, because it was
 	// woken by voice (the frame says so) or because another session turned it on,
@@ -787,8 +787,8 @@ export interface SessionListenerLinkOptions {
 	onDisplay?(frame: Extract<ListenerFrame, { type: "display" | "level" }>): void;
 }
 
-// One connection per session carries both roles: it registers the pane that the
-// focus sends a transcript to, and it asks for the microphone. A capture that
+// One connection per session carries both roles: it registers the pane for
+// focus fallback, and it asks for the microphone. A capture that
 // cannot get the listener records here instead of failing the dictation. Its
 // hello carries no `role`: the session's own connection is what a listener read
 // before the role existed, so only a reading declares itself (S6).
@@ -814,7 +814,7 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 			options.onVoice?.(frame.command, frame.wake === true, client?.listenerState !== "asleep");
 			return;
 		}
-		// No capture of this session asked for it: the focus sent it here (S6).
+		// No capture of this session asked for it; pass the transcript to the session.
 		if (frame.type === "transcript") options.onTranscript?.(frame.text, frame.truncated === true);
 	};
 	let detachAdopted = options.adoptedClient?.onFrame(route);
@@ -948,8 +948,7 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 			failure = { error: outcome.error };
 			rejectTranscript(outcome.error);
 		};
-		// The listener reports the capture it holds here; the transcript itself only
-		// arrives when this pane has the focus.
+		// The listener reports this connection's capture and its finished transcript.
 		const handle = (frame: ListenerFrame): boolean => {
 			if (frame.type === "transcript") {
 				settle({ transcript: { text: frame.text, truncated: frame.truncated === true } });
@@ -1029,7 +1028,7 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 					if (failure) throw failure.error;
 				} catch (error) {
 					// A start that failed holds no capture, so its handler goes with it: a
-					// transcript the focus sends this session still reaches onTranscript.
+					// later fallback transcript still reaches onTranscript.
 					settle({ error });
 					throw error;
 				}

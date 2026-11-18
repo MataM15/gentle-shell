@@ -455,9 +455,6 @@ interface ActiveCapture {
 	readonly readingTailEndsAt?: number;
 	finishedAt?: number;
 	collecting: boolean;
-	// Once the transcript exists, losing its requester must not discard it while
-	// a focused recipient is still being resolved.
-	transcriptReady: boolean;
 	// Stop requests that arrived while the outcome was being collected: answered
 	// once it is known, so a requester has its transcript when its stop returns.
 	readonly afterCollect: Array<() => void>;
@@ -691,15 +688,23 @@ export class VoiceListener {
 		void this.close("error");
 	}
 
-	// Focus wins; when it cannot resolve a target, a finished capture falls back
-	// only to its own still-open connection. Cancellation is checked after either
-	// a focus result or failure, before either route can send anything.
+	// A capture belongs to the connection that opened it. Only if that connection
+	// is gone do we resolve focus; calls without an owner retain focus routing.
 	async deliverTranscript(text: string, truncated = false, cancelled?: () => boolean, requester?: Client): Promise<string | undefined> {
 		const liveClients = () => [...this.clients.values()].filter((client) => client.sessionId && !client.socket.destroyed && client.socket.writable);
 		const initial = liveClients();
 		if (initial.length === 0) {
 			this.log("transcript.undelivered", { clients: 0 });
 			return undefined;
+		}
+		if (requester && initial.includes(requester)) {
+			if (cancelled?.()) {
+				this.log("transcript.undelivered", { clients: initial.length, capture: "cancelled" });
+				return undefined;
+			}
+			this.say(requester, truncated ? { type: "transcript", text, truncated: true } : { type: "transcript", text });
+			this.log("transcript.delivered", { sessionId: requester.sessionId });
+			return requester.sessionId;
 		}
 		let lookup: ListenerFocusResult;
 		try { lookup = await (this.options.focus ?? noFocus).focusedPaneId(); }
@@ -717,14 +722,12 @@ export class VoiceListener {
 		// same throughout the lookup; a departing requester must not redirect to an
 		// unrelated connection that happened to become the only one left.
 		if (!target && "focused" in lookup && focused === undefined && initial.length === 1 && clients.length === 1 && initial[0] === clients[0] && clients[0]?.role === "session") target = clients[0];
-		let fallback = false;
-		if (!target && requester && clients.includes(requester)) { target = requester; fallback = true; }
 		if (!target) {
 			this.log("transcript.undelivered", { clients: clients.length, ...("failed" in lookup ? { focus: "unknown" } : {}) });
 			return undefined;
 		}
 		this.say(target, truncated ? { type: "transcript", text, truncated: true } : { type: "transcript", text });
-		this.log("transcript.delivered", { sessionId: target.sessionId, ...(fallback ? { fallback: "requester" } : {}) });
+		this.log("transcript.delivered", { sessionId: target.sessionId, ...(requester ? { fallback: "focus" } : {}) });
 		return target.sessionId;
 	}
 
@@ -1030,8 +1033,8 @@ export class VoiceListener {
 
 	// --- the microphone (slice C) --------------------------------------------------
 
-	// One capture at a time, owned by the session that asked. The listener records
-	// and transcribes; the requester only learns where its transcript went. A
+	// One capture at a time, owned by the connection that asked. The listener
+	// records and transcribes, then sends its result to that connection. A
 	// worker that cannot record answers the same request with a failed capture
 	// carrying the worker's own code, so the session reports it as it always did.
 	private async beginCapture(client: Client, request: { id?: string; mode: CaptureMode; endpoint?: ListenerEndpoint }): Promise<void> {
@@ -1096,7 +1099,7 @@ export class VoiceListener {
 			kws: this.options.keyword,
 			onKeywordRejected: (hit) => this.logKeywordRejection(hit),
 		});
-		const capture: ActiveCapture = { client, sessionId, mode: request.mode, dictation, readingTailEndsAt: this.reading?.tailEndsAt, collecting: false, transcriptReady: false, afterCollect: [], cue: "none" };
+		const capture: ActiveCapture = { client, sessionId, mode: request.mode, dictation, readingTailEndsAt: this.reading?.tailEndsAt, collecting: false, afterCollect: [], cue: "none" };
 		this.capture = capture;
 		this.capturePending = undefined;
 		this.levelAt = undefined;
@@ -1148,8 +1151,8 @@ export class VoiceListener {
 		this.collectCapture(capture);
 	}
 
-	// The recording ends. Focus at delivery wins; without a target, the capture's
-	// own connection receives the finished transcript if it is still open.
+	// The recording ends. Its own connection receives the finished transcript;
+	// focus is consulted only if that connection has gone away.
 	private endCapture(client: Client, id?: string): void {
 		const capture = this.refuseUnlessOwner(client, id, this.capture);
 		if (!capture) return;
@@ -1161,9 +1164,8 @@ export class VoiceListener {
 		this.collectCapture(capture, () => this.captureState(client, "transcribing"));
 	}
 
-	// Collects the outcome of a recording once, whoever ended it: the session
-	// that asked to stop, or the worker itself. The transcript goes to whoever
-	// has the focus now; a command or a failure is settled in its own way.
+	// Collects the outcome once, whether stopped by the requester or the worker.
+	// A command or failure is settled separately from a finished transcript.
 	private collectCapture(capture: ActiveCapture, beforeStop?: () => void): void {
 		if (capture.collecting) return;
 		capture.collecting = true;
@@ -1179,15 +1181,18 @@ export class VoiceListener {
 			// What was said was a command, not speech (S4): nothing is delivered, and
 			// the requester gets the same frames a capture with no speech gives it.
 			if (transcript.command !== undefined) {
+				// A departed owner's completed speech can fall back, but its stale
+				// commands must not change the voice state of other sessions.
+				if (this.capture === capture && (!this.clients.has(capture.client.socket) || capture.client.socket.destroyed || !capture.client.socket.writable)) this.releaseCapture(capture);
 				this.captureCommand(capture, transcript.command);
 				return;
 			}
 			if (this.capture !== capture) return;
-			capture.transcriptReady = true;
 			const target = await this.deliverTranscript(transcript.text, transcript.truncated === true, () => this.capture !== capture, capture.client);
-			// A cancel inside that lookup released the capture and already answered.
+			// A cancel inside a fallback lookup released the capture and already answered.
 			if (this.capture === capture) {
-				const phase = target === undefined ? "dropped" : target === capture.sessionId ? "delivered" : "elsewhere";
+				const ownerOpen = this.clients.has(capture.client.socket) && !capture.client.socket.destroyed && capture.client.socket.writable;
+				const phase = target === undefined ? "dropped" : ownerOpen ? "delivered" : "elsewhere";
 				this.log("capture.end", { sessionId: capture.sessionId, mode: capture.mode, phase, target });
 				if (this.clients.has(capture.client.socket)) this.say(capture.client, phase === "elsewhere" && target ? { type: "capture", phase, target } : { type: "capture", phase });
 				this.releaseCapture(capture);
@@ -1876,11 +1881,11 @@ export class VoiceListener {
 	private forget(client: Client, close: (socket: Socket) => void = (socket) => socket.destroy(), quiet = false): void {
 		if (!this.clients.delete(client.socket)) return;
 		if (this.reading && !this.reading.ended && this.reading.socket === client.socket) this.endReading("closed");
-		// A disconnect while recording still cancels; an already-finished
-		// transcript gets to finish resolving its focused recipient.
+		// Recording still cancels on disconnect; once collection has started,
+		// finish transcription and resolve a fallback instead of losing speech.
 		const capture = this.capture;
 		if (capture && capture.client === client) {
-			if (!capture.transcriptReady) this.releaseCapture(capture, true);
+			if (!capture.collecting) this.releaseCapture(capture, true);
 			this.log("capture.closed", { sessionId: capture.sessionId, mode: capture.mode });
 		}
 		if (this.capturePending?.client === client) {

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
-import { createServer, type Socket } from "node:net";
+import { createServer, Server, type Socket } from "node:net";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import nodeTest from "node:test";
@@ -13,7 +13,7 @@ import { createReadingTurn, CONVERSATION_ENDPOINT, HELD_REPLY_POLL_MS, HELD_REPL
 import { listenerPaths, VoiceListener, type ListenerDictation, type ListenerDictationRequest, type ListenerSpotFactory } from "../lib/voice-listener.ts";
 import { createSessionListenerLink, VoiceListenerClient } from "../lib/voice-listener-client.ts";
 import { createVoiceReceiver } from "../lib/shell-voice-state.ts";
-import { encodeListenerFrame } from "../lib/voice-listener-protocol.ts";
+import { encodeListenerFrame, parseListenerFrameLine } from "../lib/voice-listener-protocol.ts";
 import type { PaneFocus } from "../lib/voice-presence.ts";
 import type { CuePlayer } from "../lib/voice-cues.ts";
 import type { PushToTalkTimers } from "../lib/voice-push-to-talk.ts";
@@ -906,6 +906,50 @@ test("a toggle dictation records through the listener and this session only past
 	}
 });
 
+test("moving focus during transcription pastes only into the session that dictated", async () => {
+	const home = mkdtempSync(join(tmpdir(), "voice-command-owner-"));
+	const dir = join(home, "voice");
+	const gate = deferred<void>();
+	let focused = "w1:p1";
+	const server = new VoiceListener({
+		dir, focus: { focusedPaneId: async () => ({ focused }) },
+		dictation: (request) => ({
+			start: async () => request.onStateChange("recording"),
+			stop: async () => { request.onStateChange("transcribing"); await gate.promise; request.onStateChange("finished"); return { text: "mi dictado", truncated: false }; },
+			cancel: async () => request.onStateChange("finished"),
+		}),
+	});
+	const first = harness({ installed: true, env: { HERDR_PANE_ID: "w1:p1", GENTLE_PI_CONFIG_HOME: home } });
+	const second = harness({ installed: true, env: { HERDR_PANE_ID: "w1:p2", GENTLE_PI_CONFIG_HOME: home } });
+	delete first.deps.createSession; delete second.deps.createSession;
+	const piFirst = register(first); const piSecond = register(second);
+	const uiFirst = fakeContext({}, "tui", true, "session-alpha");
+	const uiSecond = fakeContext({}, "tui", true, "session-beta");
+	await server.listen();
+	try {
+		await piFirst.fire("session_start", uiFirst.ctx);
+		await piSecond.fire("session_start", uiSecond.ctx);
+		await until(() => server.sessionIds.length === 2);
+		const done = press(piFirst, uiFirst);
+		await until(() => /recording/i.test(uiFirst.statuses.at(-1) ?? ""));
+		await press(piFirst, uiFirst);
+		await until(() => /transcrib/i.test(uiFirst.statuses.at(-1) ?? ""));
+		focused = "w1:p2";
+		gate.resolve();
+		await done;
+		assert.equal(uiFirst.editor(), "draft: mi dictado");
+		assert.equal(uiSecond.editor(), "draft: ");
+		assert.deepEqual(piFirst.sent, []);
+		assert.deepEqual(piSecond.sent, []);
+	} finally {
+		gate.resolve();
+		await piFirst.fire("session_shutdown", uiFirst.ctx);
+		await piSecond.fire("session_shutdown", uiSecond.ctx);
+		await server.close();
+		rmSync(home, { recursive: true, force: true });
+	}
+});
+
 test("a voice-off shortcut inserts its own finished transcript when focus fails", async () => {
 	const home = mkdtempSync(join(tmpdir(), "voice-command-requester-"));
 	const dir = join(home, "voice");
@@ -934,7 +978,7 @@ test("a voice-off shortcut inserts its own finished transcript when focus fails"
 		assert.equal(ui.editor(), "draft: dictado guardado");
 		assert.deepEqual(pi.sent, []);
 		assert.deepEqual(h.voice.sessions, []);
-		assert.deepEqual(events.filter((entry) => entry.event === "transcript.delivered").map(({ sessionId, fallback }) => ({ sessionId, fallback })), [{ sessionId: "session-alpha", fallback: "requester" }]);
+		assert.deepEqual(events.filter((entry) => entry.event === "transcript.delivered").map(({ sessionId, fallback }) => ({ sessionId, fallback })), [{ sessionId: "session-alpha", fallback: undefined }]);
 		assert.equal(events.find((entry) => entry.event === "capture.end")?.phase, "delivered");
 	} finally {
 		await pi.fire("session_shutdown", ui.ctx);
@@ -947,12 +991,13 @@ for (const registration of ["passive-off", "turned-off", "voice-on"] as const) t
 	const home = mkdtempSync(join(tmpdir(), "voice-command-received-"));
 	const dir = join(home, "voice");
 	const serverEvents: Array<{ event: string } & Record<string, unknown>> = [];
+	const result = deferred<void>();
 	const server = new VoiceListener({
 		dir,
 		focus: { focusedPaneId: async () => ({ focused: "w1:p1" }) },
 		dictation: (request) => ({
 			start: async () => request.onStateChange("recording"),
-			stop: async () => { request.onStateChange("transcribing"); request.onStateChange("finished"); return { text: "texto de otra sesión", truncated: true }; },
+			stop: async () => { request.onStateChange("transcribing"); await result.promise; request.onStateChange("finished"); return { text: "texto de otra sesión", truncated: true }; },
 			cancel: async () => request.onStateChange("finished"),
 		}),
 		log: (event, fields) => serverEvents.push({ event, ...fields }),
@@ -975,15 +1020,23 @@ for (const registration of ["passive-off", "turned-off", "voice-on"] as const) t
 		}
 		await actor.connect();
 		assert.equal((await actor.request({ type: "dictate", mode: "dictation" })).type, "ok");
-		assert.equal((await actor.request({ type: "stop" })).type, "ok");
+		const stopping = actor.request({ type: "stop" });
+		stopping.catch(() => {});
+		await until(() => actorFrames.some((frame) => frame.type === "capture" && frame.phase === "transcribing"));
+		actor.close();
+		await assert.rejects(stopping);
+		await until(() => server.clientCount === 1);
+		result.resolve();
 		await until(() => h.events.some((entry) => entry.event === "transcript.received"));
 		assert.equal(ui.editor(), "draft: texto de otra sesión");
 		assert.deepEqual(h.events.filter((entry) => entry.event === "transcript.received"), [{ event: "transcript.received", session: "session-alpha", pasted: true, chars: "texto de otra sesión".length, truncated: true }]);
-		assert.deepEqual(actorFrames, [{ type: "capture", phase: "recording" }, { type: "capture", phase: "transcribing" }, { type: "capture", phase: "elsewhere", target: "session-alpha" }]);
-		assert.deepEqual(serverEvents.filter((entry) => entry.event === "transcript.delivered").map(({ sessionId, fallback }) => ({ sessionId, fallback })), [{ sessionId: "session-alpha", fallback: undefined }]);
+		assert.deepEqual(actorFrames, [{ type: "capture", phase: "recording" }, { type: "capture", phase: "transcribing" }]);
+		assert.deepEqual(serverEvents.filter((entry) => entry.event === "transcript.delivered").map(({ sessionId, fallback }) => ({ sessionId, fallback })), [{ sessionId: "session-alpha", fallback: "focus" }]);
+		assert.equal(serverEvents.find((entry) => entry.event === "capture.end")?.phase, "elsewhere");
 		assert.deepEqual(pi.sent, []);
 		assert.equal(h.voice.sessions.includes("session-alpha"), registration === "voice-on");
 	} finally {
+		result.resolve();
 		actor.close();
 		await pi.fire("session_shutdown", ui.ctx);
 		await server.close();
@@ -1046,7 +1099,7 @@ function registrationPeer(dir: string, holdFirstWelcome = false) {
 	};
 }
 
-for (const voiceOn of [false, true]) test(`a connected ${voiceOn ? "voice-on" : "voice-off"} session restarts a vanished listener`, async () => {
+for (const voiceOn of [false, true]) nodeTest(`a connected ${voiceOn ? "voice-on" : "voice-off"} session restarts a vanished listener`, { timeout: 12_000 }, async () => {
 	const home = mkdtempSync(join(tmpdir(), "voice-command-restart-"));
 	const dir = join(home, "voice");
 	const { engine } = fakeEngine();
@@ -1058,17 +1111,50 @@ for (const voiceOn of [false, true]) test(`a connected ${voiceOn ? "voice-on" : 
 	await server.listen();
 	const pi = register(h);
 	const ui = fakeContext();
+	const clients: VoiceListenerClient[] = [];
+	const connect = VoiceListenerClient.prototype.connect;
+	const emit = Server.prototype.emit;
+	let releaseWelcome: (() => void) | undefined;
+	const waitFor = async (check: () => boolean, message: string) => {
+		const deadline = performance.now() + 8_000;
+		while (!check() && performance.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+		assert.ok(check(), message);
+	};
+	VoiceListenerClient.prototype.connect = function () { clients.push(this); return connect.call(this); };
+	// Hold the welcome to exercise the gap between server registration and the
+	// client actually joining, rather than assuming those happen at the same time.
+	Server.prototype.emit = function (event: string | symbol, ...args: unknown[]) {
+		if (event === "connection") {
+			const socket = args[0] as Socket;
+			const write = socket.write.bind(socket);
+			socket.write = ((chunk: string) => {
+				if (!releaseWelcome && parseListenerFrameLine(chunk)?.type === "welcome") {
+					releaseWelcome = () => { if (!socket.destroyed) write(chunk); };
+					return true;
+				}
+				return write(chunk);
+			}) as typeof socket.write;
+		}
+		return emit.call(this, event, ...args);
+	} as typeof Server.prototype.emit;
 	try {
 		await pi.fire("session_start", ui.ctx);
-		await until(() => server.sessionIds.includes("session-alpha"));
+		await waitFor(() => server.sessionIds.includes("session-alpha"), "the listener never registered the session");
+		assert.ok(releaseWelcome, "the server registered a hello before sending welcome");
+		assert.equal(clients[0]?.connected, false, "registration alone does not mean the session joined");
+		Server.prototype.emit = emit;
+		releaseWelcome();
+		await waitFor(() => clients[0]?.connected === true, "the client never completed its initial join");
 		assert.equal(starts, 0, "startup joins the existing listener");
 		await server.close();
-		await until(() => starts === 1 && server.sessionIds.includes("session-alpha"), 2_000);
+		await waitFor(() => starts > 0 && clients[0]?.connected === true && server.sessionIds.includes("session-alpha"), "the connected session did not restart and rejoin");
 		assert.deepEqual(server.voiceSessions, voiceOn ? ["session-alpha"] : []);
 		assert.equal(server.clientCount, 1);
 		assert.equal(starts, 1);
 	} finally {
 		await pi.fire("session_shutdown", ui.ctx);
+		VoiceListenerClient.prototype.connect = connect;
+		Server.prototype.emit = emit;
 		await server.close();
 		rmSync(home, { recursive: true, force: true });
 	}
@@ -3184,6 +3270,36 @@ async function awakeConversationFixture(busy: boolean, installGate?: Promise<voi
 		close: async () => { await pi.fire("session_shutdown", ui.ctx); await server.close(); rmSync(home, { recursive: true, force: true }); },
 	};
 }
+
+test("spoken-wake and reopened conversations stay with their initiating session after focus moves", async () => {
+	const f = await awakeConversationFixture(false);
+	const other = new VoiceListenerClient({ dir: f.dir, session: { sessionId: "session-beta", paneId: "w1:p2", voiceOn: true } });
+	const otherTranscripts: string[] = [];
+	other.onFrame((frame) => { if (frame.type === "transcript") otherTranscripts.push(frame.text); });
+	try {
+		await other.connect();
+		f.hearOn();
+		await f.reached(() => f.requests.length === 1);
+		f.focus.pane = "w1:p2";
+		f.requests[0]!.onStateChange("finished");
+		await f.reached(() => f.pi.sent.length === 1);
+		assert.equal(f.pi.sent[0]!.content, "seguí por favor");
+		assert.deepEqual(otherTranscripts, []);
+		f.focus.pane = "w1:p1";
+		await settleReply(f.pi, f.ui.ctx, "Te escucho.");
+		await f.reached(() => f.readings.length === 1);
+		f.readings[0]!.finish("done");
+		await f.reached(() => f.requests.length === 2);
+		f.focus.pane = "w1:p2";
+		f.requests[1]!.onStateChange("finished");
+		await f.reached(() => f.pi.sent.length === 2);
+		assert.deepEqual(f.pi.sent.map((entry) => entry.content), ["seguí por favor", "seguí por favor"]);
+		assert.deepEqual(otherTranscripts, []);
+	} finally {
+		other.close();
+		await f.close();
+	}
+});
 
 test("the real listener sends this session's reading and its played levels to the display bus", async () => {
  const f=await awakeConversationFixture(false);
