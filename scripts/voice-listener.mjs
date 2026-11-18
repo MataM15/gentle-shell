@@ -26,8 +26,8 @@ if (!warm) log("listener.capture-unavailable", { reason: diagnosis.limitations[0
 
 // The cues are played where the microphone is: this process, next to the worker.
 const cues = createCuePlayer({ env });
-// Focus comes from herdr; a failed lookup focuses nothing, so nothing is
-// delivered and the microphone stays closed.
+// Focus comes from herdr: a failed lookup never wakes a session or opens the
+// microphone, while an already-finished transcript can fall back to its requester.
 //
 // The keyword option (S7): built from the spotter that is installed here, its
 // pinned digests and the keyword file that ships with the package. Without it no

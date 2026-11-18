@@ -418,8 +418,13 @@ a session that asks for a capture only receives the transcript.
   is free.
 - **One target.** A transcript goes only to the session whose pane herdr
   reports focused when the recording ends; with nobody focused it goes to the
-  single registered session, and otherwise it is dropped and logged. A failed
-  herdr lookup never guesses, so it never opens a microphone for the wrong pane.
+  single registered session. When neither resolves (the focused pane is not a
+  registered session, several sessions and none focused, or the herdr lookup
+  failed), a finished transcript goes back to the session that started the
+  recording, logged as `transcript.delivered` with `fallback: "requester"`; it
+  is dropped and logged only when that session is gone too. A session inserts
+  a transcript it receives whether its voice is on or off. A failed herdr
+  lookup still never opens a microphone for the wrong pane.
 - **One reading.** The listener hands the reading turn to one session at a time
   and never speaks itself: the session reads through PowerShell exactly as it
   did before. The turn is renewed every 5 seconds against a 15-second lease, so

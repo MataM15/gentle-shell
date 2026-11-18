@@ -13,9 +13,9 @@ Branch `feat/voice-control` (worktree `gentle-shell-worktrees/voice-control`), f
 
 ## Tasks
 
-- [ ] T1a (S1) Record which native capture error ends a capture, as a fixed code, in the voice event log (`capture.native`). The worker prints one fixed line on stderr and the warm worker reads it, so the stdout frames stay exactly as they are and an old listener with a new worker (or the reverse) keeps working. Worker. Commit: pending.
+- [x] T1a (S1) Record which native capture error ends a capture, as a fixed code, in the voice event log (`capture.native`). The worker prints one fixed line on stderr and the warm worker reads it, so the stdout frames stay exactly as they are and an old listener with a new worker (or the reverse) keeps working. Worker. Commit: 31f39b4ac.
 - [ ] T1b (S1, S5) Fix the handoff failure once `capture.native` names it in real use. Blocked on T1a being integrated live. Commit: pending.
-- [ ] T2 (S2) When no delivery target resolves, deliver the finished transcript to the session that started the capture; a transcript a session receives is always inserted. Worker. Commit: pending.
+- [x] T2 (S2) When no delivery target resolves, deliver the finished transcript to the session that started the capture; a transcript a session receives is always inserted. Worker. Commit: the one after 31f39b4ac (`fix(voice): hand a finished dictation back to its session`).
 - [ ] T3 (S3, S5) Listener lifetime tied to connected sessions; clients restart a dead listener. Inline. Commit: pending.
 - [ ] T4 (S4) Unload the dictation model when voice goes off, spotting stays. Inline. Commit: pending.
 - [ ] T5 (S4) Measure worker memory over repeated captures and long spotting; fix only what the measurement names. Inline. Commit: pending.

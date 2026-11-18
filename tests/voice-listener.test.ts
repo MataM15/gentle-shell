@@ -976,6 +976,7 @@ test("a dictation is recorded by the listener and its transcript goes to the foc
 	assert.deepEqual(framesOf(asker, "transcript"), [], "the session that asked earns nothing it was not focused for");
 	assert.deepEqual(framesOf(focused, "transcript"), [{ type: "transcript", text: "hola mundo" }]);
 	assert.deepEqual(phases(asker), ["recording", "transcribing", "elsewhere"]);
+	assert.deepEqual(started.events.filter((entry) => entry.event === "transcript.delivered").map((entry) => entry.fields), [{ sessionId: "s-2" }]);
 	assert.deepEqual(capture.calls, ["start", "stop"]);
 	// The microphone closes when the recording does; a session that has voice
 	// keeps the listener awake, so it stays listening rather than asleep.
@@ -1009,22 +1010,159 @@ test("the focus is read when the recording ends, not when it starts", async () =
 	await started.listener.close();
 });
 
-test("a transcript with nobody focused, or with the lookup failed, is dropped instead of broadcast", async () => {
-	for (const focus of [{ focusedPaneId: async () => ({ focused: undefined }) }, { focusedPaneId: async () => ({ failed: true as const }) }]) {
-		const dir = scratch();
-		const started = await startListener(dir, { dictation: fakeCapture().factory, focus });
-		const clients = [await started.client(), await started.client(), await started.client()];
-		clients.forEach((client, index) => client.hello(`s-${index + 1}`, `w1:p${index + 1}`));
-		await waitFor(() => clients.every((client) => framesOf(client, "welcome").length === 1));
-		clients[0].send({ type: "dictate", mode: "dictation" });
-		await awaitFrame(clients[0], (frame) => frame.type === "capture" && frame.phase === "recording");
-		clients[0].send({ type: "stop" });
-		assert.deepEqual(await awaitFrame(clients[0], (frame) => frame.type === "capture" && frame.phase === "dropped"), { type: "capture", phase: "dropped" });
-		for (const client of clients) assert.deepEqual(framesOf(client, "transcript"), []);
-		assert.equal(started.events.filter((entry) => entry.event === "transcript.undelivered").length, 1);
-		for (const client of clients) client.socket.destroy();
-		await started.listener.close();
+test("an unresolved focus delivers a finished transcript only to its requester and logs the fallback", async (t) => {
+	const scenarios: Array<{ name: string; focus: ListenerFocus; count: number }> = [
+		{ name: "failed lookup with one connection", focus: { focusedPaneId: async () => ({ failed: true }) }, count: 1 },
+		{ name: "failed lookup with two connections", focus: { focusedPaneId: async () => ({ failed: true }) }, count: 2 },
+		{ name: "lookup throws or times out", focus: { focusedPaneId: async () => { throw new Error("timeout with private details"); } }, count: 2 },
+		{ name: "focused pane has no client", focus: { focusedPaneId: async () => ({ focused: "w9:p9" }) }, count: 2 },
+		{ name: "nobody focused with two connections", focus: { focusedPaneId: async () => ({ focused: undefined }) }, count: 2 },
+	];
+	for (const { name, focus, count } of scenarios) {
+		await t.test(name, async (st) => {
+			const started = await startListener(scratch(), { dictation: fakeCapture({ text: "texto terminado", truncated: true }).factory, focus });
+			st.after(() => started.listener.close());
+			const clients = await Promise.all(Array.from({ length: count }, () => started.client()));
+			clients.forEach((client, index) => client.hello(`s-${index + 1}`, `w1:p${index + 1}`));
+			await waitFor(() => clients.every((client) => framesOf(client, "welcome").length === 1));
+			const requester = clients[0]!;
+			requester.send({ type: "dictate", id: "d", mode: "dictation" });
+			await awaitFrame(requester, (frame) => frame.type === "capture" && frame.phase === "recording");
+			requester.send({ type: "stop", id: "stop" });
+			await awaitFrame(requester, (frame) => "id" in frame && frame.id === "stop");
+			assert.deepEqual(framesOf(requester, "transcript"), [{ type: "transcript", text: "texto terminado", truncated: true }]);
+			assert.deepEqual(phases(requester), ["recording", "transcribing", "delivered"]);
+			for (const other of clients.slice(1)) assert.deepEqual(framesOf(other, "transcript"), []);
+			assert.deepEqual(started.events.filter((entry) => entry.event === "transcript.delivered").map((entry) => entry.fields), [{ sessionId: "s-1", fallback: "requester" }]);
+			assert.equal(started.events.filter((entry) => entry.event === "transcript.undelivered").length, 0);
+			assert.equal(started.events.find((entry) => entry.event === "capture.end")?.fields?.phase, "delivered");
+			assert.equal(JSON.stringify(started.events).includes("texto terminado"), false);
+		});
 	}
+});
+
+test("focus selects the session connection rather than its earlier reading connection", async (t) => {
+	const started = await startListener(scratch(), { dictation: fakeCapture({ text: "hola" }).factory, focus: { focusedPaneId: async () => ({ focused: "w1:p2" }) } });
+	t.after(() => started.listener.close());
+	const requester = await started.client();
+	const reader = await started.client();
+	const focused = await started.client();
+	requester.hello("s-1", "w1:p1");
+	reader.hello("s-2", "w1:p2", true, "reading");
+	await awaitFrame(reader, (frame) => frame.type === "welcome");
+	focused.hello("s-2", "w1:p2", true, "session");
+	await waitFor(() => [requester, focused].every((client) => framesOf(client, "welcome").length === 1));
+	requester.send({ type: "dictate", mode: "dictation" });
+	await awaitFrame(requester, (frame) => frame.type === "capture" && frame.phase === "recording");
+	requester.send({ type: "stop", id: "stop" });
+	await awaitFrame(requester, (frame) => "id" in frame && frame.id === "stop");
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	assert.deepEqual(framesOf(focused, "transcript"), [{ type: "transcript", text: "hola" }]);
+	assert.deepEqual(framesOf(reader, "transcript"), []);
+	assert.deepEqual(framesOf(requester, "capture").at(-1), { type: "capture", phase: "elsewhere", target: "s-2" });
+	assert.deepEqual(started.events.filter((entry) => entry.event === "transcript.delivered").map((entry) => entry.fields), [{ sessionId: "s-2" }]);
+});
+
+test("a focused reading-only connection is not a transcript target", async (t) => {
+	const started = await startListener(scratch(), { dictation: fakeCapture({ text: "hola" }).factory, focus: { focusedPaneId: async () => ({ focused: "w1:p2" }) } });
+	t.after(() => started.listener.close());
+	const requester = await started.client();
+	const reader = await started.client();
+	requester.hello("s-1", "w1:p1"); reader.hello("s-2", "w1:p2", true, "reading");
+	await waitFor(() => [requester, reader].every((client) => framesOf(client, "welcome").length === 1));
+	requester.send({ type: "dictate", mode: "dictation" });
+	await awaitFrame(requester, (frame) => frame.type === "capture" && frame.phase === "recording");
+	requester.send({ type: "stop", id: "stop" });
+	await awaitFrame(requester, (frame) => "id" in frame && frame.id === "stop");
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	assert.deepEqual(framesOf(requester, "transcript"), [{ type: "transcript", text: "hola" }]);
+	assert.deepEqual(framesOf(reader, "transcript"), []);
+	assert.equal(phases(requester).at(-1), "delivered");
+	assert.deepEqual(started.events.filter((entry) => entry.event === "transcript.delivered").map((entry) => entry.fields), [{ sessionId: "s-1", fallback: "requester" }]);
+});
+
+test("a requester gone during focus lookup leaves an untargeted finished transcript dropped", async (t) => {
+	for (const outcome of ["failed", "unfocused"] as const) {
+		await t.test(outcome, async (st) => {
+			let release!: () => void;
+			let asked = false;
+			const gate = new Promise<void>((resolve) => { release = resolve; });
+			const started = await startListener(scratch(), {
+				dictation: fakeCapture({ text: "texto terminado" }).factory,
+				focus: { focusedPaneId: async () => { asked = true; await gate; return outcome === "failed" ? { failed: true } : { focused: undefined }; } },
+			});
+			st.after(() => { release(); return started.listener.close(); });
+			const requester = await started.client();
+			const other = await started.client();
+			requester.hello("s-1", "w1:p1"); other.hello("s-2", "w1:p2");
+			await waitFor(() => [requester, other].every((client) => framesOf(client, "welcome").length === 1));
+			requester.send({ type: "dictate", mode: "dictation" });
+			await awaitFrame(requester, (frame) => frame.type === "capture" && frame.phase === "recording");
+			requester.send({ type: "stop" });
+			await waitFor(() => asked);
+			requester.socket.destroy();
+			await waitFor(() => started.listener.clientCount === 1);
+			release();
+			await waitFor(() => started.events.some((entry) => entry.event === "transcript.undelivered"));
+			assert.deepEqual(framesOf(other, "transcript"), []);
+			assert.equal(started.events.find((entry) => entry.event === "capture.end")?.fields?.phase, "dropped");
+			assert.equal(started.events.some((entry) => entry.event === "transcript.delivered"), false);
+		});
+	}
+});
+
+test("a focused client still gets a finished transcript if the requester disconnects during lookup", async (t) => {
+	let release!: () => void;
+	let asked = false;
+	const gate = new Promise<void>((resolve) => { release = resolve; });
+	const started = await startListener(scratch(), {
+		dictation: fakeCapture({ text: "texto terminado" }).factory,
+		focus: { focusedPaneId: async () => { asked = true; await gate; return { focused: "w1:p2" }; } },
+	});
+	t.after(() => { release(); return started.listener.close(); });
+	const requester = await started.client();
+	const focused = await started.client();
+	requester.hello("s-1", "w1:p1"); focused.hello("s-2", "w1:p2");
+	await waitFor(() => [requester, focused].every((client) => framesOf(client, "welcome").length === 1));
+	requester.send({ type: "dictate", mode: "dictation" });
+	await awaitFrame(requester, (frame) => frame.type === "capture" && frame.phase === "recording");
+	requester.send({ type: "stop" });
+	await waitFor(() => asked);
+	requester.socket.destroy();
+	await waitFor(() => started.listener.clientCount === 1);
+	release();
+	await waitFor(() => started.events.some((entry) => entry.event === "transcript.undelivered" || entry.event === "transcript.delivered"));
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	assert.deepEqual(framesOf(focused, "transcript"), [{ type: "transcript", text: "texto terminado" }]);
+	assert.deepEqual(started.events.filter((entry) => entry.event === "transcript.delivered").map((entry) => entry.fields), [{ sessionId: "s-2" }]);
+	assert.equal(started.events.find((entry) => entry.event === "capture.end")?.fields?.phase, "elsewhere");
+});
+
+test("a focused client that leaves during lookup cannot steal the requester's fallback", async (t) => {
+	let release!: () => void;
+	let asked = false;
+	const gate = new Promise<void>((resolve) => { release = resolve; });
+	const started = await startListener(scratch(), {
+		dictation: fakeCapture({ text: "hola" }).factory,
+		focus: { focusedPaneId: async () => { asked = true; await gate; return { focused: "w1:p2" }; } },
+	});
+	t.after(() => { release(); return started.listener.close(); });
+	const requester = await started.client();
+	const focused = await started.client();
+	requester.hello("s-1", "w1:p1"); focused.hello("s-2", "w1:p2");
+	await waitFor(() => [requester, focused].every((client) => framesOf(client, "welcome").length === 1));
+	requester.send({ type: "dictate", mode: "dictation" });
+	await awaitFrame(requester, (frame) => frame.type === "capture" && frame.phase === "recording");
+	requester.send({ type: "stop", id: "stop" });
+	await waitFor(() => asked);
+	focused.socket.destroy();
+	await waitFor(() => started.listener.clientCount === 1);
+	release();
+	await awaitFrame(requester, (frame) => "id" in frame && frame.id === "stop");
+	assert.deepEqual(framesOf(requester, "transcript"), [{ type: "transcript", text: "hola" }]);
+	assert.deepEqual(framesOf(focused, "transcript"), []);
+	assert.equal(phases(requester).at(-1), "delivered");
+	assert.deepEqual(started.events.filter((entry) => entry.event === "transcript.delivered").map((entry) => entry.fields), [{ sessionId: "s-1", fallback: "requester" }]);
 });
 
 test("one capture at a time, and none while a reading holds the microphone shut", async () => {
@@ -1104,6 +1242,35 @@ test("a cancel that arrives while the focus is read delivers nothing", async () 
 	asker.socket.destroy();
 	focused.socket.destroy();
 	await started.listener.close();
+});
+
+test("cancellation during a failed focus lookup cannot fall back to the requester", async (t) => {
+	for (const outcome of ["failed", "throws"] as const) {
+		await t.test(outcome, async (st) => {
+			let release!: () => void;
+			let asked = false;
+			const gate = new Promise<void>((resolve) => { release = resolve; });
+			const started = await startListener(scratch(), {
+				dictation: fakeCapture({ text: "no debería" }).factory,
+				focus: { focusedPaneId: async () => { asked = true; await gate; if (outcome === "throws") throw new Error("late error"); return { failed: true }; } },
+			});
+			st.after(() => { release(); return started.listener.close(); });
+			const client = await started.client();
+			client.hello("s-1", "w1:p1");
+			await awaitFrame(client, (frame) => frame.type === "welcome");
+			client.send({ type: "dictate", mode: "dictation" });
+			await awaitFrame(client, (frame) => frame.type === "capture" && frame.phase === "recording");
+			client.send({ type: "stop", id: "stop" });
+			await waitFor(() => asked);
+			client.send({ type: "cancel", id: "cancel" });
+			await awaitFrame(client, (frame) => "id" in frame && frame.id === "cancel");
+			release();
+			await awaitFrame(client, (frame) => "id" in frame && frame.id === "stop");
+			assert.deepEqual(framesOf(client, "transcript"), []);
+			assert.deepEqual(phases(client), ["recording", "transcribing", "cancelled"]);
+			assert.equal(started.events.some((entry) => entry.event === "transcript.delivered"), false);
+		});
+	}
 });
 
 test("a capture that fails reports the worker's code and closes the microphone", async () => {

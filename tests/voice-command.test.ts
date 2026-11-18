@@ -905,6 +905,91 @@ test("a toggle dictation records through the listener and this session only past
 	}
 });
 
+test("a voice-off shortcut inserts its own finished transcript when focus fails", async () => {
+	const home = mkdtempSync(join(tmpdir(), "voice-command-requester-"));
+	const dir = join(home, "voice");
+	const events: Array<{ event: string } & Record<string, unknown>> = [];
+	const server = new VoiceListener({
+		dir, focus: { focusedPaneId: async () => ({ failed: true }) },
+		dictation: (request) => ({
+			start: async () => request.onStateChange("recording"),
+			stop: async () => { request.onStateChange("transcribing"); request.onStateChange("finished"); return { text: "dictado guardado", truncated: false }; },
+			cancel: async () => request.onStateChange("finished"),
+		}),
+		log: (event, fields) => events.push({ event, ...fields }),
+	});
+	const h = harness({ installed: true, env: { HERDR_PANE_ID: "w1:p1", GENTLE_PI_CONFIG_HOME: home } });
+	delete h.deps.createSession;
+	const pi = register(h);
+	const ui = fakeContext();
+	await server.listen();
+	try {
+		await pi.fire("session_start", ui.ctx);
+		await until(() => server.sessionIds.includes("session-alpha"));
+		const done = press(pi, ui);
+		await until(() => /recording/i.test(ui.statuses.at(-1) ?? ""));
+		await press(pi, ui);
+		await done;
+		assert.equal(ui.editor(), "draft: dictado guardado");
+		assert.deepEqual(pi.sent, []);
+		assert.deepEqual(h.voice.sessions, []);
+		assert.deepEqual(events.filter((entry) => entry.event === "transcript.delivered").map(({ sessionId, fallback }) => ({ sessionId, fallback })), [{ sessionId: "session-alpha", fallback: "requester" }]);
+		assert.equal(events.find((entry) => entry.event === "capture.end")?.phase, "delivered");
+	} finally {
+		await pi.fire("session_shutdown", ui.ctx);
+		await server.close();
+		rmSync(home, { recursive: true, force: true });
+	}
+});
+
+for (const registration of ["passive-off", "turned-off", "voice-on"] as const) test(`a focused ${registration} session inserts a transcript received from another capture`, async () => {
+	const home = mkdtempSync(join(tmpdir(), "voice-command-received-"));
+	const dir = join(home, "voice");
+	const serverEvents: Array<{ event: string } & Record<string, unknown>> = [];
+	const server = new VoiceListener({
+		dir,
+		focus: { focusedPaneId: async () => ({ focused: "w1:p1" }) },
+		dictation: (request) => ({
+			start: async () => request.onStateChange("recording"),
+			stop: async () => { request.onStateChange("transcribing"); request.onStateChange("finished"); return { text: "texto de otra sesión", truncated: true }; },
+			cancel: async () => request.onStateChange("finished"),
+		}),
+		log: (event, fields) => serverEvents.push({ event, ...fields }),
+	});
+	const { engine } = fakeEngine();
+	const h = harness({ installed: true, voice: registration !== "passive-off", engine, env: { HERDR_PANE_ID: "w1:p1", GENTLE_PI_CONFIG_HOME: home } });
+	delete h.deps.createSession;
+	const pi = register(h);
+	const ui = fakeContext({ select: pick(/^Voice in this session \(on\): turn off$/) });
+	const actor = new VoiceListenerClient({ dir, session: { sessionId: "session-beta", paneId: "w1:p2", voiceOn: true } });
+	const actorFrames: Array<{ type: string; phase?: string }> = [];
+	actor.onFrame((frame) => { if (frame.type === "capture" || frame.type === "transcript") actorFrames.push(frame); });
+	await server.listen();
+	try {
+		await pi.fire("session_start", ui.ctx);
+		await until(() => server.sessionIds.includes("session-alpha"));
+		if (registration === "turned-off") {
+			await run(pi, ui);
+			await until(() => !server.voiceSessions.includes("session-alpha"));
+		}
+		await actor.connect();
+		assert.equal((await actor.request({ type: "dictate", mode: "dictation" })).type, "ok");
+		assert.equal((await actor.request({ type: "stop" })).type, "ok");
+		await until(() => h.events.some((entry) => entry.event === "transcript.received"));
+		assert.equal(ui.editor(), "draft: texto de otra sesión");
+		assert.deepEqual(h.events.filter((entry) => entry.event === "transcript.received"), [{ event: "transcript.received", session: "session-alpha", pasted: true, chars: "texto de otra sesión".length, truncated: true }]);
+		assert.deepEqual(actorFrames, [{ type: "capture", phase: "recording" }, { type: "capture", phase: "transcribing" }, { type: "capture", phase: "elsewhere", target: "session-alpha" }]);
+		assert.deepEqual(serverEvents.filter((entry) => entry.event === "transcript.delivered").map(({ sessionId, fallback }) => ({ sessionId, fallback })), [{ sessionId: "session-alpha", fallback: undefined }]);
+		assert.deepEqual(pi.sent, []);
+		assert.equal(h.voice.sessions.includes("session-alpha"), registration === "voice-on");
+	} finally {
+		actor.close();
+		await pi.fire("session_shutdown", ui.ctx);
+		await server.close();
+		rmSync(home, { recursive: true, force: true });
+	}
+});
+
 // A protocol peer for session registration, independent of the concurrently
 // edited listener. It speaks only hello, session-voice and command frames.
 function registrationPeer(dir: string, holdFirstWelcome = false) {
