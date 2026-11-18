@@ -161,19 +161,26 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 	let live: Live | undefined;
 	let current: Capture | undefined;
 	let retiring: Promise<void> | undefined;
-	// A child that survives SIGKILL must still fence the microphone, but callers
-	// cannot wait forever for its close event.
-	let retirementFailure: Promise<never> | undefined;
 	let idleTimer: ReturnType<typeof setTimeout> | undefined;
 
-	// A terminal worker message is written before the process exits. Do not send
-	// another start to it, or let a replacement own the microphone before it exits.
-	const retire = (entry: Live) => {
-		if (live === entry) live = undefined;
-		const previous = retiring;
-		const waiting = previous ? Promise.all([previous, entry.closed]).then(() => {}) : entry.closed;
+	// All callers share a bounded wait, but only a real exit clears the fence.
+	// A rejected wait therefore keeps starts failing rather than permitting a
+	// replacement child to open the microphone over the old one.
+	const retire = (entry: Live, graceMs: number): Promise<void> => {
+		live = undefined;
+		const waiting = new Promise<void>((resolve, reject) => {
+			const deadline = setTimeout(() => reject(fail("worker-exited")), graceMs > 0 ? graceMs * 2 : VOICE_SESSION_DEFAULTS.exitGraceMs);
+			const killTimer = graceMs > 0 ? setTimeout(() => kill(entry), graceMs) : undefined;
+			void entry.closed.then(() => {
+				clearTimeout(deadline);
+				if (killTimer !== undefined) clearTimeout(killTimer);
+				if (retiring === waiting) retiring = undefined;
+				resolve();
+			});
+		});
 		retiring = waiting;
-		void waiting.then(() => { if (retiring === waiting) retiring = undefined; });
+		void waiting.catch(() => {});
+		return waiting;
 	};
 
 	const setState = (capture: Capture, state: VoiceSessionState) => {
@@ -197,7 +204,9 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 			capture.recording.reject(outcome.error);
 			capture.result.reject(outcome.error);
 		}
-		if (releaseAfter) void releaseAfter.then(capture.release);
+		// Release this capture's bookkeeping even on retirement failure. A
+		// replacement must still pass the worker's separate retirement fence.
+		if (releaseAfter) void releaseAfter.then(capture.release, capture.release);
 		else capture.release();
 		if (!current && live && !live.exited) armIdle();
 	};
@@ -205,14 +214,14 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 		if (capture.timer) clearTimeout(capture.timer);
 		capture.timer = unref(setTimeout(() => {
 			const entry = capture.entry;
-			if (entry) retire(entry);
-			settle(capture, { error: fail("timeout") }, entry?.closed);
+			const retirement = entry ? retire(entry, 0) : undefined;
+			settle(capture, { error: fail("timeout") }, retirement);
 			if (entry) kill(entry);
 		}, ms));
 	};
 	const armIdle = () => {
 		if (idleTimer) clearTimeout(idleTimer);
-		idleTimer = unref(setTimeout(() => void close(), idleMs));
+		idleTimer = unref(setTimeout(() => void close().catch(() => {}), idleMs));
 	};
 	const kill = (entry: Live | undefined = live) => {
 		try {
@@ -286,19 +295,15 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 				// The error is the child's last message, not its exit. Bound a child
 				// that never exits and keep the microphone reserved until it does.
 				const entry = live;
-				if (entry) {
-					retire(entry);
-					const timer = setTimeout(() => kill(entry), VOICE_SESSION_DEFAULTS.exitGraceMs);
-					void entry.closed.then(() => clearTimeout(timer));
-				}
-				settle(capture, { error: fail(message.code) }, entry?.closed);
+				const retirement = entry ? retire(entry, VOICE_SESSION_DEFAULTS.exitGraceMs) : undefined;
+				settle(capture, { error: fail(message.code) }, retirement);
 			}
 		}
 	};
 	const protocolError = () => {
 		const entry = live;
-		if (entry) retire(entry);
-		if (current) settle(current, { error: fail("protocol") }, entry?.closed);
+		const retirement = entry ? retire(entry, 0) : undefined;
+		if (current) settle(current, { error: fail("protocol") }, retirement);
 		if (entry) kill(entry);
 	};
 
@@ -382,13 +387,12 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 		const entry = live;
 		if (!entry) {
 			if (current) settle(current, { error: fail("cancelled") }, retiring);
-			if (retiring && retirementFailure) await Promise.race([retiring, retirementFailure]);
-			else await retiring;
+			await retiring;
 			return;
 		}
 		const active = current;
-		retire(entry);
-		if (active) settle(active, { error: fail("cancelled") }, entry.closed);
+		const retirement = retire(entry, graceMs);
+		if (active) settle(active, { error: fail("cancelled") }, retirement);
 		try {
 			// The worker accepts close only when idle; an active capture is cancelled.
 			entry.child.stdin?.write(`${JSON.stringify({ schema: VOICE_WORKER_SCHEMA, type: active ? "cancel" : "close" })}\n`);
@@ -396,16 +400,8 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 		} catch {
 			/* already gone */
 		}
-		// Not unref'd: Pi must not exit before its worker is gone.
-		const timer = setTimeout(() => {
-			try {
-				entry.child.kill("SIGKILL");
-			} catch {
-				/* already gone */
-			}
-		}, graceMs);
-		await entry.closed;
-		clearTimeout(timer);
+		if (graceMs <= 0) kill(entry);
+		await retirement;
 	};
 
 	const recycle = async (graceMs: number = WARM_WORKER_DEFAULTS.closeGraceMs): Promise<boolean> => {
@@ -414,19 +410,8 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 		// A dictation is never interrupted. A stuck spot-only stop can instead be
 		// cancelled by close(), which still fences the child until it exits.
 		if (current && !current.spot) throw fail("invalid-state");
-		let rejectFailure!: (error: VoiceSessionError) => void;
-		const failure = new Promise<never>((_resolve, reject) => { rejectFailure = reject; });
-		retirementFailure = failure;
-		void entry.closed.then(() => { if (retirementFailure === failure) retirementFailure = undefined; });
-		// close() sends close, then SIGKILL at graceMs. If even that does not
-		// produce close, fail waiting captures while still fencing a new child.
-		const timer = setTimeout(() => rejectFailure(fail("worker-exited")), graceMs * 2);
-		try {
-			await Promise.race([close(graceMs), failure]);
-			return true;
-		} finally {
-			clearTimeout(timer);
-		}
+		await close(graceMs);
+		return true;
 	};
 
 	// One capture on the worker: a dictation, or with `spot` a capture for the
@@ -470,7 +455,7 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 						throw error instanceof VoiceSessionError ? error : fail("not-installed");
 					}
 					while (retiring && !capture.settled) {
-						try { await (retirementFailure ? Promise.race([retiring, retirementFailure]) : retiring); }
+						try { await retiring; }
 						catch (error) {
 							if (!capture.settled) settle(capture, { error: error instanceof VoiceSessionError ? error : fail("worker-exited") });
 							return recordingPromise;
@@ -510,26 +495,15 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 						return;
 					}
 					const entry = capture.entry;
-					if (entry) {
-						entry.cancelling = capture;
-						retire(entry);
-					}
-					settle(capture, { error: fail("cancelled") }, entry?.closed ?? retiring);
-					if (!entry) { await retiring; return; }
+					const retirement = entry ? retire(entry, VOICE_SESSION_DEFAULTS.exitGraceMs) : retiring;
+					if (entry) entry.cancelling = capture;
+					settle(capture, { error: fail("cancelled") }, retirement);
 					try {
-						entry.child.stdin?.write(`${JSON.stringify({ schema: VOICE_WORKER_SCHEMA, type: "cancel" })}\n`);
+						entry?.child.stdin?.write(`${JSON.stringify({ schema: VOICE_WORKER_SCHEMA, type: "cancel" })}\n`);
 					} catch {
 						/* already gone */
 					}
-					const timer = setTimeout(() => {
-						try {
-							entry.child.kill("SIGKILL");
-						} catch {
-							/* already gone */
-						}
-					}, VOICE_SESSION_DEFAULTS.exitGraceMs);
-					await entry.closed;
-					clearTimeout(timer);
+					await retirement;
 				},
 			};
 	};

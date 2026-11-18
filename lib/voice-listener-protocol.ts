@@ -148,7 +148,9 @@ export type ListenerFrame =
 	| { type: "level"; rms: number; at: number }
 	| { type: "display"; state: ListenerDisplayState; language: ListenerLanguage; label?: string }
 	| { type: "command"; command: ListenerCommand; wake?: boolean }
-	| { type: "transcript"; text: string; truncated?: boolean }
+	// A negotiated captureId is the recipient's dictate id, or null for an
+	// unsolicited transcript. Missing means a legacy listener.
+	| { type: "transcript"; text: string; truncated?: boolean; captureId?: string | null }
 	// What became of the capture: its phase, why it failed, and where the
 	// transcript went when another session had the focus.
 	| { type: "capture"; phase: CapturePhase; code?: CaptureErrorCode; target?: string }
@@ -184,6 +186,7 @@ type Kind =
 	| "mode"
 	| "phase"
 	| "capture-error"
+	| "capture-id"
 	| "endpoint"
 	| "role";
 
@@ -221,6 +224,7 @@ const KINDS: Record<Kind, (value: unknown) => boolean> = {
 	mode: (value) => CAPTURE_MODES.includes(value as CaptureMode),
 	phase: (value) => CAPTURE_PHASES.includes(value as CapturePhase),
 	"capture-error": (value) => CAPTURE_ERRORS.includes(value as CaptureErrorCode),
+	"capture-id": (value) => value === null || KINDS.string(value),
 	endpoint: (value) => {
 		if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
 		const record = value as Record<string, unknown>;
@@ -238,6 +242,10 @@ interface Spec {
 }
 
 const ID: Record<string, Kind> = { id: "string" };
+
+// Advertise in the existing hello request id: even a strict v1 peer accepts
+// and echoes this opaque string. Legacy clients use plain numbered ids.
+export const TRANSCRIPT_CAPTURE_HELLO_PREFIX = "capture-id:";
 
 const REQUEST_SPECS: Record<string, Spec> = {
 	hello: {
@@ -270,7 +278,7 @@ const FRAME_SPECS: Record<string, Spec> = {
 	display: { required: { state: "display-state", language: "language" }, optional: { label: "string" } },
 	// Only a voice on can be a wake: nothing else means "start listening here".
 	command: { required: { command: "command" }, optional: { wake: "boolean" }, check: (record) => record.wake === undefined || record.command === "voice-on" },
-	transcript: { required: { text: "text" }, optional: { truncated: "boolean" } },
+	transcript: { required: { text: "text" }, optional: { truncated: "boolean", captureId: "capture-id" } },
 	// A failure always names its code, and only a failure carries one.
 	capture: { required: { phase: "phase" }, optional: { code: "capture-error", target: "session" }, check: (record) => (record.phase === "failed") === (record.code !== undefined) },
 	error: { required: { code: "error" }, optional: { ...ID } },

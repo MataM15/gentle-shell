@@ -612,6 +612,12 @@ test("a worker that survives the recycle kill fails waiting captures until it ex
 		const failedCapture = assert.rejects(next.start(), (error: unknown) => error instanceof VoiceSessionError && error.code === "worker-exited");
 		await failedRecycle;
 		await failedCapture;
+		await assert.rejects(h.warm.close(), { code: "worker-exited" });
+		const cancelled = h.warm.session({ onStateChange: () => {} });
+		const start = assert.rejects(cancelled.start(), { code: "cancelled" });
+		await assert.rejects(cancelled.cancel(), { code: "worker-exited" });
+		await cancelled.waitUntilReleased();
+		await start;
 		assert.deepEqual(old.signals, ["SIGKILL"]);
 		assert.equal(h.workers.length, 1, "a surviving child is never overlapped");
 		old.exit();

@@ -111,6 +111,16 @@ test("every listener frame parses and re-encodes as exactly one line", () => {
 	assert.deepEqual(parseListenerFrameLine(encoded.trimEnd()), { type: "state", state: "reading", at: 1 });
 });
 
+test("a transcript distinguishes a dictate result, unsolicited text and legacy frames", () => {
+	const plain = { type: "transcript", text: "hola", truncated: true } as const;
+	for (const frame of [plain, { ...plain, captureId: "42" }, { ...plain, captureId: null }]) {
+		assert.deepEqual(parseListenerFrameLine(encodeListenerFrame(frame).trimEnd()), frame);
+	}
+	for (const captureId of [42, false, {}, "x".repeat(257)]) {
+		assert.equal(parseListenerFrameLine(line({ ...plain, captureId })), undefined);
+	}
+});
+
 test("a wake says so on the voice-on frame, and a frame written before it still parses (S7, S11)", () => {
 	// A session hears voice-on from the menu, from its own set-voice and from a
 	// spoken wake alike; only the spoken one starts a conversation, so only it

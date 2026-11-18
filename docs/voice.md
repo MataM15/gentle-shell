@@ -404,7 +404,11 @@ a session that asks for a capture only receives the transcript.
 - **Protocol.** `gentle.voice-listener/v1`, JSON on one line each way, at most
   64 KiB per line. A connection starts with a hello carrying the session id and
   the herdr pane id, then answers status and reports the state:
-  `asleep`, `listening`, `transcribing`, `reading`. One session holds two
+  `asleep`, `listening`, `transcribing`, `reading`. A client whose hello id
+  starts with `capture-id:` gets a `captureId` on every transcript: the id of
+  the `dictate` it answers, or `null` for a transcript handed over from another
+  session, so a handed-over text is never taken for the result of its own
+  recording. Older clients get the frame without it. One session holds two
   connections at once: its own long-lived one (the microphone, the wake, the
   voice frames) and the one a reply is read on. Only the reading connection
   names itself (`role: "reading"`); the session's own sends no role at all, which
@@ -533,11 +537,14 @@ a session that asks for a capture only receives the transcript.
   recording ends with no session that has voice on (a wake, or voice that was on,
   leaves the listener awake instead). A reading stops the spotter too: a reply is
   never read while the microphone is open for a keyword, and spotting starts
-  again after the reading's tail. Leaving `asleep` for any reason stops it, and
-  so does closing the listener. A spotter that cannot open the microphone, or
-  that dies, is logged once (`kws.failed`, the event name only) and dropped for
-  the rest of the listener's life: it stays asleep without spotting, and capture,
-  transcripts, cues and readings carry on as before.
+  again after the reading's tail. Closing the listener stops it. Going to sleep
+  keeps it running when its worker only ever listened for commands, and restarts
+  it in a fresh worker when that worker had transcribed. A spotter that cannot
+  open the microphone, that dies or whose capture ends on its own is logged
+  (`kws.failed`, with a fixed reason) and retried after 1, 5, 30 and then 60
+  seconds; capture, transcripts, cues and readings carry on meanwhile. Only a
+  missing or invalid keyword model stops spotting for the rest of the
+  listener's life.
 - **No spotter, no keyword.** The option is built by
   `buildVoiceKeywordOption()` from the installed component, the pinned digests
   and `assets/voice/kws-keywords.txt`. When the spotter is not installed, is half
@@ -582,8 +589,9 @@ a session that asks for a capture only receives the transcript.
 A session dictates through the listener: the lock, the socket, the turn and the
 microphone are live, and a reply is read only in the pane herdr reports focused
 (S12). A session that cannot reach a listener records itself, exactly as
-described above, and a session that is not focused receives neither a transcript
-nor a reading. The keyword spotter is live for the spoken commands and the wake
+described above. A transcript goes back to the session that started the
+recording whether or not it is focused; a session that is not focused receives
+no reading. The keyword spotter is live for the spoken commands and the wake
 word; the echo cancellation the design defers (§5) is still to come, and with it
 a phrase that cuts a reply being read: nothing listens while a reading speaks, so
 `Gentle Voice off` does not cut a reply aloud yet. The capture path is shaped so

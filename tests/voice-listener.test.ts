@@ -1068,7 +1068,7 @@ test("a connected requester receives a finished transcript without a fallback lo
 	}
 });
 
-test("a departed requester falls back to the focused session, not its reading connection", async (t) => {
+test("a legacy focused session receives an unmarked fallback, not its reading connection", async (t) => {
 	const capture = delayedCapture("hola");
 	const started = await startListener(scratch(), { dictation: capture.factory, focus: { focusedPaneId: async () => ({ focused: "w1:p2" }) } });
 	t.after(() => { capture.finish(); return started.listener.close(); });
@@ -1092,6 +1092,22 @@ test("a departed requester falls back to the focused session, not its reading co
 	assert.deepEqual(started.events.filter((entry) => entry.event === "transcript.delivered").map((entry) => entry.fields), [{ sessionId: "s-2", fallback: "focus" }]);
 	assert.equal(started.events.find((entry) => entry.event === "capture.end")?.fields?.phase, "elsewhere");
 	assert.deepEqual(capture.calls, ["start", "stop"]);
+});
+
+test("only a client that advertises capture ids gets a marked capture result", async (t) => {
+	const started = await startListener(scratch(), { dictation: fakeCapture({ text: "hola", truncated: true }).factory });
+	t.after(() => started.listener.close());
+	for (const [sessionId, helloId, tagged] of [["s-1", "1", false], ["s-2", "capture-id:1", true]] as const) {
+		const client = await started.client();
+		client.send({ type: "hello", proto: 1, sessionId, voiceOn: true, id: helloId });
+		assert.equal((await awaitFrame(client, (frame) => "id" in frame && frame.id === helloId)).type, "welcome");
+		client.send({ type: "dictate", mode: "dictation", id: "capture-1" });
+		assert.equal((await awaitFrame(client, (frame) => "id" in frame && frame.id === "capture-1")).type, "ok");
+		client.send({ type: "stop" });
+		assert.deepEqual(await awaitFrame(client, (frame) => frame.type === "transcript"), {
+			type: "transcript", text: "hola", truncated: true, ...(tagged ? { captureId: "capture-1" } : {}),
+		});
+	}
 });
 
 test("replacing the requester's connection with the same session is still a focus fallback", async (t) => {
@@ -3459,11 +3475,14 @@ class GatedWarmChild extends EventEmitter {
 	exit() { if (!this.exited) { this.exited = true; this.emit("close", 0, null); } }
 }
 
-async function recycleFixture(t: import("node:test").TestContext, options: { failRecycle?: boolean; failFreshSpot?: boolean; readTailMs?: number } = {}) {
+async function recycleFixture(t: import("node:test").TestContext, options: { failRecycle?: boolean; failFreshSpot?: boolean; readTailMs?: number; recycleGraceMs?: number; beforePrepare?: () => void | Promise<void> } = {}) {
 	const children: GatedWarmChild[] = [];
 	const warm = createWarmVoiceWorker({
 		target: "linux-x64", env: {},
-		prepare: async () => ({ root: "/fake", request: { schema: VOICE_WORKER_SCHEMA, type: "start" } }),
+		prepare: async () => {
+			await options.beforePrepare?.();
+			return { root: "/fake", request: { schema: VOICE_WORKER_SCHEMA, type: "start" } };
+		},
 		spawn: () => {
 			const child = new GatedWarmChild();
 			children.push(child);
@@ -3489,7 +3508,7 @@ async function recycleFixture(t: import("node:test").TestContext, options: { fai
 		recycle: async () => {
 			recycleCalls++;
 			if (options.failRecycle && recycleCalls === 1) throw new VoiceSessionError("capture");
-			return warm.recycle();
+			return warm.recycle(options.recycleGraceMs);
 		},
 		close: async () => { closeCalls++; await warm.close(); },
 	};
@@ -3622,6 +3641,55 @@ test("a stuck spot stop is cancelled so a waiting capture can proceed", async (t
 	f.children[1]!.say({ type: "transcribing" });
 	f.children[1]!.say({ type: "result", text: "after stuck stop", truncated: false });
 	assert.deepEqual(await awaitFrame(f.client, (frame) => frame.type === "transcript" && frame.text === "after stuck stop"), { type: "transcript", text: "after stuck stop" });
+});
+
+test("voice on cannot strand a capture waiting for a stuck voice-off spot stop", async (t) => {
+	const f = await recycleFixture(t);
+	const old = await f.transcribe("first");
+	await waitFor(() => old.received.filter((message) => message.spot === true).length === 2);
+	const stops = old.received.filter((message) => message.type === "stop").length;
+	old.holdStop = true;
+	f.client.send({ type: "set-voice", voiceOn: false });
+	await waitFor(() => old.received.filter((message) => message.type === "stop").length === stops + 1);
+	f.client.send({ type: "session-voice", voiceOn: true });
+	f.client.send({ type: "dictate", id: "waiting-awake", mode: "dictation" });
+	assert.equal((await awaitFrame(f.client, (frame) => "id" in frame && frame.id === "waiting-awake", 2_600)).type, "ok");
+	assert.deepEqual(framesOf(f.client, "capture").at(-1), { type: "capture", phase: "failed", code: "capture" });
+	assert.ok(old.received.some((message) => message.type === "cancel"));
+	assert.equal(f.children.length, 1, "nothing opens over the cancelled child");
+	assert.equal(f.recycleCalls(), 0, "voice on skips model recycle, not spot cancellation");
+	f.client.send({ type: "dictate", id: "after-deadline", mode: "dictation" });
+	assert.equal((await awaitFrame(f.client, (frame) => "id" in frame && frame.id === "after-deadline", 500)).type, "ok");
+	assert.deepEqual(framesOf(f.client, "capture").at(-1), { type: "capture", phase: "failed", code: "capture" });
+	old.exit();
+	await waitFor(() => f.children[1]?.received.some((message) => message.spot === true) === true);
+	await waitFor(() => f.started.events.some((entry) => entry.event === "kws.recovered"));
+});
+
+test("cancelling during prepare after failed retirement does not hang the next capture", async (t) => {
+	let prepareCalls = 0;
+	let resume!: () => void;
+	const gate = new Promise<void>((resolve) => { resume = resolve; });
+	const f = await recycleFixture(t, { recycleGraceMs: 20, beforePrepare: () => { if (++prepareCalls === 4) return gate; } });
+	t.after(resume);
+	const old = await f.transcribe("first");
+	await waitFor(() => old.received.filter((message) => message.spot === true).length === 2);
+	old.holdClose = true;
+	old.kill = (signal) => { old.signals.push(signal); return true; };
+	f.client.send({ type: "set-voice", voiceOn: false });
+	await waitFor(() => f.started.events.some((entry) => entry.event === "kws.failed" && entry.fields?.reason === "worker-exited"));
+	assert.deepEqual(old.signals, ["SIGKILL"]);
+	f.client.send({ type: "session-voice", voiceOn: true });
+	f.client.send({ type: "dictate", id: "during-prepare", mode: "dictation" });
+	await waitFor(() => prepareCalls === 4);
+	f.client.send({ type: "cancel", id: "cancel-prepare" });
+	assert.equal((await awaitFrame(f.client, (frame) => "id" in frame && frame.id === "cancel-prepare")).type, "ok");
+	resume();
+	f.client.send({ type: "dictate", id: "after-cancel", mode: "dictation" });
+	assert.equal((await awaitFrame(f.client, (frame) => "id" in frame && frame.id === "after-cancel", 500)).type, "ok");
+	assert.deepEqual(framesOf(f.client, "capture").at(-1), { type: "capture", phase: "failed", code: "worker-exited" });
+	assert.equal(old.exited, false);
+	assert.equal(f.children.length, 1);
 });
 
 test("a fresh spot that fails after recycling retries and hears wake", async (t) => {

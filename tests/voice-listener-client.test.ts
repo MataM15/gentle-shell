@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { createSessionListenerLink, cutListenerReading, ensureListener, LISTENER_DICTATE_TIMEOUT_MS, listenerReadingTurn, sessionDisplayLabel, SESSION_LABEL_MAX, VoiceListenerClient, type ListenerSession, type ListenerWakeReservation, type SessionDictation } from "../lib/voice-listener-client.ts";
 import { VoiceSessionError, type VoiceSessionErrorCode, type VoiceSessionState } from "../lib/voice-session.ts";
 import { listenerPaths, readListenerLock, takeListenerLock, VoiceListener, type ListenerDictation, type ListenerDictationRequest } from "../lib/voice-listener.ts";
-import { encodeListenerFrame, type ListenerFrame } from "../lib/voice-listener-protocol.ts";
+import { encodeListenerFrame, parseListenerRequestLine, type ListenerFrame } from "../lib/voice-listener-protocol.ts";
 
 // The session side of the one voice listener (S6, slice A): join the running
 // listener, start it once when it is not there, survive a stale socket or a
@@ -1026,6 +1026,90 @@ test("a refused capture still receives a focus fallback after the requester disc
 		asker.close();
 		focused.close();
 		await server.close();
+	}
+});
+
+test("a focus fallback never settles the recipient's new capture", async () => {
+	const dir = scratch();
+	let finish!: () => void;
+	let focus!: () => void;
+	let looking = false;
+	const transcription = new Promise<void>((resolve) => { finish = resolve; });
+	const lookup = new Promise<void>((resolve) => { focus = resolve; });
+	const a = fakeCapture({ text: "A transcript", transcriptGate: transcription });
+	const b = fakeCapture({ text: "B transcript" });
+	const server = new VoiceListener({
+		dir, dictation: (request) => (request.mode === "dictation" ? a : b).factory(request),
+		focus: { focusedPaneId: async () => { looking = true; await lookup; return { focused: "w1:p2" }; } },
+	});
+	const received: string[] = [];
+	const owner = createSessionListenerLink({ dir, session: () => session("s-1") });
+	const recipient = createSessionListenerLink({ dir, session: () => session("s-2", true, "w1:p2"), onTranscript: (text) => received.push(text) });
+	await server.listen();
+	try {
+		assert.equal(await owner.ensure(), true);
+		assert.equal(await recipient.ensure(), true);
+		const first = owner.dictate({ mode: "dictation", onStateChange: () => {}, fallback: () => assert.fail("listener capture expected") });
+		await first.start();
+		const disconnected = assert.rejects(first.stop(), { code: "worker-exited" });
+		await waitFor(() => first.state === "transcribing");
+		owner.close();
+		await disconnected;
+		await waitFor(() => server.clientCount === 1);
+		finish();
+		await waitFor(() => looking);
+		focus();
+		// Install B's handler before the lookup resumes and writes A's transcript.
+		const second = recipient.dictate({ mode: "conversation", onStateChange: () => {}, fallback: () => assert.fail("listener capture expected") });
+		await second.start();
+		assert.deepEqual({ result: await second.stop(), received }, { result: { text: "B transcript", truncated: false }, received: ["A transcript"] });
+	} finally {
+		finish();
+		focus();
+		owner.close();
+		recipient.close();
+		await server.close();
+	}
+});
+
+test("a new client still accepts an unmarked transcript from a legacy listener", async () => {
+	const dir = scratch();
+	const sockets = new Set<Socket>();
+	const hellos: string[] = [];
+	const server = createServer((socket) => {
+		sockets.add(socket);
+		socket.on("close", () => sockets.delete(socket));
+		socket.setEncoding("utf8");
+		let buffered = "";
+		socket.on("data", (chunk: string) => {
+			buffered += chunk;
+			let newline: number;
+			while ((newline = buffered.indexOf("\n")) !== -1) {
+				const frame = parseListenerRequestLine(buffered.slice(0, newline));
+				buffered = buffered.slice(newline + 1);
+				// Requests must still fit the v1 schema. The old peer just echoes ids.
+				if (frame?.type === "hello") {
+					hellos.push(frame.id ?? "");
+					socket.write(encodeListenerFrame({ type: "welcome", id: frame.id, proto: 1, listenerPid: process.pid, state: "listening" }));
+				} else if (frame?.type === "dictate") socket.write(encodeListenerFrame({ type: "ok", id: frame.id, request: "dictate" }));
+				else if (frame?.type === "stop") socket.write(encodeListenerFrame({ type: "transcript", text: "legacy" }) + encodeListenerFrame({ type: "ok", id: frame.id, request: "stop" }));
+			}
+		});
+	});
+	await new Promise<void>((resolve) => server.listen(listenerPaths(dir).socket, resolve));
+	const received: string[] = [];
+	const link = createSessionListenerLink({ dir, session: () => session("s-1"), onTranscript: (text) => received.push(text) });
+	try {
+		assert.equal(await link.ensure(), true);
+		assert.deepEqual(hellos, ["capture-id:1"]);
+		const capture = link.dictate({ mode: "dictation", onStateChange: () => {}, fallback: () => assert.fail("listener capture expected") });
+		await capture.start();
+		assert.deepEqual(await capture.stop(), { text: "legacy", truncated: false });
+		assert.deepEqual(received, []);
+	} finally {
+		link.close();
+		for (const socket of sockets) socket.destroy();
+		await new Promise<void>((resolve) => server.close(() => resolve()));
 	}
 });
 

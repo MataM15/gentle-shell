@@ -17,6 +17,7 @@ import {
 	LISTENER_MAX_FRAME_MS,
 	LISTENER_MAX_LEVELS,
 	LISTENER_MAX_LINE,
+	TRANSCRIPT_CAPTURE_HELLO_PREFIX,
 	type CaptureMode,
 	type ListenerCommand,
 	type ListenerConnectionRole,
@@ -267,10 +268,11 @@ export class VoiceListenerClient {
 		return frame.state;
 	}
 
-	request(frame: ListenerRequest, timeoutMs = LISTENER_REQUEST_TIMEOUT_MS): Promise<ListenerFrame> {
+	request(frame: ListenerRequest, timeoutMs = LISTENER_REQUEST_TIMEOUT_MS, onId?: (id: string) => void): Promise<ListenerFrame> {
 		const socket = this.socket;
 		if (!socket || socket.destroyed || this.closed || this.socketRetired) return Promise.reject(new Error("voice listener is not connected"));
-		const id = String(this.nextId++);
+		const id = (frame.type === "hello" ? TRANSCRIPT_CAPTURE_HELLO_PREFIX : "") + this.nextId++;
+		onId?.(id);
 		const answered = new Promise<ListenerFrame>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				this.pending.delete(id);
@@ -922,6 +924,7 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 		let settled = false;
 		let cancelled = false;
 		let requested = false;
+		let captureId: string | undefined;
 		let waitingForJoin: PendingJoin | undefined;
 		let failure: { error: unknown } | undefined;
 		let resolveTranscript!: (transcript: VoiceTranscript) => void;
@@ -951,6 +954,9 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 		// The listener reports this connection's capture and its finished transcript.
 		const handle = (frame: ListenerFrame): boolean => {
 			if (frame.type === "transcript") {
+				// A fallback is unsolicited, not this dictate's result. Treat an
+				// unmarked transcript as before for older listeners.
+				if (frame.captureId !== undefined && frame.captureId !== captureId) return false;
 				settle({ transcript: { text: frame.text, truncated: frame.truncated === true } });
 				return true;
 			}
@@ -1007,7 +1013,7 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 					let answer: ListenerFrame;
 					try {
 						requested = true;
-						answer = await active.request({ type: "dictate", mode: request.mode, endpoint: request.endpoint }, options.dictateTimeoutMs ?? LISTENER_DICTATE_TIMEOUT_MS);
+						answer = await active.request({ type: "dictate", mode: request.mode, endpoint: request.endpoint }, options.dictateTimeoutMs ?? LISTENER_DICTATE_TIMEOUT_MS, (id) => { captureId = id; });
 					} catch (error) {
 						// Only confirmed unavailability records here instead: a listener that is
 						// gone, or one that answered and refused. A timeout may still be owned by

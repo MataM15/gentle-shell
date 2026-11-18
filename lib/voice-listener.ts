@@ -11,6 +11,7 @@ import {
 	LISTENER_MAX_CLIENTS,
 	LISTENER_MAX_FRAMES_PER_SECOND,
 	LISTENER_MAX_LINE,
+	TRANSCRIPT_CAPTURE_HELLO_PREFIX,
 	parseListenerRequestLine,
 	type CaptureErrorCode,
 	type CaptureMode,
@@ -256,6 +257,7 @@ interface Client {
 	// A replacement may be registered for voice accounting before its welcome,
 	// but it must not receive broadcasts until the handshake has been sent.
 	welcomed: boolean;
+	transcriptCaptureIds?: boolean;
 	sessionId?: string;
 	paneId?: string;
 	voiceOn: boolean;
@@ -447,6 +449,7 @@ interface PendingCapture {
 
 interface ActiveCapture {
 	readonly client: Client;
+	readonly requestId?: string;
 	readonly sessionId: string;
 	readonly mode: CaptureMode;
 	readonly dictation: ListenerDictation;
@@ -510,7 +513,8 @@ export class VoiceListener {
 	private spottingRetry: ReturnType<typeof setTimeout> | undefined;
 	private spottingStable: ReturnType<typeof setTimeout> | undefined;
 	private spottingSettling: Promise<void> | undefined;
-	private spottingStop: Promise<void> | undefined;
+	private spottingStop: Promise<boolean> | undefined;
+	private spottingCancelling: Promise<void> | undefined;
 	private recycling: Promise<void> | undefined;
 	// True only while the capture really records, from the worker's own report to
 	// the moment the recording ends (S10). Levels never change it.
@@ -690,7 +694,11 @@ export class VoiceListener {
 
 	// A capture belongs to the connection that opened it. Only if that connection
 	// is gone do we resolve focus; calls without an owner retain focus routing.
-	async deliverTranscript(text: string, truncated = false, cancelled?: () => boolean, requester?: Client): Promise<string | undefined> {
+	async deliverTranscript(text: string, truncated = false, cancelled?: () => boolean, requester?: Client, requestId?: string): Promise<string | undefined> {
+		const send = (target: Client, captureId: string | null | undefined) => this.say(target, {
+			type: "transcript", text, ...(truncated ? { truncated: true } : {}),
+			...(target.transcriptCaptureIds && captureId !== undefined ? { captureId } : {}),
+		});
 		const liveClients = () => [...this.clients.values()].filter((client) => client.sessionId && !client.socket.destroyed && client.socket.writable);
 		const initial = liveClients();
 		if (initial.length === 0) {
@@ -702,7 +710,7 @@ export class VoiceListener {
 				this.log("transcript.undelivered", { clients: initial.length, capture: "cancelled" });
 				return undefined;
 			}
-			this.say(requester, truncated ? { type: "transcript", text, truncated: true } : { type: "transcript", text });
+			send(requester, requestId);
 			this.log("transcript.delivered", { sessionId: requester.sessionId });
 			return requester.sessionId;
 		}
@@ -726,7 +734,7 @@ export class VoiceListener {
 			this.log("transcript.undelivered", { clients: clients.length, ...("failed" in lookup ? { focus: "unknown" } : {}) });
 			return undefined;
 		}
-		this.say(target, truncated ? { type: "transcript", text, truncated: true } : { type: "transcript", text });
+		send(target, null);
 		this.log("transcript.delivered", { sessionId: target.sessionId, ...(requester ? { fallback: "focus" } : {}) });
 		return target.sessionId;
 	}
@@ -821,6 +829,7 @@ export class VoiceListener {
 		// voice-on reload never briefly looks like the last session went away.
 		const owner = role === "reading" ? [...this.clients.values()].find((other) => other.sessionId === hello.sessionId && other.role === "session") : undefined;
 		client.sessionId = hello.sessionId;
+		client.transcriptCaptureIds = hello.id?.startsWith(TRANSCRIPT_CAPTURE_HELLO_PREFIX);
 		client.paneId = hello.paneId;
 		// A reader may have queued its hello before the session turned voice off.
 		// With no session link, its own current flag retains the reader-only path.
@@ -1061,12 +1070,15 @@ export class VoiceListener {
 		const pending: PendingCapture = { client, sessionId, mode: request.mode, wake, cancelled: false };
 		this.capturePending = pending;
 		if (wake) this.awakeWake = undefined;
-		if (this.spotting || this.spottingStop) await this.stopSpotting();
-		if (this.recycling) await this.recycling;
-		if (this.captureClosing) await this.captureClosing;
+		const stopped = this.spotting || this.spottingStop ? await this.stopSpotting() : !this.spottingCancelling;
+		// If voice came back on, don't make this capture wait beyond the stop
+		// deadline. The cancellation continues behind the worker's exit fence.
+		const stopFailed = (!stopped || this.spottingCancelling !== undefined) && (this.voiceSessions.length > 0 || !this.recycling);
+		if (!stopFailed && this.recycling) await this.recycling;
+		if (!stopFailed && this.captureClosing) await this.captureClosing;
 		// Focus may have changed during the session's install check or microphone
 		// teardown. Bypass the herdr cache and fail closed on a failed lookup.
-		if (wake && !pending.cancelled && !wake.invalid) {
+		if (!stopFailed && wake && !pending.cancelled && !wake.invalid) {
 			// A hung focus lookup must not keep a cancelled wake's reservation.
 			const cancelled = new Promise<ListenerFocusResult>((resolve) => { pending.cancelWakeCheck = () => resolve({ failed: true }); });
 			let lookup: ListenerFocusResult;
@@ -1077,10 +1089,15 @@ export class VoiceListener {
 		}
 		if (wake && !wake.invalid && !client.voiceOn) this.invalidateAwakeWake("ignored:voice-off");
 		if (wake && !wake.invalid && (this.currentState !== "listening" || this.reading)) this.invalidateAwakeWake("ignored:stale");
-		if (pending.cancelled || wake?.invalid || !this.clients.has(client.socket) || this.closing) {
+		if (stopFailed || pending.cancelled || wake?.invalid || !this.clients.has(client.socket) || this.closing) {
 			this.capturePending = undefined;
 			if (this.clients.has(client.socket) && !this.closing) {
-				if (!pending.cancelled) this.say(client, { type: "capture", phase: "cancelled" });
+				if (!pending.cancelled) {
+					if (stopFailed) {
+						this.log("capture.failed", { sessionId, mode: request.mode, code: "capture" });
+						this.say(client, { type: "capture", phase: "failed", code: "capture" });
+					} else this.say(client, { type: "capture", phase: "cancelled" });
+				}
 				this.answer(client, "dictate", request.id);
 			}
 			this.refreshSpotting();
@@ -1099,7 +1116,7 @@ export class VoiceListener {
 			kws: this.options.keyword,
 			onKeywordRejected: (hit) => this.logKeywordRejection(hit),
 		});
-		const capture: ActiveCapture = { client, sessionId, mode: request.mode, dictation, readingTailEndsAt: this.reading?.tailEndsAt, collecting: false, afterCollect: [], cue: "none" };
+		const capture: ActiveCapture = { client, requestId: request.id, sessionId, mode: request.mode, dictation, readingTailEndsAt: this.reading?.tailEndsAt, collecting: false, afterCollect: [], cue: "none" };
 		this.capture = capture;
 		this.capturePending = undefined;
 		this.levelAt = undefined;
@@ -1188,7 +1205,7 @@ export class VoiceListener {
 				return;
 			}
 			if (this.capture !== capture) return;
-			const target = await this.deliverTranscript(transcript.text, transcript.truncated === true, () => this.capture !== capture, capture.client);
+			const target = await this.deliverTranscript(transcript.text, transcript.truncated === true, () => this.capture !== capture, capture.client, capture.requestId);
 			// A cancel inside a fallback lookup released the capture and already answered.
 			if (this.capture === capture) {
 				const ownerOpen = this.clients.has(capture.client.socket) && !capture.client.socket.destroyed && capture.client.socket.writable;
@@ -1347,18 +1364,12 @@ export class VoiceListener {
 			}
 			if (this.spottingRetry || this.spottingSettling) return;
 			const operation = (async () => {
-				let timer: ReturnType<typeof setTimeout> | undefined;
-				const stopped = await Promise.race([
-					this.stopSpotting().then(() => true),
-					new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), VOICE_SESSION_DEFAULTS.exitGraceMs); timer.unref?.(); }),
-				]);
-				if (timer) clearTimeout(timer);
-				// A pending capture waits for this recycle; a new awake state or
-				// shutdown can instead make the recycle unnecessary.
+				await this.stopSpotting();
+				// Stop enforces its own deadline, even when the awake state makes
+				// unloading unnecessary. While still off, finish the teardown first.
 				if (this.closing || this.currentState !== "asleep" || this.voiceSessions.length > 0 || this.capture || this.captureClosing || this.reading) return;
-				// A worker that never acknowledges stop is cancelled by recycle, and
-				// spotting reports the failure and retries rather than waiting forever.
-				if (!stopped) this.failSpotting(new VoiceSessionError("capture"));
+				if (this.spottingCancelling) await this.spottingCancelling;
+				if (this.closing || this.currentState !== "asleep" || this.voiceSessions.length > 0 || this.reading) return;
 				if (await worker.recycle()) this.log("worker.recycled", { reason: "voice-off" });
 			})();
 			const recycling = operation.catch((error: unknown) => this.failSpotting(error));
@@ -1392,7 +1403,7 @@ export class VoiceListener {
 	private startSpotting(): void {
 		const factory = this.options.spot;
 		if (!this.options.keyword || !factory || this.spotDisabled || this.closing) return;
-		if (this.spotting || this.spottingSettling || this.spottingRetry || !this.shouldSpot()) return;
+		if (this.spotting || this.spottingSettling || this.spottingCancelling || this.spottingRetry || !this.shouldSpot()) return;
 		// A capture that is still closing holds the microphone: the next one waits.
 		const stopping = this.spottingStop;
 		if (stopping) {
@@ -1592,26 +1603,40 @@ export class VoiceListener {
 		this.spottingRetry = timer;
 	}
 
-	// Releasing the microphone is asynchronous: a capture that must start waits on
-	// this promise instead of opening a second one.
-	private stopSpotting(): Promise<void> {
+	// The stop acknowledgment is bounded independently of any model recycle.
+	// Cancellation still holds the microphone until its own teardown settles.
+	private stopSpotting(): Promise<boolean> {
 		if (this.closing && this.spottingRetry) clearTimeout(this.spottingRetry);
 		if (this.closing) this.spottingRetry = undefined;
 		if (this.spottingStable) clearTimeout(this.spottingStable);
 		this.spottingStable = undefined;
 		const capture = this.spotting;
-		if (!capture) return this.spottingStop ?? Promise.resolve();
+		if (!capture) return this.spottingStop ?? Promise.resolve(!this.spottingCancelling);
 		this.spotting = undefined;
-		let stopping: Promise<void>;
-		try {
-			stopping = capture.stop().catch(() => {});
-		} catch {
-			stopping = Promise.resolve();
-		}
-		this.spottingStop = stopping;
-		void stopping.then(() => {
-			if (this.spottingStop === stopping) this.spottingStop = undefined;
+		let stopped: Promise<true>;
+		try { stopped = capture.stop().then(() => true, () => true); }
+		catch { stopped = Promise.resolve(true); }
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const deadline = new Promise<false>((resolve) => {
+			timer = setTimeout(() => resolve(false), VOICE_SESSION_DEFAULTS.exitGraceMs);
+			timer.unref?.();
 		});
+		const stopping = Promise.race([stopped, deadline]).then((acknowledged) => {
+			clearTimeout(timer);
+			if (!acknowledged) {
+				const cancelling = Promise.resolve().then(() => capture.cancel()).catch(() => {});
+				this.spottingCancelling = cancelling;
+				this.failSpotting(new VoiceSessionError("capture"));
+				void cancelling.then(() => {
+					if (this.spottingCancelling !== cancelling) return;
+					this.spottingCancelling = undefined;
+					this.refreshSpotting();
+				});
+			}
+			if (this.spottingStop === stopping) this.spottingStop = undefined;
+			return acknowledged;
+		});
+		this.spottingStop = stopping;
 		return stopping;
 	}
 
