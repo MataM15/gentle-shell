@@ -94,6 +94,10 @@ export interface WarmVoiceWorker {
 	session(options: { onStateChange(state: VoiceSessionState): void; endpoint?: VoiceEndpoint; levels?: boolean; onLevel?: (rms: number) => void; kws?: VoiceKeywordOption; onKeywordRejected?: (hit: KeywordRejection) => void }): WarmDictation;
 	// Listens for spoken commands only, on the same worker and its one spotter.
 	spot(options: { kws: VoiceKeywordOption; onStateChange?(state: VoiceSessionState): void; onKeywordRejected?: (hit: KeywordRejection) => void }): WarmSpotting;
+	// A child that reached transcription may hold the dictation model.
+	needsRecycle(): boolean;
+	// Retire that child, waiting for its exit before another child may start.
+	recycle(graceMs?: number): Promise<boolean>;
 	// Closes the worker, killing it if it has not exited within graceMs.
 	close(graceMs?: number): Promise<void>;
 }
@@ -104,6 +108,7 @@ interface Live {
 	child: VoiceWorkerChild;
 	closed: Promise<void>;
 	exited: boolean;
+	transcribed: boolean;
 	// A cancelled worker can report its last pending hit before it exits.
 	cancelling?: Capture;
 }
@@ -156,6 +161,9 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 	let live: Live | undefined;
 	let current: Capture | undefined;
 	let retiring: Promise<void> | undefined;
+	// A child that survives SIGKILL must still fence the microphone, but callers
+	// cannot wait forever for its close event.
+	let retirementFailure: Promise<never> | undefined;
 	let idleTimer: ReturnType<typeof setTimeout> | undefined;
 
 	// A terminal worker message is written before the process exits. Do not send
@@ -262,6 +270,7 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 				return;
 			case "transcribing":
 				if (capture.spot) return protocolError();
+				if (capture.entry) capture.entry.transcribed = true;
 				if (capture.state === "recording") {
 					setState(capture, "transcribing");
 					arm(capture, VOICE_SESSION_DEFAULTS.transcribeTimeoutMs);
@@ -303,7 +312,7 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 			env: childEnv(env),
 		});
 		let resolveClosed!: () => void;
-		const entry: Live = { child, closed: new Promise((resolve) => { resolveClosed = resolve; }), exited: false };
+		const entry: Live = { child, closed: new Promise((resolve) => { resolveClosed = resolve; }), exited: false, transcribed: false };
 		const decoder = new StringDecoder("utf8");
 		let buffered = "";
 		child.stdout?.on("data", (chunk: unknown) => {
@@ -373,13 +382,16 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 		const entry = live;
 		if (!entry) {
 			if (current) settle(current, { error: fail("cancelled") }, retiring);
-			await retiring;
+			if (retiring && retirementFailure) await Promise.race([retiring, retirementFailure]);
+			else await retiring;
 			return;
 		}
+		const active = current;
 		retire(entry);
-		if (current) settle(current, { error: fail("cancelled") }, entry.closed);
+		if (active) settle(active, { error: fail("cancelled") }, entry.closed);
 		try {
-			entry.child.stdin?.write(`${JSON.stringify({ schema: VOICE_WORKER_SCHEMA, type: "close" })}\n`);
+			// The worker accepts close only when idle; an active capture is cancelled.
+			entry.child.stdin?.write(`${JSON.stringify({ schema: VOICE_WORKER_SCHEMA, type: active ? "cancel" : "close" })}\n`);
 			entry.child.stdin?.end();
 		} catch {
 			/* already gone */
@@ -394,6 +406,27 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 		}, graceMs);
 		await entry.closed;
 		clearTimeout(timer);
+	};
+
+	const recycle = async (graceMs: number = WARM_WORKER_DEFAULTS.closeGraceMs): Promise<boolean> => {
+		const entry = live;
+		if (!entry?.transcribed) return false;
+		// A dictation is never interrupted. A stuck spot-only stop can instead be
+		// cancelled by close(), which still fences the child until it exits.
+		if (current && !current.spot) throw fail("invalid-state");
+		let rejectFailure!: (error: VoiceSessionError) => void;
+		const failure = new Promise<never>((_resolve, reject) => { rejectFailure = reject; });
+		retirementFailure = failure;
+		void entry.closed.then(() => { if (retirementFailure === failure) retirementFailure = undefined; });
+		// close() sends close, then SIGKILL at graceMs. If even that does not
+		// produce close, fail waiting captures while still fencing a new child.
+		const timer = setTimeout(() => rejectFailure(fail("worker-exited")), graceMs * 2);
+		try {
+			await Promise.race([close(graceMs), failure]);
+			return true;
+		} finally {
+			clearTimeout(timer);
+		}
 	};
 
 	// One capture on the worker: a dictation, or with `spot` a capture for the
@@ -436,7 +469,13 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 						settle(capture, { error: error instanceof VoiceSessionError ? error : fail("not-installed") });
 						throw error instanceof VoiceSessionError ? error : fail("not-installed");
 					}
-					while (retiring && !capture.settled) await retiring;
+					while (retiring && !capture.settled) {
+						try { await (retirementFailure ? Promise.race([retiring, retirementFailure]) : retiring); }
+						catch (error) {
+							if (!capture.settled) settle(capture, { error: error instanceof VoiceSessionError ? error : fail("worker-exited") });
+							return recordingPromise;
+						}
+					}
 					if (capture.settled) return recordingPromise;
 					live ??= launch(prepared.root);
 					capture.entry = live;
@@ -497,6 +536,8 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 
 	return {
 		close,
+		needsRecycle: () => Boolean(live?.transcribed),
+		recycle,
 		session: (sessionOptions) => open(sessionOptions),
 		spot({ kws, onStateChange, onKeywordRejected }) {
 			const capture = open({ onStateChange: onStateChange ?? (() => {}), kws, spot: true, onKeywordRejected });

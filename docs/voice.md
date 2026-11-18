@@ -378,7 +378,7 @@ answers reuses its own worker the same way:
 | Next recordings | Reuse the verified model and the loaded recognizer, with 4 decoding threads: 0.3 to 0.6 seconds, measured. The install is still checked before each one. |
 | Microphone | Opened only while recording and released after each one; the worker keeps only the model. |
 | Memory | The loaded model, about 1 GB, stays in that one worker process, on the CPU only. |
-| Release | The worker closes after 10 idle minutes, when voice is turned off in every session and when the listener exits. On its own, a session follows the same rules and ends with the Pi session. A cancel or any error ends it, and the next recording starts a fresh one. |
+| Release | The worker closes after 10 idle minutes and when the listener exits. When voice is turned off in every session, a worker that has transcribed (so it holds the dictation model) is stopped once any recording or reading in progress has settled, and a fresh keyword-only worker keeps listening for `Gentle Voice on` until dictation is needed again; each time, the log gets `worker.recycled` with `reason: "voice-off"`. A worker that only listened for commands is left running. On its own, a session follows the same rules and ends with the Pi session. A cancel or any error ends it, and the next recording starts a fresh one. |
 | Noise | With no speech heard by the end-of-speech detector, the recognizer is not asked at all and the transcript is blank, because Parakeet can turn noise into a word such as "Yeah." that would otherwise be sent. |
 
 ## Voice listener

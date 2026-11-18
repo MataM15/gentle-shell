@@ -25,7 +25,7 @@ import { KWS_MODEL_MANIFEST, KWS_SPOTTER_FILES } from "../lib/voice-artifacts.ts
 import { encodeListenerFrame, parseListenerFrameLine, VOICE_LISTENER_SCHEMA, type ListenerFrame, type ListenerLanguage, type ListenerRequest, type ListenerState } from "../lib/voice-listener-protocol.ts";
 import type { CuePlayer } from "../lib/voice-cues.ts";
 import { VOICE_WORKER_SCHEMA, VoiceSessionError, type VoiceKeywordOption, type VoiceSessionErrorCode, type VoiceSessionState } from "../lib/voice-session.ts";
-import { createWarmVoiceWorker } from "../lib/voice-warm.ts";
+import { createWarmVoiceWorker, type WarmVoiceWorker } from "../lib/voice-warm.ts";
 
 // One voice listener for every Pi session (S6, slice A): the single-instance
 // lock, the unix-socket registry, the state edges, focus resolution and the
@@ -124,6 +124,7 @@ async function startListener(
 		language?: ListenerLanguage;
 		keyword?: VoiceKeywordOption;
 		spot?: ListenerSpotFactory;
+		worker?: Pick<WarmVoiceWorker, "needsRecycle" | "recycle" | "close">;
 	} = {},
 ): Promise<Started> {
 	const events: Array<{ event: string; fields?: Record<string, unknown> }> = [];
@@ -135,6 +136,7 @@ async function startListener(
 		dictation: options.dictation,
 		keyword: options.keyword,
 		spot: options.spot,
+		worker: options.worker,
 		cues: options.cues,
 		now: options.now,
 		language: options.language,
@@ -3381,14 +3383,16 @@ class GatedWarmChild extends EventEmitter {
 	readonly stdout = new EventEmitter();
 	readonly stderr = new EventEmitter();
 	exited = false;
+	holdClose = false;
+	holdStop = false;
 	readonly stdin = {
 		on: () => {}, end: () => {},
 		write: (line: string) => {
 			const message = JSON.parse(line) as Record<string, unknown>;
 			this.received.push(message);
 			if (message.type === "start") queueMicrotask(() => this.say({ type: message.spot ? "spotting" : "recording" }));
-			if (message.type === "stop") queueMicrotask(() => this.say({ type: "stopped" }));
-			if (message.type === "close") queueMicrotask(() => this.exit());
+			if (message.type === "stop" && !this.holdStop) queueMicrotask(() => this.say({ type: "stopped" }));
+			if (message.type === "close" && !this.holdClose) queueMicrotask(() => this.exit());
 			return true;
 		},
 	};
@@ -3396,6 +3400,264 @@ class GatedWarmChild extends EventEmitter {
 	kill(signal: string) { this.signals.push(signal); this.exit(); return true; }
 	exit() { if (!this.exited) { this.exited = true; this.emit("close", 0, null); } }
 }
+
+async function recycleFixture(t: import("node:test").TestContext, options: { failRecycle?: boolean; failFreshSpot?: boolean; readTailMs?: number } = {}) {
+	const children: GatedWarmChild[] = [];
+	const warm = createWarmVoiceWorker({
+		target: "linux-x64", env: {},
+		prepare: async () => ({ root: "/fake", request: { schema: VOICE_WORKER_SCHEMA, type: "start" } }),
+		spawn: () => {
+			const child = new GatedWarmChild();
+			children.push(child);
+			if (options.failFreshSpot && children.length === 2) {
+				const write = child.stdin.write;
+				child.stdin.write = (line: string) => {
+					const message = JSON.parse(line) as Record<string, unknown>;
+					if (message.type === "start" && message.spot === true) {
+						child.received.push(message);
+						queueMicrotask(() => { child.say({ type: "error", code: "capture" }); child.exit(); });
+						return true;
+					}
+					return write(line);
+				};
+			}
+			return child;
+		},
+	});
+	let recycleCalls = 0;
+	let closeCalls = 0;
+	const worker = {
+		needsRecycle: () => warm.needsRecycle(),
+		recycle: async () => {
+			recycleCalls++;
+			if (options.failRecycle && recycleCalls === 1) throw new VoiceSessionError("capture");
+			return warm.recycle();
+		},
+		close: async () => { closeCalls++; await warm.close(); },
+	};
+	const kws = keywordOption();
+	const started = await startListener(scratch(), {
+		keyword: kws, worker, readTailMs: options.readTailMs,
+		spot: (onKeywordRejected) => warm.spot({ kws, onKeywordRejected }),
+		dictation: ({ onStateChange, endpoint, levels, onLevel, kws: option, onKeywordRejected }) => warm.session({ onStateChange, endpoint, levels, onLevel, kws: option, onKeywordRejected }),
+		focus: { focusedPaneId: async () => ({ focused: "w1:p1" }) },
+	});
+	t.after(async () => { for (const child of children) child.exit(); await started.listener.close(); await warm.close(); });
+	const client = await started.client();
+	client.hello("s-1", "w1:p1", true);
+	await waitFor(() => framesOf(client, "welcome").length === 1 && children[0]?.received.some((message) => message.spot === true) === true);
+	const transcribe = async (id: string) => {
+		client.send({ type: "dictate", id, mode: "dictation" });
+		assert.equal((await awaitFrame(client, (frame) => "id" in frame && frame.id === id)).type, "ok");
+		const child = children.at(-1)!;
+		child.say({ type: "transcribing" });
+		child.say({ type: "result", text: `text-${id}`, truncated: false });
+		await waitFor(() => framesOf(client, "transcript").some((frame) => frame.type === "transcript" && frame.text === `text-${id}`));
+		return child;
+	};
+	return { children, warm, worker, started, client, transcribe, recycleCalls: () => recycleCalls, closeCalls: () => closeCalls };
+}
+
+for (const source of ["menu", "spoken"] as const) test(`${source} voice off recycles a transcribed worker and the fresh spotter wakes`, async (t) => {
+	const f = await recycleFixture(t);
+	const old = await f.transcribe("first");
+	await waitFor(() => old.received.filter((message) => message.spot === true).length === 2);
+	old.holdClose = true;
+	if (source === "menu") {
+		f.client.send({ type: "set-voice", id: "off", voiceOn: false });
+		await awaitFrame(f.client, (frame) => "id" in frame && frame.id === "off");
+	} else old.say({ type: "command", command: "voice-off" });
+	await waitFor(() => old.received.some((message) => message.type === "close"));
+	assert.equal(f.children.length, 1, "the fresh spotter waits until the old child exits");
+	assert.equal(f.started.listener.state, "asleep");
+	old.exit();
+	await waitFor(() => f.children.length === 2 && f.children[1]!.received.some((message) => message.spot === true));
+	await waitFor(() => f.started.events.some((entry) => entry.event === "worker.recycled"));
+	assert.deepEqual(f.started.events.filter((entry) => entry.event === "worker.recycled").map((entry) => entry.fields), [{ reason: "voice-off" }]);
+	assert.equal(f.recycleCalls(), 1);
+	const fresh = f.children[1]!;
+	await sleep(10);
+	fresh.say({ type: "command", command: "voice-on" });
+	assert.deepEqual(await awaitFrame(f.client, (frame) => frame.type === "command" && frame.command === "voice-on"), { type: "command", command: "voice-on", wake: true });
+	assert.deepEqual(f.started.listener.voiceSessions, ["s-1"]);
+	assert.equal(await f.transcribe("again"), fresh, "the new child takes the next lazy dictation");
+	assert.equal(f.children.length, 2);
+});
+
+test("a spot-only worker stays open without a spotting gap when voice goes off", async (t) => {
+	const f = await recycleFixture(t);
+	const child = f.children[0]!;
+	f.client.send({ type: "session-voice", voiceOn: false });
+	f.client.send({ type: "status", id: "barrier" });
+	await awaitFrame(f.client, (frame) => "id" in frame && frame.id === "barrier");
+	await sleep(20);
+	assert.equal(f.started.listener.state, "asleep");
+	assert.equal(f.children.length, 1);
+	assert.equal(child.exited, false);
+	assert.deepEqual(child.received.map((message) => message.type), ["start"]);
+	assert.equal(f.recycleCalls(), 0);
+	assert.equal(f.started.events.some((entry) => entry.event === "worker.recycled"), false);
+	child.say({ type: "command", command: "voice-on" });
+	assert.deepEqual(await awaitFrame(f.client, (frame) => frame.type === "command" && frame.command === "voice-on"), { type: "command", command: "voice-on", wake: true });
+});
+
+test("a capture requested during recycle starts only after the old worker exits", async (t) => {
+	const f = await recycleFixture(t);
+	const old = await f.transcribe("first");
+	await waitFor(() => old.received.filter((message) => message.spot === true).length === 2);
+	old.holdClose = true;
+	f.client.send({ type: "set-voice", id: "off", voiceOn: false });
+	await waitFor(() => old.received.some((message) => message.type === "close"));
+	f.client.send({ type: "dictate", id: "during", mode: "dictation" });
+	await sleep(30);
+	assert.equal(f.children.length, 1);
+	assert.equal(f.client.frames.some((frame) => "id" in frame && frame.id === "during"), false);
+	old.exit();
+	assert.equal((await awaitFrame(f.client, (frame) => "id" in frame && frame.id === "during")).type, "ok");
+	assert.equal(f.children.length, 2);
+	const fresh = f.children[1]!;
+	assert.equal(fresh.received.some((message) => message.type === "start" && message.spot !== true), true);
+	fresh.say({ type: "transcribing" });
+	fresh.say({ type: "result", text: "during recycle", truncated: false });
+	assert.deepEqual(await awaitFrame(f.client, (frame) => frame.type === "transcript" && frame.text === "during recycle"), { type: "transcript", text: "during recycle" });
+});
+
+test("a capture requested while the old spotter stops still waits for recycle", async (t) => {
+	const f = await recycleFixture(t);
+	const old = await f.transcribe("first");
+	await waitFor(() => old.received.filter((message) => message.spot === true).length === 2);
+	const before = old.received.filter((message) => message.type === "stop").length;
+	const starts = old.received.filter((message) => message.type === "start").length;
+	old.holdStop = true;
+	old.holdClose = true;
+	f.client.send({ type: "set-voice", voiceOn: false });
+	await waitFor(() => old.received.filter((message) => message.type === "stop").length === before + 1);
+	f.client.send({ type: "dictate", id: "during-stop", mode: "dictation" });
+	await sleep(20);
+	old.say({ type: "stopped" });
+	await waitFor(() => old.received.some((message) => message.type === "close"), 500);
+	assert.equal(old.received.filter((message) => message.type === "start").length, starts, "the capture cannot use the old child");
+	assert.equal(f.children.length, 1);
+	old.exit();
+	assert.equal((await awaitFrame(f.client, (frame) => "id" in frame && frame.id === "during-stop")).type, "ok");
+	assert.equal(f.children.length, 2);
+	f.children[1]!.say({ type: "transcribing" });
+	f.children[1]!.say({ type: "result", text: "after stop", truncated: false });
+	assert.deepEqual(await awaitFrame(f.client, (frame) => frame.type === "transcript" && frame.text === "after stop"), { type: "transcript", text: "after stop" });
+});
+
+test("a stuck spot stop is cancelled so a waiting capture can proceed", async (t) => {
+	const f = await recycleFixture(t);
+	const old = await f.transcribe("first");
+	await waitFor(() => old.received.filter((message) => message.spot === true).length === 2);
+	const stops = old.received.filter((message) => message.type === "stop").length;
+	old.holdStop = true;
+	f.client.send({ type: "set-voice", voiceOn: false });
+	await waitFor(() => old.received.filter((message) => message.type === "stop").length === stops + 1);
+	f.client.send({ type: "dictate", id: "waiting", mode: "dictation" });
+	await waitFor(() => old.received.some((message) => message.type === "cancel"), 3_000);
+	assert.equal(f.children.length, 1, "the replacement waits for the cancelled child to exit");
+	assert.ok(f.started.events.some((entry) => entry.event === "kws.failed"));
+	old.exit();
+	assert.equal((await awaitFrame(f.client, (frame) => "id" in frame && frame.id === "waiting")).type, "ok");
+	assert.equal(f.children.length, 2);
+	f.children[1]!.say({ type: "transcribing" });
+	f.children[1]!.say({ type: "result", text: "after stuck stop", truncated: false });
+	assert.deepEqual(await awaitFrame(f.client, (frame) => frame.type === "transcript" && frame.text === "after stuck stop"), { type: "transcript", text: "after stuck stop" });
+});
+
+test("a fresh spot that fails after recycling retries and hears wake", async (t) => {
+	const f = await recycleFixture(t, { failFreshSpot: true });
+	const old = await f.transcribe("first");
+	await waitFor(() => old.received.filter((message) => message.spot === true).length === 2);
+	f.client.send({ type: "set-voice", voiceOn: false });
+	await waitFor(() => f.started.events.some((entry) => entry.event === "kws.failed"));
+	assert.equal(old.exited, true);
+	assert.equal(f.children[1]!.exited, true);
+	assert.equal(f.started.events.filter((entry) => entry.event === "worker.recycled").length, 1);
+	await waitFor(() => f.children.length === 3 && f.children[2]!.received.some((message) => message.spot === true));
+	await waitFor(() => f.started.events.some((entry) => entry.event === "kws.recovered"));
+	f.children[2]!.say({ type: "command", command: "voice-on" });
+	assert.deepEqual(await awaitFrame(f.client, (frame) => frame.type === "command" && frame.command === "voice-on"), { type: "command", command: "voice-on", wake: true });
+});
+
+test("a recycle failure uses the spot failure backoff and eventually hears wake", async (t) => {
+	const f = await recycleFixture(t, { failRecycle: true });
+	const old = await f.transcribe("first");
+	await waitFor(() => old.received.filter((message) => message.spot === true).length === 2);
+	f.client.send({ type: "set-voice", id: "off", voiceOn: false });
+	await waitFor(() => f.started.events.some((entry) => entry.event === "kws.failed"));
+	assert.deepEqual(f.started.events.filter((entry) => entry.event === "kws.failed").map((entry) => entry.fields), [{ reason: "capture" }]);
+	await waitFor(() => f.children.length === 2 && f.children[1]!.received.some((message) => message.spot === true));
+	assert.equal(f.recycleCalls(), 2);
+	assert.equal(f.started.events.filter((entry) => entry.event === "worker.recycled").length, 1);
+	await sleep(10);
+	f.children[1]!.say({ type: "command", command: "voice-on" });
+	assert.deepEqual(await awaitFrame(f.client, (frame) => frame.type === "command" && frame.command === "voice-on"), { type: "command", command: "voice-on", wake: true });
+});
+
+test("a voiced session prevents recycling when another session turns off", async (t) => {
+	const f = await recycleFixture(t);
+	const child = await f.transcribe("first");
+	await waitFor(() => child.received.filter((message) => message.spot === true).length === 2);
+	const other = await f.started.client();
+	other.hello("s-2", "w1:p2", true);
+	await awaitFrame(other, (frame) => frame.type === "welcome");
+	f.client.send({ type: "session-voice", voiceOn: false });
+	f.client.send({ type: "status", id: "barrier" });
+	await awaitFrame(f.client, (frame) => "id" in frame && frame.id === "barrier");
+	await sleep(30);
+	assert.deepEqual(f.started.listener.voiceSessions, ["s-2"]);
+	assert.equal(child.exited, false);
+	assert.equal(f.recycleCalls(), 0);
+	assert.equal(f.started.events.some((entry) => entry.event === "worker.recycled"), false);
+	other.socket.destroy();
+});
+
+for (const pending of ["capture", "reading"] as const) test(`voice off waits for the active ${pending} before recycling`, async (t) => {
+	const f = await recycleFixture(t, { readTailMs: 100 });
+	const old = await f.transcribe("first");
+	await waitFor(() => old.received.filter((message) => message.spot === true).length === 2);
+	if (pending === "capture") {
+		f.client.send({ type: "dictate", id: "active", mode: "dictation" });
+		await awaitFrame(f.client, (frame) => "id" in frame && frame.id === "active");
+	} else {
+		f.client.send({ type: "read-begin", id: "read", readingId: "r1", chars: 30 });
+		assert.equal((await awaitFrame(f.client, (frame) => "id" in frame && frame.id === "read")).type, "granted");
+	}
+	f.client.send({ type: "set-voice", id: "off", voiceOn: false });
+	await awaitFrame(f.client, (frame) => "id" in frame && frame.id === "off");
+	await sleep(20);
+	assert.equal(old.exited, false);
+	assert.equal(f.recycleCalls(), 0, "the active turn has not settled");
+	if (pending === "capture") {
+		old.say({ type: "transcribing" });
+		old.say({ type: "result", text: "still delivered", truncated: false });
+		await awaitFrame(f.client, (frame) => frame.type === "transcript" && frame.text === "still delivered");
+	}
+	await waitFor(() => old.exited && f.children.length === 2);
+	assert.equal(f.recycleCalls(), 1);
+});
+
+for (const reason of ["idle", "shutdown", "error"] as const) test(`listener ${reason} closes its warm worker`, async (t) => {
+	const children: GatedWarmChild[] = [];
+	const warm = createWarmVoiceWorker({
+		target: "linux-x64", env: {},
+		prepare: async () => ({ root: "/fake", request: { schema: VOICE_WORKER_SCHEMA, type: "start" } }),
+		spawn: () => { const child = new GatedWarmChild(); children.push(child); return child; },
+	});
+	let closes = 0;
+	const worker = { needsRecycle: () => warm.needsRecycle(), recycle: () => warm.recycle(), close: async () => { closes++; await warm.close(); } };
+	const kws = keywordOption();
+	const started = await startListener(scratch(), { idleMs: reason === "idle" ? 40 : 60_000, keyword: kws, worker, spot: (onKeywordRejected) => warm.spot({ kws, onKeywordRejected }) });
+	t.after(async () => { for (const child of children) child.exit(); await started.listener.close(); await warm.close(); });
+	await waitFor(() => children[0]?.received.some((message) => message.spot === true) === true);
+	if (reason === "idle") await waitFor(() => started.events.some((entry) => entry.event === "listener.exit"));
+	else await started.listener.close(reason);
+	assert.equal(closes, 1);
+	assert.equal(children[0]!.exited, true);
+	assert.ok(children[0]!.received.some((message) => message.type === "close"));
+});
 
 test("late native diagnostics from dictation and spotting reach the listener event log", async (t) => {
 	for (const mode of ["dictation", "spot"] as const) {

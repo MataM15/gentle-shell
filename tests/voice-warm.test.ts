@@ -546,6 +546,88 @@ const KWS = {
 	trailingBlanks: 2,
 };
 
+test("a transcribed worker recycles before a fresh spot and later dictation", async () => {
+	const h = harness();
+	const { worker: old } = await record(h, "primero");
+	old.stubborn = true;
+	try {
+		assert.equal(h.warm.needsRecycle(), true);
+		const recycling = h.warm.recycle(1_000);
+		await h.until(() => old.received.at(-1)?.type === "close");
+		const spot = h.warm.spot({ kws: KWS });
+		const starting = spot.start();
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.equal(h.workers.length, 1, "the replacement cannot start before the old child exits");
+		old.exit();
+		assert.equal(await recycling, true);
+		await h.until(() => h.workers.length === 2 && h.workers[1]!.received.some((message) => message.spot === true));
+		const fresh = h.workers[1]!;
+		assert.equal(old.exited, true);
+		fresh.say({ type: "spotting" });
+		await starting;
+		fresh.say({ type: "command", command: "voice-on" });
+		assert.equal(await spot.heard(), "voice-on");
+		assert.equal(h.warm.needsRecycle(), false, "spotting alone does not load the dictation model");
+		const next = await record(h, "después");
+		assert.equal(next.worker, fresh);
+		assert.deepEqual(next.transcript, { text: "después", truncated: false });
+		assert.equal(h.warm.needsRecycle(), true);
+	} finally {
+		for (const child of h.workers) child.exit();
+		await h.warm.close();
+	}
+});
+
+test("a spot-only worker is not recycled and keeps its capture open", async () => {
+	const h = harness();
+	const spot = h.warm.spot({ kws: KWS });
+	const starting = spot.start();
+	await h.until(() => h.workers.length === 1 && h.workers[0]!.received.length === 1);
+	const child = h.workers[0]!;
+	child.say({ type: "spotting" });
+	await starting;
+	try {
+		assert.equal(h.warm.needsRecycle(), false);
+		assert.equal(await h.warm.recycle(), false);
+		assert.equal(child.exited, false);
+		assert.deepEqual(child.received.map((frame) => frame.type), ["start"]);
+		child.say({ type: "command", command: "voice-on" });
+		assert.equal(await spot.heard(), "voice-on");
+		assert.equal(h.workers.length, 1);
+	} finally {
+		child.exit();
+		await h.warm.close();
+	}
+});
+
+test("a worker that survives the recycle kill fails waiting captures until it exits", async () => {
+	const h = harness();
+	const { worker: old } = await record(h, "primero");
+	old.stubborn = true;
+	old.kill = (signal: string) => { old.signals.push(signal); return true; };
+	try {
+		const recycling = h.warm.recycle(10);
+		const failedRecycle = assert.rejects(recycling, (error: unknown) => error instanceof VoiceSessionError && error.code === "worker-exited");
+		const next = h.warm.session({ onStateChange: () => {} });
+		const failedCapture = assert.rejects(next.start(), (error: unknown) => error instanceof VoiceSessionError && error.code === "worker-exited");
+		await failedRecycle;
+		await failedCapture;
+		assert.deepEqual(old.signals, ["SIGKILL"]);
+		assert.equal(h.workers.length, 1, "a surviving child is never overlapped");
+		old.exit();
+		const spot = h.warm.spot({ kws: KWS });
+		const started = spot.start();
+		await h.until(() => h.workers.length === 2 && h.workers[1]!.received.length === 1);
+		h.workers[1]!.say({ type: "spotting" });
+		await started;
+		h.workers[1]!.say({ type: "command", command: "voice-on" });
+		assert.equal(await spot.heard(), "voice-on");
+	} finally {
+		for (const child of h.workers) child.exit();
+		await h.warm.close();
+	}
+});
+
 test("a warm session that asks for keywords forwards the option and ends on a command instead of a transcript", async () => {
 	const h = harness();
 	const states: VoiceSessionState[] = [];

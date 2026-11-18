@@ -16,9 +16,9 @@ const env = process.env;
 const dir = resolveVoiceHome(env);
 const log = createVoiceLog({ dir });
 
-// One warm worker for the listener's lifetime: the model is verified and loaded
-// once, and a recording reuses it. A platform without a pinned runtime gets no
-// worker, so dictate is refused and the sessions keep recording themselves.
+// One warm worker owns each child: recordings reuse its loaded model until voice
+// goes off, then the listener recycles it before resuming keyword spotting.
+// A platform without a pinned runtime leaves capture to the sessions.
 const diagnosis = diagnoseVoicePlatform(readVoicePlatformProbe());
 const target = diagnosis.support === "unsupported" ? undefined : diagnosis.target;
 const warm = target ? createWarmVoiceWorker({ target, env, onNativeError: (error) => listener.reportNativeCaptureError(error) }) : undefined;
@@ -45,6 +45,7 @@ const listener = new VoiceListener({
 	// The display levels travel with the capture: the listener decides whether
 	// they are needed and the warm worker publishes them only then.
 	dictation: warm ? ({ onStateChange, endpoint, levels, onLevel, kws, onKeywordRejected }) => warm.session({ onStateChange, endpoint, levels, onLevel, kws, onKeywordRejected }) : undefined,
+	worker: warm,
 	// Spotting shares the warm worker while asleep, between turns and during readings.
 	keyword: keywordOption,
 	spot: warm && keywordOption ? (onKeywordRejected) => warm.spot({ kws: keywordOption, onKeywordRejected }) : undefined,
@@ -54,11 +55,8 @@ let stopping = false;
 const stop = (reason) => {
 	if (stopping) return;
 	stopping = true;
-	// The worker is this process's child, so it goes down with the listener.
-	void listener.close(reason)
-		.then(() => warm?.close(), () => warm?.close())
-		.catch(() => {})
-		.then(() => process.exit(0));
+	// Listener shutdown also closes the worker it owns.
+	void listener.close(reason).catch(() => {}).then(() => process.exit(0));
 };
 for (const signal of ["SIGTERM", "SIGINT"]) process.once(signal, () => stop("shutdown"));
 // The parent session going away must not leave a microphone owner behind.

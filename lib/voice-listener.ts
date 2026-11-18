@@ -28,8 +28,8 @@ import {
 import type { CueName, CuePlayer, CueResult } from "./voice-cues.ts";
 import { KWS_MODEL_MANIFEST, KWS_SPOTTER_FILES, parseVoiceKeywords, VOICE_KEYWORD_ASSET, type VoiceKeywordCommand, type VoiceKeywordSet, type VoiceModelFile } from "./voice-artifacts.ts";
 import { resolveVoiceKeywordSpotterPaths, type VoiceKeywordSpotterPaths } from "./voice-install.ts";
-import { VoiceSessionError, type VoiceKeywordOption, type VoiceSessionState, type VoiceTranscript } from "./voice-session.ts";
-import type { KeywordRejection, NativeCaptureError } from "./voice-warm.ts";
+import { VOICE_SESSION_DEFAULTS, VoiceSessionError, type VoiceKeywordOption, type VoiceSessionState, type VoiceTranscript } from "./voice-session.ts";
+import type { KeywordRejection, NativeCaptureError, WarmVoiceWorker } from "./voice-warm.ts";
 
 // One voice listener for every Pi session (S6, odd/notes/voice-listener-design.md).
 // It owns the process, the microphone and the shared turn: a single instance per
@@ -321,6 +321,8 @@ export interface VoiceListenerOptions {
 	// Spot-only capture, asleep and while awake between captures (S7, S14), on
 	// the same warm worker in production and a fake in the tests.
 	spot?: ListenerSpotFactory;
+	// The shared worker owns the model and is closed with the listener.
+	worker?: Pick<WarmVoiceWorker, "needsRecycle" | "recycle" | "close">;
 	// The microphone cues are played here, where the microphone is.
 	cues?: CuePlayer;
 	// The language shown and listened in, carried on every state frame.
@@ -512,6 +514,7 @@ export class VoiceListener {
 	private spottingStable: ReturnType<typeof setTimeout> | undefined;
 	private spottingSettling: Promise<void> | undefined;
 	private spottingStop: Promise<void> | undefined;
+	private recycling: Promise<void> | undefined;
 	// True only while the capture really records, from the worker's own report to
 	// the moment the recording ends (S10). Levels never change it.
 	private recording = false;
@@ -648,22 +651,27 @@ export class VoiceListener {
 			client.socket.once("close", () => clearTimeout(timer));
 		}
 		this.clients.clear();
-		this.closed = new Promise<void>((resolve) => {
+		const serverClosed = new Promise<void>((resolve) => {
 			if (!this.server) {
 				resolve();
 				return;
 			}
 			this.server.close(() => resolve());
 		});
+		this.closed = (async () => {
+			// Closing the child also settles a spot capture that is still stopping.
+			const workerClosed = Promise.resolve().then(() => this.options.worker?.close()).catch(() => {});
+			await Promise.all([serverClosed, workerClosed]);
+			// Ownership-aware: after a takeover the socket file belongs to the replacement.
+			try {
+				if (this.ownsSocket()) unlinkSync(this.paths.socket);
+			} catch {
+				/* already gone */
+			}
+			if (!this.fenced) releaseListenerLock(this.paths, { pid: this.pid });
+			this.log("listener.exit", { reason });
+		})();
 		await this.closed;
-		// Ownership-aware: after a takeover the socket file belongs to the replacement.
-		try {
-			if (this.ownsSocket()) unlinkSync(this.paths.socket);
-		} catch {
-			/* already gone */
-		}
-		if (!this.fenced) releaseListenerLock(this.paths, { pid: this.pid });
-		this.log("listener.exit", { reason });
 	}
 
 	// True while the socket path still resolves to the inode this listener published.
@@ -1051,6 +1059,7 @@ export class VoiceListener {
 		this.capturePending = pending;
 		if (wake) this.awakeWake = undefined;
 		if (this.spotting || this.spottingStop) await this.stopSpotting();
+		if (this.recycling) await this.recycling;
 		if (this.captureClosing) await this.captureClosing;
 		// Focus may have changed during the session's install check or microphone
 		// teardown. Bypass the herdr cache and fail closed on a failed lookup.
@@ -1322,18 +1331,52 @@ export class VoiceListener {
 	}
 
 	private refreshSpotting(): void {
+		if (this.closing || this.recycling) return;
+		const worker = this.options.worker;
+		if (worker && this.currentState === "asleep" && this.voiceSessions.length === 0 && worker.needsRecycle()) {
+			// A recording or reading keeps its turn; do not reopen an asleep spotter
+			// on the loaded worker while waiting for that turn to finish.
+			if (this.capture || this.capturePending || this.captureClosing || this.reading) {
+				if (this.reading && this.spotting) void this.stopSpotting();
+				return;
+			}
+			if (this.spottingRetry || this.spottingSettling) return;
+			const operation = (async () => {
+				let timer: ReturnType<typeof setTimeout> | undefined;
+				const stopped = await Promise.race([
+					this.stopSpotting().then(() => true),
+					new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), VOICE_SESSION_DEFAULTS.exitGraceMs); timer.unref?.(); }),
+				]);
+				if (timer) clearTimeout(timer);
+				// A pending capture waits for this recycle; a new awake state or
+				// shutdown can instead make the recycle unnecessary.
+				if (this.closing || this.currentState !== "asleep" || this.voiceSessions.length > 0 || this.capture || this.captureClosing || this.reading) return;
+				// A worker that never acknowledges stop is cancelled by recycle, and
+				// spotting reports the failure and retries rather than waiting forever.
+				if (!stopped) this.failSpotting(new VoiceSessionError("capture"));
+				if (await worker.recycle()) this.log("worker.recycled", { reason: "voice-off" });
+			})();
+			const recycling = operation.catch((error: unknown) => this.failSpotting(error));
+			this.recycling = recycling;
+			void recycling.then(() => {
+				if (this.recycling !== recycling) return;
+				this.recycling = undefined;
+				this.refreshSpotting();
+			});
+			return;
+		}
 		if (this.shouldSpot()) this.startSpotting();
 		else void this.stopSpotting();
 	}
 
-	// Once the last voiced session leaves, retire the awake spotter before
-	// opening an asleep one. startSpotting waits for the same teardown promise.
+	// A clean spot-only worker keeps listening across the voice-off edge. A
+	// loaded worker (or an injected spotter without a worker) is retired first.
 	private sleepWithoutVoice(): void {
 		if (this.voiceSessions.length > 0 || this.currentState === "asleep") {
 			this.refreshSpotting();
 			return;
 		}
-		void this.stopSpotting();
+		if (!this.options.worker || this.options.worker.needsRecycle()) void this.stopSpotting();
 		this.setState("asleep");
 	}
 
