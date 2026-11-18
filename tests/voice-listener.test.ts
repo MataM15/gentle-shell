@@ -1699,40 +1699,65 @@ async function grantedReading(started: Started, sessionId = "s-1", readingId = "
 	return reader;
 }
 
-test("the reading's loudness reaches the subscribed display in audio time and stops on end", async () => {
+test("the reading's loudness reaches the subscribed display in audio time and stops on end", async (t) => {
 	const started = await startListener(scratch());
 	const reader = await grantedReading(started);
 	await watchDisplay(reader);
-	const overlay = { get levels() { return levelFrames(reader).map(frame => frame.type === "level" ? frame.rms : 0); } };
-	reader.send({ type: "read-levels", id: "v1", readingId: "read-1", frameMs: 50, levels: [0.3, 0.6, 0.1] });
-	assert.deepEqual(await awaitFrame(reader, (frame) => "id" in frame && frame.id === "v1"), { type: "ok", id: "v1", request: "read-levels", state: "reading" });
-	assert.deepEqual(overlay.levels, [], "a level is drawn in audio time, never at the moment it arrives");
-	const first = Date.now();
-	await waitFor(() => overlay.levels.length === 3);
-	assert.deepEqual(overlay.levels, [0.3, 0.6, 0.1], "the session receives raw output loudness");
-	assert.ok(Date.now() - first >= 80, "three values of 50 ms each take at least 100 ms, not one burst");
-	await sleep(120);
-	assert.equal(overlay.levels.length, 3, "nothing is drawn past the last value of the chunk");
+	const received = () => levelFrames(reader).map((frame) => frame.rms);
+	const expected: number[] = [];
+	const request = async (message: ListenerRequest & { id: string }): Promise<ListenerFrame> => {
+		const reply = () => reader.frames.find((frame) => "id" in frame && frame.id === message.id);
+		reader.send(message);
+		for (let i = 0; i < 100 && !reply(); i++) await new Promise<void>((resolve) => setImmediate(resolve));
+		const frame = reply();
+		assert.ok(frame, `listener did not answer ${message.id}`);
+		return frame;
+	};
+	let barriers = 0;
+	const syncLevels = async () => {
+		// The snapshot travels on the same socket, after any level already sent.
+		assert.equal((await request({ type: "status", id: `barrier-${++barriers}` })).type, "snapshot");
+	};
+	const beginChunk = async (id: string, frameMs: number, levels: number[]) => {
+		assert.deepEqual(await request({ type: "read-levels", id, readingId: "read-1", frameMs, levels }), { type: "ok", id, request: "read-levels", state: "reading" });
+		await syncLevels();
+		assert.deepEqual(received(), expected, `${id}: no level at chunk arrival (0 ms)`);
+	};
+	const nextLevel = async (id: string, index: number, value: number) => {
+		t.mock.timers.tick(49);
+		await syncLevels();
+		assert.deepEqual(received(), expected, `${id}: no new level at ${index * 50 - 1} ms`);
+		t.mock.timers.tick(1);
+		await syncLevels();
+		expected.push(value);
+		assert.deepEqual(received(), expected, `${id}: exactly one new raw level at ${index * 50} ms`);
+	};
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	try {
+		const first = [0.3, 0.6, 0.1];
+		await beginChunk("v1", 50, first);
+		for (const [index, value] of first.entries()) await nextLevel("v1", index + 1, value);
+		t.mock.timers.tick(120);
+		await syncLevels();
+		assert.deepEqual(received(), expected, "nothing is drawn past the last value of the chunk");
 
-	// A narrower frame than the ceiling is still paced at the ceiling: twenty a
-	// second, never faster.
-	reader.send({ type: "read-levels", id: "v2", readingId: "read-1", frameMs: 10, levels: [0.2, 0.2, 0.2, 0.2, 0.2] });
-	await awaitFrame(reader, (frame) => "id" in frame && frame.id === "v2");
-	const paced = Date.now();
-	await waitFor(() => overlay.levels.length === 8);
-	assert.ok(Date.now() - paced >= 200, "five ten-millisecond frames take the same quarter second twenty a second allows");
+		// A narrower frame than the ceiling is still paced at twenty a second.
+		const second = [0.2, 0.2, 0.2, 0.2, 0.2];
+		await beginChunk("v2", 10, second);
+		for (const [index, value] of second.entries()) await nextLevel("v2", index + 1, value);
 
-	// Ending the reading stops whatever is still scheduled.
-	reader.send({ type: "read-levels", id: "v3", readingId: "read-1", frameMs: 50, levels: [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9] });
-	await awaitFrame(reader, (frame) => "id" in frame && frame.id === "v3");
-	await waitFor(() => overlay.levels.length >= 9);
-	reader.send({ type: "read-end", id: "e1", readingId: "read-1", outcome: "done" });
-	await awaitFrame(reader, (frame) => "id" in frame && frame.id === "e1");
-	const atEnd = overlay.levels.length;
-	await sleep(200);
-	assert.equal(overlay.levels.length, atEnd, "no level is delivered after the reading ended");
-	reader.socket.destroy();
-	await started.listener.close();
+		// Ending after one value stops all seven remaining scheduled values.
+		await beginChunk("v3", 50, Array<number>(8).fill(0.9));
+		await nextLevel("v3", 1, 0.9);
+		assert.equal((await request({ type: "read-end", id: "e1", readingId: "read-1", outcome: "done" })).type, "ok");
+		for (let i = 0; i < 7; i++) t.mock.timers.tick(50);
+		await syncLevels();
+		assert.deepEqual(received(), expected, "no level is delivered after the reading ended");
+	} finally {
+		t.mock.timers.reset();
+		reader.socket.destroy();
+		await started.listener.close();
+	}
 });
 
 test("only the session holding this reading is accepted, and a new chunk replaces the one still scheduled", async () => {
@@ -4253,6 +4278,7 @@ test("D2: a delivered capture's refused reopen waits for exit, retries, and hear
 
 test("D2: a spotting device that repeatedly fails after opening retries with backoff", async (t) => {
 	const starts: number[] = [];
+	t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
 	const started = await startListener(scratch(), {
 		keyword: keywordOption(),
 		spot: () => ({
@@ -4263,10 +4289,28 @@ test("D2: a spotting device that repeatedly fails after opening retries with bac
 			cancel: async () => {},
 		}),
 	});
-	t.after(() => started.listener.close());
-	await waitFor(() => starts.length >= 3, 8_000);
-	assert.ok(starts[2]! - starts[1]! >= 4_900, `the second retry backs off, got ${starts[2]! - starts[1]!} ms`);
-	assert.ok(started.events.some((entry) => entry.event === "kws.failed"));
+	const flush = async () => { for (let i = 0; i < 20; i++) await Promise.resolve(); };
+	try {
+		await flush();
+		assert.deepEqual(starts, [0]);
+		const expected = [0];
+		for (const delay of [1_000, 5_000]) {
+			t.mock.timers.tick(delay - 1);
+			await flush();
+			assert.deepEqual(starts, expected, `no new start ${delay - 1} ms after failure`);
+			t.mock.timers.tick(1);
+			await flush();
+			expected.push(expected.at(-1)! + delay);
+			assert.deepEqual(starts, expected, `exactly one new start ${delay} ms after failure`);
+		}
+		// Each start opens successfully before its own capture failure.
+		assert.deepEqual(started.events.filter((entry) => entry.event === "kws.failed").map((entry) => entry.fields), [
+			{ reason: "capture" }, { reason: "capture" }, { reason: "capture" },
+		]);
+	} finally {
+		t.mock.timers.reset();
+		await started.listener.close();
+	}
 });
 
 test("D1/D2: a delivered turn, reading, automatic reopen, off and wake reach the focused session", async (t) => {
