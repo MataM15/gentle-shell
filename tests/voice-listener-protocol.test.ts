@@ -121,6 +121,22 @@ test("a transcript distinguishes a dictate result, unsolicited text and legacy f
 	}
 });
 
+test("transcript encoding fits the escaped frame and keeps whole characters", () => {
+	const text = "\u0001".repeat(10_890) + "🗣".repeat(1_000);
+	for (const captureId of [undefined, null, "\u0001".repeat(256)]) {
+		const request = { type: "transcript", text, captureId } as const;
+		const encoded = encodeListenerFrame(request).slice(0, -1);
+		assert.ok(Buffer.byteLength(encoded) <= LISTENER_MAX_LINE);
+		const frame = parseListenerFrameLine(encoded);
+		assert.ok(frame?.type === "transcript" && frame.truncated);
+		assert.equal(frame.captureId, captureId);
+		assert.ok(text.startsWith(frame.text) && frame.text.length < text.length);
+		assert.ok(!/[\uD800-\uDBFF]$/.test(frame.text), "a cut cannot split a surrogate pair");
+		const next = String.fromCodePoint(text.codePointAt(frame.text.length)!);
+		assert.ok(Buffer.byteLength(line({ ...frame, text: frame.text + next })) > LISTENER_MAX_LINE);
+	}
+});
+
 test("a wake says so on the voice-on frame, and a frame written before it still parses (S7, S11)", () => {
 	// A session hears voice-on from the menu, from its own set-voice and from a
 	// spoken wake alike; only the spoken one starts a conversation, so only it

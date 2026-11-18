@@ -81,7 +81,7 @@ export interface WarmVoiceWorkerOptions {
 	onNativeError?: (error: NativeCaptureError) => void;
 	// Tests only: the install check and launch, the process and its script.
 	prepare?: () => Promise<{ root: string; request: Record<string, unknown> }>;
-	spawn?: (executable: string, args: string[], options: VoiceWorkerSpawnOptions) => VoiceWorkerChild;
+	spawn?: (executable: string, args: string[], options: VoiceWorkerSpawnOptions) => VoiceWorkerChild & { pid?: number };
 	workerPath?: string;
 }
 
@@ -100,12 +100,14 @@ export interface WarmVoiceWorker {
 	recycle(graceMs?: number): Promise<boolean>;
 	// Closes the worker, killing it if it has not exited within graceMs.
 	close(graceMs?: number): Promise<void>;
+	// A rejected close is not proof of exit. The listener uses this to retain its lock.
+	unclosedChild(): { pid?: number; closed: Promise<void> } | undefined;
 }
 
 const fail = (code: VoiceSessionErrorCode) => new VoiceSessionError(code);
 
 interface Live {
-	child: VoiceWorkerChild;
+	child: VoiceWorkerChild & { pid?: number };
 	closed: Promise<void>;
 	exited: boolean;
 	transcribed: boolean;
@@ -161,20 +163,26 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 	let live: Live | undefined;
 	let current: Capture | undefined;
 	let retiring: Promise<void> | undefined;
+	let retiringEntry: Live | undefined;
 	let idleTimer: ReturnType<typeof setTimeout> | undefined;
 
 	// All callers share a bounded wait, but only a real exit clears the fence.
 	// A rejected wait therefore keeps starts failing rather than permitting a
 	// replacement child to open the microphone over the old one.
-	const retire = (entry: Live, graceMs: number): Promise<void> => {
+	const retire = (entry: Live, graceMs: number): Promise<void> | undefined => {
+		if (live !== entry) return retiringEntry === entry ? retiring : undefined;
 		live = undefined;
+		retiringEntry = entry;
 		const waiting = new Promise<void>((resolve, reject) => {
 			const deadline = setTimeout(() => reject(fail("worker-exited")), graceMs > 0 ? graceMs * 2 : VOICE_SESSION_DEFAULTS.exitGraceMs);
 			const killTimer = graceMs > 0 ? setTimeout(() => kill(entry), graceMs) : undefined;
 			void entry.closed.then(() => {
 				clearTimeout(deadline);
 				if (killTimer !== undefined) clearTimeout(killTimer);
-				if (retiring === waiting) retiring = undefined;
+				if (retiring === waiting) {
+					retiring = undefined;
+					retiringEntry = undefined;
+				}
 				resolve();
 			});
 		});
@@ -208,20 +216,26 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 		// replacement must still pass the worker's separate retirement fence.
 		if (releaseAfter) void releaseAfter.then(capture.release, capture.release);
 		else capture.release();
-		if (!current && live && !live.exited) armIdle();
+		if (!current && live && !live.exited) armIdle(live);
 	};
-	const arm = (capture: Capture, ms: number) => {
+	const arm = (capture: Capture, ms: number, state: VoiceSessionState = capture.state) => {
+		const entry = capture.entry;
+		if (capture.settled || current !== capture || !entry || live !== entry || capture.state !== state) return;
 		if (capture.timer) clearTimeout(capture.timer);
-		capture.timer = unref(setTimeout(() => {
-			const entry = capture.entry;
-			const retirement = entry ? retire(entry, 0) : undefined;
+		const timer = unref(setTimeout(() => {
+			if (capture.settled || current !== capture || live !== entry || capture.timer !== timer) return;
+			const retirement = retire(entry, 0);
 			settle(capture, { error: fail("timeout") }, retirement);
-			if (entry) kill(entry);
+			kill(entry);
 		}, ms));
+		capture.timer = timer;
 	};
-	const armIdle = () => {
+	const armIdle = (entry: Live) => {
 		if (idleTimer) clearTimeout(idleTimer);
-		idleTimer = unref(setTimeout(() => void close().catch(() => {}), idleMs));
+		const timer = unref(setTimeout(() => {
+			if (idleTimer === timer && live === entry && !current) void close().catch(() => {});
+		}, idleMs));
+		idleTimer = timer;
 	};
 	const kill = (entry: Live | undefined = live) => {
 		try {
@@ -255,14 +269,15 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 			case "recording":
 				if (capture.spot || capture.state !== "starting") return protocolError();
 				setState(capture, "recording");
-				arm(capture, VOICE_SESSION_DEFAULTS.maxRecordingMs + RECORDING_MARGIN_MS);
+				// An observer can synchronously stop or cancel this capture.
+				arm(capture, VOICE_SESSION_DEFAULTS.maxRecordingMs + RECORDING_MARGIN_MS, "recording");
 				capture.recording.resolve();
 				return;
 			case "spotting":
 				if (!capture.spot || capture.state !== "starting") return protocolError();
-				setState(capture, "recording");
 				// No limit: it listens until a command is heard or it is told to stop.
 				if (capture.timer) clearTimeout(capture.timer);
+				setState(capture, "recording");
 				capture.recording.resolve();
 				return;
 			case "command":
@@ -336,7 +351,7 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 					try { diagnosticCapture.onKeywordRejected(rejected); } catch { /* diagnostics are advisory */ }
 				} else if (live === entry) protocolError();
 			}
-			if (buffered.length > MAX_LINE) protocolError();
+			if (live === entry && buffered.length > MAX_LINE) protocolError();
 		});
 		// Native libraries can print paths or device names: only accept fixed,
 		// complete diagnostic lines. Oversized lines are discarded until newline.
@@ -510,6 +525,10 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 
 	return {
 		close,
+		unclosedChild: () => {
+			const entry = live ?? retiringEntry;
+			return entry && !entry.exited ? { pid: entry.child.pid, closed: entry.closed } : undefined;
+		},
 		needsRecycle: () => Boolean(live?.transcribed),
 		recycle,
 		session: (sessionOptions) => open(sessionOptions),

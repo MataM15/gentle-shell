@@ -46,6 +46,9 @@ const listener = new VoiceListener({
 	// they are needed and the warm worker publishes them only then.
 	dictation: warm ? ({ onStateChange, endpoint, levels, onLevel, kws, onKeywordRejected }) => warm.session({ onStateChange, endpoint, levels, onLevel, kws, onKeywordRejected }) : undefined,
 	worker: warm,
+	// A surviving child must not keep the listener process (or its pipes) alive.
+	// Exit only after confirming worker closure or persisting a surviving child's PID.
+	onExit: () => process.exit(0),
 	// Spotting shares the warm worker while asleep, between turns and during readings.
 	keyword: keywordOption,
 	spot: warm && keywordOption ? (onKeywordRejected) => warm.spot({ kws: keywordOption, onKeywordRejected }) : undefined,
@@ -56,9 +59,9 @@ const stop = (reason) => {
 	if (stopping) return;
 	stopping = true;
 	// Listener shutdown also closes the worker it owns.
-	void listener.close(reason).catch(() => {}).then(() => process.exit(0));
+	void listener.close(reason).catch(() => {});
 };
-for (const signal of ["SIGTERM", "SIGINT"]) process.once(signal, () => stop("shutdown"));
+for (const signal of ["SIGTERM", "SIGINT"]) process.on(signal, () => stop("shutdown"));
 // The parent session going away must not leave a microphone owner behind.
 process.once("disconnect", () => stop("shutdown"));
 

@@ -7,6 +7,7 @@ import { basename, dirname, join } from "node:path";
 import test, { after } from "node:test";
 import {
 	buildVoiceKeywordOption,
+	clearStaleListenerLock,
 	createHerdrFocus,
 	listenerLockStale,
 	listenerPaths,
@@ -3452,6 +3453,7 @@ test("a reading waits for a cancelled capture's microphone teardown (S15, JD-A-0
 // Exercise the real warm-worker handoff with fake child processes: a cancelled
 // child deliberately holds its microphone until the test emits its close.
 class GatedWarmChild extends EventEmitter {
+	pid?: number;
 	readonly received: Array<Record<string, unknown>> = [];
 	readonly signals: string[] = [];
 	readonly stdout = new EventEmitter();
@@ -3511,6 +3513,7 @@ async function recycleFixture(t: import("node:test").TestContext, options: { fai
 			return warm.recycle(options.recycleGraceMs);
 		},
 		close: async () => { closeCalls++; await warm.close(); },
+		unclosedChild: warm.unclosedChild,
 	};
 	const kws = keywordOption();
 	const started = await startListener(scratch(), {
@@ -3690,6 +3693,53 @@ test("cancelling during prepare after failed retirement does not hang the next c
 	assert.deepEqual(framesOf(f.client, "capture").at(-1), { type: "capture", phase: "failed", code: "worker-exited" });
 	assert.equal(old.exited, false);
 	assert.equal(f.children.length, 1);
+});
+
+test("shutdown cannot hand the listener lock to a replacement while its worker still owns the microphone", async (t) => {
+	const f = await recycleFixture(t);
+	const old = f.children[0]!;
+	old.holdStop = true;
+	old.holdClose = true;
+	old.kill = (signal: string) => { old.signals.push(signal); return true; };
+	f.worker.close = () => f.warm.close(20);
+	const closing = f.started.listener.close("shutdown");
+	const replacement = new VoiceListener({ dir: f.started.listener.paths.dir });
+	let bound = false;
+	try {
+		await waitFor(() => old.signals.includes("SIGKILL"));
+		await sleep(80);
+		assert.equal(old.exited, false);
+		await assert.rejects(replacement.listen().then(() => { bound = true; }), /voice_listener_busy/);
+	} finally {
+		old.exit();
+		await closing;
+		if (bound) await replacement.close();
+	}
+});
+
+test("a shutdown lock can be reclaimed once the surviving child exits", async (t) => {
+	const f = await recycleFixture(t);
+	const old = f.children[0]!;
+	old.pid = process.pid; // Fake a live PID for the shutdown fence; signals are fake too.
+	old.holdStop = true;
+	old.holdClose = true;
+	old.kill = (signal) => { old.signals.push(signal); return true; };
+	f.worker.close = () => f.warm.close(20);
+	const paths = f.started.listener.paths;
+	await f.started.listener.close("shutdown");
+	assert.equal(old.exited, false, "the listener finishes shutdown without waiting indefinitely");
+	const lock = readListenerLock(paths);
+	assert.ok(lock, "shutdown retains its lock");
+	assert.equal(lock.workerPid, old.pid);
+	const afterListenerExit = { now: lock.heartbeatAt + 60_000, isAlive: (pid: number) => pid === old.pid && !old.exited };
+	assert.equal(listenerLockStale({ ...lock, pid: old.pid + 1 }, afterListenerExit), false, "only the worker's PID still matters");
+	const replacement = new VoiceListener({ dir: paths.dir, now: () => afterListenerExit.now });
+	await assert.rejects(replacement.listen(), /voice_listener_busy/, "a stale heartbeat cannot override the live child PID");
+	assert.equal(clearStaleListenerLock(paths, afterListenerExit), false);
+	old.exit();
+	assert.equal(clearStaleListenerLock(paths, afterListenerExit), true, "a starter can reclaim the persisted lock when the child PID is gone");
+	await replacement.listen();
+	await replacement.close();
 });
 
 test("a fresh spot that fails after recycling retries and hears wake", async (t) => {

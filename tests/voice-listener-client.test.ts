@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { createSessionListenerLink, cutListenerReading, ensureListener, LISTENER_DICTATE_TIMEOUT_MS, listenerReadingTurn, sessionDisplayLabel, SESSION_LABEL_MAX, VoiceListenerClient, type ListenerSession, type ListenerWakeReservation, type SessionDictation } from "../lib/voice-listener-client.ts";
 import { VoiceSessionError, type VoiceSessionErrorCode, type VoiceSessionState } from "../lib/voice-session.ts";
 import { listenerPaths, readListenerLock, takeListenerLock, VoiceListener, type ListenerDictation, type ListenerDictationRequest } from "../lib/voice-listener.ts";
-import { encodeListenerFrame, parseListenerRequestLine, type ListenerFrame } from "../lib/voice-listener-protocol.ts";
+import { encodeListenerFrame, parseListenerRequestLine, VOICE_LISTENER_SCHEMA, type ListenerFrame } from "../lib/voice-listener-protocol.ts";
 
 // The session side of the one voice listener (S6, slice A): join the running
 // listener, start it once when it is not there, survive a stale socket or a
@@ -1070,6 +1070,35 @@ test("a focus fallback never settles the recipient's new capture", async () => {
 		recipient.close();
 		await server.close();
 	}
+});
+
+test("capture id negotiation does not discard a valid near-limit transcript", async () => {
+	const { MAX_LINE, parseWorkerLine, VOICE_WORKER_SCHEMA } = await import("../lib/voice-session.ts");
+	const text = "x" + "\u0001".repeat(10_906) + "x";
+	const workerLine = JSON.stringify({ schema: VOICE_WORKER_SCHEMA, type: "result", text, truncated: true });
+	assert.ok(workerLine.length <= MAX_LINE && parseWorkerLine(workerLine));
+	const dir = scratch();
+	const server = new VoiceListener({ dir, dictation: (request) => {
+		const capture = fakeCapture({ text }).factory(request);
+		return { ...capture, stop: async () => ({ ...await capture.stop(), truncated: true }) };
+	} });
+	const received: ListenerFrame[] = [];
+	const client = new VoiceListenerClient({ dir, session: session("s-1"), onFrame: (frame) => {
+		if (frame.type === "transcript") received.push(frame);
+	} });
+	await server.listen();
+	try {
+		await client.connect();
+		await client.request({ type: "dictate", mode: "dictation" });
+		await client.request({ type: "stop" });
+		assert.equal(received.length, 1, "the client receives the transcript before stop returns");
+		const frame = received[0]!;
+		assert.ok(frame.type === "transcript" && frame.truncated);
+		assert.equal(frame.captureId, "2");
+		assert.ok(text.startsWith(frame.text) && frame.text.length < text.length);
+		assert.ok(Buffer.byteLength(encodeListenerFrame(frame).trimEnd()) <= MAX_LINE);
+		assert.ok(Buffer.byteLength(JSON.stringify({ schema: VOICE_LISTENER_SCHEMA, ...frame, text: text.slice(0, frame.text.length + 1) })) > MAX_LINE, "only cut what cannot fit");
+	} finally { client.close(); await server.close(); }
 });
 
 test("a new client still accepts an unmarked transcript from a legacy listener", async () => {

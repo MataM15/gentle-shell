@@ -45,6 +45,36 @@ class FakeWorker extends EventEmitter {
 	}
 }
 
+nodeTest("a reentrant recording cancel cannot let its old timer detach a later spotter", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const h = harness();
+	let cancelled: Promise<void> | undefined;
+	const first = h.warm.session({ onStateChange: (state) => {
+		if (state === "recording") cancelled = first.cancel();
+	} });
+	const initial = assert.rejects(first.start(), { code: "cancelled" });
+	try {
+		await Promise.resolve();
+		const old = h.workers[0]!;
+		old.say({ type: "recording" });
+		await initial;
+		await cancelled;
+		const spotting = h.warm.spot({ kws: KWS }).start();
+		await Promise.resolve();
+		const second = h.workers[1]!;
+		second.say({ type: "spotting" });
+		await spotting;
+		t.mock.timers.tick(VOICE_SESSION_DEFAULTS.maxRecordingMs + 10_000);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		await h.warm.close();
+		assert.equal(second.exited, true, "the current spotter cannot be lost behind the previous capture's timer");
+		assert.deepEqual(old.signals, [], "no cancelled recording timer kills the old worker");
+	} finally {
+		for (const child of h.workers) child.exit();
+		await h.warm.close();
+	}
+});
+
 const BASE_REQUEST = { schema: VOICE_WORKER_SCHEMA, type: "start", target: "linux-x64", maxRecordingMs: 120000, numThreads: 4, runtime: { root: "/r", files: [] }, model: { root: "/m", files: {} } };
 
 function harness(options: { idleMs?: number; prepareError?: VoiceSessionError; onNativeError?: (error: { phase: "open" | "stream"; kind: string }) => void } = {}) {

@@ -322,4 +322,26 @@ export const parseListenerRequestLine = (line: string): ListenerRequest | undefi
 
 export const parseListenerFrameLine = (line: string): ListenerFrame | undefined => decode(line, FRAME_SPECS) as ListenerFrame | undefined;
 
-export const encodeListenerFrame = (frame: ListenerRequest | ListenerFrame): string => `${JSON.stringify({ schema: VOICE_LISTENER_SCHEMA, ...frame })}\n`;
+const encodeLine = (frame: ListenerRequest | ListenerFrame): string => JSON.stringify({ schema: VOICE_LISTENER_SCHEMA, ...frame });
+
+export function encodeListenerFrame(frame: ListenerRequest | ListenerFrame): string {
+	const line = encodeLine(frame);
+	if (frame.type !== "transcript" || (frame.text.length <= LISTENER_MAX_TEXT && Buffer.byteLength(line) <= LISTENER_MAX_LINE)) return `${line}\n`;
+
+	// Size the actual escaped wire line (including captureId and truncated),
+	// not just the text. Search whole code points so a cut never splits a pair.
+	const points = Array.from(frame.text.slice(0, LISTENER_MAX_TEXT + 1));
+	let low = 0;
+	let high = points.length;
+	let fitted = encodeLine({ ...frame, text: "", truncated: true });
+	while (low < high) {
+		const middle = Math.ceil((low + high) / 2);
+		const text = points.slice(0, middle).join("");
+		const candidate = encodeLine({ ...frame, text, truncated: true });
+		if (text.length <= LISTENER_MAX_TEXT && Buffer.byteLength(candidate) <= LISTENER_MAX_LINE) {
+			low = middle;
+			fitted = candidate;
+		} else high = middle - 1;
+	}
+	return `${fitted}\n`;
+}
