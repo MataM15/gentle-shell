@@ -668,6 +668,14 @@ carry the time, the process id and the session id, and sizes instead of text:
 no reply or transcript text is written. Past 512 KB the log moves to
 `voice-events.log.1`.
 
+When the microphone stream itself ends a capture (`capture.failed` or
+`kws.failed` with `capture`), a `capture.native` line names why: its `phase`
+is `open` when the stream could not be opened and `stream` when an open one
+failed, and its `kind` is one of a fixed list of native error kinds
+(`DEVICE_NOT_AVAILABLE`, `STREAM_INVALIDATED`, `BACKEND_ERROR` and the like,
+or `UNKNOWN`). It never carries the native message, a path or a device name,
+and it can be written a moment after the failure it explains.
+
 An `input` line names its `source` and also says `dictated: true` when the
 submitted message still carried the transcript a dictation inserted, which is
 what makes it a spoken turn. A `voice.command` line carries the command `name`

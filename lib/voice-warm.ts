@@ -39,6 +39,12 @@ export const WARM_WORKER_DEFAULTS = {
 } as const;
 
 const RECORDING_MARGIN_MS = 10_000;
+const MAX_NATIVE_DIAGNOSTIC_LINE = 128;
+const NATIVE_CAPTURE_KINDS = [
+	"DEVICE_BUSY", "DEVICE_CHANGED", "DEVICE_NOT_AVAILABLE", "HOST_UNAVAILABLE", "INVALID_INPUT", "PERMISSION_DENIED", "REALTIME_DENIED", "RESOURCE_EXHAUSTED", "STREAM_INVALIDATED", "UNSUPPORTED_CONFIG", "UNSUPPORTED_OPERATION", "BACKEND_ERROR", "CALLBACK_FAILED", "OTHER", "UNKNOWN",
+] as const;
+
+export interface NativeCaptureError { readonly phase: "open" | "stream"; readonly kind: typeof NATIVE_CAPTURE_KINDS[number] }
 
 export type KeywordRejectionReason = "lead" | "speech-after" | "no-utterance" | "unknown-command" | "superseded" | "stopped" | "ended" | "cancelled";
 export interface KeywordRejection { readonly command: string; readonly reason: KeywordRejectionReason }
@@ -71,6 +77,8 @@ export interface WarmVoiceWorkerOptions {
 	target: VoiceTarget;
 	env?: NodeJS.ProcessEnv;
 	idleMs?: number;
+	// Audio-free, fixed-code diagnostics from the worker's stderr; advisory only.
+	onNativeError?: (error: NativeCaptureError) => void;
 	// Tests only: the install check and launch, the process and its script.
 	prepare?: () => Promise<{ root: string; request: Record<string, unknown> }>;
 	spawn?: (executable: string, args: string[], options: VoiceWorkerSpawnOptions) => VoiceWorkerChild;
@@ -316,8 +324,33 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 			}
 			if (buffered.length > MAX_LINE) protocolError();
 		});
-		// Native libraries may print paths or device names: drained, never shown.
-		child.stderr?.on("data", () => {});
+		// Native libraries can print paths or device names: only accept fixed,
+		// complete diagnostic lines. Oversized lines are discarded until newline.
+		const stderrDecoder = new StringDecoder("utf8");
+		let stderrBuffered = "";
+		let discardStderrLine = false;
+		child.stderr?.on("data", (chunk: unknown) => {
+			const text = typeof chunk === "string" ? chunk : stderrDecoder.write(chunk as Buffer);
+			let at = 0;
+			while (at < text.length) {
+				const newline = text.indexOf("\n", at);
+				const end = newline === -1 ? text.length : newline;
+				if (!discardStderrLine) {
+					if (stderrBuffered.length + end - at > MAX_NATIVE_DIAGNOSTIC_LINE) { stderrBuffered = ""; discardStderrLine = true; }
+					else stderrBuffered += text.slice(at, end);
+				}
+				if (newline === -1) break;
+				if (!discardStderrLine) {
+					const match = /^gentle-voice-diag capture (open|stream):([A-Z_]+)$/.exec(stderrBuffered);
+					if (match && (NATIVE_CAPTURE_KINDS as readonly string[]).includes(match[2]!)) {
+						try { options.onNativeError?.({ phase: match[1] as NativeCaptureError["phase"], kind: match[2] as NativeCaptureError["kind"] }); } catch { /* diagnostics are advisory */ }
+					}
+				}
+				stderrBuffered = "";
+				discardStderrLine = false;
+				at = newline + 1;
+			}
+		});
 		child.stdin?.on("error", () => {});
 		child.once("error", () => {
 			/* close follows a spawn error */

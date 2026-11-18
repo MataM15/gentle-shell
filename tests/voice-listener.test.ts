@@ -3171,6 +3171,40 @@ class GatedWarmChild extends EventEmitter {
 	exit() { if (!this.exited) { this.exited = true; this.emit("close", 0, null); } }
 }
 
+test("late native diagnostics from dictation and spotting reach the listener event log", async (t) => {
+	for (const mode of ["dictation", "spot"] as const) {
+		await t.test(mode, async (st) => {
+			const children: GatedWarmChild[] = [];
+			const kws = keywordOption();
+			const warm = createWarmVoiceWorker({
+				target: "linux-x64", env: {},
+				prepare: async () => ({ root: "/fake", request: { schema: VOICE_WORKER_SCHEMA, type: "start" } }),
+				spawn: () => { const child = new GatedWarmChild(); children.push(child); return child; },
+				onNativeError: (error) => started.listener.reportNativeCaptureError(error),
+			});
+			const started = await startListener(scratch(), {
+				...(mode === "spot" ? { keyword: kws, spot: (onKeywordRejected: Parameters<ListenerSpotFactory>[0]) => warm.spot({ kws, onKeywordRejected }) } : {}),
+				dictation: ({ onStateChange, endpoint, levels, onLevel, kws: option, onKeywordRejected }) => warm.session({ onStateChange, endpoint, levels, onLevel, kws: option, onKeywordRejected }),
+			});
+			st.after(async () => { for (const child of children) child.exit(); await started.listener.close(); await warm.close(); });
+			const client = await started.client();
+			client.hello("s-1", "w1:p1");
+			await awaitFrame(client, (frame) => frame.type === "welcome");
+			if (mode === "dictation") {
+				client.send({ type: "dictate", mode: "dictation" });
+				await awaitFrame(client, (frame) => frame.type === "capture" && frame.phase === "recording");
+			}
+			await waitFor(() => children[0]?.received.some((message) => message.type === "start") === true);
+			children[0]!.say({ type: "error", code: "capture" });
+			if (mode === "spot") await waitFor(() => started.events.some((entry) => entry.event === "kws.failed"));
+			else await awaitFrame(client, (frame) => frame.type === "capture" && frame.phase === "failed");
+			children[0]!.stderr.emit("data", "gentle-voice-diag capture stream:DEVICE_BUSY\n");
+			assert.deepEqual(started.events.filter((entry) => entry.event === "capture.native"), [{ event: "capture.native", fields: { phase: "stream", kind: "DEVICE_BUSY" } }]);
+			assert.equal(started.events.filter((entry) => entry.event === (mode === "spot" ? "kws.failed" : "capture.failed")).length, 1);
+		});
+	}
+});
+
 test("a reading waits for a failed warm worker to exit before taking the microphone (S15, L37)", async (t) => {
 	const children: GatedWarmChild[] = [];
 	const warm = createWarmVoiceWorker({

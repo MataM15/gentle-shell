@@ -47,7 +47,7 @@ class FakeWorker extends EventEmitter {
 
 const BASE_REQUEST = { schema: VOICE_WORKER_SCHEMA, type: "start", target: "linux-x64", maxRecordingMs: 120000, numThreads: 4, runtime: { root: "/r", files: [] }, model: { root: "/m", files: {} } };
 
-function harness(options: { idleMs?: number; prepareError?: VoiceSessionError } = {}) {
+function harness(options: { idleMs?: number; prepareError?: VoiceSessionError; onNativeError?: (error: { phase: "open" | "stream"; kind: string }) => void } = {}) {
 	const workers: FakeWorker[] = [];
 	const launches: Array<{ executable: string; args: string[]; cwd: string; env: Record<string, unknown> }> = [];
 	let prepares = 0;
@@ -56,6 +56,7 @@ function harness(options: { idleMs?: number; prepareError?: VoiceSessionError } 
 		env: { HOME: "/home/someone", SECRET_TOKEN: "abc" },
 		workerPath: "/fixed/voice-worker.cjs",
 		idleMs: options.idleMs ?? 60_000,
+		onNativeError: options.onNativeError,
 		prepare: async () => {
 			prepares++;
 			if (options.prepareError) throw options.prepareError;
@@ -74,6 +75,54 @@ function harness(options: { idleMs?: number; prepareError?: VoiceSessionError } 
 	};
 	return { warm, workers, launches, until, prepares: () => prepares };
 }
+
+test("native stderr accepts only bounded, complete allowlisted lines even after a capture retires", async () => {
+	const errors: Array<{ phase: string; kind: string }> = [];
+	const h = harness({ onNativeError: (error) => errors.push(error) });
+	const capture = h.warm.session({ onStateChange: () => {} });
+	const started = capture.start();
+	await h.until(() => h.workers.length === 1 && h.workers[0]!.received.length === 1);
+	const child = h.workers[0]!;
+	try {
+		child.say({ type: "recording" });
+		await started;
+		child.stderr.emit("data", Buffer.from("gentle-voice-diag capture op"));
+		child.stderr.emit("data", Buffer.from("en:DEVICE_BUSY\nnoise /private/device\n"));
+		child.stderr.emit("data", "gentle-voice-diag capture stream:XRUN\ngentle-voice-diag capture open:UNKNOWN extra\n gentle-voice-diag capture open:OTHER\ngentle-voice-diag capture open:OTHER\r\n");
+		child.stderr.emit("data", "x".repeat(10_000));
+		child.stderr.emit("data", "gentle-voice-diag capture stream:OTHER\n");
+		const result = capture.stop();
+		child.say({ type: "error", code: "capture" });
+		await assert.rejects(result, (error: unknown) => error instanceof VoiceSessionError && error.code === "capture");
+		child.stderr.emit("data", "gentle-voice-diag capture stream:UNKNOWN\n");
+		assert.deepEqual(errors, [{ phase: "open", kind: "DEVICE_BUSY" }, { phase: "stream", kind: "UNKNOWN" }]);
+	} finally {
+		child.exit();
+		await h.warm.close();
+	}
+});
+
+test("a throwing native diagnostic observer cannot disturb a recording", async () => {
+	let called = 0;
+	const h = harness({ onNativeError: () => { called++; throw new Error("observer"); } });
+	const capture = h.warm.session({ onStateChange: () => {} });
+	const started = capture.start();
+	await h.until(() => h.workers.length === 1 && h.workers[0]!.received.length === 1);
+	const child = h.workers[0]!;
+	try {
+		child.say({ type: "recording" });
+		await started;
+		child.stderr.emit("data", "gentle-voice-diag capture stream:OTHER\n");
+		const result = capture.stop();
+		child.say({ type: "transcribing" });
+		child.say({ type: "result", text: "hola", truncated: false });
+		assert.deepEqual(await result, { text: "hola", truncated: false });
+		assert.equal(called, 1);
+	} finally {
+		child.exit();
+		await h.warm.close();
+	}
+});
 
 // One full recording on the current worker.
 async function record(h: ReturnType<typeof harness>, text: string, endpoint = { endOfSpeechMs: 1200, noSpeechMs: 8000 }) {

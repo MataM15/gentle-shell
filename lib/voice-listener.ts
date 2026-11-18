@@ -29,7 +29,7 @@ import type { CueName, CuePlayer, CueResult } from "./voice-cues.ts";
 import { KWS_MODEL_MANIFEST, KWS_SPOTTER_FILES, parseVoiceKeywords, VOICE_KEYWORD_ASSET, type VoiceKeywordCommand, type VoiceKeywordSet, type VoiceModelFile } from "./voice-artifacts.ts";
 import { resolveVoiceKeywordSpotterPaths, type VoiceKeywordSpotterPaths } from "./voice-install.ts";
 import { VoiceSessionError, type VoiceKeywordOption, type VoiceSessionState, type VoiceTranscript } from "./voice-session.ts";
-import type { KeywordRejection } from "./voice-warm.ts";
+import type { KeywordRejection, NativeCaptureError } from "./voice-warm.ts";
 
 // One voice listener for every Pi session (S6, odd/notes/voice-listener-design.md).
 // It owns the process, the microphone and the shared turn: a single instance per
@@ -539,6 +539,12 @@ export class VoiceListener {
 		this.readLeaseMs = options.readLeaseMs ?? READING_LEASE_MS;
 		this.readTailMs = options.readTailMs ?? READING_TAIL_MS;
 		this.language = options.language ?? "es";
+	}
+
+	// stderr and stdout are independent: a diagnostic can arrive after the
+	// capture failed or its child was retired, and is logged independently.
+	reportNativeCaptureError({ phase, kind }: NativeCaptureError): void {
+		this.log("capture.native", { phase, kind });
 	}
 
 	get state(): ListenerState {

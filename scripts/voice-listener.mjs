@@ -21,7 +21,7 @@ const log = createVoiceLog({ dir });
 // worker, so dictate is refused and the sessions keep recording themselves.
 const diagnosis = diagnoseVoicePlatform(readVoicePlatformProbe());
 const target = diagnosis.support === "unsupported" ? undefined : diagnosis.target;
-const warm = target ? createWarmVoiceWorker({ target, env }) : undefined;
+const warm = target ? createWarmVoiceWorker({ target, env, onNativeError: (error) => listener.reportNativeCaptureError(error) }) : undefined;
 if (!warm) log("listener.capture-unavailable", { reason: diagnosis.limitations[0] ?? diagnosis.support });
 
 // The cues are played where the microphone is: this process, next to the worker.

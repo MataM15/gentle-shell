@@ -44,6 +44,9 @@ const pulseNative = (target) => `node_modules/node-cpal/bin/backend-pulseaudio/$
 const MAX_INPUT_LINE = 64 * 1024;
 const MAX_TREE_ENTRIES = 256;
 const MAX_TEXT = 16 * 1024;
+const NATIVE_CAPTURE_KINDS = new Set([
+	"DEVICE_BUSY", "DEVICE_CHANGED", "DEVICE_NOT_AVAILABLE", "HOST_UNAVAILABLE", "INVALID_INPUT", "PERMISSION_DENIED", "REALTIME_DENIED", "RESOURCE_EXHAUSTED", "STREAM_INVALIDATED", "UNSUPPORTED_CONFIG", "UNSUPPORTED_OPERATION", "BACKEND_ERROR", "CALLBACK_FAILED", "OTHER",
+]);
 const TARGET_RATE = 16000;
 // Less than a tenth of a second of audio is treated as no audio at all.
 const MIN_SECONDS = 0.1;
@@ -62,9 +65,10 @@ const SAMPLE_FORMATS = {
 };
 
 class WorkerFailure extends Error {
-	constructor(code) {
+	constructor(code, diagnostic) {
 		super(code);
 		this.code = code;
+		this.diagnostic = diagnostic;
 	}
 }
 
@@ -73,6 +77,11 @@ const fail = (code) => {
 };
 
 const isRecord = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
+const captureFailure = (phase, error) => {
+	const code = isRecord(error) ? error.code : undefined;
+	const kind = typeof code === "string" && NATIVE_CAPTURE_KINDS.has(code) ? code : "UNKNOWN";
+	return new WorkerFailure("capture", `gentle-voice-diag capture ${phase}:${kind}\n`);
+};
 const hasExactKeys = (value, keys) => isRecord(value) && Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
 const isSafeRelative = (value) => typeof value === "string" && value.split("/").every((segment) => segment !== "." && segment !== ".." && SAFE_SEGMENT.test(segment));
 const isInteger = (value, min, max) => Number.isSafeInteger(value) && value >= min && value <= max;
@@ -434,12 +443,15 @@ class WorkerSession {
 	}
 
 	// Ends the session once: closes capture, reports at most one final message.
-	async end(final) {
+	async end(final, diagnostic) {
 		if (this.state === "ended") return;
 		this.rejectPendingKws("ended");
 		this.state = "ended";
 		this.verification.abort();
 		await this.closeStream();
+		if (diagnostic) {
+			try { this.io.writeDiagnostic?.(diagnostic); } catch { /* diagnostics are advisory */ }
+		}
 		if (final) this.send(final);
 		this.exit(final?.type === "error" ? 1 : 0);
 	}
@@ -763,13 +775,13 @@ class WorkerSession {
 				// running; WASAPI reports one at start on some devices.
 				onError: (error) => {
 					if (isRecord(error) && error.code === "XRUN") return;
-					void this.fail(new WorkerFailure("capture"));
+					void this.fail(captureFailure("stream", error));
 				},
 				autoStart: true,
 				queueCapacityBuffers: 64,
 			});
-		} catch {
-			fail("capture");
+		} catch (error) {
+			throw captureFailure("open", error);
 		}
 		if (this.state !== "loading") return this.closeStream();
 		if (spot) {
@@ -908,7 +920,7 @@ class WorkerSession {
 
 	fail(error) {
 		const code = error instanceof WorkerFailure ? error.code : "internal";
-		return this.end({ type: "error", code });
+		return this.end({ type: "error", code }, error instanceof WorkerFailure ? error.diagnostic : undefined);
 	}
 }
 
@@ -972,7 +984,8 @@ if (require.main === module) {
 	const io = {
 		input: process.stdin,
 		write: (line) => process.stdout.write(line),
-		exit: (code) => process.stdout.write("", () => process.exit(code)),
+		writeDiagnostic: (line) => process.stderr.write(line),
+		exit: (code) => process.stdout.write("", () => process.stderr.write("", () => process.exit(code))),
 		loadModule: (file) => require(file),
 		platform: process.platform,
 		kernelRelease: release(),

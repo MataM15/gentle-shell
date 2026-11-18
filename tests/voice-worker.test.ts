@@ -3,17 +3,16 @@ import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Readable } from "node:stream";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
 
 // The voice worker (S1-S3) runs in its own process; here its entry function is
 // driven in-process with fake capture and recognizer modules, so no native code
 // or microphone is ever touched. The installed files it validates are real
 // files in an owned scratch directory under tmp/.
 
-const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const { runVoiceWorker } = createRequire(import.meta.url)("../scripts/voice-worker.cjs");
 
 const SCHEMA = "gentle.voice/v1";
@@ -34,9 +33,7 @@ interface Install {
 }
 
 function install(t: test.TestContext): Install {
-	const base = join(repoRoot, "tmp");
-	mkdirSync(base, { recursive: true });
-	const dir = mkdtempSync(join(base, "voice-worker-"));
+	const dir = mkdtempSync(join(tmpdir(), "voice-worker-"));
 	t.after(() => rmSync(dir, { recursive: true, force: true }));
 	const runtimeRoot = join(dir, "runtime");
 	for (const file of [SHERPA_ENTRY, CPAL_ENTRY, NATIVE, PULSE_ENTRY, PULSE_NATIVE, KWS_ENTRY]) {
@@ -104,6 +101,7 @@ interface FakeOptions {
 	defaults?: { sampleRate: number; channels: number; sampleFormat: string };
 	formats?: string[];
 	loadError?: string;
+	openError?: unknown;
 	recognizerError?: string;
 	text?: string;
 	// The fake keyword spotter reports `keyword` once it was fed `at` samples of
@@ -116,6 +114,8 @@ function harness(t: test.TestContext, fake: FakeOptions = {}, io: Record<string,
 	const input = new EventEmitter();
 	const messages: Array<Record<string, unknown>> = [];
 	const raw: string[] = [];
+	const diagnostics: string[] = [];
+	const output: string[] = [];
 	const loaded: string[] = [];
 	const streams: FakeStream[] = [];
 	const recognizers: Array<{ config: any; waves: Array<{ sampleRate: number; samples: Float32Array }>; decodes: number }> = [];
@@ -125,6 +125,7 @@ function harness(t: test.TestContext, fake: FakeOptions = {}, io: Record<string,
 		getDefaultInputConfig: () => fake.defaults ?? { sampleRate: 48000, channels: 2, sampleFormat: "i16" },
 		getSupportedFormats: () => fake.formats ?? ["i16"],
 		createInputStream: async (options: FakeStream["options"]) => {
+			if ("openError" in fake) throw fake.openError;
 			const stream: FakeStream = { options, closes: 0, close: async () => void stream.closes++ };
 			streams.push(stream);
 			return stream;
@@ -192,8 +193,10 @@ function harness(t: test.TestContext, fake: FakeOptions = {}, io: Record<string,
 		input,
 		write: (line: string) => {
 			raw.push(line);
+			output.push(`stdout:${line}`);
 			messages.push(JSON.parse(line));
 		},
+		writeDiagnostic: (line: string) => { diagnostics.push(line); output.push(`stderr:${line}`); },
 		exit: (code: number) => {
 			exitCode = code;
 		},
@@ -217,7 +220,7 @@ function harness(t: test.TestContext, fake: FakeOptions = {}, io: Record<string,
 		assert.ok(predicate(), `timed out waiting for ${label}; messages: ${JSON.stringify(messages)}`);
 	};
 	const types = () => messages.map((message) => message.type);
-	return { paths, input, messages, raw, loaded, streams, recognizers, spotters, done, send, waitFor, types, exitCode: () => exitCode };
+	return { paths, input, messages, raw, diagnostics, output, loaded, streams, recognizers, spotters, done, send, waitFor, types, exitCode: () => exitCode };
 }
 
 test("WSL uses the shipped PulseAudio backend without loading ALSA", async (t) => {
@@ -447,6 +450,48 @@ test("reports a missing microphone, an unusable format and empty audio", async (
 // node-cpal reports stream errors as CpalError objects with a string code.
 const cpalError = (code: string, message: string) => Object.assign(new Error(message), { code });
 
+test("capture diagnostics report only allowed native stream kinds immediately before the unchanged error frame", async (t) => {
+	const kinds = ["DEVICE_BUSY", "DEVICE_CHANGED", "DEVICE_NOT_AVAILABLE", "HOST_UNAVAILABLE", "INVALID_INPUT", "PERMISSION_DENIED", "REALTIME_DENIED", "RESOURCE_EXHAUSTED", "STREAM_INVALIDATED", "UNSUPPORTED_CONFIG", "UNSUPPORTED_OPERATION", "BACKEND_ERROR", "CALLBACK_FAILED", "OTHER"];
+	const cases: Array<[unknown, string]> = [
+		...kinds.map((kind): [unknown, string] => [cpalError(kind, "private device and path"), kind]),
+		[cpalError("unsafe\nprivate", "private"), "UNKNOWN"],
+		[new Error("private"), "UNKNOWN"],
+		[undefined, "UNKNOWN"],
+	];
+	for (const [error, kind] of cases) {
+		await t.test(kind, async (st) => {
+			const worker = harness(st);
+			worker.send(startRequest(worker.paths));
+			await worker.waitFor(() => worker.types().includes("recording"));
+			worker.streams[0]!.options.onError(error);
+			worker.streams[0]!.options.onError(error);
+			await worker.done;
+			assert.deepEqual(worker.diagnostics, [`gentle-voice-diag capture stream:${kind}\n`]);
+			assert.deepEqual(worker.output.slice(-2), [`stderr:gentle-voice-diag capture stream:${kind}\n`, `stdout:{"schema":"${SCHEMA}","type":"error","code":"capture"}\n`]);
+			assert.equal(worker.exitCode(), 1);
+		});
+	}
+});
+
+test("a thrown native open logs its allowed kind without changing stdout", async (t) => {
+	const worker = harness(t, { openError: cpalError("DEVICE_BUSY", "private device and path") });
+	worker.send(startRequest(worker.paths));
+	await worker.done;
+	assert.deepEqual(worker.diagnostics, ["gentle-voice-diag capture open:DEVICE_BUSY\n"]);
+	assert.deepEqual(worker.output, ["stderr:gentle-voice-diag capture open:DEVICE_BUSY\n", `stdout:{"schema":"${SCHEMA}","type":"error","code":"capture"}\n`]);
+	assert.equal(worker.exitCode(), 1);
+});
+
+test("a worker io without a diagnostic writer still reports the original capture error", async (t) => {
+	const worker = harness(t, {}, { writeDiagnostic: undefined });
+	worker.send(startRequest(worker.paths));
+	await worker.waitFor(() => worker.types().includes("recording"));
+	worker.streams[0]!.options.onError(cpalError("DEVICE_BUSY", "private"));
+	await worker.done;
+	assert.deepEqual(worker.messages.at(-1), { schema: SCHEMA, type: "error", code: "capture" });
+	assert.equal(worker.exitCode(), 1);
+});
+
 test("a buffer underrun or overrun keeps capturing and the dictation is still transcribed", async (t) => {
 	const worker = harness(t);
 	worker.send(startRequest(worker.paths));
@@ -462,6 +507,7 @@ test("a buffer underrun or overrun keeps capturing and the dictation is still tr
 	assert.deepEqual(worker.types(), ["recording", "transcribing", "result"]);
 	assert.equal(worker.messages.at(-1)!.text, "hello world");
 	assert.equal(worker.recognizers[0]!.waves[0]!.samples.length, 3200);
+	assert.deepEqual(worker.diagnostics, [], "XRUN is not a capture failure");
 	assert.equal(stream!.closes, 1);
 	assert.equal(worker.exitCode(), 0);
 });
