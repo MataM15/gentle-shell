@@ -40,6 +40,7 @@ import { BANNER_COLORS, DEFAULT_BANNER_CONFIG, readBannerConfig, readBannerConfi
 import { commandKeymapId, commandKeymapIds, effectiveKey, keymapCommand, keymapLabel, keymapSavedNotice, loadKeymaps, prepareKeymapChange, writeKeymaps, type KeymapBindings, type PiKeybindings } from "../lib/keymaps.ts";
 import { GentleAiDevBinaryOverrideError, resolveGentleAiDevBinaryOverride } from "../lib/gentle-ai-binary.ts";
 import { DOUBLE_ESC_CANCEL_HINT, floatPromptRow, framePromptLines, panelPromptRow, resolvePromptLayout, IDLE_ESC_CLEAR_HINT, PANEL_BUTTON, PANEL_LABEL_TEXT, COMMANDS_LABEL_TEXT, PROMPT_HINT, PROMPT_STATE, SHELL_PULSE_MS, SHELL_PULSE_WATCHDOG_MS, withPromptHint, workingTick, type PromptState } from "../lib/shell-prompt.ts";
+import { installPromptCopyBridge, registerPromptCopyRows } from "../lib/shell-copy-spans.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 import { oddPhaseRegistry } from "../lib/odd-phase.ts";
 import { resolveAgentHomeDirectory } from "../lib/agent-model-resolution.ts";
@@ -618,6 +619,8 @@ export class GentlePromptEditor extends CustomEditor {
 	private watchdog: NodeJS.Timeout | undefined;
 	private readonly deps: PromptEditorDeps;
 	private readonly pointerTui: TUI;
+	private copyFrame?: ReturnType<typeof registerPromptCopyRows>;
+	private readonly removeCopyBridge: () => void;
 	private floatMouseLayout?: ReturnType<typeof resolvePromptLayout>;
 	private topRowCount = 0;
 	private hoveredTopRow: number | undefined;
@@ -657,6 +660,7 @@ export class GentlePromptEditor extends CustomEditor {
 		this.selectionEngine = new SelectionEngine(this);
 		this.deps = deps;
 		this.pointerTui = tui;
+		this.removeCopyBridge = installPromptCopyBridge(tui, () => this.copyFrame);
 		this.keybindingsManager = keybindings;
 		const attachments = deps.attachments;
 		if (!attachments || !deps.readClipboardImage) return;
@@ -1445,7 +1449,8 @@ export class GentlePromptEditor extends CustomEditor {
 		this.floatMouseLayout = layout.background || layout.panel ? layout : undefined;
 		const inner = layout.nativeWidth;
 		const lines = super.render(inner);
-		if (this.getText() === "" && lines.length === 3) lines[1] = withPromptHint(lines[1], PROMPT_HINT, this.deps.fg);
+		const emptyDraft = this.getText() === "";
+		if (emptyDraft && lines.length === 3) lines[1] = withPromptHint(lines[1], PROMPT_HINT, this.deps.fg);
 		const state = this.promptState === PROMPT_STATE.WORKING && this.deps.pending() ? PROMPT_STATE.QUEUED : this.promptState;
 		// Neon keeps the shell's border role; float follows Pi's live public
 		// borderColor callback so thinking/bash mode accents survive.
@@ -1530,6 +1535,7 @@ export class GentlePromptEditor extends CustomEditor {
 			framed.push(this.deps.fg(PROMPT_FRAME_ROLE, border) + clipped +
 				" ".repeat(Math.max(0, inner - visibleWidth(clipped))) + this.deps.fg(PROMPT_FRAME_ROLE, border));
 		}
+		this.copyFrame = registerPromptCopyRows(framed, editorLines, topRows.length, borderEnd, layout, this.getPaddingX(), emptyDraft);
 		return framed;
 	}
 
@@ -1544,6 +1550,7 @@ export class GentlePromptEditor extends CustomEditor {
 
 	dispose(): void {
 		this.disposed = true;
+		this.removeCopyBridge();
 		this.clearEditorHover();
 		this.stopWatchdog();
 	}
