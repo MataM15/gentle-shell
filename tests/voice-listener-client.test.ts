@@ -181,6 +181,115 @@ test("the client reconnects with backoff and keeps its session id", async () => 
 	await server.close();
 });
 
+test("a vanished listener restarts on the existing backoff and rejoins with current voice", async () => {
+	const dir = scratch();
+	let currentVoice = true;
+	let server = new VoiceListener({ dir });
+	await server.listen();
+	const starts: number[] = [];
+	const link = createSessionListenerLink({
+		dir, session: () => session("s-1", currentVoice), backoffMs: [80, 160],
+		start: async () => { starts.push(Date.now()); server = new VoiceListener({ dir }); await server.listen(); },
+	});
+	try {
+		assert.equal(await link.ensure(), true);
+		await server.close();
+		currentVoice = false;
+		const disconnectedAt = Date.now();
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		assert.deepEqual(starts, [], "the first restart waits for reconnect backoff");
+		await waitFor(() => starts.length === 1 && server.sessionIds.includes("s-1"));
+		assert.ok(starts[0]! - disconnectedAt >= 50);
+		assert.deepEqual(server.voiceSessions, [], "hello reads the current off state");
+		const first = starts[0]!;
+		await server.close();
+		currentVoice = true;
+		await waitFor(() => starts.length === 2 && server.sessionIds.includes("s-1"));
+		assert.ok(starts[1]! - first >= 130, "unstable restart uses the next backoff");
+		assert.deepEqual(server.voiceSessions, ["s-1"]);
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		assert.equal(starts.length, 2, "one start per vanished listener");
+	} finally {
+		link.close();
+		await server.close();
+	}
+});
+
+test("a replacement listener is rejoined without starting another", async () => {
+	const dir = scratch();
+	let server = new VoiceListener({ dir });
+	await server.listen();
+	let starts = 0;
+	const link = createSessionListenerLink({ dir, session: () => session("s-1", false), backoffMs: [100], start: () => { starts++; } });
+	try {
+		assert.equal(await link.ensure(), true);
+		await server.close();
+		server = new VoiceListener({ dir });
+		await server.listen();
+		await waitFor(() => server.sessionIds.includes("s-1"));
+		assert.deepEqual(server.voiceSessions, []);
+		assert.equal(starts, 0);
+	} finally {
+		link.close();
+		await server.close();
+	}
+});
+
+test("closing a session link cancels a delayed recovery probe and cannot start a listener", async () => {
+	const dir = scratch();
+	const server = new VoiceListener({ dir });
+	await server.listen();
+	let starts = 0;
+	let probes = 0;
+	let release!: (value: boolean) => void;
+	const gate = new Promise<boolean>((resolve) => { release = resolve; });
+	const link = createSessionListenerLink({ dir, session: () => session("s-1"), backoffMs: [20], probe: async () => ++probes === 1 ? true : gate, start: () => { starts++; } });
+	try {
+		assert.equal(await link.ensure(), true);
+		await server.close();
+		await waitFor(() => probes === 2, 500);
+		link.close();
+		release(false);
+		await new Promise((resolve) => setTimeout(resolve, 80));
+		assert.equal(starts, 0);
+	} finally {
+		release(false);
+		link.close();
+		await server.close();
+	}
+});
+
+for (const outcome of ["resolve", "reject"] as const) test(`a manual rejoin supersedes a recovery probe that later ${outcome}s`, async () => {
+	const dir = scratch();
+	let server = new VoiceListener({ dir });
+	await server.listen();
+	let starts = 0;
+	let probes = 0;
+	let release!: (value: boolean) => void;
+	let reject!: (error: Error) => void;
+	const gate = new Promise<boolean>((resolve, fail) => { release = resolve; reject = fail; });
+	const link = createSessionListenerLink({ dir, session: () => session("s-1"), backoffMs: [20], probe: async () => ++probes === 1 ? true : gate, start: () => { starts++; } });
+	try {
+		assert.equal(await link.ensure(), true);
+		await server.close();
+		await waitFor(() => probes === 2, 500);
+		server = new VoiceListener({ dir });
+		await server.listen();
+		assert.equal(await link.ensure(), true);
+		if (outcome === "resolve") release(false);
+		else reject(new Error("late probe failure"));
+		await new Promise((resolve) => setTimeout(resolve, 80));
+		assert.equal(starts, 0);
+		assert.deepEqual(server.sessionIds, ["s-1"]);
+		assert.equal(server.clientCount, 1);
+		assert.equal(await link.ensure(), true);
+	} finally {
+		release(false);
+		link.close();
+		await server.close();
+	}
+});
+
 // Exercise the production client with a deterministic socket and clock: a peer
 // can welcome a client, then disappear before the connection becomes stable.
 class ReconnectTestSocket extends EventEmitter {
@@ -567,7 +676,8 @@ test("a connection the listener replaced never reconnects to evict its replaceme
 		if (event === "listener.hello" || event === "listener.client-closed") events.push({ event, clients: fields?.clients });
 	} });
 	await server.listen();
-	const stale = new VoiceListenerClient({ dir, session: session("s-1") });
+	let starts = 0;
+	const stale = new VoiceListenerClient({ dir, session: session("s-1"), restartOnDisconnect: { start: () => { starts++; } } });
 	const frames: ListenerFrame[] = [];
 	stale.onFrame((frame) => frames.push(frame));
 	await stale.connect();
@@ -587,6 +697,7 @@ test("a connection the listener replaced never reconnects to evict its replaceme
 	await assert.rejects(stale.request({ type: "status" }), "and it refuses to come back");
 	await assert.rejects(stale.connect());
 	assert.equal(server.clientCount, 1, "the session keeps the one connection it has");
+	assert.equal(starts, 0, "a replaced connection cannot restart a listener");
 	fresh.close();
 	await server.close();
 });

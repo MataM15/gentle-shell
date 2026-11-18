@@ -243,6 +243,7 @@ function harness(overrides: { platform?: string; arch?: string; installed?: bool
 	const install = overrides.install ?? (async (kind) => ({ kind, path: `${VOICE_HOME}/${kind}`, alreadyInstalled: false }));
 	const deps: VoiceCommandDeps = {
 		env: overrides.env ?? {},
+		startListener: () => { throw new Error("listener start not configured in test"); },
 		probe: () => { calls.push("probe"); return { platform: overrides.platform ?? "darwin", arch: overrides.arch ?? "arm64" }; },
 		readStatus: async (target) => {
 			calls.push(`status:${target}`);
@@ -1044,6 +1045,34 @@ function registrationPeer(dir: string, holdFirstWelcome = false) {
 		},
 	};
 }
+
+for (const voiceOn of [false, true]) test(`a connected ${voiceOn ? "voice-on" : "voice-off"} session restarts a vanished listener`, async () => {
+	const home = mkdtempSync(join(tmpdir(), "voice-command-restart-"));
+	const dir = join(home, "voice");
+	const { engine } = fakeEngine();
+	const h = harness({ voice: voiceOn, engine, env: { GENTLE_PI_CONFIG_HOME: home, HERDR_PANE_ID: "w1:p1" } });
+	delete h.deps.createSession;
+	let server = new VoiceListener({ dir });
+	let starts = 0;
+	h.deps.startListener = async () => { starts++; server = new VoiceListener({ dir }); await server.listen(); };
+	await server.listen();
+	const pi = register(h);
+	const ui = fakeContext();
+	try {
+		await pi.fire("session_start", ui.ctx);
+		await until(() => server.sessionIds.includes("session-alpha"));
+		assert.equal(starts, 0, "startup joins the existing listener");
+		await server.close();
+		await until(() => starts === 1 && server.sessionIds.includes("session-alpha"), 2_000);
+		assert.deepEqual(server.voiceSessions, voiceOn ? ["session-alpha"] : []);
+		assert.equal(server.clientCount, 1);
+		assert.equal(starts, 1);
+	} finally {
+		await pi.fire("session_shutdown", ui.ctx);
+		await server.close();
+		rmSync(home, { recursive: true, force: true });
+	}
+});
 
 test("a voice-off startup keeps one display connection to a healthy listener", async () => {
 	const home = mkdtempSync(join(tmpdir(), "voice-command-passive-stable-"));

@@ -53,8 +53,6 @@ export const LISTENER_HEARTBEAT_MS = 2_000;
 export const LISTENER_STALE_MS = 6_000;
 // No client at all: nothing can receive a transcript, so the mic owner leaves.
 export const LISTENER_IDLE_MS = 60_000;
-// Asleep with no session that has voice on: L10 asks for ten minutes, then off.
-export const LISTENER_ASLEEP_IDLE_MS = 600_000;
 // A reading is renewed while it speaks; a session that stopped renewing (killed,
 // or stuck) loses the turn instead of muting voice everywhere.
 export const READING_LEASE_MS = 15_000;
@@ -328,7 +326,6 @@ export interface VoiceListenerOptions {
 	// The language shown and listened in, carried on every state frame.
 	language?: ListenerLanguage;
 	idleMs?: number;
-	asleepIdleMs?: number;
 	heartbeatMs?: number;
 	readLeaseMs?: number;
 	readTailMs?: number;
@@ -490,7 +487,6 @@ export class VoiceListener {
 	private readonly now: () => number;
 	private readonly log: ListenerLog;
 	private readonly idleMs: number;
-	private readonly asleepIdleMs: number;
 	private readonly heartbeatMs: number;
 	private readonly readLeaseMs: number;
 	private readonly readTailMs: number;
@@ -537,7 +533,6 @@ export class VoiceListener {
 		this.now = options.now ?? Date.now;
 		this.log = options.log ?? (() => {});
 		this.idleMs = options.idleMs ?? LISTENER_IDLE_MS;
-		this.asleepIdleMs = options.asleepIdleMs ?? LISTENER_ASLEEP_IDLE_MS;
 		this.heartbeatMs = options.heartbeatMs ?? LISTENER_HEARTBEAT_MS;
 		this.readLeaseMs = options.readLeaseMs ?? READING_LEASE_MS;
 		this.readTailMs = options.readTailMs ?? READING_TAIL_MS;
@@ -1225,7 +1220,7 @@ export class VoiceListener {
 	}
 
 	// Voice on for one session, through the broadcast a session's own voice on
-	// sends: the flag armIdle reads, and the frame every session
+	// sends: the flag the listener tracks, and the frame every session
 	// already receives when voice turns on. A wake says so on the frame of the
 	// session it woke, and on no other: the others only learn that voice is on.
 	private turnVoiceOn(client: Client, wake = false): void {
@@ -1420,10 +1415,15 @@ export class VoiceListener {
 			if (command !== undefined) this.log("kws.hit", { command, reason: "ignored:stale" });
 			return;
 		}
+		// A stop requested by this listener retires the capture before it settles.
+		// An undefined outcome from the still-current capture was unexpected.
+		if (command === undefined) {
+			this.spottingFailed(capture, new VoiceSessionError("capture"));
+			return;
+		}
 		this.spotting = undefined;
 		if (this.spottingStable) clearTimeout(this.spottingStable);
 		this.spottingStable = undefined;
-		if (command === undefined) return;
 		this.spotRetryAttempt = 0;
 		// Reading text is not carried by the protocol. Fail closed for the whole
 		// reading and its audible tail, rather than reacting to its own speech.
@@ -1852,24 +1852,18 @@ export class VoiceListener {
 		this.armIdle();
 	}
 
-	// Two windows, both from the design: nobody connected for a minute, or asleep
-	// with no session that has voice on for the ten minutes L10 chose. A listener
-	// that owns no client can deliver a transcript to nobody, so it leaves.
+	// A connected client keeps spotting alive even while every session is off.
+	// With nobody connected, the listener leaves after the no-client window.
 	private armIdle(): void {
 		if (this.idleTimer) {
 			clearTimeout(this.idleTimer);
 			this.idleTimer = undefined;
 		}
-		if (!this.server || this.closing) return;
-		const wantsVoice = this.voiceSessions.length > 0;
-		let delay: number | undefined;
-		if (this.clients.size === 0) delay = this.idleMs;
-		else if (this.currentState === "asleep" && !wantsVoice) delay = this.asleepIdleMs;
-		if (delay === undefined) return;
+		if (!this.server || this.closing || this.clients.size > 0) return;
 		const timer = setTimeout(() => {
 			this.idleTimer = undefined;
 			void this.close("idle");
-		}, delay);
+		}, this.idleMs);
 		timer.unref?.();
 		this.idleTimer = timer;
 	}

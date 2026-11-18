@@ -115,7 +115,6 @@ async function startListener(
 	dir: string,
 	options: {
 		idleMs?: number;
-		asleepIdleMs?: number;
 		focus?: ListenerFocus;
 		readLeaseMs?: number;
 		readTailMs?: number;
@@ -131,7 +130,6 @@ async function startListener(
 	const listener = new VoiceListener({
 		dir,
 		idleMs: options.idleMs ?? 60_000,
-		asleepIdleMs: options.asleepIdleMs ?? 600_000,
 		readLeaseMs: options.readLeaseMs,
 		readTailMs: options.readTailMs,
 		dictation: options.dictation,
@@ -373,9 +371,9 @@ test("herdr failing delivers nothing instead of guessing", async () => {
 	await started.listener.close();
 });
 
-test("voice off from one session clears every session's flag so the asleep exit arms (L10)", async () => {
+test("voice off from one session clears every session's flag without disconnecting either", async () => {
 	const dir = scratch();
-	const started = await startListener(dir, { idleMs: 600_000, asleepIdleMs: 40 });
+	const started = await startListener(dir, { idleMs: 40 });
 	const first = await started.client();
 	const second = await started.client();
 	first.hello("s-1", "w1:p1", true);
@@ -384,9 +382,14 @@ test("voice off from one session clears every session's flag so the asleep exit 
 	await new Promise((resolve) => setTimeout(resolve, 60));
 	assert.deepEqual(framesOf(first, "bye"), [], "two sessions with voice keep the listener alive");
 	first.send({ type: "set-voice", voiceOn: false });
-	await waitFor(() => framesOf(second, "bye").length === 1, 3_000);
-	assert.deepEqual(framesOf(second, "bye")[0], { type: "bye", reason: "idle" }, "asleep with no session asking for voice idles out");
-	await waitFor(() => !existsSync(listenerPaths(dir).socket), 3_000);
+	await waitFor(() => started.listener.state === "asleep");
+	await new Promise((resolve) => setTimeout(resolve, 60));
+	assert.deepEqual(started.listener.voiceSessions, []);
+	assert.equal(started.listener.clientCount, 2);
+	assert.deepEqual(framesOf(second, "bye"), []);
+	first.socket.destroy();
+	second.socket.destroy();
+	await started.listener.close();
 });
 
 test("a frame naming an inherited property gets one error and the listener keeps serving", async () => {
@@ -469,21 +472,9 @@ test("a listener with no client exits after the idle window and takes its files 
 	assert.ok(started.events.some((entry) => entry.event === "listener.exit" && entry.fields?.reason === "idle"));
 });
 
-test("asleep with no session that has voice ends after ten minutes of its own window (L10)", async () => {
+test("a session with voice on keeps the listener alive past the no-client idle window", async () => {
 	const dir = scratch();
-	const started = await startListener(dir, { idleMs: 600_000, asleepIdleMs: 40 });
-	const client = await started.client();
-	client.hello("s-1", "w1:p1", false);
-	await waitFor(() => framesOf(client, "welcome").length === 1);
-	await waitFor(() => framesOf(client, "bye").length === 1, 3_000);
-	assert.deepEqual(framesOf(client, "bye")[0], { type: "bye", reason: "idle" });
-	await client.closed;
-	await waitFor(() => !existsSync(listenerPaths(dir).socket), 3_000);
-});
-
-test("a session with voice on keeps the listener alive past the asleep window", async () => {
-	const dir = scratch();
-	const started = await startListener(dir, { idleMs: 600_000, asleepIdleMs: 40 });
+	const started = await startListener(dir, { idleMs: 40 });
 	const client = await started.client();
 	client.hello("s-1", "w1:p1", true);
 	await waitFor(() => framesOf(client, "welcome").length === 1);
@@ -1890,8 +1881,9 @@ interface FakeSpotting {
 	hearing(command: string): void;
 	// A rejected hit never closes the capture.
 	rejectHit(command: string, reason: "lead" | "speech-after"): void;
-	// The open spot-only capture dies, as a worker that exited does.
+	// The open spot-only capture dies or stops without being asked.
 	dying(): void;
+	stopping(): void;
 }
 
 // A spot-only capture driven by the test: it records the calls the listener made,
@@ -1946,6 +1938,7 @@ function fakeSpotting(options: { order?: string[]; failStart?: boolean; stopGate
 		hearing: (command) => pending?.resolve(command),
 		rejectHit: (command, reason) => onRejected?.({ command, reason }),
 		dying: () => pending?.reject(new VoiceSessionError("worker-exited")),
+		stopping: () => pending?.resolve(undefined),
 	};
 }
 
@@ -1977,7 +1970,7 @@ test("a spoken voice off turns voice off everywhere and is never delivered as te
 	await waitForState(started, "asleep");
 	assert.deepEqual(states(started.events), ["listening", "transcribing", "asleep"]);
 	assert.deepEqual(cueLog(started.events).map((cue) => cue?.name), ["open", "close"]);
-	assert.deepEqual(started.listener.voiceSessions, [], "voice is off in every session, so the asleep exit is armed");
+	assert.deepEqual(started.listener.voiceSessions, [], "voice is off in every session, but their connections stay open");
 	// No transcript anywhere: the matcher in the session cannot fire for this capture.
 	assert.deepEqual([...framesOf(asker, "transcript"), ...framesOf(other, "transcript")], []);
 	// The event name and the command id only: never audio, never a transcript.
@@ -2232,19 +2225,85 @@ test("without the keyword option the listener never opens a spot capture", async
 	await started.listener.close();
 });
 
-test("the ten minute asleep exit closes the spot capture with everything else (L10, S7)", async () => {
+test("a connected asleep session still hears voice on after ten minutes", async (t) => {
 	const dir = scratch();
 	const spot = fakeSpotting();
-	const started = await startListener(dir, { keyword: keywordOption(), spot: spot.factory, asleepIdleMs: 40 });
+	const started = await startListener(dir, { keyword: keywordOption(), spot: spot.factory, focus: { focusedPaneId: async () => ({ focused: "w1:p1" }) } });
+	const client = await started.client();
+	client.hello("s-1", "w1:p1", true);
+	await awaitFrame(client, (frame) => frame.type === "welcome");
 	await waitFor(() => spot.starts === 1);
+	const flushIO = async (condition: () => boolean) => {
+		for (let i = 0; i < 100 && !condition(); i++) await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.ok(condition(), "listener did not process the frame");
+	};
+	t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+	try {
+		client.send({ type: "set-voice", id: "off", voiceOn: false });
+		await flushIO(() => framesOf(client, "ok").some((frame) => "id" in frame && frame.id === "off"));
+		assert.equal(started.listener.state, "asleep");
+		t.mock.timers.tick(600_001);
+		await Promise.resolve();
+		assert.equal(started.listener.clientCount, 1, "voice-off session keeps the listener alive past ten minutes");
+		assert.deepEqual(spot.calls, ["spot.start"], "the same spotter remains open");
+		spot.hearing("voice-on");
+		await flushIO(() => framesOf(client, "command").some((frame) => frame.type === "command" && frame.command === "voice-on"));
+		assert.deepEqual(started.listener.voiceSessions, ["s-1"]);
+		assert.deepEqual(framesOf(client, "bye"), []);
+	} finally {
+		t.mock.timers.reset();
+		client.socket.destroy();
+		await started.listener.close();
+	}
+});
+
+test("an unexpected stopped spotter retries and hears the next command", async (t) => {
+	const spot = fakeSpotting();
+	const started = await startListener(scratch(), { keyword: keywordOption(), spot: spot.factory, focus: { focusedPaneId: async () => ({ focused: "w1:p1" }) } });
 	const client = await started.client();
 	client.hello("s-1", "w1:p1", false);
-	await waitFor(() => framesOf(client, "welcome").length === 1);
-	assert.deepEqual(await awaitFrame(client, (frame) => frame.type === "bye", 3_000), { type: "bye", reason: "idle" });
-	assert.deepEqual(spot.calls, ["spot.start", "spot.stop"], "the microphone is released with the listener");
-	await waitFor(() => !existsSync(listenerPaths(dir).lock));
-	client.socket.destroy();
-	await started.listener.close();
+	await awaitFrame(client, (frame) => frame.type === "welcome");
+	t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+	const flush = async () => { for (let i = 0; i < 20; i++) await Promise.resolve(); };
+	try {
+		spot.stopping();
+		await flush();
+		assert.deepEqual(started.events.filter((entry) => entry.event === "kws.failed").map((entry) => entry.fields), [{ reason: "capture" }]);
+		t.mock.timers.tick(999); await flush();
+		assert.equal(spot.starts, 1);
+		t.mock.timers.tick(1); await flush();
+		assert.equal(spot.starts, 2);
+		spot.hearing("voice-on");
+		await flush();
+		assert.deepEqual(started.listener.voiceSessions, ["s-1"]);
+		assert.equal(started.events.filter((entry) => entry.event === "kws.recovered").length, 1);
+	} finally {
+		t.mock.timers.reset();
+		client.socket.destroy();
+		await started.listener.close();
+	}
+});
+
+for (const code of ["not-installed", "model-invalid"] as const) test(`a ${code} spotter failure stays disabled`, async (t) => {
+	let starts = 0;
+	let reject!: (error: unknown) => void;
+	const first = new Promise<void>((_resolve, fail) => { reject = fail; });
+	const started = await startListener(scratch(), { keyword: keywordOption(), spot: () => {
+		starts++;
+		return { start: () => first, heard: () => new Promise(() => {}), stop: async () => {}, cancel: async () => {} };
+	} });
+	t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+	try {
+		reject(new VoiceSessionError(code));
+		for (let i = 0; i < 20; i++) await Promise.resolve();
+		t.mock.timers.tick(600_001);
+		for (let i = 0; i < 20; i++) await Promise.resolve();
+		assert.equal(starts, 1);
+		assert.deepEqual(started.events.filter((entry) => entry.event === "kws.failed").map((entry) => entry.fields), [{ reason: code }]);
+	} finally {
+		t.mock.timers.reset();
+		await started.listener.close();
+	}
 });
 
 // A hands-free recording ends by itself: the worker hears the end of speech (or

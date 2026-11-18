@@ -394,9 +394,13 @@ a session that asks for a capture only receives the transcript.
   turn uses). A second listener refuses with `voice_listener_busy`; a lock left
   by a process that is gone, or one whose heartbeat stopped, is taken over.
 - **No session, no listener.** With no client connected it exits after a
-  minute; asleep with no session that has voice on, it ends after ten minutes
-  (turning voice off in any session turns it off everywhere), and it removes its
-  socket and lock on the way out.
+  minute and removes its socket and lock on the way out. A connected session
+  keeps it running and spotting even while every session has voice off
+  (turning voice off in any session turns it off everywhere), so the spoken
+  `Gentle Voice on` keeps working however long voice stays off. A session that
+  was connected and loses the listener rejoins a replacement, or starts a new
+  listener when there is none, on the throttled reconnect schedule. A session
+  that starts with voice off joins a running listener but never starts one.
 - **Protocol.** `gentle.voice-listener/v1`, JSON on one line each way, at most
   64 KiB per line. A connection starts with a hello carrying the session id and
   the herdr pane id, then answers status and reports the state:
@@ -520,8 +524,8 @@ a session that asks for a capture only receives the transcript.
   no focused pane, a failed lookup or a focused pane with no session, nothing
   turns on and the listener opens another spot-only capture; anything else it
   hears (a `voice-off`, a `cancel`, an unknown id) changes nothing and listens
-  again. Ten minutes of being asleep with no session that has voice on still
-  closes the listener, and the spot-only capture closes with it.
+  again. Being asleep never closes the listener while a session is connected,
+  and a spot-only capture that ends on its own is retried like a failed one.
 - **One microphone.** The spotter owns the microphone only while nothing else
   needs it: a `dictate` from any session stops the spot-only capture and waits
   until it closed before the recording opens, and spotting resumes when that

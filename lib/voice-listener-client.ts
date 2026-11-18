@@ -96,6 +96,9 @@ export interface VoiceListenerClientOptions {
 	role?: ListenerConnectionRole;
 	dial?: (path: string) => Socket;
 	backoffMs?: readonly number[];
+	// A previously joined session may restart a vanished listener on reconnect.
+	// An initial passive connection never starts one.
+	restartOnDisconnect?: { start?: () => void | Promise<void>; probe?: (path: string) => Promise<boolean>; waitMs?: number };
 	onFrame?: (frame: ListenerFrame) => void;
 	// Opt in to display snapshots after each welcome; never wait for them.
 	display?: boolean;
@@ -134,8 +137,10 @@ export class VoiceListenerClient {
 	private attempt = 0;
 	private rateLimited = false;
 	private joined = false;
+	private everJoined = false;
 	private closed = false;
 	private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+	private reconnectOperation: AbortController | undefined;
 	private stableTimer: ReturnType<typeof setTimeout> | undefined;
 	private currentState: ListenerState = "asleep";
 	private updatedVoiceOn: boolean | undefined;
@@ -193,6 +198,13 @@ export class VoiceListenerClient {
 	// One attempt: dials, sends hello and resolves with the state the listener
 	// reports. Throws when the listener is not there or refuses the session.
 	async connect(): Promise<ListenerState> {
+		// A manual join supersedes any delayed recovery before it can start or dial.
+		this.reconnectOperation?.abort();
+		this.reconnectOperation = undefined;
+		return this.connectOnce();
+	}
+
+	private async connectOnce(): Promise<ListenerState> {
 		// A connection the listener already replaced never comes back: the caller
 		// joins again with a new one instead of evicting its own replacement.
 		if (this.replaced) throw new Error("this voice listener connection was replaced");
@@ -239,6 +251,7 @@ export class VoiceListenerClient {
 		if (this.closed || this.socket !== socket || this.socketRetired) throw new Error("voice listener connection closed or replaced");
 		if (frame.type !== "welcome") throw new Error("the voice listener refused hello");
 		this.joined = true;
+		this.everJoined = true;
 		this.rateLimited = false;
 		const stableTimer = setTimeout(() => {
 			if (this.socket === socket && this.joined && !this.socketRetired) this.attempt = 0;
@@ -275,6 +288,8 @@ export class VoiceListenerClient {
 		if (this.closed) return;
 		this.closed = true;
 		this.joined = false;
+		this.reconnectOperation?.abort();
+		this.reconnectOperation = undefined;
 		this.clearStableTimer();
 		const socket = this.socket;
 		this.socket = undefined;
@@ -360,13 +375,38 @@ export class VoiceListenerClient {
 	}
 
 	private scheduleReconnect(): void {
-		if (this.closed || this.replaced || this.reconnectTimer) return;
+		if (this.closed || this.replaced || this.reconnectTimer || this.reconnectOperation) return;
 		const delays = this.options.backoffMs ?? (this.rateLimited ? LISTENER_RATE_LIMIT_BACKOFF_MS : LISTENER_BACKOFF_MS);
 		const delay = delays[Math.min(this.attempt, delays.length - 1)];
 		this.attempt += 1;
 		const timer = setTimeout(() => {
 			this.reconnectTimer = undefined;
-			const joining = this.connect();
+			const recovery = this.options.restartOnDisconnect;
+			if (recovery && this.everJoined && this.options.role !== "reading") {
+				if (!this.session()) return;
+				const controller = new AbortController();
+				this.reconnectOperation = controller;
+				void (async () => {
+					try {
+						await ensureListenerAvailable({
+							dir: this.options.dir, probe: recovery.probe, waitMs: recovery.waitMs, signal: controller.signal,
+							start: () => {
+								if (!this.session()) throw new Error("voice listener session ended");
+								return recovery.start?.();
+							},
+						});
+						if (this.reconnectOperation === controller && !controller.signal.aborted) await this.connectOnce();
+					} catch { /* retry on the same bounded schedule */ }
+					finally {
+						if (this.reconnectOperation === controller) {
+							this.reconnectOperation = undefined;
+							if (!this.connected) this.scheduleReconnect();
+						}
+					}
+				})();
+				return;
+			}
+			const joining = this.connectOnce();
 			const socket = this.socket;
 			void joining.catch(() => {
 				// A manual rejoin may have superseded this dial. Its failure must not
@@ -451,13 +491,41 @@ async function waitForListener(path: string, waitMs: number, probe: (path: strin
 	}
 }
 
+// The availability half of ensureListener is also used by a connected session's
+// reconnect. Both paths share the same probe, lock and stale-socket safeguards.
+async function ensureListenerAvailable(options: Pick<EnsureListenerOptions, "dir" | "start" | "signal" | "probe" | "waitMs" | "now" | "isAlive">): Promise<boolean> {
+	const paths = listenerPaths(options.dir);
+	const waitMs = options.waitMs ?? LISTENER_START_TIMEOUT_MS;
+	const probe = options.probe ?? probeListenerSocket;
+	const signal = options.signal;
+	throwIfAborted(signal);
+	if (await withAbort(probe(paths.socket), signal)) return false;
+	throwIfAborted(signal);
+
+	// A lock somebody is renewing means a listener is starting or running: wait
+	// for its socket instead of starting a second microphone owner.
+	if (!clearStaleListenerLock(paths, { now: options.now, isAlive: options.isAlive })) {
+		if (await waitForListener(paths.socket, waitMs, probe, signal)) return false;
+		throw new Error("voice_listener_busy");
+	}
+	const lock = takeListenerLock(paths, { now: options.now, socket: paths.socket });
+	if (!lock) {
+		if (await waitForListener(paths.socket, waitMs, probe, signal)) return false;
+		throw new Error("voice_listener_busy");
+	}
+	// A path that is not this user's socket is refused, never unlinked.
+	clearStaleListenerSocket(paths.socket);
+	releaseListenerLock(paths, { pid: lock.pid });
+	throwIfAborted(signal);
+	await withAbort(Promise.resolve().then(() => { throwIfAborted(signal); return options.start?.(); }), signal);
+	if (await waitForListener(paths.socket, waitMs, probe, signal)) return true;
+	throw new Error("voice_listener_missing");
+}
+
 // Joins the listener, or starts exactly one and joins it. The start lock is
 // released before spawning because the listener takes its own; two sessions
 // racing here cannot both win, and the loser's process fails to bind and stops.
 export async function ensureListener(options: EnsureListenerOptions): Promise<{ client: VoiceListenerClient; started: boolean }> {
-	const paths = listenerPaths(options.dir);
-	const waitMs = options.waitMs ?? LISTENER_START_TIMEOUT_MS;
-	const probe = options.probe ?? probeListenerSocket;
 	const signal = options.signal;
 	const join = async (started: boolean) => {
 		throwIfAborted(signal);
@@ -477,28 +545,8 @@ export async function ensureListener(options: EnsureListenerOptions): Promise<{ 
 			signal?.removeEventListener("abort", abort);
 		}
 	};
-	throwIfAborted(signal);
-	if (await withAbort(probe(paths.socket), signal)) return join(false);
-	throwIfAborted(signal);
-
-	// A lock somebody is renewing means a listener is starting or running: wait
-	// for its socket instead of starting a second microphone owner.
-	if (!clearStaleListenerLock(paths, { now: options.now, isAlive: options.isAlive })) {
-		if (await waitForListener(paths.socket, waitMs, probe, signal)) return join(false);
-		throw new Error("voice_listener_busy");
-	}
-	const lock = takeListenerLock(paths, { now: options.now, socket: paths.socket });
-	if (!lock) {
-		if (await waitForListener(paths.socket, waitMs, probe, signal)) return join(false);
-		throw new Error("voice_listener_busy");
-	}
-	// A path that is not this user's socket is refused, never unlinked.
-	clearStaleListenerSocket(paths.socket);
-	releaseListenerLock(paths, { pid: lock.pid });
-	throwIfAborted(signal);
-	await withAbort(Promise.resolve().then(() => { throwIfAborted(signal); return options.start?.(); }), signal);
-	if (await waitForListener(paths.socket, waitMs, probe, signal)) return join(true);
-	throw new Error("voice_listener_missing");
+	const started = await ensureListenerAvailable(options);
+	return join(started);
 }
 
 // How often a reading renews its turn: well inside the listener's lease, and
@@ -798,6 +846,9 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 					} catch (error) {
 						throwIfAborted(controller.signal);
 						if (error instanceof ListenerRateLimitError) return false;
+						// Its retry must not race the new client created below.
+						client.close();
+						client = undefined;
 						/* the lock or the socket is gone: start a listener below */
 					}
 				}
@@ -821,6 +872,7 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 								return current?.sessionId === session.sessionId ? current : undefined;
 							},
 							backoffMs: options.backoffMs,
+							restartOnDisconnect: { start: options.start, probe: options.probe, waitMs: options.waitMs },
 							display: Boolean(options.onDisplay),
 							onFrame: route,
 						}));

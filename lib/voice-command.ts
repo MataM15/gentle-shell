@@ -112,6 +112,8 @@ export interface VoiceCommandDeps {
 	// a session that cannot reach it records itself. Tests inject a link built on a
 	// socket they own; production builds one from the voice home.
 	listener?: SessionListenerLink;
+	// Starts the listener when a session join or recovery needs one.
+	startListener?: () => void | Promise<void>;
 	// Cuts whatever the listener is reading, wherever it is spoken.
 	readCut?: (sessionId: string) => void;
 	// Releases the dictation worker kept alive for hands-free recordings.
@@ -476,6 +478,7 @@ const readingEndFor = (outcome: string | undefined): ReadingEnd => (outcome === 
 
 export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = {}): void {
 	const env = deps.env ?? process.env;
+	const startListener = deps.startListener ?? (() => startVoiceListenerProcess(env));
 	const probe = deps.probe ?? readVoicePlatformProbe;
 	const readStatus = deps.readStatus ?? ((target) => readVoiceStatus({ env, target }));
 	// Production always installs and runs the pinned manifests: no manifest or
@@ -533,7 +536,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		const link = createSessionListenerLink({
 			dir: resolveVoiceHome(env),
 			adoptedClient,
-			start: () => startVoiceListenerProcess(env),
+			start: startListener,
 			session: () => {
 				const id = sessionIdOf(sessionCtx);
 				return id ? { sessionId: id, paneId: paneIdOf(), label: labelOf(sessionCtx), voiceOn: voiceOn(sessionCtx) } : undefined;
@@ -1020,7 +1023,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 			return;
 		}
 		// The listener's registration follows this session's persisted voice. An
-		// off session never starts a listener; an on session may join/start one.
+		// off session does not start one at initial join; a joined client may recover it.
 		const liveCtx = sessionCtx;
 		if (!deps.createSession && liveCtx && sessionIdOf(liveCtx) === id) {
 			if (enabled && passiveClient?.connected && !sessionLink) {
@@ -1779,6 +1782,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 				const client = new VoiceListenerClient({
 					dir: resolveVoiceHome(env),
 					display: true,
+					restartOnDisconnect: { start: startListener },
 					session: () => sessionIdOf(sessionCtx) === id
 						? { sessionId: id, paneId: paneIdOf(), label: labelOf(sessionCtx), voiceOn: voiceOn(sessionCtx) }
 						: undefined,
