@@ -47,6 +47,7 @@ import {
 	otherPackageInjections,
 	parseLauncherArgs,
 	parseLauncherConfig,
+	parseTowerArgs,
 	parseRawLauncherConfig,
 	planSpawn,
 	POST_INSTALL_REMOVAL_SOURCES,
@@ -1876,6 +1877,66 @@ async function handleUpgradeCommand(commandArgs) {
 		if (error instanceof MainChannelError) fail(`gentle-shell upgrade: ${error.message}`, error.code === "upgrade-usage" ? 2 : 1);
 		throw error;
 	}
+	if (process.exitCode === 0) await refreshDesktopAfterUpgrade(undefined);
+}
+
+// After a forward upgrade the new Gentle Shell refreshes Gentle Shell Desktop's
+// gentle-* mods and layout, only when `gentle-shell desktop` installed them (its
+// state file); a user who never ran desktop gets nothing installed. The old
+// process cannot do it: the new mods ship with the new package. A target
+// without the desktop command (an older release) would take `desktop` as a
+// prompt for the model, so it is never launched. `upgrade --rollback` never
+// calls this.
+async function refreshDesktopAfterUpgrade(bundled) {
+	let stateFile;
+	let supportsDesktop;
+	try {
+		// After an npm upgrade this package folder holds the new version, which may not ship desktop.
+		const desktop = await import("../runtime/gentle-shell-desktop.mjs");
+		stateFile = desktop.desktopPaths(process.env, homedir()).stateFile;
+		supportsDesktop = desktop.supportsDesktop;
+	} catch {
+		return;
+	}
+	if (!existsSync(stateFile)) return;
+	const warn = (reason) => process.stderr.write(`gentle-shell upgrade: could not refresh Gentle Shell Desktop's mods (${reason}); run 'gentle-shell desktop'.\n`);
+	try {
+		const next = bundled
+			? await resolveStartupRelaunch({ root: bundled.root, home: homedir(), platform: process.platform, env: process.env, argv: ["desktop", "--refresh"] })
+			: { command: process.execPath, args: [join(packageRoot, "bin", "gentle-shell.mjs"), "desktop", "--refresh"], env: process.env };
+		// next.args[0] is the target's bin/gentle-shell.mjs.
+		if (!supportsDesktop(dirname(dirname(next.args[0])))) return;
+		const result = spawnSync(next.command, next.args, { stdio: "inherit", env: next.env });
+		if (result.error) warn(result.error.message);
+		else if (result.status !== 0) warn(`exit ${result.status}`);
+	} catch (error) {
+		warn(error.message);
+	}
+}
+
+// `gentle-shell desktop` (Gentle Shell Desktop): before any Pi runtime check,
+// since it never runs Pi; lib/gentle-shell-desktop.ts owns the decisions.
+async function handleDesktopCommand(commandArgs) {
+	const { nodeDesktopIO, runDesktop } = await import("../runtime/gentle-shell-desktop.mjs");
+	const { askLine } = await import("../runtime/gentle-shell-uninstall.mjs");
+	return runDesktop({
+		args: commandArgs,
+		env: process.env,
+		home: homedir(),
+		platform: process.platform,
+		arch: process.arch,
+		cwd: process.cwd(),
+		interactive: process.stdin.isTTY === true && process.stdout.isTTY === true,
+		packageRoot,
+		shellVersion: ownPackageVersion(),
+		io: {
+			...nodeDesktopIO(),
+			// End of input or Ctrl+C answers No.
+			ask: (question) => askLine(question, { input: process.stdin, output: process.stdout }).catch(() => ""),
+			out: (line) => process.stdout.write(`${line}\n`),
+			err: (line) => process.stderr.write(`${line}\n`),
+		},
+	});
 }
 
 // `gentle-shell upgrade` in a bundled install: the latest release installed
@@ -1906,11 +1967,12 @@ async function handleBundledUpgrade(bundled, commandArgs) {
 			adapters: { latest: () => latestRelease(globalThis.fetch), distribution: (version) => fetchDistribution({ version }) },
 			out,
 		});
-		return 0;
 	} catch (error) {
 		process.stderr.write(`gentle-shell upgrade: ${error.message}${error.stderr ? `\n${error.stderr}` : ""}\n`);
 		return 1;
 	}
+	await refreshDesktopAfterUpgrade(bundled);
+	return 0;
 }
 
 // `gentle-shell update` in a bundled install: the newest published
@@ -2094,13 +2156,27 @@ async function main() {
 	const args = parseLauncherArgs(process.argv.slice(2));
 	if (args.error !== undefined) fail(`${args.error}\nRun 'gentle-shell --help' for usage.`, 2);
 	if (args.help) {
-		process.stdout.write("Pi updates: update resolves the newest published stable Pi and updates its verified supplier\n(a global Pi, or its Shell package at the same Shell version), then reads the Pi version back.\npnpm temporarily exempts only Pi and the @earendil-works packages it pins exactly (transitively) from\nminimumReleaseAge, merged into their existing exclusions; other exclusions and policy stay in force.\nA linked source Shell updates local Pi with its project manager and one matching lockfile;\npnpm may be newer than the declared minimum; npm must match its pin. No manager is downloaded;\nGit roots only, no lifecycle scripts or manifest range changes. Root-only pnpm configuration is preserved;\nmulti-project/ancestor workspaces and conflicting lockfiles refuse before installation. Unknown ownership refuses; update --extensions-only stays Pi-only.\nPrefix-bundled update also selects the latest stable Pi; upgrade updates Shell.\n");
+		process.stdout.write("Pi updates: update resolves the newest published stable Pi and updates its verified supplier\n(a global Pi, or its Shell package at the same Shell version), then reads the Pi version back.\npnpm temporarily exempts only Pi and the @earendil-works packages it pins exactly (transitively) from\nminimumReleaseAge, merged into their existing exclusions; other exclusions and policy stay in force.\nA linked source Shell updates local Pi, and the directly declared @earendil-works packages (pi-ai, pi-tui)\nto the exact versions that Pi pins, with its project manager and one matching lockfile;\npnpm may be newer than the declared minimum; npm must match its pin. No manager is downloaded;\nGit roots only, no lifecycle scripts or manifest range changes. Root-only pnpm configuration is preserved;\nmulti-project/ancestor workspaces and conflicting lockfiles refuse before installation. Unknown ownership refuses; update --extensions-only stays Pi-only.\nPrefix-bundled update also selects the latest stable Pi; upgrade updates Shell.\n");
 		process.stdout.write(`${helpText()}\nBundled Engram memory: Shell shares the global Engram server on 127.0.0.1:7437, like other agents' hooks.\nA running server is reused only with verified /compatibility evidence; when nothing listens, Shell starts the\nbundled core's engram serve (default ~/.engram) and waits for that evidence. Otherwise ENGRAM_BIN is Shell's\nguard and memory stays off for that launch. Matching versions or updating alone do not prove compatibility.\nBack up existing data before manual changes; do not delete it or bypass the safety check.\nShell rechecks on every launch and remains usable without memory.\nAn explicit ENGRAM_BIN or ENGRAM_URL is kept and bypasses the guard.\n`);
 		process.exit(0);
 	}
 	if (args.command === "home") {
 		if (args.commandArgs[0] === "import-pi") await handleImportPiCommand(args);
 		else handleHomeCommand(args.commandArgs);
+		return;
+	}
+	if (args.command === "desktop") {
+		process.exitCode = await handleDesktopCommand(args.commandArgs);
+		return;
+	}
+	// `gentle-shell tower`: the same local web view as /gentle:tower, without a
+	// session or a Pi runtime; serves until SIGINT/SIGTERM.
+	if (args.command === "tower") {
+		const tower = parseTowerArgs(args.commandArgs);
+		if (tower.error !== undefined) fail(`gentle-shell tower: ${tower.error}\nRun 'gentle-shell --help' for usage.`, 2);
+		const { runTower } = await import("../runtime/tower-open.mjs");
+		process.exitCode = await runTower({ env: process.env, open: tower.open, port: tower.port, json: tower.json === true,
+			stdout: (text) => process.stdout.write(text), stderr: (text) => process.stderr.write(text) });
 		return;
 	}
 	// The verification input applies to `--version` only (scripts/bundled-install.mjs upgradeBundled).

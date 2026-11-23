@@ -16,8 +16,10 @@ import { resolveSessionProfile, sessionProfileLabel, sessionProfileModelProfiles
 import * as os from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { BAND_RIGHT_WIDTH, buildShellHeaderModel, renderDevBuildLine, renderFoldedBand, renderShellBar, renderShellBelowInputFloat, renderShellBottomOnlyBar, renderShellHeaderChrome, renderShellNarrowTopBar, renderShellRailHeader, renderShellStatusBar, renderShellStatusSections, renderShellChromeBar, renderShellChromePad, renderShellTitleRow, type StatusSection, type StatusTarget, keepNativeWorkingRow, shellEnabled, shellHeaderCommandsHit, shellHeaderUsageHit, shellJobsCount, shellSessionUsageHit, type FoldedBand, type ShellBarModel, type ShellBarTheme } from "../lib/shell-bar.ts";
-import { CHANGE_STATUS, DIFF_MAX_BYTES, DIFF_MAX_LINES, DIFF_TOO_LARGE, WorktreeChangesTracker, changesDigest, renderChangesWidget, type ChangedFile, type ChangesModel, type FileRevision, type GitRunner, type LineCounter, type WorktreeChanges } from "../lib/shell-changes.ts";
+import { DIFF_MAX_BYTES, WorktreeChangesTracker, changesDigest, renderChangesWidget, type ChangedFile, type ChangesModel, type FileRevision, type GitRunner, type LineCounter, type WorktreeChanges } from "../lib/shell-changes.ts";
 import { WorktreeChangesView } from "../lib/shell-changes-view.ts";
+import { changeDirectoryInsideRoot, loadFileDiff, repositoryGitDirectories, runFileDiff } from "../lib/change-diff.ts";
+import { DESKTOP_CHANGES_SERVICE_CHANNEL, DESKTOP_CHANGES_SERVICE_SCHEMA, projectDesktopChanges, projectDesktopDiff, type DesktopChangesService } from "../lib/desktop-rpc-changes.ts";
 import { createNativeFullscreenInteraction } from "../lib/native-fullscreen-interaction.ts";
 import { windowsProcessTreeKiller, type ProcessTreeKiller } from "../lib/native-review-cli.ts";
 import { SessionWorktreeRegistry, resolveSessionWorktree, worktreeGitEnvironment, type WorktreeResolver, type WorktreeIdentity } from "../lib/session-worktree-registry.ts";
@@ -33,6 +35,7 @@ import { NATIVE_REVIEW_MODE_SOURCE } from "../lib/native-review-cli.ts";
 import { VisualCustomizeView, type CustomizeCategory, type CustomizeRow, type ProfileActions } from "../lib/visual-customize-view.ts";
 import { deleteVisualProfile, getVisualProfile, listVisualProfiles, resetVisualProfiles, saveVisualProfile } from "../lib/visual-profiles.ts";
 import { gaugePaintFor } from "../lib/gauge-theme.ts";
+import { isTokenCount, readCompactionThreshold } from "../lib/compaction-threshold.ts";
 import type { GaugePaint } from "../lib/shell-gauge.ts";
 import { sourcePalettePreview } from "../lib/theme-customization.ts";
 import { applyVisualPreset, CHROME_SURFACE, DEFAULT_VISUAL_SETTINGS, DENSITY, HEADER_PLACEMENT, STATUS_PLACEMENT, VISUAL_PRESET, VISUAL_SECTION_KEYS, resolveVisualSettings, visualPresetOf, writeVisualSettings, type VisualPreset } from "../lib/visual-customization-policy.ts";
@@ -361,6 +364,12 @@ function sessionStats(ctx: ExtensionContext): ShellSessionStats {
 	return stats;
 }
 
+function contextHeadroom(pi: ExtensionAPI, model: ExtensionContext["model"], usage: ShellSessionStats["usage"]): ShellBarModel["contextHeadroom"] {
+	const threshold = readCompactionThreshold(pi, model, usage?.contextWindow ?? model?.contextWindow);
+	if (typeof threshold !== "number") return threshold;
+	return isTokenCount(usage?.tokens) ? Math.max(0, threshold - usage.tokens) : null;
+}
+
 export function buildShellBarModel(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
@@ -391,6 +400,7 @@ export function buildShellBarModel(
 		effort: model?.reasoning ? pi.getThinkingLevel() : undefined,
 		contextPercent: usage?.percent ?? null,
 		contextWindow: usage?.contextWindow ?? model?.contextWindow ?? 0,
+		contextHeadroom: contextHeadroom(pi, model, usage),
 		costTotal,
 		// claude-bridge runs on a Claude subscription without a Pi OAuth credential.
 		subscription: model ? model.provider === CLAUDE_BRIDGE_PROVIDER || ctx.modelRegistry.isUsingOAuth(model) : false,
@@ -431,15 +441,15 @@ export function createFooterStatusMemo(deps: FooterStatusMemoDeps): { key(): str
 	let cache: { key: string; model: ShellBarModel } | undefined;
 	const key = (): string => {
 		const statsKey = sessionStatsKey(ctx);
+		const stats = sessionStats(ctx);
 		const model = ctx.model;
 		return JSON.stringify([
-			// Session statistics identity by value: without leaf identity the
-			// computed stats ride the key, so those hosts keep exactly the pre-memo
-			// digest honesty. The model rides its value pieces (id, contextWindow,
-			// effort lookup, OAuth state) because that is all buildShellBarModel
-			// reads — serializing the model object itself would bloat every digest.
-			statsKey ? [statsKey[0], statsKey[1], statsKey[2]] : sessionStats(ctx),
+			// Without leaf identity, use the computed stats by value. Keep the
+			// live compaction setting in the key even when the session is idle.
+			statsKey ? [statsKey[0], statsKey[1], statsKey[2]] : stats,
+			contextHeadroom(pi, model, stats.usage),
 			model?.id ?? null,
+			model?.provider ?? null,
 			model?.contextWindow ?? null,
 			model?.reasoning ? pi.getThinkingLevel() : undefined,
 			model ? ctx.modelRegistry.isUsingOAuth(model) : false,
@@ -1795,12 +1805,8 @@ export function shellGitRunner(cwd: string, env: NodeJS.ProcessEnv = process.env
 	});
 }
 
-export async function loadFileDiff(git: GitRunner, file: ChangedFile): Promise<string> {
-	const args = file.status === CHANGE_STATUS.UNTRACKED ? ["diff", "--no-index", "--", "/dev/null", file.path] : ["diff", "HEAD", "--", file.path];
-	const result = await git(args);
-	if (result.truncated || result.stdout.length > DIFF_MAX_BYTES || result.stdout.split("\n", DIFF_MAX_LINES + 2).length > DIFF_MAX_LINES + 1) return DIFF_TOO_LARGE;
-	return !result.timedOut && (result.code === 0 || result.code === 1) ? result.stdout : "";
-}
+// One file's diff lives in lib/change-diff.ts so the panel and Desktop RPC show the same text.
+export { loadFileDiff };
 
 // Untracked files have no numstat; count their lines without reading past the diff bound.
 const untrackedLines = (root: string): LineCounter => async (path) => {
@@ -2758,6 +2764,70 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		const model = await tracker.refresh();
 		if (changes === tracker) applyChanges(ctx, model);
 	};
+	// Desktop's changes slice reaches this tracker only through a versioned,
+	// adapter-shaped seam (the changes analogue of the usage seam above). Both
+	// reads refresh the tracker the way the panel does and answer only from its
+	// own file list: a diff is served for a file in the current change set of a
+	// root this adapter named, through the same Git arguments as the panel.
+	// Roots cross as opaque ids; the absolute path never leaves this closure.
+	pi.events.on(DESKTOP_CHANGES_SERVICE_CHANNEL, (payload: unknown) => {
+		if (!payload || typeof payload !== "object") return;
+		const request = payload as Partial<{ context: ExtensionContext; respond(service: DesktopChangesService): void }>;
+		if (typeof request.respond !== "function" || !request.context) return;
+		let sessionId: string;
+		try { sessionId = request.context.sessionManager.getSessionId(); } catch { return; }
+		if (!changes || registry?.sessionId !== sessionId) return;
+		let disposed = false;
+		const ids = new Map<string, string>();
+		const idFor = (root: string) => {
+			let id = ids.get(root);
+			if (id === undefined) ids.set(root, id = `root-${ids.size + 1}`);
+			return id;
+		};
+		// No tracked worktree, a failed root, or a replaced session is
+		// unavailable: a failed scan is never reported as a clean root.
+		const scan = async (): Promise<WorktreeChangesTracker | undefined> => {
+			const tracker = changes;
+			if (disposed || !tracker || registry?.sessionId !== sessionId) return undefined;
+			const model = await tracker.refresh();
+			if (disposed || changes !== tracker) return undefined;
+			if (currentContext) applyChanges(currentContext, model);
+			return tracker.scannedRootCount === 0 || tracker.failedRoots.length > 0 ? undefined : tracker;
+		};
+		try {
+			request.respond({
+				schema: DESKTOP_CHANGES_SERVICE_SCHEMA,
+				async read() {
+					const tracker = await scan();
+					return tracker ? projectDesktopChanges(tracker.worktrees, idFor) : undefined;
+				},
+				async diff(rootId, path) {
+					const tracker = await scan();
+					if (!tracker) return { kind: "unavailable" };
+					const root = [...ids].find(([, id]) => id === rootId)?.[0];
+					const tree = root === undefined ? undefined : tracker.worktrees.find((candidate) => candidate.root === root);
+					// Exact match on the owner's own list: the file object (and so its
+					// status and Git arguments) is the owner's, never the request's.
+					const file = tree?.model.files.find((candidate) => candidate.path === path);
+					if (!tree || !file) return { kind: "not_found" };
+					// Git lists files behind a directory link (a Windows junction) as
+					// part of the tree; Desktop never serves content outside the root,
+					// nor the repository's own git dir reached through an alias in it.
+					const gitDirectories = await repositoryGitDirectories(deps.gitRunner(tree.root), tree.root);
+					if (disposed || !gitDirectories) return { kind: "unavailable" };
+					if (!(await changeDirectoryInsideRoot(tree.root, file.path, gitDirectories))) return { kind: "not_found" };
+					// Unlike the panel, never run a command the repository's config
+					// names (textconv, external diff, fsmonitor) for a Desktop read.
+					const projected = projectDesktopDiff(await runFileDiff(deps.gitRunner(tree.root, DIFF_MAX_BYTES), file, { inertRepositoryCommands: true }));
+					if (disposed || !projected) return { kind: "unavailable" };
+					return { kind: "ok", ...projected };
+				},
+				dispose() { disposed = true; },
+			});
+		} catch {
+			/* a responder that throws is ignored */
+		}
+	});
 	pi.registerTool({
 		name: "session_worktree_register",
 		renderShell: "self",
@@ -3233,7 +3303,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 					const key = bandKey(width);
 					if (bandPainted?.key === key && bandPainted.width === width) return bandPainted.band.rows;
 					let breaks: string[] | undefined;
-					try { breaks = breaksPart()?.render(BAND_RIGHT_WIDTH); } catch { breaks = undefined; }
+					try { const rendered = breaksPart()?.render(BAND_RIGHT_WIDTH); breaks = rendered ? [...rendered] : undefined; } catch { breaks = undefined; }
 					const band = renderFoldedBand(footerModel(), theme, width, breaks, usageShortcutKey, visualSettings, gaugePaint(ctx));
 					bandPainted = { key, width, band };
 					return band.rows;
