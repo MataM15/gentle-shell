@@ -6,7 +6,7 @@
 import { keyHint, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { BASH_BACKGROUND_TOOL, MAX_RUNNING_JOBS, MONITOR_TOOL, type JobRecord, type JobRegistry } from "./background-jobs.ts";
 import { MONITOR_BATCH_MS, MONITOR_FLOOD_LINES, MONITOR_FLOOD_WINDOW_MS, MONITOR_LINES_PER_NOTICE, MONITOR_MAX_TIMEOUT_SECONDS, type MonitorBatch, type MonitorController, type MonitorStopReason } from "./background-monitor.ts";
-import { CARD_TONE, panelExtraRows, renderCard, sharedCardFrameCache, type CardTheme } from "./shell-card.ts";
+import { cachedCard, CARD_TONE, panelExtraRows, renderCard, type CardTheme } from "./shell-card.ts";
 import { sanitizeTerminalText } from "./terminal-theme.ts";
 
 export const JOB_NOTICE_TYPE = "gentle-jobs.notice";
@@ -197,20 +197,14 @@ export function registerBackgroundJobTools(pi: ExtensionAPI, options: Background
 			: details?.status === "exited" && details.exitCode === 0 ? CARD_TONE.SUCCESS : CARD_TONE.ERROR;
 		let hint: string;
 		try { hint = keyHint("app.tools.expand", renderOptions.expanded ? "collapse" : "expand"); } catch { hint = renderOptions.expanded ? "collapse" : "expand"; }
-		// The personal margins and width-based title stay; the frame cache keyed on the
-		// message replays the same rows while nothing they read changed (upstream #2921).
-		const cache = sharedCardFrameCache(message as object, "card");
-		return {
-			render(width: number) {
-				const cardTheme = theme as CardTheme;
-				return cache.render(width, () => [cardTheme, renderOptions.expanded, hint, tone, details?.kind, details?.label, ...lines], (w) => {
-					const margin = w < 8 ? 0 : panelExtraRows(cardTheme, w - 2, tone) ? 1 : 2;
-					const title = details?.kind === "monitor" ? "Monitor" : w < 45 ? "Job" : "Background job";
-					const rows = renderCard({ title, subtitle: details?.label, body: lines, tone, glyph: JOB_GLYPH }, cardTheme, w - margin * 2, { expanded: renderOptions.expanded, previewRows: 3, hint });
-					return margin ? rows.map((row) => `${" ".repeat(margin)}${row}`) : rows;
-				});
-			},
-			invalidate() { cache.invalidate(); },
-		};
+		// The personal margins and width-based title stay; the settled card keeps one
+		// frame per width and card style (upstream #3490).
+		const cardTheme = theme as CardTheme;
+		return cachedCard((w) => {
+			const margin = w < 8 ? 0 : panelExtraRows(cardTheme, w - 2, tone) ? 1 : 2;
+			const title = details?.kind === "monitor" ? "Monitor" : w < 45 ? "Job" : "Background job";
+			const rows = renderCard({ title, subtitle: details?.label, body: lines, tone, glyph: JOB_GLYPH }, cardTheme, w - margin * 2, { expanded: renderOptions.expanded, previewRows: 3, hint });
+			return margin ? rows.map((row) => `${" ".repeat(margin)}${row}`) : rows;
+		});
 	});
 }

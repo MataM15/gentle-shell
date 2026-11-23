@@ -2,7 +2,7 @@ import { sanitizeTerminalText } from "./terminal-theme.ts";
 import { readableDataRows } from "./orchestrator-tool-card.ts";
 import {
 	cachedCard, CARD_TONE, cardAwaitingResult, cardBodyRows, cardBottom, cardRunningLine, cardTop,
-	floatRows, markCardResult, sharedCardFrameCache, type CardRowContext, type CardTheme,
+	floatRows, markCardResult, renderCard, type CardRowContext, type CardTheme,
 } from "./shell-card.ts";
 
 export interface OrchestratorMessageDetails {
@@ -37,47 +37,33 @@ function technicalRows(data: OrchestratorMessageDetails): string[] {
 	].filter((row): row is string => typeof row === "string" && row.length > 0);
 }
 
-export function incomingMessageCard(data: OrchestratorMessageDetails, content: string, expanded: boolean, theme: CardTheme, hint: string, identity?: object) {
+export function incomingMessageCard(data: OrchestratorMessageDetails, content: string, expanded: boolean, theme: CardTheme, hint: string) {
 	// Older stored entries only have the model-facing envelope. Remove only
 	// its exact prefix; new entries carry the original message separately.
 	const prefix = `Session message from ${data.senderSessionId} (correlation ${data.correlationId}): `;
 	const body = clean(data.message ?? (content.startsWith(prefix) ? content.slice(prefix.length) : content)).split("\n");
-	return cachedCard({
-		identity,
-		card: () => ({ title: "Message received", subtitle: route(data, true), body: expanded ? [...body, "", ...technicalRows(data)] : body, tone: CARD_TONE.INFO, glyph: "↙" }),
-		theme: () => theme,
-		options: () => ({ expanded, previewRows: 3, hint }),
-	});
+	// Settled once received: one frame per width and card style (#3490).
+	return cachedCard((width) => renderCard({ title: "Message received", subtitle: route(data, true), body: expanded ? [...body, "", ...technicalRows(data)] : body, tone: CARD_TONE.INFO, glyph: "↙" }, theme, width, { expanded, previewRows: 3, hint }));
 }
 
 export function outgoingMessageCall(args: { message?: unknown }, theme: CardTheme, context: MessageRowContext, hint: string) {
-	// The call's frame changes when the shared tool state moves: the result
-	// arrives (pending drops, the spinner and bottom rows go away) or the
-	// delivery fails (tone and title flip). Those values key the cache, which
-	// is shared per tool-call context so it survives transcript rebuilds.
-	const cache = sharedCardFrameCache(context, "call");
 	return {
 		render(width: number) {
 			if (width <= 0) return [];
-			return cache.render(width, () => {
-				const data = context.state?.orchestratorMessage ?? {};
-				return [theme, context.expanded, hint, cardAwaitingResult(context), context.state?.messageError, data.state, clean(args.message)];
-			}, (w) => floatRows(context.state?.messageError ? CARD_TONE.ERROR : CARD_TONE.INFO, theme, w, (inner) => {
-				const data = context.state?.orchestratorMessage ?? {};
-				const pending = cardAwaitingResult(context);
-				const tone = context.state?.messageError ? CARD_TONE.ERROR : CARD_TONE.INFO;
-				const title = pending ? "Sending message" : context.state?.messageError ? "Message not sent" : data.state === "accepted" ? "Message queued" : "Orchestrator message";
-				return {
-					// Fixed status titles stay on one row; long routes are clipped, not wrapped.
-					head: [cardTop({ title, subtitle: route(data), body: [], tone, glyph: "↗" }, theme, inner, hint)],
-					...(pending ? {
-						body: [...cardBodyRows(clean(args.message).split("\n"), tone, theme, inner, { expanded: !!context.expanded, previewRows: 3 }), cardRunningLine(tone, theme, inner)],
-						bottom: cardBottom(tone, theme, inner),
-					} : {}),
-				};
+			const data = context.state?.orchestratorMessage ?? {};
+			const pending = cardAwaitingResult(context);
+			const tone = context.state?.messageError ? CARD_TONE.ERROR : CARD_TONE.INFO;
+			const title = pending ? "Sending message" : context.state?.messageError ? "Message not sent" : data.state === "accepted" ? "Message queued" : "Orchestrator message";
+			return floatRows(tone, theme, width, (inner) => ({
+				// Fixed status titles stay on one row; long routes are clipped, not wrapped.
+				head: [cardTop({ title, subtitle: route(data), body: [], tone, glyph: "↗" }, theme, inner, hint)],
+				...(pending ? {
+					body: [...cardBodyRows(clean(args.message).split("\n"), tone, theme, inner, { expanded: !!context.expanded, previewRows: 3 }), cardRunningLine(tone, theme, inner)],
+					bottom: cardBottom(tone, theme, inner),
+				} : {}),
 			}));
 		},
-		invalidate() { cache.invalidate(); },
+		invalidate() {},
 	};
 }
 
@@ -101,19 +87,10 @@ export function outgoingMessageResult(result: { content: Array<{ type: string; t
 	} else if (expanded) {
 		body.push(...readableDataRows({ request: context.args, details: details?.gentleAgents }));
 	}
-	// Body, tone and expanded flag are fixed once the result lands, so the
-	// settled frame can be replayed between renders. The body bytes key the
-	// cache so a later result for the same context cannot replay old rows.
-	const cache = sharedCardFrameCache(context, "result");
-	return {
-		render(width: number) {
-			if (width <= 0) return [];
-			return cache.render(width, () => [theme, expanded, body.join("\u0000")], (w) => floatRows(tone, theme, w, (inner) => ({
-				afterHeading: true,
-				body: cardBodyRows(body, tone, theme, inner, { expanded, previewRows: 3 }),
-				bottom: cardBottom(tone, theme, inner),
-			})));
-		},
-		invalidate() { cache.invalidate(); },
-	};
+	// The result never changes once it lands; Pi rebuilds the row when it does.
+	return cachedCard((width) => width <= 0 ? [] : floatRows(tone, theme, width, (inner) => ({
+		afterHeading: true,
+		body: cardBodyRows(body, tone, theme, inner, { expanded, previewRows: 3 }),
+		bottom: cardBottom(tone, theme, inner),
+	})));
 }

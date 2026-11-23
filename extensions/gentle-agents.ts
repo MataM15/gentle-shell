@@ -73,7 +73,7 @@ import { createNativeFullscreenInteraction } from "../lib/native-fullscreen-inte
 import { HERDR_BUSY_CHANNEL, nextHerdrBusyAction, type HerdrBusyEmitted } from "../lib/herdr-busy.ts";
 import { HERDR_DESKTOP_TASKS, HERDR_DESKTOP_TASKS_REQUEST, HERDR_DESKTOP_TASK_FINISHED, HERDR_DESKTOP_JOBS, HERDR_DESKTOP_JOB_SETTLED, HERDR_DESKTOP_CONSULT, HERDR_DESKTOP_SEND, HERDR_DESKTOP_INBOUND, type HerdrDesktopInbound, type HerdrDesktopJobSettled } from "../lib/herdr-desktop-events.ts";
 import { AGENTS_GLYPH, agentsCardTone, agentsSpend, agentsSummary, renderAgentsAlert, renderAgentsCard, renderAgentsSection, widgetExpiryMs, widgetRows } from "../lib/agents-widget.ts";
-import { cachedCard, cachedFrame, CARD_TONE, cardAwaitingResult, cardBodyRows, cardBottom, cardInnerWidth, cardRunningLine, cardTop, floatRows, headingFits, markCardResult, panelHeaderRow, panelInnerWidth, type CardRowContext, type CardTheme, type CardTone } from "../lib/shell-card.ts";
+import { cachedCard, CARD_TONE, renderCard, cardAwaitingResult, cardBodyRows, cardBottom, cardInnerWidth, cardRunningLine, cardTop, floatRows, headingFits, markCardResult, panelHeaderRow, panelInnerWidth, type CardRowContext, type CardTheme, type CardTone } from "../lib/shell-card.ts";
 import { openInExternalEditor } from "./gentle-shell.ts";
 import { gentlePiConfigHome } from "../lib/agent-home.ts";
 import { resolveAgentHomeDirectory } from "../lib/agent-model-resolution.ts";
@@ -2234,7 +2234,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 
 	pi.registerMessageRenderer(AGENTS_ORCHESTRATOR_MESSAGE_TYPE, (message, options, theme) => {
 		const details = (message.details as { gentleAgents?: OrchestratorMessageDetails } | undefined)?.gentleAgents ?? {};
-		return incomingMessageCard(details, messageText(message.content), options.expanded, theme, expandHint(options.expanded), message);
+		return incomingMessageCard(details, messageText(message.content), options.expanded, theme, expandHint(options.expanded));
 	});
 
 	pi.registerMessageRenderer(AGENTS_RESULT_TYPE, (message, options, theme) => {
@@ -2252,16 +2252,11 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		const chips = [details?.agent, modelChip(facts?.model), facts?.thinking ? sanitizeTerminalText(facts.thinking) : undefined];
 		const answer = expanded ? text.split("\n") : agentResultPreview(text).split("\n").filter((line) => line.trim() !== "");
 		const body = facts ? [statusCardRows(facts, t, false)[0], ...answer] : answer;
-		return cachedCard({
-			identity: message,
-			card: (width) => {
-				// Same one-line heading budget as the tool cards: the answer card's
-				// inner columns are the style's, not the terminal's.
-				const subtitle = fitSubject({ title: "Agent answer", tone, glyph: ACTION_GLYPH.result }, hint, panelInnerWidth(theme, width, tone), chips);
-				return { title: "Agent answer", subtitle, body, tone, glyph: ACTION_GLYPH.result };
-			},
-			theme: () => t,
-			options: () => ({ expanded: options.expanded, previewRows: 3, hint }),
+		return cachedCard((width) => {
+			// Same one-line heading budget as the tool cards: the answer card's
+			// inner columns are the style's, not the terminal's.
+			const subtitle = fitSubject({ title: "Agent answer", tone, glyph: ACTION_GLYPH.result }, hint, panelInnerWidth(theme, width, tone), chips);
+			return renderCard({ title: "Agent answer", subtitle, body, tone, glyph: ACTION_GLYPH.result }, t, width, { expanded: options.expanded, previewRows: 3, hint });
 		});
 	});
 
@@ -2280,12 +2275,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			"Marked stale: the result was not replayed into the conversation. It stays available through subagent_status and subagent_result.",
 		];
 		const staleTheme = agentTheme(theme, CARD_TONE.WARNING);
-		return cachedCard({
-			identity: entry,
-			card: () => ({ title: "Stale agent answer", subtitle: `${headingText(agent)} · task ${headingText(taskId)}`, body, tone: CARD_TONE.WARNING, glyph: ACTION_GLYPH.result }),
-			theme: () => staleTheme,
-			options: () => ({ expanded: options.expanded, previewRows: 3, hint: expandHint(options.expanded) }),
-		});
+		return cachedCard((width) => renderCard({ title: "Stale agent answer", subtitle: `${headingText(agent)} · task ${headingText(taskId)}`, body, tone: CARD_TONE.WARNING, glyph: ACTION_GLYPH.result }, staleTheme, width, { expanded: options.expanded, previewRows: 3, hint: expandHint(options.expanded) }));
 	});
 
 	const isOwnedActive = (task: TaskRecord | undefined): task is TaskRecord => task !== undefined && ownedTaskIds.has(task.id) && !isFinished(task.status);
@@ -3101,7 +3091,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 				};
 				// Pi reconstructs the result on output, expansion, and theme changes;
 				// the separate call still reads its live task and shared state.
-				return options.isPartial === false ? cachedFrame(render) : { render, invalidate() {} };
+				return options.isPartial === false ? cachedCard(render) : { render, invalidate() {} };
 			},
 			async execute(_id, params, signal, _onUpdate, ctx) {
 				return execute(params as Record<string, unknown>, ctx, signal);
