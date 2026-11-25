@@ -10,7 +10,7 @@ import { installKokoro, installMiro, KOKORO_MANIFESTS, KOKORO_NOTICES, kokoroByt
 import { createReplyReader, defaultSpeechEngineResolver, lastAssistantText, replyLanguage } from "./voice-reply-speech.ts";
 import { createVoiceSpeechPublisher, type VoiceSpeechChunk, type VoiceSpeechReading } from "./voice-speech-events.ts";
 import { acquireLocalReadingTurn, paneFocus as herdrPaneFocus, paneFocused as herdrPaneFocused, type PaneFocus } from "./voice-presence.ts";
-import { cutListenerReading, createSessionListenerLink, listenerReadingTurn, sessionDisplayLabel, startVoiceListenerProcess, ListenerRateLimitError, VoiceListenerClient, type ListenerReading, type ListenerSession, type ListenerWakeReservation, type SessionDictation, type SessionListenerLink } from "./voice-listener-client.ts";
+import { cutListenerReading, createSessionCaptureGuard, createSessionListenerLink, listenerReadingTurn, sessionDisplayLabel, startVoiceListenerProcess, ListenerRateLimitError, VoiceListenerClient, type ListenerReading, type ListenerSession, type ListenerWakeReservation, type SessionDictation, type SessionListenerLink } from "./voice-listener-client.ts";
 import type { ReadingReleaseReason, CaptureMode, ListenerFrame, ListenerDisplayState } from "./voice-listener-protocol.ts";
 import { createCuePlayer, type CueName, type CuePlayer, type CueResult } from "./voice-cues.ts";
 import { createVoiceLog, type VoiceLog } from "./voice-diagnostics.ts";
@@ -435,6 +435,7 @@ export interface CreateReadingTurnOptions {
 	turn?: (options: { dir: string; session: ListenerSession; chars?: number; signal: AbortSignal; maxWaitMs?: number; onCut?: (reason: ReadingReleaseReason) => void }) => Promise<ListenerReading | undefined>;
 	local?: (options: { signal: AbortSignal }) => Promise<(() => void) | undefined>;
 	start?: () => void | Promise<void>;
+	beforeStart?: () => void;
 }
 
 // The reading turn a session asks for (S6, slice B): the listener decides who
@@ -442,7 +443,7 @@ export interface CreateReadingTurnOptions {
 // where it was before the listener existed. A refusal is obeyed, never routed
 // around, so two sessions cannot both read through different turns.
 export function createReadingTurn(options: CreateReadingTurnOptions): ReadingTurn {
-	const turn = options.turn ?? ((request: Parameters<NonNullable<CreateReadingTurnOptions["turn"]>>[0]) => listenerReadingTurn({ ...request, start: options.start }));
+	const turn = options.turn ?? ((request: Parameters<NonNullable<CreateReadingTurnOptions["turn"]>>[0]) => listenerReadingTurn({ ...request, start: options.start, beforeStart: options.beforeStart }));
 	const local = options.local ?? acquireLocalReadingTurn;
 	return async (signal, hooks = {}) => {
 		if (hooks.sessionId) {
@@ -479,6 +480,7 @@ const readingEndFor = (outcome: string | undefined): ReadingEnd => (outcome === 
 export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = {}): void {
 	const env = deps.env ?? process.env;
 	const startListener = deps.startListener ?? (() => startVoiceListenerProcess(env));
+	const captureGuard = createSessionCaptureGuard();
 	const probe = deps.probe ?? readVoicePlatformProbe;
 	const readStatus = deps.readStatus ?? ((target) => readVoiceStatus({ env, target }));
 	// Production always installs and runs the pinned manifests: no manifest or
@@ -500,11 +502,15 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	// same warm worker for a hands-free recording, the same single-use worker for a
 	// dictation. This is what recorded before slice C, unchanged.
 	const localDictation = (options: Parameters<NonNullable<VoiceCommandDeps["createSession"]>>[0]): SessionDictation => {
-		const session: VoiceDictation = options.warm
+		const session = options.warm
 			? warmFor(options.target).session({ onStateChange: options.onStateChange, endpoint: options.endpoint })
 			: createVoiceSession({ env, target: options.target, onStateChange: options.onStateChange, endpoint: options.endpoint });
 		// The session holds the microphone here, so the session plays the cues.
-		return { get state() { return session.state; }, owner: "session", start: () => session.start(), stop: () => session.stop(), cancel: () => session.cancel() };
+		return {
+			get state() { return session.state; },
+			get microphoneActive() { return "microphoneActive" in session ? session.microphoneActive : undefined; },
+			owner: "session", start: () => session.start(), stop: () => session.stop(), cancel: () => session.cancel(),
+		};
 	};
 	// The session's side of the listener, built once: it joins the listener, starts
 	// one when there is none, and reports this session's pane so the focus can hand
@@ -536,6 +542,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 		const link = createSessionListenerLink({
 			dir: resolveVoiceHome(env),
 			adoptedClient,
+			captureGuard,
 			start: startListener,
 			session: () => {
 				const id = sessionIdOf(sessionCtx);
@@ -671,7 +678,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 	};
 	const paneFocused = deps.paneFocused ?? (() => herdrPaneFocused({ env }));
 	const paneFocus = deps.paneFocus ?? (() => herdrPaneFocus({ env }));
-	const readingTurn = deps.readingTurn ?? createReadingTurn({ dir: resolveVoiceHome(env), start: () => startVoiceListenerProcess(env) });
+	const readingTurn = deps.readingTurn ?? createReadingTurn({ dir: resolveVoiceHome(env), start: startListener, beforeStart: captureGuard.assertReleased });
 	const readCut = deps.readCut ?? ((sessionId: string) => {
 		void cutListenerReading({ dir: resolveVoiceHome(env), session: { sessionId, get voiceOn() { return sessionIdOf(sessionCtx) === sessionId && voiceOn(sessionCtx); } } }).catch(() => {});
 	});
@@ -1805,6 +1812,7 @@ export function registerVoiceCommand(pi: ExtensionAPI, deps: VoiceCommandDeps = 
 						else if (frame.type === "transcript") receiveTranscript(frame.text, frame.truncated === true);
 					},
 				});
+				client.guardRestart(captureGuard.assertReleased);
 				passiveClient = client;
 				void client.connect().catch((error: unknown) => {
 					// A throttled hello is temporary; the client's disconnect schedules

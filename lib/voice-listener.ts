@@ -86,6 +86,8 @@ export interface ListenerLock {
 	readonly socket: string;
 	readonly startedAt: number;
 	readonly heartbeatAt: number;
+	// The live listener still reserves the microphone while its worker closes.
+	readonly closing?: true;
 	// On failed shutdown the microphone belongs to this child, not the listener.
 	readonly workerPid?: number;
 	readonly version: 1;
@@ -115,6 +117,7 @@ const parseLock = (raw: string): ListenerLock | undefined => {
 			socket: record.socket,
 			startedAt: record.startedAt as number,
 			heartbeatAt: record.heartbeatAt as number,
+			...(record.closing === true ? { closing: true } : {}),
 			...(typeof record.workerPid === "number" && Number.isSafeInteger(record.workerPid) && record.workerPid > 0 ? { workerPid: record.workerPid } : {}),
 			version: 1,
 		};
@@ -155,10 +158,10 @@ export function takeListenerLock(paths: ListenerPaths, options: { pid?: number; 
 
 // The heartbeat is rewritten through a temporary file and renamed into place, so
 // a client never reads half a lock body.
-export function refreshListenerLock(paths: ListenerPaths, options: { pid?: number; now?: number; workerPid?: number } = {}): boolean {
+export function refreshListenerLock(paths: ListenerPaths, options: { pid?: number; now?: number; closing?: true; workerPid?: number } = {}): boolean {
 	const current = readListenerLock(paths);
 	if (!current || current.pid !== (options.pid ?? process.pid) || current.workerPid !== undefined) return false;
-	const updated = { ...current, heartbeatAt: options.now ?? Date.now(), workerPid: options.workerPid };
+	const updated = { ...current, heartbeatAt: options.now ?? Date.now(), ...(options.closing ? { closing: true } : {}), workerPid: options.workerPid };
 	const temporary = `${paths.lock}.${randomUUID()}.tmp`;
 	try {
 		writeFileSync(temporary, `${JSON.stringify(updated)}\n`, { flag: "wx", mode: 0o600 });
@@ -635,7 +638,9 @@ export class VoiceListener {
 		this.closing = true;
 		if (this.idleTimer) clearTimeout(this.idleTimer);
 		this.idleTimer = undefined;
-		// Keep renewing the lock until the worker exits or its PID is persisted.
+		// Reserve the microphone for the closing worker even if a session can't
+		// complete a hello. Keep renewing until the worker exits or its PID is fenced.
+		if (!this.fenced) refreshListenerLock(this.paths, { pid: this.pid, closing: true });
 		this.endReading("shutdown");
 		if (this.reading?.tail) clearTimeout(this.reading.tail);
 		this.reading = undefined;
@@ -651,33 +656,30 @@ export class VoiceListener {
 		// The recording flag never outlives the capture.
 		this.recording = false;
 		if (capture) void capture.dictation.cancel().catch(() => {});
-		for (const client of [...this.clients.values()]) {
-			// end() flushes the bye before the FIN; a client that never closes is
-			// dropped shortly after so shutdown cannot hang on it.
-			client.socket.end(encodeListenerFrame({ type: "bye", reason }));
-			const timer = setTimeout(() => client.socket.destroy(), 100);
-			client.socket.once("close", () => clearTimeout(timer));
-		}
-		this.clients.clear();
-		const serverClosed = new Promise<void>((resolve) => {
-			if (!this.server) {
-				resolve();
-				return;
-			}
-			this.server.close(() => resolve());
-		});
 		this.closed = (async () => {
-			// Closing the child also settles a spot capture that is still stopping.
-			const workerClosed = Promise.resolve().then(() => this.options.worker?.close()).then(() => true, () => false);
-			const [, confirmedClosed] = await Promise.all([serverClosed, workerClosed]);
+			// A disconnect can immediately trigger local fallback. Keep the socket
+			// open until the bounded worker close succeeds or its survivor is fenced.
+			const confirmedClosed = await Promise.resolve().then(() => this.options.worker?.close()).then(() => true, () => false);
+			const canReleaseLock = confirmedClosed || await this.protectShutdownLock();
 			// Ownership-aware: after a takeover the socket file belongs to the replacement.
 			try {
 				if (this.ownsSocket()) unlinkSync(this.paths.socket);
 			} catch {
 				/* already gone */
 			}
-			if (!confirmedClosed) await this.protectShutdownLock();
-			else if (!this.fenced) releaseListenerLock(this.paths, { pid: this.pid });
+			const serverClosed = new Promise<void>((resolve) => {
+				if (this.server) this.server.close(() => resolve());
+				else resolve();
+			});
+			if (canReleaseLock && !this.fenced) releaseListenerLock(this.paths, { pid: this.pid });
+			for (const client of this.clients.values()) {
+				// Flush bye before the FIN; don't wait indefinitely for the peer.
+				client.socket.end(encodeListenerFrame({ type: "bye", reason }));
+				const timer = setTimeout(() => client.socket.destroy(), 100);
+				client.socket.once("close", () => clearTimeout(timer));
+			}
+			this.clients.clear();
+			await serverClosed;
 			if (this.heartbeat) clearInterval(this.heartbeat);
 			this.heartbeat = undefined;
 			this.log("listener.exit", { reason });
@@ -686,24 +688,21 @@ export class VoiceListener {
 		await this.closed;
 	}
 
-	private async protectShutdownLock(): Promise<void> {
+	private async protectShutdownLock(): Promise<boolean> {
 		const worker = this.options.worker;
 		const survivor = worker?.unclosedChild?.();
-		if (!survivor && worker?.unclosedChild) {
-			// The child closed after the worker's shutdown deadline.
-			if (!this.fenced) releaseListenerLock(this.paths, { pid: this.pid });
-			return;
-		}
+		// The child may have closed just after the worker's shutdown deadline.
+		if (!survivor && worker?.unclosedChild) return true;
 		const workerPid = survivor?.pid;
 		if (workerPid !== undefined && Number.isSafeInteger(workerPid) && workerPid > 0 && !this.fenced && refreshListenerLock(this.paths, { pid: this.pid, workerPid })) {
 			// The next starter checks the child PID even after this listener exits.
-			return;
+			return false;
 		}
 		// No durable fence was written. Fail closed and keep the old heartbeat
 		// referenced rather than exit before the child is confirmed gone.
 		this.heartbeat?.ref();
 		await (survivor?.closed ?? new Promise<void>(() => {}));
-		if (!this.fenced) releaseListenerLock(this.paths, { pid: this.pid });
+		return true;
 	}
 
 	// True while the socket path still resolves to the inode this listener published.
@@ -803,6 +802,8 @@ export class VoiceListener {
 	}
 
 	private receive(client: Client, chunk: string): void {
+		// Keep existing clients connected without admitting new work during close.
+		if (this.closing) return;
 		client.buffered += chunk;
 		let newline: number;
 		while ((newline = client.buffered.indexOf("\n")) !== -1) {

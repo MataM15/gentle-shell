@@ -51,6 +51,8 @@ export interface KeywordRejection { readonly command: string; readonly reason: K
 
 export interface WarmDictation {
 	readonly state: VoiceSessionState;
+	// Unlike state and the bounded release wait, this follows actual child exit.
+	readonly microphoneActive: boolean;
 	start(): Promise<void>;
 	stop(): Promise<VoiceTranscript>;
 	cancel(): Promise<void>;
@@ -446,6 +448,10 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 				get state() {
 					return capture.state;
 				},
+				get microphoneActive() {
+					const entry = capture.entry;
+					return (capture.state !== "idle" && !capture.settled) || Boolean(entry && entry === retiringEntry && !entry.exited);
+				},
 				result: () => resultPromise,
 				// Reuse the capture release that the busy-spot retry already waits for.
 				waitUntilReleased: () => blockedBy ?? released,
@@ -501,8 +507,8 @@ export function createWarmVoiceWorker(options: WarmVoiceWorkerOptions): WarmVoic
 					}
 					return resultPromise;
 				},
-				// The worker leaves on cancel; it settles once it has exited, so the
-				// microphone is free when this resolves.
+				// Publish the cancellation promptly, then wait for exit to a deadline.
+				// The microphone guard stays active even if that wait rejects.
 				async cancel() {
 					if (capture.settled) return;
 					if (capture.state === "idle") {

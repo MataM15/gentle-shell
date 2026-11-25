@@ -144,6 +144,7 @@ export class VoiceListenerClient {
 	private closed = false;
 	private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 	private reconnectOperation: AbortController | undefined;
+	private beforeRestart: (() => void) | undefined;
 	private stableTimer: ReturnType<typeof setTimeout> | undefined;
 	private currentState: ListenerState = "asleep";
 	private updatedVoiceOn: boolean | undefined;
@@ -178,6 +179,18 @@ export class VoiceListenerClient {
 	onFrame(handler: (frame: ListenerFrame) => void): () => void {
 		this.listeners.add(handler);
 		return () => this.listeners.delete(handler);
+	}
+
+	// Adoption transfers microphone arbitration without replacing the live socket.
+	guardRestart(beforeRestart: () => void): void {
+		this.beforeRestart = beforeRestart;
+	}
+
+	// A failed manual rejoin must not discard this client's established recovery.
+	keepRecovering(): boolean {
+		if (!this.everJoined || !this.options.restartOnDisconnect || this.closed || this.replaced) return false;
+		this.scheduleReconnect();
+		return true;
 	}
 
 	private session(): ListenerSession | undefined {
@@ -396,6 +409,7 @@ export class VoiceListenerClient {
 							dir: this.options.dir, probe: recovery.probe, waitMs: recovery.waitMs, signal: controller.signal,
 							start: () => {
 								if (!this.session()) throw new Error("voice listener session ended");
+								this.beforeRestart?.();
 								return recovery.start?.();
 							},
 						});
@@ -487,7 +501,7 @@ const wait = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve, r
 
 function hasLiveShutdownWorker(paths: ListenerPaths, isAlive?: EnsureListenerOptions["isAlive"]): boolean {
 	const lock = readListenerLock(paths);
-	return lock?.workerPid !== undefined && !listenerLockStale(lock, { isAlive });
+	return Boolean(lock && (lock.closing || lock.workerPid !== undefined) && !listenerLockStale(lock, { isAlive }));
 }
 
 async function waitForListener(paths: ListenerPaths, waitMs: number, probe: (path: string) => Promise<boolean>, { signal, isAlive }: Pick<EnsureListenerOptions, "signal" | "isAlive">): Promise<boolean> {
@@ -575,6 +589,7 @@ export interface ListenerReadingOptions {
 	// own ("cut", "lease", "closed", "shutdown") or "lease" for a failed renewal.
 	onCut?: (reason: ReadingReleaseReason) => void;
 	start?: () => void | Promise<void>;
+	beforeStart?: () => void;
 	waitMs?: number;
 	pollMs?: number;
 	maxWaitMs?: number;
@@ -669,8 +684,8 @@ function holdReading(client: VoiceListenerClient, readingId: string, options: Li
 }
 
 // The one reading turn through the listener (slice B): ask, wait behind another
-// session's reading, and hold it until the reply ends. Never starts a listener
-// for a session that cannot join one, because speaking stays in the session.
+// session's reading, and hold it until the reply ends. Opening a new listener
+// must pass the session's microphone guard; joining an existing one needn't.
 export async function listenerReadingTurn(options: ListenerReadingOptions): Promise<ListenerReading | undefined> {
 	let client: VoiceListenerClient;
 	try {
@@ -678,7 +693,10 @@ export async function listenerReadingTurn(options: ListenerReadingOptions): Prom
 		const joined = await ensureListener({
 			dir: options.dir,
 			session,
-			start: options.start,
+			start: () => {
+				options.beforeStart?.();
+				return options.start?.();
+			},
 			waitMs: options.waitMs,
 			// Keep the live session source, including its voice getter, on reconnect.
 			createClient: () => new VoiceListenerClient({ dir: options.dir, session: () => session, role: "reading" }),
@@ -730,6 +748,8 @@ export async function cutListenerReading(options: { dir: string; session: Listen
 export interface SessionDictation {
 	readonly state: VoiceSessionState;
 	readonly owner: "listener" | "session";
+	// A warm capture can finish reporting its outcome before its child exits.
+	readonly microphoneActive?: boolean;
 	start(): Promise<void>;
 	stop(): Promise<VoiceTranscript>;
 	cancel(): Promise<void>;
@@ -783,9 +803,29 @@ export interface SessionListenerLink {
 	close(): void;
 }
 
+// Keep the guard alive even when the command replaces a link during a session
+// switch: a microphone still being released belongs to the same Pi process.
+export function createSessionCaptureGuard() {
+	const captures = new Set<SessionDictation>();
+	const active = (): boolean => {
+		for (const capture of captures) {
+			if (!(capture.microphoneActive ?? (capture.state !== "idle" && capture.state !== "finished"))) captures.delete(capture);
+		}
+		return captures.size > 0;
+	};
+	return {
+		track: (capture: SessionDictation) => { captures.add(capture); },
+		active,
+		assertReleased: () => {
+			if (active()) throw new ShutdownWorkerBusyError();
+		},
+	};
+}
+
 export interface SessionListenerLinkOptions {
 	dir: string;
 	session(): ListenerSession | undefined;
+	captureGuard?: ReturnType<typeof createSessionCaptureGuard>;
 	// Transfer a connected passive session without replacing its socket.
 	adoptedClient?: VoiceListenerClient;
 	start?: () => void | Promise<void>;
@@ -815,21 +855,13 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 	const checkShutdownWorker = (): void => {
 		if (hasLiveShutdownWorker(paths)) throw new ShutdownWorkerBusyError();
 	};
-	// This session's own fallback captures. While one is starting, recording or
-	// transcribing, its worker may hold the microphone, so this session starts no
-	// listener: the new listener's spotter would open the microphone a second
-	// time (T9). A capture reports "finished" only after its worker has exited;
-	// the automatic reconnect keeps retrying on its backoff until then.
-	const ownCaptures = new Set<SessionDictation>();
-	const ownCaptureActive = (): boolean => {
-		for (const capture of ownCaptures) if (capture.state === "idle" || capture.state === "finished") ownCaptures.delete(capture);
-		return ownCaptures.size > 0;
-	};
+	const captures = options.captureGuard ?? createSessionCaptureGuard();
 	const startListener = (): void | Promise<void> => {
-		if (ownCaptureActive()) throw new Error("this session's own capture still holds the microphone");
+		captures.assertReleased();
 		return options.start?.();
 	};
 	let client: VoiceListenerClient | undefined = options.adoptedClient;
+	client?.guardRestart(captures.assertReleased);
 	let wakeIdentity: object | undefined;
 	let joining: PendingJoin | undefined;
 	let handler: ((frame: ListenerFrame) => boolean) | undefined;
@@ -859,7 +891,7 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 		if (joining) return joining.promise;
 		// Leave the current client, and the reconnect it owns, untouched: it starts
 		// the listener once this session's own capture has released the microphone.
-		if (ownCaptureActive()) return Promise.resolve(false);
+		if (captures.active()) return Promise.resolve(false);
 		const controller = new AbortController();
 		const pending: PendingJoin = { controller, promise: undefined!, allowStart: true };
 		joining = pending;
@@ -867,14 +899,6 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 			try {
 				const session = options.session();
 				if (!session) return false;
-				if (client && client === options.adoptedClient && !client.connected) {
-					// The transferred socket is gone. Retire its reconnect timer before
-					// creating another client, so the two can never evict each other.
-					detachAdopted?.();
-					detachAdopted = undefined;
-					client.close();
-					client = undefined;
-				}
 				if (client) {
 					pending.client = client;
 					try {
@@ -883,8 +907,12 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 						return true;
 					} catch (error) {
 						throwIfAborted(controller.signal);
-						if (error instanceof ListenerRateLimitError) return false;
-						// Its retry must not race the new client created below.
+						if (client.keepRecovering() || error instanceof ListenerRateLimitError) return false;
+						// An unjoined or replaced client cannot recover the listener.
+						if (client === options.adoptedClient) {
+							detachAdopted?.();
+							detachAdopted = undefined;
+						}
 						client.close();
 						client = undefined;
 						/* the lock or the socket is gone: start a listener below */
@@ -1020,10 +1048,14 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 			}
 		};
 		const local = (): Promise<void> => {
-			// The fence may have appeared while joining or asking for the microphone.
+			// The shutdown fence may have appeared while joining or requesting the mic.
 			checkShutdownWorker();
 			if (handler === handle) handler = undefined;
-			if (!fallback) ownCaptures.add((fallback = request.fallback()));
+			if (!fallback) {
+				captures.assertReleased();
+				fallback = request.fallback();
+				captures.track(fallback);
+			}
 			return fallback.start();
 		};
 		return {

@@ -401,10 +401,12 @@ a session that asks for a capture only receives the transcript.
   was connected and loses the listener rejoins a replacement, or starts a new
   listener when there is none, on the throttled reconnect schedule. A session
   that starts with voice off joins a running listener but never starts one.
-  While a session's own local capture is starting, recording or transcribing,
-  that session starts no listener at all, neither on reconnect nor on demand:
-  the new listener would open the microphone a second time. It starts one on
-  the next reconnect attempt after that capture's worker has exited.
+  A session starts no listener while its own local capture may hold the
+  microphone. This applies to automatic reconnect (including an adopted
+  voice-off connection), an explicit join, and reply reading. A failed
+  explicit join leaves automatic recovery in place. Cancellation can report
+  that the capture has finished before the worker exits; the next reconnect
+  can start a listener only once the microphone is free.
 - **Protocol.** `gentle.voice-listener/v1`, JSON on one line each way, at most
   64 KiB per line. A connection starts with a hello carrying the session id and
   the herdr pane id, then answers status and reports the state:
@@ -444,8 +446,9 @@ a session that asks for a capture only receives the transcript.
   a session that crashed, was closed or lost its listener frees it without
   anybody waiting for the lease, and the state stays `reading` for a short tail
   after the end so the next reading never starts over the last sentence. A
-  session starts the listener when none is running, and reads through its own
-  local turn only when no listener can be reached at all.
+  session can join an already running listener even while its local capture
+  is active, but it cannot start one at that time. If no listener can be
+  reached, the session uses its own local reading turn.
 
 - **Capture.** `dictate` asks for the microphone with a mode (`dictation` or
   `conversation`, the latter carrying the conversation endpoint), `stop` ends
@@ -541,10 +544,13 @@ a session that asks for a capture only receives the transcript.
   recording ends with no session that has voice on (a wake, or voice that was on,
   leaves the listener awake instead). A reading stops the spotter too: a reply is
   never read while the microphone is open for a keyword, and spotting starts
-  again after the reading's tail. Closing the listener stops it. Going to sleep
-  keeps it running when its worker only ever listened for commands, and restarts
-  it in a fresh worker when that worker had transcribed. A spotter that cannot
-  open the microphone, that dies or whose capture ends on its own is logged
+  again after the reading's tail. The listener reserves the microphone in
+  its lock during shutdown and sends `bye` only after its worker closes or
+  the lock records the surviving worker's PID. Local capture reports the
+  microphone as busy while either reservation is live. Going to sleep keeps
+  spotting running when the worker only ever listened for commands, and
+  restarts it in a fresh worker when that worker had transcribed. A spotter
+  that cannot open the microphone, dies or ends on its own is logged
   (`kws.failed`, with a fixed reason) and retried after 1, 5, 30 and then 60
   seconds; capture, transcripts, cues and readings carry on meanwhile. Only a
   missing or invalid keyword model stops spotting for the rest of the
