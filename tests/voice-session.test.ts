@@ -65,7 +65,7 @@ interface Fixture {
 
 // Installs a fake runtime and model through the real installer, so status,
 // markers and layout are exactly what /gentle:voice will find.
-async function installFixture(t: test.TestContext, target: VoiceTarget): Promise<Fixture> {
+async function installFixture(t: test.TestContext, target: VoiceTarget, { pulse = false } = {}): Promise<Fixture> {
 	const base = join(repoRoot, "tmp");
 	mkdirSync(base, { recursive: true });
 	const dir = mkdtempSync(join(base, "voice-session-"));
@@ -91,7 +91,13 @@ async function installFixture(t: test.TestContext, target: VoiceTarget): Promise
 	const runtime: VoiceRuntimeManifest = {
 		id: `test-runtime-${target}`,
 		target,
-		packages: [pkg("sherpa-onnx-node", { "package.json": "{}", "non-streaming-asr.js": FAKE_ASR }), pkg("node-cpal", { "package.json": "{}", "index.js": FAKE_CPAL })],
+		packages: [pkg("sherpa-onnx-node", { "package.json": "{}", "non-streaming-asr.js": FAKE_ASR }), pkg("node-cpal", {
+				"package.json": "{}",
+				"index.js": FAKE_CPAL,
+				// On a WSL kernel the real worker captures through the PulseAudio facade.
+				...(pulse ? { "backend-pulseaudio.js": FAKE_CPAL, [`bin/backend-pulseaudio/${target}/index.node`]: "fake native" } : {}),
+			}),
+		],
 		redirects: [],
 	};
 	const model: VoiceModelManifest = { id: "test-model", revision: "test", baseUrl: "https://huggingface.co/test", files: [], redirects: [] };
@@ -109,6 +115,12 @@ async function installFixture(t: test.TestContext, target: VoiceTarget): Promise
 	return { voiceHome, target, manifests: { model, runtime } };
 }
 
+// Fakes a test left running stop holding the event loop once the test ends.
+const liveFakes = new Set<FakeWorker>();
+test.afterEach(() => {
+	for (const fake of [...liveFakes]) fake.release();
+});
+
 // A scripted worker: records what it is sent and exits when its stdin ends,
 // unless told to hang so only a kill can end it.
 class FakeWorker extends EventEmitter {
@@ -120,8 +132,14 @@ class FakeWorker extends EventEmitter {
 	hang = false;
 	exited = false;
 
+	// A real child process keeps the event loop alive until it exits; without
+	// this a hanging fake leaves only the session's unref'd grace timer, and the
+	// test runner cancels the test before the kill arrives.
+	private alive: ReturnType<typeof setInterval> | undefined = setInterval(() => {}, 1_000);
+
 	constructor() {
 		super();
+		liveFakes.add(this);
 		this.stdin.setEncoding("utf8");
 		let buffered = "";
 		this.stdin.on("data", (chunk: string) => {
@@ -142,7 +160,14 @@ class FakeWorker extends EventEmitter {
 	exit(): void {
 		if (this.exited) return;
 		this.exited = true;
+		this.release();
 		setImmediate(() => this.emit("close", 0, null));
+	}
+
+	release(): void {
+		clearInterval(this.alive);
+		this.alive = undefined;
+		liveFakes.delete(this);
 	}
 
 	say(message: Record<string, unknown>): void {
@@ -480,7 +505,7 @@ test("a transcript produced by the recording limit is returned by a later stop",
 });
 
 test("the real worker process records and transcribes through fake installed modules", { skip: !hostTarget && "no pinned voice target for this host" }, async (t) => {
-	const fixture = await installFixture(t, hostTarget!);
+	const fixture = await installFixture(t, hostTarget!, { pulse: true });
 	const session = createVoiceSession({ target: fixture.target, voiceHome: fixture.voiceHome, manifests: fixture.manifests, startTimeoutMs: 10_000, transcribeTimeoutMs: 10_000 });
 	await session.start();
 	assert.equal(session.state, "recording");
