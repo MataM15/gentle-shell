@@ -25,7 +25,7 @@ const model: ShellBarModel = {
 		{ label: "week", usedPercent: 40, windowSeconds: 604800, resetAt: null },
 	] }] },
 };
-const rows = (lines: string[]) => lines.map((line) => stripAnsi(line));
+const rows = (lines: readonly string[]) => lines.map((line) => stripAnsi(line));
 
 test("the rail header stacks model, ctx and cost, then the commands and usage actions between two rules (S3)", () => {
 	for (const width of [50, 40]) {

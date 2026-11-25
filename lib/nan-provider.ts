@@ -23,7 +23,7 @@ const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 // 393,216 budget and GLM 5.3 Flash its exact published 131,072 (NaN lowers anything
 // above); Qwen 3.8 Flash retains 131,000 and Gemma 4 and Qwen 3.6 retain 65,536. The
 // November larger models now publish Max answer caps (Kimi K3.1 Pro 1M, Qwen 3.8 Max
-// 131K, DeepSeek V4 Pro 393K, Hy4 64K); glm5.3 publishes no maximum and keeps 32,768.
+// 131K, DeepSeek V4 Pro 393K, Hy4 64K, Qwen4 Max 131K, Hy4 Flash 64K); glm5.3 publishes no maximum and keeps 32,768.
 // Pi requires explicit xhigh/max mappings to offer those levels; missing ordinary
 // levels pass through. GLM always reasons, while none disables all other models.
 const GLM_THINKING_LEVEL_MAP: NanChatModelConfig["thinkingLevelMap"] = {
@@ -89,6 +89,14 @@ const CHAT_MODELS: NanChatModelConfig[] = ([
 	},
 	{
 		id: "hy4", name: "Hy4", input: ["text", "image"], contextWindow: 1_000_000,
+		thinkingLevelMap: EXTENDED_THINKING_LEVEL_MAP, maxTokens: 64_000,
+	},
+	{
+		id: "qwen4-max", name: "Qwen4 Max", input: ["text", "image"], contextWindow: 1_000_000,
+		thinkingLevelMap: EXTENDED_THINKING_LEVEL_MAP, maxTokens: 131_000,
+	},
+	{
+		id: "hy4-flash", name: "Hy4 Flash", input: ["text", "image"], contextWindow: 1_000_000,
 		thinkingLevelMap: EXTENDED_THINKING_LEVEL_MAP, maxTokens: 64_000,
 	},
 ] satisfies Partial<NanChatModelConfig>[]).map((model) => ({

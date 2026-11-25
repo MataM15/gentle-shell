@@ -93,10 +93,10 @@ function headerParts(line: string, theme: ShellBarTheme): { glyph?: string; titl
  * per card group: the same title and body rows through the same card, on the
  * transparent surface only; any other surface keeps the part's own panel rows.
  */
-export function sheetCardPart<T extends { render(width: number): string[]; cardGroups?: SidebarRail["cardGroups"] }>(part: T, theme: ShellBarTheme): { render(width: number): string[] } {
+export function sheetCardPart<T extends { render(width: number): readonly string[]; cardGroups?: SidebarRail["cardGroups"] }>(part: T, theme: ShellBarTheme): { render(width: number): string[] } {
 	return {
 		render(width: number) {
-			if (chromeSurface() !== "transparent") return part.render(width);
+			if (chromeSurface() !== "transparent") return [...part.render(width)];
 			const inner = panelInnerWidth(theme, width) + PANEL_ROW_INDENT;
 			const lines = part.render(inner);
 			if (lines.length === 0) return [];

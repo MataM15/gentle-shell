@@ -9,19 +9,24 @@ import { defaultCacheRoot, ImageDiskCache } from "../lib/image-disk-cache.ts";
 import { execFile, spawnSync } from "node:child_process";
 import { openInExternalEditor, type ExternalEditorHost } from "../lib/external-editor.ts";
 import { existsSync, realpathSync, statSync } from "node:fs";
-import { lstat, readFile } from "node:fs/promises";
+import { lstat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import { createShellGitWorker, failedGitRead, gitExecResult, type GitExecError, type ShellGitWorkerRead } from "../lib/shell-git-worker.ts";
+import { shellUntrackedLines } from "../lib/shell-untracked-lines.ts";
+import { createIdleChanges, scheduleChangesIdle, type ChangesIdleScheduler } from "../lib/shell-idle-changes.ts";
 import { profilesFilePath, profileRoleEntries, readProfilesFileResult } from "../lib/agent-profiles.ts";
 import { resolveSessionProfile, sessionProfileLabel, sessionProfileModelProfiles } from "../lib/session-profile-freeze.ts";
 import * as os from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { BAND_RIGHT_WIDTH, buildShellHeaderModel, renderDevBuildLine, renderFoldedBand, renderShellBar, renderShellBelowInputFloat, renderShellBottomOnlyBar, renderShellHeaderChrome, renderShellNarrowTopBar, renderShellRailHeader, renderShellStatusBar, renderShellStatusSections, renderShellChromeBar, renderShellChromePad, renderShellTitleRow, type StatusSection, type StatusTarget, keepNativeWorkingRow, shellEnabled, shellHeaderCommandsHit, shellHeaderUsageHit, shellJobsCount, shellSessionUsageHit, type FoldedBand, type ShellBarModel, type ShellBarTheme } from "../lib/shell-bar.ts";
-import { CHANGE_STATUS, DIFF_MAX_BYTES, DIFF_MAX_LINES, DIFF_TOO_LARGE, WorktreeChangesTracker, changesDigest, renderChangesWidget, type ChangedFile, type ChangesModel, type FileRevision, type GitRunner, type LineCounter, type WorktreeChanges } from "../lib/shell-changes.ts";
+import { DIFF_MAX_BYTES, WorktreeChangesTracker, changesDigest, renderChangesWidget, type ChangedFile, type ChangesModel, type FileRevision, type GitRunner, type UntrackedLineCounts, type WorktreeChanges } from "../lib/shell-changes.ts";
 import { WorktreeChangesView } from "../lib/shell-changes-view.ts";
+import { changeDirectoryInsideRoot, loadFileDiff, repositoryGitDirectories, runFileDiff } from "../lib/change-diff.ts";
+import { DESKTOP_CHANGES_SERVICE_CHANNEL, DESKTOP_CHANGES_SERVICE_SCHEMA, projectDesktopChanges, projectDesktopDiff, type DesktopChangesService } from "../lib/desktop-rpc-changes.ts";
 import { createNativeFullscreenInteraction } from "../lib/native-fullscreen-interaction.ts";
 import { windowsProcessTreeKiller, type ProcessTreeKiller } from "../lib/native-review-cli.ts";
 import { SessionWorktreeRegistry, resolveSessionWorktree, worktreeGitEnvironment, type WorktreeResolver, type WorktreeIdentity } from "../lib/session-worktree-registry.ts";
-import { cachedCard, CARD_STYLE, CARD_TONE, cardStyle, setCardStyle, type Card, type CardTheme } from "../lib/shell-card.ts";
+import { cachedCard, CARD_STYLE, CARD_TONE, cardStyle, renderCard, setCardStyle, type Card, type CardTheme } from "../lib/shell-card.ts";
 import { resolveCardStyle, writeCardStyle } from "../lib/card-style-policy.ts";
 import { CARD_CONTENT, resolveCardContent, setCardContent, writeCardContent } from "../lib/card-content-policy.ts";
 import { CommandPalette, commandsKey, type CommandPaletteResult } from "../lib/command-palette.ts";
@@ -33,6 +38,7 @@ import { NATIVE_REVIEW_MODE_SOURCE } from "../lib/native-review-cli.ts";
 import { VisualCustomizeView, type CustomizeCategory, type CustomizeRow, type ProfileActions } from "../lib/visual-customize-view.ts";
 import { deleteVisualProfile, getVisualProfile, listVisualProfiles, resetVisualProfiles, saveVisualProfile } from "../lib/visual-profiles.ts";
 import { gaugePaintFor } from "../lib/gauge-theme.ts";
+import { isTokenCount, readCompactionThreshold } from "../lib/compaction-threshold.ts";
 import type { GaugePaint } from "../lib/shell-gauge.ts";
 import { sourcePalettePreview } from "../lib/theme-customization.ts";
 import { applyVisualPreset, CHROME_SURFACE, DEFAULT_VISUAL_SETTINGS, DENSITY, HEADER_PLACEMENT, STATUS_PLACEMENT, VISUAL_PRESET, VISUAL_SECTION_KEYS, resolveVisualSettings, visualPresetOf, writeVisualSettings, type VisualPreset } from "../lib/visual-customization-policy.ts";
@@ -40,13 +46,14 @@ import { BANNER_COLORS, DEFAULT_BANNER_CONFIG, readBannerConfig, readBannerConfi
 import { commandKeymapId, commandKeymapIds, effectiveKey, keymapCommand, keymapLabel, keymapSavedNotice, loadKeymaps, prepareKeymapChange, writeKeymaps, type KeymapBindings, type PiKeybindings } from "../lib/keymaps.ts";
 import { GentleAiDevBinaryOverrideError, resolveGentleAiDevBinaryOverride } from "../lib/gentle-ai-binary.ts";
 import { DOUBLE_ESC_CANCEL_HINT, floatPromptRow, framePromptLines, panelPromptRow, resolvePromptLayout, IDLE_ESC_CLEAR_HINT, PANEL_BUTTON, PANEL_LABEL_TEXT, COMMANDS_LABEL_TEXT, PROMPT_HINT, PROMPT_STATE, SHELL_PULSE_MS, SHELL_PULSE_WATCHDOG_MS, withPromptHint, workingTick, type PromptState } from "../lib/shell-prompt.ts";
+import { installPromptCopyBridge, registerPromptCopyRows } from "../lib/shell-copy-spans.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 import { oddPhaseRegistry } from "../lib/odd-phase.ts";
 import { resolveAgentHomeDirectory } from "../lib/agent-model-resolution.ts";
 import { CLAUDE_BRIDGE_PROVIDER, priceBridgeMessage } from "../lib/bridge-cost.ts";
 import { inferOddPhase } from "../lib/odd-phase-inference.ts";
 import { isInteractiveMode } from "../lib/rpc-host.ts";
-import { gentlePiConfigHome } from "../lib/agent-home.ts";
+import { gentlePiConfigHome, resolveGentlePiAgentHome } from "../lib/agent-home.ts";
 import { resolveAnimationPolicy, writeAnimationPolicy, type AnimationPolicy } from "../lib/animation-policy.ts";
 import { resolveVimPolicy, writeVimPolicy, type VimPolicy } from "../lib/vim-policy.ts";
 import { resolveHistoryCapture, writeHistoryCapturePolicy } from "../lib/history-capture-policy.ts";
@@ -205,6 +212,10 @@ export interface ShellDeps {
 	gitRunner(cwd: string, maxBuffer?: number): GitRunner;
 	/** A root Changes may scan: removed worktrees and leftover directories are skipped. */
 	rootExists(root: string): boolean;
+	scheduleChangesIdle: ChangesIdleScheduler;
+	/** Override the per-user untracked count cache directory. */
+	changesCacheDirectory?: string;
+	changesLineCache(directory?: string): UntrackedLineCounts;
 	vimRuntimeVersion?(): string | undefined;
 	/** Clipboard image source for the prompt's attachment chips; tests inject a fake. */
 	readClipboardImage?(): Promise<ClipboardImage | null>;
@@ -298,7 +309,7 @@ function ambientDevBinary(): DevBinaryNotice | undefined {
 	}
 }
 
-const defaultShellDeps: Omit<ShellDeps, "activeProfile"> = { fetch: (input, init) => globalThis.fetch(input, init), now: () => Date.now(), devBinary: ambientDevBinary, resolveWorktree: resolveSessionWorktree, gitRunner: (cwd, maxBuffer) => shellGitRunner(cwd, process.env, execFile, maxBuffer), rootExists: (root) => existsSync(join(root, ".git")) };
+const defaultShellDeps: Omit<ShellDeps, "activeProfile" | "gitRunner"> = { fetch: (input, init) => globalThis.fetch(input, init), now: () => Date.now(), devBinary: ambientDevBinary, resolveWorktree: resolveSessionWorktree, rootExists: (root) => existsSync(join(root, ".git")), scheduleChangesIdle, changesLineCache: (directory) => shellUntrackedLines(undefined, undefined, directory) };
 
 interface AssistantUsageEntry {
 	type: string;
@@ -360,6 +371,12 @@ function sessionStats(ctx: ExtensionContext): ShellSessionStats {
 	return stats;
 }
 
+function contextHeadroom(pi: ExtensionAPI, model: ExtensionContext["model"], usage: ShellSessionStats["usage"]): ShellBarModel["contextHeadroom"] {
+	const threshold = readCompactionThreshold(pi, model, usage?.contextWindow ?? model?.contextWindow);
+	if (typeof threshold !== "number") return threshold;
+	return isTokenCount(usage?.tokens) ? Math.max(0, threshold - usage.tokens) : null;
+}
+
 export function buildShellBarModel(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
@@ -390,6 +407,7 @@ export function buildShellBarModel(
 		effort: model?.reasoning ? pi.getThinkingLevel() : undefined,
 		contextPercent: usage?.percent ?? null,
 		contextWindow: usage?.contextWindow ?? model?.contextWindow ?? 0,
+		contextHeadroom: contextHeadroom(pi, model, usage),
 		costTotal,
 		// claude-bridge runs on a Claude subscription without a Pi OAuth credential.
 		subscription: model ? model.provider === CLAUDE_BRIDGE_PROVIDER || ctx.modelRegistry.isUsingOAuth(model) : false,
@@ -430,15 +448,15 @@ export function createFooterStatusMemo(deps: FooterStatusMemoDeps): { key(): str
 	let cache: { key: string; model: ShellBarModel } | undefined;
 	const key = (): string => {
 		const statsKey = sessionStatsKey(ctx);
+		const stats = sessionStats(ctx);
 		const model = ctx.model;
 		return JSON.stringify([
-			// Session statistics identity by value: without leaf identity the
-			// computed stats ride the key, so those hosts keep exactly the pre-memo
-			// digest honesty. The model rides its value pieces (id, contextWindow,
-			// effort lookup, OAuth state) because that is all buildShellBarModel
-			// reads — serializing the model object itself would bloat every digest.
-			statsKey ? [statsKey[0], statsKey[1], statsKey[2]] : sessionStats(ctx),
+			// Without leaf identity, use the computed stats by value. Keep the
+			// live compaction setting in the key even when the session is idle.
+			statsKey ? [statsKey[0], statsKey[1], statsKey[2]] : stats,
+			contextHeadroom(pi, model, stats.usage),
 			model?.id ?? null,
+			model?.provider ?? null,
 			model?.contextWindow ?? null,
 			model?.reasoning ? pi.getThinkingLevel() : undefined,
 			model ? ctx.modelRegistry.isUsingOAuth(model) : false,
@@ -618,6 +636,8 @@ export class GentlePromptEditor extends CustomEditor {
 	private watchdog: NodeJS.Timeout | undefined;
 	private readonly deps: PromptEditorDeps;
 	private readonly pointerTui: TUI;
+	private copyFrame?: ReturnType<typeof registerPromptCopyRows>;
+	private readonly removeCopyBridge: () => void;
 	private floatMouseLayout?: ReturnType<typeof resolvePromptLayout>;
 	private topRowCount = 0;
 	private hoveredTopRow: number | undefined;
@@ -657,6 +677,7 @@ export class GentlePromptEditor extends CustomEditor {
 		this.selectionEngine = new SelectionEngine(this);
 		this.deps = deps;
 		this.pointerTui = tui;
+		this.removeCopyBridge = installPromptCopyBridge(tui, () => this.copyFrame);
 		this.keybindingsManager = keybindings;
 		const attachments = deps.attachments;
 		if (!attachments || !deps.readClipboardImage) return;
@@ -1445,7 +1466,8 @@ export class GentlePromptEditor extends CustomEditor {
 		this.floatMouseLayout = layout.background || layout.panel ? layout : undefined;
 		const inner = layout.nativeWidth;
 		const lines = super.render(inner);
-		if (this.getText() === "" && lines.length === 3) lines[1] = withPromptHint(lines[1], PROMPT_HINT, this.deps.fg);
+		const emptyDraft = this.getText() === "";
+		if (emptyDraft && lines.length === 3) lines[1] = withPromptHint(lines[1], PROMPT_HINT, this.deps.fg);
 		const state = this.promptState === PROMPT_STATE.WORKING && this.deps.pending() ? PROMPT_STATE.QUEUED : this.promptState;
 		// Neon keeps the shell's border role; float follows Pi's live public
 		// borderColor callback so thinking/bash mode accents survive.
@@ -1530,6 +1552,7 @@ export class GentlePromptEditor extends CustomEditor {
 			framed.push(this.deps.fg(PROMPT_FRAME_ROLE, border) + clipped +
 				" ".repeat(Math.max(0, inner - visibleWidth(clipped))) + this.deps.fg(PROMPT_FRAME_ROLE, border));
 		}
+		this.copyFrame = registerPromptCopyRows(framed, editorLines, topRows.length, borderEnd, layout, this.getPaddingX(), emptyDraft);
 		return framed;
 	}
 
@@ -1544,6 +1567,7 @@ export class GentlePromptEditor extends CustomEditor {
 
 	dispose(): void {
 		this.disposed = true;
+		this.removeCopyBridge();
 		this.clearEditorHover();
 		this.stopWatchdog();
 	}
@@ -1720,17 +1744,35 @@ const COMMANDS_COMMAND_NAME = "gentle:commands";
 // calling back; cut them after this grace so the scan still settles.
 const GIT_TREE_KILL_GRACE_MS = 1_000;
 
-export function shellGitRunner(cwd: string, env: NodeJS.ProcessEnv = process.env, run: typeof execFile = execFile, maxBuffer = Infinity, killProcessTree: ProcessTreeKiller | undefined = process.platform === "win32" ? windowsProcessTreeKiller : undefined): GitRunner {
+const GIT_WORKER_SHUTDOWN_MS = GIT_TIMEOUT_MS + GIT_TREE_KILL_GRACE_MS;
+const standaloneGitWorker = createShellGitWorker(GIT_WORKER_SHUTDOWN_MS);
+
+export function shellGitRunner(cwd: string, env: NodeJS.ProcessEnv = process.env, run: typeof execFile = execFile, maxBuffer = Infinity, killProcessTree: ProcessTreeKiller | undefined = process.platform === "win32" ? windowsProcessTreeKiller : undefined, timeoutMs = GIT_TIMEOUT_MS, readGitOnWorker: ShellGitWorkerRead = standaloneGitWorker.read): GitRunner {
 	// Pi exec cannot replace the inherited environment. Use argv directly and
 	// a complete sanitized environment for discovery, status, and lazy diffs.
 	const childEnv = worktreeGitEnvironment(env);
+	const options = {
+		env: childEnv,
+		encoding: "utf8",
+		shell: false,
+		windowsHide: true,
+		// Only a single diff passes a bound, and is told when it hit it.
+		// Large porcelain inventories must not become partial successful scans.
+		maxBuffer,
+	} as const;
+	// execFile's UTF-8 maxBuffer slices the boundary chunk in string units
+	// after tracking bytes. Moving that reader to a worker changes chunking
+	// (notably during a UI stall), and can change the text of a bounded diff.
+	// Keep lazy, bounded reads on the legacy reader; inventory stays off-thread.
+	if (maxBuffer === Infinity && process.platform !== "win32" && !killProcessTree && run === execFile) {
+		return (args) => readGitOnWorker(["-C", cwd, ...args], { ...options, timeout: timeoutMs });
+	}
 	// A timed-out Git scan on Windows is more than one process: `git` hands the
 	// status work to a descendant, and that descendant survives the direct child
 	// Node itself kills, so a large repository whose scan passes the timeout
 	// leaks another orphaned git.exe on every poll until physical memory is
 	// exhausted (#927). Windows therefore owns the deadline below, so the tree
-	// kill lands while the parent is still alive for taskkill to walk; everywhere
-	// else execFile's own timeout stays exactly as it was.
+	// kill lands while the parent is still alive for taskkill to walk.
 	const treeKiller = killProcessTree;
 	return (args) => new Promise((resolve) => {
 		let deadline: ReturnType<typeof setTimeout> | undefined;
@@ -1739,28 +1781,19 @@ export function shellGitRunner(cwd: string, env: NodeJS.ProcessEnv = process.env
 		// A scan that passed its deadline is a failed scan, never a partial
 		// success, even if the direct child exited 0 before its pipes closed.
 		let timedOut = false;
-		const settle = (error: { code?: unknown; killed?: boolean } | null, stdout: string): void => {
+		const settle = (error: GitExecError | null, stdout: string): void => {
 			settled = true;
 			if (deadline !== undefined) clearTimeout(deadline);
 			if (grace !== undefined) clearTimeout(grace);
-			if (error?.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") { resolve({ stdout, code: 1, truncated: true }); return; }
-			const code = timedOut ? 1 : error ? typeof error.code === "number" ? error.code : 1 : 0;
 			// Without a tree killer execFile owns the timeout and reports its kill on the error.
-			resolve({ stdout, code, ...(timedOut || (treeKiller === undefined && error?.killed) ? { timedOut: true } : {}) });
+			resolve(gitExecResult(error, stdout, timedOut || Boolean(treeKiller === undefined && error?.killed)));
 		};
 		let child: ReturnType<typeof execFile>;
 		try {
 			child = run("git", ["-C", cwd, ...args], {
-				env: childEnv,
-				encoding: "utf8",
-				shell: false,
-				windowsHide: true,
-				...(treeKiller === undefined ? { timeout: GIT_TIMEOUT_MS } : {}),
-				// Pi exec accumulates output without a maxBuffer cap. In particular,
-				// large porcelain inventories must not become partial successful scans.
-				// Only a single diff passes a bound, and is told when it hit it.
-				maxBuffer,
-			}, (error, stdout) => settle(error, stdout));
+				...options,
+				...(treeKiller === undefined ? { timeout: timeoutMs } : {}),
+			}, settle);
 		} catch (error) {
 			// A spawn that throws (invalid options, an injected runner) is a failed scan.
 			settle(error as { code?: unknown }, "");
@@ -1783,26 +1816,15 @@ export function shellGitRunner(cwd: string, env: NodeJS.ProcessEnv = process.env
 				child.stderr?.destroy();
 			}, GIT_TREE_KILL_GRACE_MS);
 			grace.unref?.();
-		}, GIT_TIMEOUT_MS);
+		}, timeoutMs);
 		deadline.unref?.();
 	});
 }
 
-export async function loadFileDiff(git: GitRunner, file: ChangedFile): Promise<string> {
-	const args = file.status === CHANGE_STATUS.UNTRACKED ? ["diff", "--no-index", "--", "/dev/null", file.path] : ["diff", "HEAD", "--", file.path];
-	const result = await git(args);
-	if (result.truncated || result.stdout.length > DIFF_MAX_BYTES || result.stdout.split("\n", DIFF_MAX_LINES + 2).length > DIFF_MAX_LINES + 1) return DIFF_TOO_LARGE;
-	return !result.timedOut && (result.code === 0 || result.code === 1) ? result.stdout : "";
-}
+// One file's diff lives in lib/change-diff.ts so the panel and Desktop RPC show the same text.
+export { loadFileDiff };
 
-// Untracked files have no numstat; count their lines without reading past the diff bound.
-const untrackedLines = (root: string): LineCounter => async (path) => {
-	const target = join(root, path);
-	const info = await lstat(target);
-	if (!info.isFile() || info.size > DIFF_MAX_BYTES) return 0;
-	const text = await readFile(target, "utf8");
-	return text === "" ? 0 : text.split("\n").length - (text.endsWith("\n") ? 1 : 0);
-};
+export { shellUntrackedLines };
 // Same-count edits still change size or mtime, so an open diff reloads.
 const fileRevision = (root: string): FileRevision => async (path) => {
 	const info = await lstat(join(root, path));
@@ -2004,16 +2026,16 @@ interface CardComponentOptions {
 	hint?: string;
 }
 
-function cardComponent(card: Card, theme: CardTheme, options: CardComponentOptions, identity?: object) {
+function cardComponent(card: Card, theme: CardTheme, options: CardComponentOptions) {
 	// The card never changes for one component, so the cache replays its rows
 	// across frames until pi rebuilds it (expanded toggle, theme invalidate);
 	// with an identity (the transcript message) it even survives rebuilds.
-	return cachedCard({ card: () => card, theme: () => theme, options: () => options, identity });
+	return cachedCard((width) => renderCard(card, theme, width, options));
 }
 
 // Widgets above the editor sit flush against the prompt frame; a blank line
 // after the card keeps the two frames apart.
-function spaced(component: { render(width: number): string[]; invalidate(): void }) {
+function spaced(component: { render(width: number): readonly string[]; invalidate(): void }) {
 	return {
 		render(width: number) {
 			return [...component.render(width), ""];
@@ -2108,8 +2130,8 @@ async function fetchFromSource(source: UsageSource, apiKey: string | undefined, 
 	}
 }
 
-// Changes refreshes started without awaiting (turn end, worktree registration)
-// are tracked so tests can wait for them instead of guessing a delay.
+// Fire-and-forget Changes refreshes are tracked so tests can wait for them
+// instead of guessing a delay.
 const backgroundChangeRefreshes = new Set<Promise<void>>();
 function trackChangeRefresh(refresh: Promise<void>): void {
 	const tracked = refresh.catch(() => {}).finally(() => { backgroundChangeRefreshes.delete(tracked); });
@@ -2144,7 +2166,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		ctx.ui.notify(`Keymaps: ${keymaps.path} is unreadable or malformed; using the default keys.`, "warning");
 	});
 	const profileReader = createActiveProfileReader(env);
-	const deps: ShellDeps = { ...defaultShellDeps, activeProfile: profileReader, ...overrides };
+	const deps = { ...defaultShellDeps, activeProfile: profileReader, ...overrides };
 	let closeCustomize: (() => void) | undefined;
 	let customizeGeneration = 0;
 	let profilePoll: ReturnType<typeof setInterval> | undefined;
@@ -2427,7 +2449,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		const lines = messageText(message.content as string | Array<{ type: string; text?: string }>).split("\n");
 		const body = options.expanded ? lines : lines.filter((line) => line.trim() !== "");
 		const hint = keyHint("app.tools.expand", options.expanded ? "collapse" : "expand");
-		return cardComponent({ title: "Gentle AI", subtitle: "review preflight", body, tone: CARD_TONE.INFO }, theme, { expanded: options.expanded, previewRows: 3, hint }, message);
+		return cardComponent({ title: "Gentle AI", subtitle: "review preflight", body, tone: CARD_TONE.INFO }, theme, { expanded: options.expanded, previewRows: 3, hint });
 	});
 	// The attached narrow fullscreen layout owns the mobile editor and work row
 	// for every header placement. Wide split uses the IDE chrome beside the rail;
@@ -2655,6 +2677,8 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		gentlePiConfigHome: doubleEscCancelConfigHome,
 	}).policy;
 	let changes: WorktreeChangesTracker | undefined;
+	let changesGit: { run: ShellDeps["gitRunner"]; dispose(): Promise<void> } | undefined;
+	let changesIdle: ReturnType<typeof createIdleChanges> | undefined;
 	let registry: SessionWorktreeRegistry | undefined;
 	let currentContext: ExtensionContext | undefined;
 	let disposeFooter: (() => void) | undefined;
@@ -2734,23 +2758,105 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		shown = fingerprint;
 		showChanges(ctx, model, visualSettings.visibility.changes, (width) => groupedChangesOwner(width));
 	};
-	const gitForRoot = (root: string) => deps.gitRunner(root);
-	// Changes is the Git state of the session's roots that still exist: read
-	// at turn end, on panel open and by the panel's poll, never at startup.
-	const changesTracker = (ctx: ExtensionContext) => {
+	// Changes inventories the session's surviving roots. The first background
+	// scan waits until after startup and the first quiet paint.
+	const changesTracker = (ctx: ExtensionContext, git: ShellDeps["gitRunner"]) => {
 		const sessionId = ctx.sessionManager.getSessionId();
 		const roots = () => {
 			try { return sessionChangeRoots(sessionId, ctx.sessionManager.getEntries()).filter((root) => deps.rootExists(root) && !isHomeOrBroadUserDirectory(root)); }
 			catch { return []; }
 		};
-		return new WorktreeChangesTracker(gitForRoot(ctx.cwd), gitForRoot, untrackedLines, roots, fileRevision);
+		// An injected environment without an agent home stays isolated from the
+		// user's cache unless the caller explicitly supplies a cache directory.
+		const directory = deps.changesCacheDirectory ?? (env === process.env || env.GENTLE_PI_AGENT_HOME || env.PI_CODING_AGENT_DIR
+			? join(resolveGentlePiAgentHome(env), "cache", "gentle-shell-untracked-lines") : undefined);
+		return new WorktreeChangesTracker(git(ctx.cwd), (root) => git(root), undefined, roots, fileRevision, deps.changesLineCache(directory));
 	};
-	const refreshChanges = async (ctx: ExtensionContext) => {
+	const refreshChangesTracker = async (tracker: WorktreeChangesTracker, fromIdle = false) => {
+		// Opening the panel (or another explicit refresh) can cover a waiting
+		// idle scan. Concurrent callers still share the tracker's in-flight scan.
+		const idle = changes === tracker ? changesIdle : undefined;
+		const turn = idle?.scanStarted();
+		const model = await tracker.refresh();
+		idle?.scanFinished(tracker.untrackedCountsPendingFiles, model, tracker.failedRoots.length, fromIdle ? turn : undefined);
+		return model;
+	};
+	const refreshChanges = async (ctx: ExtensionContext, fromIdle = false) => {
 		const tracker = changes;
 		if (!tracker || !ctx.hasUI || registry?.sessionId !== ctx.sessionManager.getSessionId()) return;
-		const model = await tracker.refresh();
+		const model = await refreshChangesTracker(tracker, fromIdle);
 		if (changes === tracker) applyChanges(ctx, model);
 	};
+	// Desktop's changes slice reaches this tracker only through a versioned,
+	// adapter-shaped seam (the changes analogue of the usage seam above). Both
+	// reads refresh the tracker the way the panel does and answer only from its
+	// own file list: a diff is served for a file in the current change set of a
+	// root this adapter named, through the same Git arguments as the panel.
+	// Roots cross as opaque ids; the absolute path never leaves this closure.
+	pi.events.on(DESKTOP_CHANGES_SERVICE_CHANNEL, (payload: unknown) => {
+		if (!payload || typeof payload !== "object") return;
+		const request = payload as Partial<{ context: ExtensionContext; respond(service: DesktopChangesService): void }>;
+		if (typeof request.respond !== "function" || !request.context) return;
+		let sessionId: string;
+		try { sessionId = request.context.sessionManager.getSessionId(); } catch { return; }
+		const git = changesGit;
+		if (!git || !changes || registry?.sessionId !== sessionId) return;
+		let disposed = false;
+		const ids = new Map<string, string>();
+		const idFor = (root: string) => {
+			let id = ids.get(root);
+			if (id === undefined) ids.set(root, id = `root-${ids.size + 1}`);
+			return id;
+		};
+		// No tracked worktree, a failed root, or a replaced session is
+		// unavailable: a failed scan is never reported as a clean root.
+		const scan = async (maxPasses = 1): Promise<WorktreeChangesTracker | undefined> => {
+			const tracker = changes;
+			if (disposed || !tracker || changesGit !== git || registry?.sessionId !== sessionId) return undefined;
+			for (let pass = 0; pass < maxPasses; pass++) {
+				await refreshChangesTracker(tracker);
+				if (disposed || changes !== tracker) return undefined;
+				if (!tracker.untrackedCountsPending || tracker.failedRoots.length > 0) break;
+			}
+			if (currentContext) applyChanges(currentContext, tracker.model);
+			return tracker.scannedRootCount === 0 || tracker.failedRoots.length > 0 ? undefined : tracker;
+		};
+		try {
+			request.respond({
+				schema: DESKTOP_CHANGES_SERVICE_SCHEMA,
+				async read() {
+					// One extra pass handles inventories just over 64 MiB, without
+					// letting a huge or continuously edited tree hold an RPC open.
+					const tracker = await scan(2);
+					return tracker ? projectDesktopChanges(tracker.worktrees, idFor) : undefined;
+				},
+				async diff(rootId, path) {
+					const tracker = await scan();
+					if (!tracker) return { kind: "unavailable" };
+					const root = [...ids].find(([, id]) => id === rootId)?.[0];
+					const tree = root === undefined ? undefined : tracker.worktrees.find((candidate) => candidate.root === root);
+					// Exact match on the owner's own list: the file object (and so its
+					// status and Git arguments) is the owner's, never the request's.
+					const file = tree?.model.files.find((candidate) => candidate.path === path);
+					if (!tree || !file) return { kind: "not_found" };
+					// Git lists files behind a directory link (a Windows junction) as
+					// part of the tree; Desktop never serves content outside the root,
+					// nor the repository's own git dir reached through an alias in it.
+					const gitDirectories = await repositoryGitDirectories(git.run(tree.root), tree.root);
+					if (disposed || !gitDirectories) return { kind: "unavailable" };
+					if (!(await changeDirectoryInsideRoot(tree.root, file.path, gitDirectories))) return { kind: "not_found" };
+					// Unlike the panel, never run a command the repository's config
+					// names (textconv, external diff, fsmonitor) for a Desktop read.
+					const projected = projectDesktopDiff(await runFileDiff(git.run(tree.root, DIFF_MAX_BYTES), file, { inertRepositoryCommands: true }));
+					if (disposed || !projected) return { kind: "unavailable" };
+					return { kind: "ok", ...projected };
+				},
+				dispose() { disposed = true; },
+			});
+		} catch {
+			/* a responder that throws is ignored */
+		}
+	});
 	pi.registerTool({
 		name: "session_worktree_register",
 		renderShell: "self",
@@ -2765,6 +2871,8 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		},
 	});
 	pi.on("session_start", async (_event, ctx) => {
+		changesIdle?.dispose();
+		changesIdle = undefined;
 		customizeGeneration++;
 		if (imagesDiskCachePolicy === "session") {
 			const cacheRoot = defaultCacheRoot(env);
@@ -2787,6 +2895,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		}
 		stopProfilePoll();
 		registry?.close();
+		void changes?.closeUntrackedCounts();
 		currentContext = ctx;
 		changes = undefined;
 		registry = new SessionWorktreeRegistry(pi, ctx.sessionManager, ctx.cwd, deps.resolveWorktree);
@@ -2807,9 +2916,28 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			}, 2_000);
 			profilePoll.unref?.();
 		}
-		changes = changesTracker(ctx);
+		void changesGit?.dispose();
+		const worker = createShellGitWorker(GIT_WORKER_SHUTDOWN_MS);
+		const git: NonNullable<typeof changesGit> = {
+			run(cwd, maxBuffer) {
+				const run = overrides.gitRunner?.(cwd, maxBuffer) ?? shellGitRunner(cwd, process.env, execFile, maxBuffer, undefined, GIT_TIMEOUT_MS, worker.read);
+				// A stale scan may request more Git work after its current call
+				// settles. It must never start a worker for a closed session.
+				return (args) => changesGit === git ? run(args) : Promise.resolve(failedGitRead());
+			},
+			dispose: worker.dispose,
+		};
+		changesGit = git;
+		changes = changesTracker(ctx, git.run);
 		const tracker = changes;
 		const devNotice = deps.devBinary();
+		const idle = changesIdle = createIdleChanges({
+			isIdle: () => ctx.isIdle(),
+			refresh: () => trackChangeRefresh(refreshChanges(ctx, true)),
+			// Observe only: returning undefined neither consumes nor rewrites the input.
+			observeInput: (listener) => ctx.ui.onTerminalInput?.(() => { listener(); return undefined; }),
+			schedule: deps.scheduleChangesIdle,
+		});
 		ctx.ui.setFooter((tui, theme, footerData) => {
 			disposeFooter?.();
 			sidebarTui = tui;
@@ -3226,7 +3354,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 					const key = bandKey(width);
 					if (bandPainted?.key === key && bandPainted.width === width) return bandPainted.band.rows;
 					let breaks: string[] | undefined;
-					try { breaks = breaksPart()?.render(BAND_RIGHT_WIDTH); } catch { breaks = undefined; }
+					try { const rendered = breaksPart()?.render(BAND_RIGHT_WIDTH); breaks = rendered ? [...rendered] : undefined; } catch { breaks = undefined; }
 					const band = renderFoldedBand(footerModel(), theme, width, breaks, usageShortcutKey, visualSettings, gaugePaint(ctx));
 					bandPainted = { key, width, band };
 					return band.rows;
@@ -3273,6 +3401,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			return { ...part,
 				render(width: number) {
 					if (disposed) return [];
+					idle.firstPaint();
 					// Running-only: a finished tail must never paint a ⧗ 0 jobs row.
 					const compactRunningJobs = runningJobs?.filter((job) => job.status === undefined);
 					if (visualSettings.statusPlacement === "hidden" && (tui as TUI & { mode?: string }).mode !== "fullscreen" && compactRunningJobs?.length) {
@@ -3352,6 +3481,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		if (changes !== tracker) return;
 		shown = "";
 		applyChanges(ctx, tracker.model);
+		idle.started();
 	});
 	// Chips still in the submitted draft travel as real image attachments, so
 	// the model sees the image without calling `read` on a temp-file path.
@@ -3367,7 +3497,12 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		}
 		return { action: "transform", text: submitted.text, images: [...(event.images ?? []), ...submitted.images] };
 	});
-	pi.on("session_shutdown", (_event, ctx) => {
+	pi.on("session_shutdown", async (_event, ctx) => {
+		const gitStopped = changesGit?.dispose();
+		const countsSaved = changes?.closeUntrackedCounts();
+		changesGit = undefined;
+		changesIdle?.dispose();
+		changesIdle = undefined;
 		customizeGeneration++;
 		disposeFooter?.();
 		imageAttachments.dispose();
@@ -3405,11 +3540,13 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		registry = undefined;
 		changes = undefined;
 		currentContext = undefined;
+		await Promise.all([gitStopped, countsSaved]);
 	});
 	const openChanges = async (ctx: ExtensionContext) => {
-		if (!changes) return;
+		const git = changesGit;
+		if (!changes || !git) return;
 		const tracker = changes;
-		const model = await tracker.refresh();
+		const model = await refreshChangesTracker(tracker);
 		if (changes !== tracker) return;
 		applyChanges(ctx, model);
 		// A failed root scan is unknown, never clean: say so whenever one failed.
@@ -3426,7 +3563,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			return;
 		}
 		if (failed > 0) ctx.ui.notify(`Git status failed for ${failed} ${failed === 1 ? "root" : "roots"}; ${failed === 1 ? "its" : "their"} changes are not listed.`, "warning");
-		await showChangesOverlay(ctx, { loadDiff: (root, file) => loadFileDiff(deps.gitRunner(root, DIFF_MAX_BYTES), file), worktrees: () => tracker.worktrees, refresh: () => tracker.refresh(), apply: applyChanges, pollMs: changesPollMs(env) });
+		await showChangesOverlay(ctx, { loadDiff: (root, file) => loadFileDiff(git.run(root, DIFF_MAX_BYTES), file), worktrees: () => tracker.worktrees, refresh: () => refreshChangesTracker(tracker), apply: applyChanges, pollMs: changesPollMs(env) });
 	};
 	pi.registerCommand(IMAGES_COMMAND_NAME, {
 		description: "List the on-disk paths of images pasted in this draft (needs GENTLE_PI_IMAGES_DISK_CACHE=session).",
@@ -4080,6 +4217,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		},
 	});
 	pi.on("agent_start", (_event, ctx) => {
+		if (registry?.sessionId === ctx.sessionManager.getSessionId()) changesIdle?.turnStarted();
 		// A turn can start any other way (the user sending the draft, an
 		// extension, a shortcut) before the aborted run's own agent_settled
 		// below has delivered the pending text. Nothing is sent from here: Pi
@@ -4137,6 +4275,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		}
 	});
 	pi.on("agent_end", async (_event, ctx) => {
+		if (registry?.sessionId === ctx.sessionManager.getSessionId()) changesIdle?.turnEnded();
 		// A slow or failing Git never holds the turn end.
 		trackChangeRefresh(refreshChanges(ctx));
 		void refreshUsage(ctx, false);

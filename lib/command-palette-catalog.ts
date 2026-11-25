@@ -73,6 +73,7 @@ export const COMMAND_PALETTE_CATALOG: readonly CommandPaletteCatalogGroup[] = [
 	{
 		title: "Tools",
 		items: [
+			{ command: "gentle:tower", label: "Gentle Tower · all sessions in the browser" },
 			{ command: "gentle:images", label: "Pasted image paths" },
 			{ command: "gentle:scratch", label: "Session scratch · list, clean" },
 			{ command: "history", label: "Prompt history" },

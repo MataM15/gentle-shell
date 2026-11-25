@@ -1,4 +1,4 @@
-import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component } from "@earendil-works/pi-tui";
 
 // Gentle Shell cards: the shape every Gentle notice takes in the transcript
 // and above the editor. The same rounded frame as the prompt and the
@@ -58,6 +58,32 @@ export function cardStyle(): CardStyle {
 
 export function setCardStyle(style: CardStyle): void {
 	styleState[CARD_STYLE_SLOT] = style;
+}
+
+/** One complete frame per card component. Pi treats returned rows as read-only. */
+export class CardFrame {
+	private frame?: { width: number; style: CardStyle; revision: unknown; lines: string[] };
+
+	render(width: number, revision: unknown, build: () => string[]): string[] {
+		const style = cardStyle();
+		const frame = this.frame;
+		if (frame?.width === width && frame.style === style && frame.revision === revision) return frame.lines;
+		const lines = build();
+		this.frame = { width, style, revision, lines };
+		return lines;
+	}
+
+	// Pi invalidates on theme changes (the theme proxy itself keeps its identity).
+	invalidate(): void { this.frame = undefined; }
+}
+
+/** Pi rebuilds notice components when their content or expanded state changes. */
+export function cachedCard(render: (width: number) => string[]): Component {
+	const frame = new CardFrame();
+	return {
+		render: (width) => frame.render(width, undefined, () => render(width)),
+		invalidate: () => frame.invalidate(),
+	};
 }
 
 export interface CardRenderOptions {
@@ -238,94 +264,6 @@ export function cardInnerWidth(width: number): number {
 export interface CardComponent {
 	render(width: number): string[];
 	invalidate(): void;
-}
-
-/**
- * One-frame row cache for components that draw card chrome directly (the
- * floatRows compositions). `render` lists every input the frame depends on
- * as values compared with `===` (primitives, the theme identity included);
- * while the width, the active card style and those inputs hold still the
- * previous rows are replayed as the very same array instance, so upstream
- * issue #2860's Container-level cache can reuse the aggregate unchanged.
- * Per-instance state, never module-level: Pi loads each extension with its
- * own module copy.
- */
-export class CardFrameCache {
-	private frame?: { key: unknown[]; lines: string[] };
-
-	render(width: number, deps: () => readonly unknown[], build: (width: number) => string[]): string[] {
-		const key = [width, cardStyle(), ...deps()];
-		const frame = this.frame;
-		if (frame && frame.key.length === key.length && frame.key.every((value, index) => value === key[index])) return frame.lines;
-		const lines = build(width);
-		this.frame = { key, lines };
-		return lines;
-	}
-
-	invalidate(): void { this.frame = undefined; }
-}
-
-/**
- * Frame caches that outlive their component. Pi re-runs a message renderer
- * and creates a fresh component whenever the transcript invalidates (issue
- * #2860), so an instance-local cache would be thrown away with it. Caches
- * keyed on a stable object (the transcript message, the tool-call context)
- * survive those rebuilds; the WeakMap lets entries die with their message.
- */
-const sharedCardFrameCaches = new WeakMap<object, Map<string, CardFrameCache>>();
-
-export function sharedCardFrameCache(identity: object, slot: string): CardFrameCache {
-	let slots = sharedCardFrameCaches.get(identity);
-	if (!slots) {
-		slots = new Map();
-		sharedCardFrameCaches.set(identity, slots);
-	}
-	let cache = slots.get(slot);
-	if (!cache) {
-		cache = new CardFrameCache();
-		slots.set(slot, cache);
-	}
-	return cache;
-}
-
-/** Everything a cached conversation card reads, resolved at render time. */
-export interface CachedCardInput {
-	/** Stable object this card belongs to (the transcript message); lets the cache outlive component rebuilds. */
-	identity?: object;
-	/** Which card of a shared identity this is, when one object renders several. */
-	slot?: string;
-	/** The card content, resolved per recompute so a streamed or updated message never shows stale output. */
-	card: (width: number) => Card;
-	/** Resolved per render: a new theme object must redraw the colored rows. */
-	theme: () => CardTheme;
-	options: () => CardRenderOptions;
-	/** Compact/density and other presentation flags the frame must follow, compared by value. */
-	variant?: () => string;
-}
-
-/**
- * One conversation card component that keeps its rendered rows between
- * frames. Pi re-renders the full transcript each fullscreen frame, so every
- * settled card would otherwise rebuild its wrapped, decorated rows for
- * nothing. The component returns the previous array instance while the
- * width, the active card style, the theme identity, the presentation
- * variant and the card content are unchanged, and recomputes through
- * `renderCard` otherwise — same bytes in and out (see issue #2860 for why
- * the identity matters). `invalidate()` drops the cached frame.
- */
-export function cachedCard(input: CachedCardInput): CardComponent {
-	const cache = input.identity ? sharedCardFrameCache(input.identity, input.slot ?? "card") : new CardFrameCache();
-	return {
-		render(width: number): string[] {
-			return cache.render(width, () => {
-				const theme = input.theme();
-				const options = input.options();
-				const card = input.card(width);
-				return [theme, input.variant?.(), card.title, card.subtitle, card.tone, card.glyph, options.expanded, options.previewRows, options.hint, options.panel, ...card.body];
-			}, (w) => renderCard(input.card(w), input.theme(), w, input.options()));
-		},
-		invalidate() { cache.invalidate(); },
-	};
 }
 
 /** Shared body for whole cards and separate call/result components. Budgets apply after wrapping. */

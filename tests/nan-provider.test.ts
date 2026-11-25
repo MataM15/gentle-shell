@@ -24,6 +24,7 @@ const DOCUMENTED_CHAT_IDS = [
 	"glm5.3", "deepseek-v4-flash", "glm5.3-flash", "qwen3.8-flash",
 	"mimo-v2.6-flash", "gemma4", "qwen3.6",
 	"kimi-k3.1-pro", "qwen3.8-max", "deepseek-v4-pro", "hy4",
+	"qwen4-max", "hy4-flash",
 ];
 
 // Pi 1.5 derives the compat and thinking-map types through pi-schema's Static, which
@@ -191,7 +192,7 @@ test("offline and already-aborted refreshes invalidate keys without publication"
 	}
 });
 
-test("initial catalog contains all eleven documented chat models with configured output caps", () => {
+test("initial catalog contains all thirteen documented chat models with configured output caps", () => {
 	const models = createNanProviderConfig().models;
 	assert.deepEqual(models.map((model) => model.id), DOCUMENTED_CHAT_IDS);
 	const model = models.find((model) => model.id === "deepseek-v4-flash");
@@ -200,7 +201,7 @@ test("initial catalog contains all eleven documented chat models with configured
 	assert.equal(model?.reasoning, true);
 	assert.deepEqual(model?.input, ["text", "image"]);
 	assert.equal(model?.contextWindow, 1_000_000);
-	assert.equal(models.length, 11);
+	assert.equal(models.length, 13);
 	assert.equal(model?.maxTokens, 393_216);
 	assert.deepEqual(model?.cost, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 });
@@ -391,6 +392,8 @@ test("known chat models retain documented capabilities without advertising audio
 		["qwen3.8-max", 1_000_000, ["text", "image"], 131_000],
 		["deepseek-v4-pro", 1_000_000, ["text"], 393_000],
 		["hy4", 1_000_000, ["text", "image"], 64_000],
+		["qwen4-max", 1_000_000, ["text", "image"], 131_000],
+		["hy4-flash", 1_000_000, ["text", "image"], 64_000],
 	] as const;
 	const config = createNanProviderConfig({
 		fetchImpl: async () => jsonResponse({ data: expected.map(([id]) => ({ id })) }),
@@ -565,7 +568,7 @@ test("NaN effort levels per model follow the reasoning contract", () => {
 	assert.deepEqual(levels, {
 		"glm5.3": glm, "glm5.3-flash": glm,
 		"deepseek-v4-flash": full, "qwen3.8-flash": full, "mimo-v2.6-flash": full, gemma4: full, "qwen3.6": full,
-		"kimi-k3.1-pro": full, "qwen3.8-max": full, "deepseek-v4-pro": full, hy4: full,
+		"kimi-k3.1-pro": full, "qwen3.8-max": full, "deepseek-v4-pro": full, hy4: full, "qwen4-max": full, "hy4-flash": full,
 	});
 	const mimo = models.find((model) => model.id === "mimo-v2.6-flash");
 	assert.deepEqual(mimo?.thinkingLevelMap, { off: "none", minimal: "low", xhigh: "max", max: "max" });

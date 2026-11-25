@@ -8,20 +8,13 @@ import { resolveAnimationPolicy, type AnimationPolicy } from "../lib/animation-p
 import { PI_SUBCOMMANDS } from "../lib/gentle-shell-launcher.ts";
 import { selectWithMouse } from "../lib/mouse-select.ts";
 import { gentlePiConfigHome } from "../lib/agent-home.ts";
+import { isChildSession } from "../lib/child-session.ts";
 
 
-export type BannerColor = "pink" | "cyan" | "yellow" | "green";
-export interface BannerConfig {
-  showRose: boolean;
-  showTextLogo: boolean;
-  color: BannerColor;
-}
-export const DEFAULT_BANNER_CONFIG: BannerConfig = {
-  showRose: true,
-  showTextLogo: true,
-  color: "pink",
-};
-export const BANNER_COLORS: BannerColor[] = ["pink", "cyan", "yellow", "green"];
+import { BANNER_COLORS, DEFAULT_BANNER_CONFIG, type BannerColor, type BannerConfig } from "../lib/banner-config.ts";
+// The banner settings' shape lives in lib/banner-config.ts (shared with the
+// Desktop config store); this module keeps exporting it for its callers.
+export { BANNER_COLORS, DEFAULT_BANNER_CONFIG, type BannerColor, type BannerConfig };
 const BANNER_PALETTES: Record<BannerColor, { rose: [number, number, number]; label: [number, number, number]; value: [number, number, number]; logoFresh: [number, number, number]; logoDim: [number, number, number] }> = {
   pink: { rose: [255, 118, 195], label: [200, 100, 160], value: [255, 140, 210], logoFresh: [255, 138, 206], logoDim: [95, 30, 60] },
   cyan: { rose: [95, 210, 255], label: [85, 170, 205], value: [130, 225, 255], logoFresh: [105, 220, 255], logoDim: [25, 80, 100] },
@@ -600,6 +593,8 @@ export function isPiCliSubcommandInvocation(argv: readonly string[]): boolean {
 }
 
 export default function (pi: ExtensionAPI) {
+  // Delegated rpc children report hasUI=true but have no terminal (gentle-shell#1690, #3386).
+  if (isChildSession()) return;
   let disposeHeader = () => {};
   pi.on("session_shutdown", () => disposeHeader());
   const notifyBannerConfig = (ctx: any, config: BannerConfig) => {
@@ -675,7 +670,7 @@ export default function (pi: ExtensionAPI) {
     if (!ctx.hasUI) return;
     // Delegated rpc children report hasUI=true but have no terminal to paint
     // (gentle-shell#1690); do not rely on a piped stdout lacking rows/columns.
-    if (process.env.GENTLE_PI_AGENTS_CHILD === "1") return;
+    if (isChildSession()) return;
 
     // CLI subcommands such as `pi update` or `pi install` skip the animated intro.
     if (isPiCliSubcommandInvocation(process.argv)) return;

@@ -24,7 +24,7 @@ import { fileURLToPath } from "node:url";
 export const UPSTREAM_BASELINE = {
 	"extensions/gentle-ai.ts": 11,
 	"extensions/quiet-tools.ts": 1,
-	"lib/native-review-cli.ts": 8,
+	"lib/native-review-cli.ts": 7,
 	"lib/review-candidate-view-owner.ts": 1,
 	"lib/review-consent-component.ts": 3,
 	"lib/review-transaction.ts": 4,
