@@ -902,19 +902,18 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 		deferredJoin = setTimeout(() => {
 			deferredJoin = undefined;
 			if (client || joining || !voiceIsOnFor(sessionId)) return;
-			if (captures.active()) deferJoin(sessionId, attempt + 1);
-			else void ensure(sessionId);
+			void ensure({ sessionId, attempt: attempt + 1 });
 		}, delays[Math.min(attempt, delays.length - 1)]);
 		deferredJoin.unref?.();
 	};
 
-	const ensure = (deferredSessionId?: string): Promise<boolean> => {
+	const ensure = (retry?: { sessionId?: string; attempt: number }): Promise<boolean> => {
 		if (client?.connected) return Promise.resolve(true);
 		if (joining) return joining.promise;
-		// Leave the current client, and the reconnect it owns, untouched: it starts
-		// the listener once this session's own capture has released the microphone.
-		if (captures.active()) return Promise.resolve(false);
-		cancelDeferredJoin();
+		const micHeld = captures.active();
+		// Dictation keeps its immediate fallback; maintenance may join a live peer.
+		if (!retry && micHeld) return Promise.resolve(false);
+		if (!micHeld) cancelDeferredJoin();
 		const controller = new AbortController();
 		const pending: PendingJoin = { controller, promise: undefined!, allowStart: true };
 		joining = pending;
@@ -945,10 +944,16 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 					dir: options.dir,
 					session,
 					start: () => {
-						if (!pending.allowStart || (deferredSessionId !== undefined && !voiceIsOnFor(deferredSessionId))) {
+						if (!pending.allowStart || (retry?.sessionId !== undefined && !voiceIsOnFor(retry.sessionId))) {
 							throw new Error("voice was turned off during listener startup");
 						}
-						return startListener();
+						try { return startListener(); }
+						catch (error) {
+							if (error instanceof ShutdownWorkerBusyError && retry && !usedLocalCapture && voiceIsOnFor(session.sessionId)) {
+								deferJoin(session.sessionId, retry.attempt);
+							}
+							throw error;
+						}
 					},
 					waitMs: options.waitMs,
 					probe: options.probe,
@@ -1173,16 +1178,7 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 	};
 
 	return {
-		ensure: () => {
-			// After a session switch there may be no client to own reconnect yet.
-			// Leave dictation's immediate fallback and established recovery alone.
-			if (!client && !joining && !usedLocalCapture && captures.active()) {
-				const session = options.session();
-				if (session?.voiceOn) deferJoin(session.sessionId);
-				return Promise.resolve(false);
-			}
-			return ensure();
-		},
+		ensure: () => ensure({ attempt: 0 }),
 		cancelWake,
 		captureWake,
 		updateVoice: (voiceOn) => {

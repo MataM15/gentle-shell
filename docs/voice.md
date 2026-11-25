@@ -404,8 +404,8 @@ a session that asks for a capture only receives the transcript.
   A session starts no listener while a local capture in the same Pi process
   may hold the microphone. This applies to automatic reconnect (including an
   adopted voice-off connection), an explicit join, and reply reading. A failed
-  explicit join leaves automatic recovery in place. After switching sessions,
-  if voice is on and the previous session's capture blocks the first join,
+  explicit join leaves recovery in place. A live listener can still be joined.
+  After a switch, if voice is on and the prior capture blocks the first start,
   the new session retries on the reconnect schedule. It can start the listener
   only after the capture's worker exits, even if the capture already reported
   cancellation. Turning voice off or ending the new session cancels that retry.
