@@ -793,7 +793,8 @@ export interface ListenerDictationOptions {
 }
 
 export interface SessionListenerLink {
-	// True when this session is joined to a running listener; starts one once.
+	// True when joined. A first voice-on join blocked by local capture can retry
+	// in the background even if this call returns false.
 	ensure(): Promise<boolean>;
 	// Optional for injected links; production updates the joined registration.
 	updateVoice?(voiceOn: boolean): void;
@@ -864,6 +865,7 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 	client?.guardRestart(captures.assertReleased);
 	let wakeIdentity: object | undefined;
 	let joining: PendingJoin | undefined;
+	let usedLocalCapture = false;
 	let handler: ((frame: ListenerFrame) => boolean) | undefined;
 	const retireJoin = (pending: PendingJoin | undefined): void => {
 		if (!pending || joining !== pending) return;
@@ -885,13 +887,34 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 		if (frame.type === "transcript") options.onTranscript?.(frame.text, frame.truncated === true);
 	};
 	let detachAdopted = options.adoptedClient?.onFrame(route);
+	let deferredJoin: ReturnType<typeof setTimeout> | undefined;
+	const cancelDeferredJoin = (): void => {
+		if (deferredJoin) clearTimeout(deferredJoin);
+		deferredJoin = undefined;
+	};
+	const voiceIsOnFor = (sessionId: string): boolean => {
+		const current = options.session();
+		return current?.sessionId === sessionId && current.voiceOn;
+	};
+	const deferJoin = (sessionId: string, attempt = 0): void => {
+		if (deferredJoin) return;
+		const delays = options.backoffMs ?? LISTENER_BACKOFF_MS;
+		deferredJoin = setTimeout(() => {
+			deferredJoin = undefined;
+			if (client || joining || !voiceIsOnFor(sessionId)) return;
+			if (captures.active()) deferJoin(sessionId, attempt + 1);
+			else void ensure(sessionId);
+		}, delays[Math.min(attempt, delays.length - 1)]);
+		deferredJoin.unref?.();
+	};
 
-	const ensure = (): Promise<boolean> => {
+	const ensure = (deferredSessionId?: string): Promise<boolean> => {
 		if (client?.connected) return Promise.resolve(true);
 		if (joining) return joining.promise;
 		// Leave the current client, and the reconnect it owns, untouched: it starts
 		// the listener once this session's own capture has released the microphone.
 		if (captures.active()) return Promise.resolve(false);
+		cancelDeferredJoin();
 		const controller = new AbortController();
 		const pending: PendingJoin = { controller, promise: undefined!, allowStart: true };
 		joining = pending;
@@ -922,7 +945,9 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 					dir: options.dir,
 					session,
 					start: () => {
-						if (!pending.allowStart) throw new Error("voice was turned off during listener startup");
+						if (!pending.allowStart || (deferredSessionId !== undefined && !voiceIsOnFor(deferredSessionId))) {
+							throw new Error("voice was turned off during listener startup");
+						}
 						return startListener();
 					},
 					waitMs: options.waitMs,
@@ -1054,6 +1079,7 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 			if (!fallback) {
 				captures.assertReleased();
 				fallback = request.fallback();
+				usedLocalCapture = true;
 				captures.track(fallback);
 			}
 			return fallback.start();
@@ -1147,10 +1173,20 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 	};
 
 	return {
-		ensure,
+		ensure: () => {
+			// After a session switch there may be no client to own reconnect yet.
+			// Leave dictation's immediate fallback and established recovery alone.
+			if (!client && !joining && !usedLocalCapture && captures.active()) {
+				const session = options.session();
+				if (session?.voiceOn) deferJoin(session.sessionId);
+				return Promise.resolve(false);
+			}
+			return ensure();
+		},
 		cancelWake,
 		captureWake,
 		updateVoice: (voiceOn) => {
+			if (!voiceOn) cancelDeferredJoin();
 			if (joining) {
 				joining.allowStart = voiceOn;
 				if (!voiceOn && !joining.client) retireJoin(joining);
@@ -1159,6 +1195,7 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 		},
 		dictate,
 		close: () => {
+			cancelDeferredJoin();
 			retireJoin(joining);
 			wakeIdentity = undefined;
 			handler = undefined;

@@ -401,12 +401,14 @@ a session that asks for a capture only receives the transcript.
   was connected and loses the listener rejoins a replacement, or starts a new
   listener when there is none, on the throttled reconnect schedule. A session
   that starts with voice off joins a running listener but never starts one.
-  A session starts no listener while its own local capture may hold the
-  microphone. This applies to automatic reconnect (including an adopted
-  voice-off connection), an explicit join, and reply reading. A failed
-  explicit join leaves automatic recovery in place. Cancellation can report
-  that the capture has finished before the worker exits; the next reconnect
-  can start a listener only once the microphone is free.
+  A session starts no listener while a local capture in the same Pi process
+  may hold the microphone. This applies to automatic reconnect (including an
+  adopted voice-off connection), an explicit join, and reply reading. A failed
+  explicit join leaves automatic recovery in place. After switching sessions,
+  if voice is on and the previous session's capture blocks the first join,
+  the new session retries on the reconnect schedule. It can start the listener
+  only after the capture's worker exits, even if the capture already reported
+  cancellation. Turning voice off or ending the new session cancels that retry.
 - **Protocol.** `gentle.voice-listener/v1`, JSON on one line each way, at most
   64 KiB per line. A connection starts with a hello carrying the session id and
   the herdr pane id, then answers status and reports the state:
