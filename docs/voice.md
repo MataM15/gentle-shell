@@ -413,10 +413,12 @@ a session that asks for a capture only receives the transcript.
   64 KiB per line. A connection starts with a hello carrying the session id and
   the herdr pane id, then answers status and reports the state:
   `asleep`, `listening`, `transcribing`, `reading`. A client whose hello id
-  starts with `capture-id:` gets a `captureId` on every transcript: the id of
-  the `dictate` it answers, or `null` for a transcript handed over from another
-  session, so a handed-over text is never taken for the result of its own
-  recording. Older clients get the frame without it. One session holds two
+  starts with `capture-id:` gets a `captureId` on transcripts: the id of
+  the `dictate` on that connection, or `null` for unsolicited text delivered to
+  a replacement connection or a focus fallback. A new capture cannot take
+  unsolicited text as its result. Older clients get the frame without
+  `captureId` and cannot distinguish unsolicited text from a capture result.
+  One session holds two
   connections at once: its own long-lived one (the microphone, the wake, the
   voice frames) and the one a reply is read on. Only the reading connection
   names itself (`role: "reading"`); the session's own sends no role at all, which
@@ -432,10 +434,12 @@ a session that asks for a capture only receives the transcript.
   naming the session that holds it (or `asleep`, when nothing has voice on),
   and every session hears the `reading` events, so a waiting one knows the turn
   is free.
-- **One target.** A finished dictation or conversation returns to the session
-  that started it, even when the focus moves to another pane while it is being
-  transcribed; no focus lookup is made for it. Only when that session has
-  closed does the focus decide: the session whose pane herdr reports focused,
+- **One target.** A finished dictation or conversation returns to the current
+  connection for the session ID that started it, even if that session
+  reconnects or focus moves while it is being transcribed. Focus is looked up
+  only if that session has no registered connection, and a requester that
+  reconnects during the lookup still takes priority. Otherwise focus decides:
+  the session whose pane herdr reports focused,
   or the single registered session when no pane is focused, logged as
   `transcript.delivered` with `fallback: "focus"` and reported as `elsewhere`.
   With neither, it is dropped and logged. A session inserts a transcript it

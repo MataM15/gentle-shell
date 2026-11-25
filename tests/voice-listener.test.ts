@@ -1111,24 +1111,38 @@ test("only a client that advertises capture ids gets a marked capture result", a
 	}
 });
 
-test("replacing the requester's connection with the same session is still a focus fallback", async (t) => {
-	const capture = delayedCapture("reconectado");
-	const started = await startListener(scratch(), { dictation: capture.factory, focus: { focusedPaneId: async () => ({ focused: "w1:p1" }) } });
-	t.after(() => { capture.finish(); return started.listener.close(); });
-	const requester = await started.client();
-	requester.hello("s-1", "w1:p1");
-	await awaitFrame(requester, (frame) => frame.type === "welcome");
-	requester.send({ type: "dictate", mode: "dictation" });
-	await awaitFrame(requester, (frame) => frame.type === "capture" && frame.phase === "recording");
-	requester.send({ type: "stop" });
-	await awaitFrame(requester, (frame) => frame.type === "capture" && frame.phase === "transcribing");
-	const replacement = await started.client();
-	replacement.hello("s-1", "w1:p1");
-	await awaitFrame(replacement, (frame) => frame.type === "welcome");
-	capture.finish();
-	assert.deepEqual(await awaitFrame(replacement, (frame) => frame.type === "transcript"), { type: "transcript", text: "reconectado" });
-	assert.deepEqual(started.events.filter((entry) => entry.event === "transcript.delivered").map((entry) => entry.fields), [{ sessionId: "s-1", fallback: "focus" }]);
-	assert.equal(started.events.find((entry) => entry.event === "capture.end")?.fields?.phase, "elsewhere");
+test("the requester's replacement receives unsolicited text, not a capture result", async (t) => {
+	for (const tagged of [true, false]) {
+		await t.test(tagged ? "capture ids" : "legacy", async (st) => {
+			const capture = delayedCapture("reconectado");
+			let lookups = 0;
+			const started = await startListener(scratch(), { dictation: capture.factory, focus: { focusedPaneId: async () => { lookups++; return { focused: "w1:p2" }; } } });
+			st.after(() => { capture.finish(); return started.listener.close(); });
+			const requester = await started.client();
+			const reader = await started.client();
+			requester.send({ type: "hello", proto: 1, sessionId: "s-1", paneId: "w1:p1", voiceOn: true, id: "capture-id:1" });
+			reader.hello("s-1", "w1:p2", true, "reading");
+			await awaitFrame(requester, (frame) => frame.type === "welcome");
+			await awaitFrame(reader, (frame) => frame.type === "welcome");
+			requester.send({ type: "dictate", mode: "dictation", id: "capture-1" });
+			await awaitFrame(requester, (frame) => frame.type === "capture" && frame.phase === "recording");
+			requester.send({ type: "stop" });
+			await awaitFrame(requester, (frame) => frame.type === "capture" && frame.phase === "transcribing");
+			const replacement = await started.client();
+			replacement.send({ type: "hello", proto: 1, sessionId: "s-1", paneId: "w1:p3", voiceOn: true, id: tagged ? "capture-id:1" : "1" });
+			await awaitFrame(replacement, (frame) => frame.type === "welcome");
+			capture.finish();
+			assert.deepEqual(await awaitFrame(replacement, (frame) => frame.type === "transcript"), {
+				type: "transcript", text: "reconectado", ...(tagged ? { captureId: null } : {}),
+			});
+			assert.deepEqual(framesOf(requester, "transcript"), []);
+			assert.deepEqual(framesOf(reader, "transcript"), []);
+			assert.deepEqual(framesOf(replacement, "capture"), []);
+			assert.equal(lookups, 0);
+			assert.deepEqual(started.events.filter((entry) => entry.event === "transcript.delivered").map((entry) => entry.fields), [{ sessionId: "s-1" }]);
+			assert.deepEqual(started.events.find((entry) => entry.event === "capture.end")?.fields, { sessionId: "s-1", mode: "dictation", phase: "delivered", target: "s-1" });
+		});
+	}
 });
 
 test("a departed requester's focused reading-only connection is not a transcript target", async (t) => {
