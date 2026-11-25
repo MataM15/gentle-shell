@@ -401,6 +401,10 @@ a session that asks for a capture only receives the transcript.
   was connected and loses the listener rejoins a replacement, or starts a new
   listener when there is none, on the throttled reconnect schedule. A session
   that starts with voice off joins a running listener but never starts one.
+  While a session's own local capture is starting, recording or transcribing,
+  that session starts no listener at all, neither on reconnect nor on demand:
+  the new listener would open the microphone a second time. It starts one on
+  the next reconnect attempt after that capture's worker has exited.
 - **Protocol.** `gentle.voice-listener/v1`, JSON on one line each way, at most
   64 KiB per line. A connection starts with a hello carrying the session id and
   the herdr pane id, then answers status and reports the state:

@@ -815,6 +815,20 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 	const checkShutdownWorker = (): void => {
 		if (hasLiveShutdownWorker(paths)) throw new ShutdownWorkerBusyError();
 	};
+	// This session's own fallback captures. While one is starting, recording or
+	// transcribing, its worker may hold the microphone, so this session starts no
+	// listener: the new listener's spotter would open the microphone a second
+	// time (T9). A capture reports "finished" only after its worker has exited;
+	// the automatic reconnect keeps retrying on its backoff until then.
+	const ownCaptures = new Set<SessionDictation>();
+	const ownCaptureActive = (): boolean => {
+		for (const capture of ownCaptures) if (capture.state === "idle" || capture.state === "finished") ownCaptures.delete(capture);
+		return ownCaptures.size > 0;
+	};
+	const startListener = (): void | Promise<void> => {
+		if (ownCaptureActive()) throw new Error("this session's own capture still holds the microphone");
+		return options.start?.();
+	};
 	let client: VoiceListenerClient | undefined = options.adoptedClient;
 	let wakeIdentity: object | undefined;
 	let joining: PendingJoin | undefined;
@@ -843,6 +857,9 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 	const ensure = (): Promise<boolean> => {
 		if (client?.connected) return Promise.resolve(true);
 		if (joining) return joining.promise;
+		// Leave the current client, and the reconnect it owns, untouched: it starts
+		// the listener once this session's own capture has released the microphone.
+		if (ownCaptureActive()) return Promise.resolve(false);
 		const controller = new AbortController();
 		const pending: PendingJoin = { controller, promise: undefined!, allowStart: true };
 		joining = pending;
@@ -878,7 +895,7 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 					session,
 					start: () => {
 						if (!pending.allowStart) throw new Error("voice was turned off during listener startup");
-						return options.start?.();
+						return startListener();
 					},
 					waitMs: options.waitMs,
 					probe: options.probe,
@@ -893,7 +910,7 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 								return current?.sessionId === session.sessionId ? current : undefined;
 							},
 							backoffMs: options.backoffMs,
-							restartOnDisconnect: { start: options.start, probe: options.probe, waitMs: options.waitMs },
+							restartOnDisconnect: { start: startListener, probe: options.probe, waitMs: options.waitMs },
 							display: Boolean(options.onDisplay),
 							onFrame: route,
 						}));
@@ -1006,7 +1023,8 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 			// The fence may have appeared while joining or asking for the microphone.
 			checkShutdownWorker();
 			if (handler === handle) handler = undefined;
-			return (fallback ??= request.fallback()).start();
+			if (!fallback) ownCaptures.add((fallback = request.fallback()));
+			return fallback.start();
 		};
 		return {
 			get state() {

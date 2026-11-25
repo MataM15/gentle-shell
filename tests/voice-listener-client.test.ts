@@ -797,6 +797,60 @@ const localCapture = () => {
 	return { calls, dictation };
 };
 
+// T9 (L13): the listener closes before acknowledging a dictate, so the session
+// records with its own capture. Until that capture has fully ended, nothing this
+// session does may start a replacement listener, whose spotter would open the
+// microphone a second time.
+for (const ending of ["stop", "cancel", "failure"] as const) test(`no listener restart while this session's own fallback capture holds the mic (${ending})`, async () => {
+	const dir = scratch();
+	const capture = fakeCapture({ delayMs: 400 });
+	let server = new VoiceListener({ dir, dictation: capture.factory, focus: focusedOn("w1:p1") });
+	await server.listen();
+	let starts = 0;
+	const link = createSessionListenerLink({
+		dir, session: () => session("s-1"), backoffMs: [20, 20], waitMs: 1_000,
+		start: async () => { starts++; server = new VoiceListener({ dir, dictation: fakeCapture().factory, focus: focusedOn("w1:p1") }); await server.listen(); },
+	});
+	// A local capture whose state only reaches "finished" once its worker is gone.
+	let ownState: VoiceSessionState = "idle";
+	let release!: () => void;
+	const released = new Promise<void>((resolve) => { release = resolve; });
+	const own: SessionDictation = {
+		get state() { return ownState; },
+		owner: "session",
+		start: async () => { ownState = "recording"; },
+		stop: async () => { ownState = "transcribing"; await released; ownState = "finished"; return { text: "local", truncated: false }; },
+		cancel: async () => { await released; ownState = "finished"; },
+	};
+	try {
+		assert.equal(await link.ensure(), true);
+		const dictation = link.dictate({ mode: "dictation", onStateChange: () => {}, fallback: () => own });
+		const starting = dictation.start();
+		await waitFor(() => capture.calls.includes("start"));
+		await server.close();
+		await starting;
+		assert.equal(dictation.owner, "session", "the unacknowledged dictate records locally");
+		assert.equal(dictation.state, "recording");
+		await new Promise((resolve) => setTimeout(resolve, 200));
+		assert.equal(starts, 0, "no automatic restart while the local capture records");
+		assert.equal(await link.ensure(), false, "no explicit start either while the local capture records");
+		assert.equal(starts, 0);
+		const ended = ending === "stop" ? dictation.stop() : ending === "cancel" ? dictation.cancel() : (ownState = "transcribing", Promise.resolve());
+		await new Promise((resolve) => setTimeout(resolve, 120));
+		assert.equal(starts, 0, `no restart while the local capture is still ${ending === "cancel" ? "closing" : "transcribing"}`);
+		if (ending === "failure") ownState = "finished";
+		release();
+		await ended;
+		await waitFor(() => starts === 1 && server.sessionIds.includes("s-1"));
+		await new Promise((resolve) => setTimeout(resolve, 60));
+		assert.equal(starts, 1, "one restart once the microphone is free");
+	} finally {
+		release();
+		link.close();
+		await server.close();
+	}
+});
+
 test("a session dictates through the listener and reads its own transcript back", async () => {
 	const dir = scratch();
 	const capture = fakeCapture({ text: "hola mundo" });
