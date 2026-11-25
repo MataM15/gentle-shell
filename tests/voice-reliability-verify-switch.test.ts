@@ -118,3 +118,21 @@ test("an offline session's own local capture does not schedule a first listener 
 	t.mock.timers.tick(20);
 	assert.equal(oldProbes(), 2, "no deferred listener startup for the same session");
 });
+
+test("S3 / 4e53f41b7: a deferred first join can use a peer that bound during its wait", { timeout: 2_000 }, async (t) => {
+	const { before, after, capture, server, starts, probes } = await retiringCapture(t);
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	before.close();
+	await capture.cancel();
+	assert.equal(await after.ensure(), false);
+	assert.equal(probes(), 1);
+	await server.listen();
+	const peer = new VoiceListenerClient({ dir: server.paths.dir, session: { sessionId: "peer", voiceOn: true } });
+	t.after(() => peer.close());
+	await peer.connect();
+	t.mock.timers.tick(20);
+	for (let attempts = 0; attempts < 250 && !server.sessionIds.includes("after-switch"); attempts++) await nextTurn();
+	assert.deepEqual(server.sessionIds, ["peer", "after-switch"]);
+	assert.deepEqual(starts, [], "the retiring worker was never overtaken");
+	assert.equal(probes(), 2);
+});

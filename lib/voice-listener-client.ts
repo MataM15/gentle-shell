@@ -504,12 +504,18 @@ function hasLiveShutdownWorker(paths: ListenerPaths, isAlive?: EnsureListenerOpt
 	return Boolean(lock && (lock.closing || lock.workerPid !== undefined) && !listenerLockStale(lock, { isAlive }));
 }
 
+class ListenerShutdownFenceError extends Error {
+	constructor() {
+		super("voice_listener_busy");
+	}
+}
+
 async function waitForListener(paths: ListenerPaths, waitMs: number, probe: (path: string) => Promise<boolean>, { signal, isAlive }: Pick<EnsureListenerOptions, "signal" | "isAlive">): Promise<boolean> {
 	const deadline = Date.now() + waitMs;
 	for (;;) {
 		throwIfAborted(signal);
 		// A shutdown worker cannot answer a probe or publish a listener socket.
-		if (hasLiveShutdownWorker(paths, isAlive)) throw new Error("voice_listener_busy");
+		if (hasLiveShutdownWorker(paths, isAlive)) throw new ListenerShutdownFenceError();
 		if (await withAbort(probe(paths.socket), signal)) return true;
 		if (Date.now() >= deadline) return false;
 		await wait(PROBE_INTERVAL_MS, signal);
@@ -793,8 +799,8 @@ export interface ListenerDictationOptions {
 }
 
 export interface SessionListenerLink {
-	// True when joined. A first voice-on join blocked by local capture can retry
-	// in the background even if this call returns false.
+	// True when joined. A first voice-on join blocked by a retiring worker can
+	// retry in the background even if this call returns false.
 	ensure(): Promise<boolean>;
 	// Optional for injected links; production updates the joined registration.
 	updateVoice?(voiceOn: boolean): void;
@@ -947,13 +953,7 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 						if (!pending.allowStart || (retry?.sessionId !== undefined && !voiceIsOnFor(retry.sessionId))) {
 							throw new Error("voice was turned off during listener startup");
 						}
-						try { return startListener(); }
-						catch (error) {
-							if (error instanceof ShutdownWorkerBusyError && retry && !usedLocalCapture && voiceIsOnFor(session.sessionId)) {
-								deferJoin(session.sessionId, retry.attempt);
-							}
-							throw error;
-						}
+						return startListener();
 					},
 					waitMs: options.waitMs,
 					probe: options.probe,
@@ -973,6 +973,12 @@ export function createSessionListenerLink(options: SessionListenerLinkOptions): 
 							onFrame: route,
 						}));
 					},
+				}).catch((error: unknown) => {
+					if ((error instanceof ShutdownWorkerBusyError || error instanceof ListenerShutdownFenceError)
+						&& retry && !usedLocalCapture && pending.allowStart && !controller.signal.aborted && voiceIsOnFor(session.sessionId)) {
+						deferJoin(session.sessionId, retry.attempt);
+					}
+					throw error;
 				});
 				throwIfAborted(controller.signal);
 				client = joined.client;
